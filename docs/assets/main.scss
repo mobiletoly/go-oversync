@@ -1,0 +1,116 @@
+---
+---
+
+@import "minima";
+
+/* Custom styles to make the main content wider (mirroring KMP site) */
+.wrapper {
+  max-width: 1000px !important; /* Increased from default ~800px */
+  width: 95% !important; /* Use more of the available width */
+}
+
+/* Ensure code blocks don't overflow */
+pre, code {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* Make tables more responsive in wider layout */
+table {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Adjust post content for better readability with wider layout */
+.post-content {
+  line-height: 1.6;
+}
+
+/* Ensure images scale properly */
+.post-content img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Mermaid diagram styling */
+.mermaid {
+  text-align: center;
+  margin: 20px 0;
+}
+
+/* Dropdown navigation styling (mirroring KMP site) */
+.dropdown {
+  position: relative;
+  display: inline-block;
+}
+
+.dropdown-content {
+  display: none !important;
+  position: absolute;
+  background-color: #f9f9f9;
+  min-width: 220px;
+  box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+  z-index: 1;
+  border-radius: 4px;
+  border: 1px solid #ddd;
+  top: 100%;
+  left: 0;
+}
+
+.dropdown-content a {
+  color: #424242 !important;
+  padding: 0 16px;
+  text-decoration: none;
+  display: block;
+  font-size: 14px;
+  border-bottom: 1px solid #eee;
+}
+
+.dropdown-content a:last-child {
+  border-bottom: none;
+}
+
+.dropdown-content a:hover {
+  background-color: #f1f1f1;
+  color: #0969da !important;
+}
+
+.dropdown:hover .dropdown-content {
+  display: block !important;
+}
+
+.dropdown-toggle {
+  cursor: pointer;
+}
+
+.dropdown-toggle::after {
+  content: " ▼";
+  font-size: 10px;
+  margin-left: 4px;
+}
+
+/* Mobile responsive dropdown */
+@media screen and (max-width: 600px) {
+  .dropdown {
+    display: block;
+  }
+
+  .dropdown-content {
+    position: static !important;
+    display: none !important;
+    box-shadow: none;
+    border: none;
+    background-color: transparent;
+    min-width: auto;
+  }
+
+  .dropdown-content a {
+    padding: 8px 16px;
+    border-left: 3px solid #e1e4e8;
+    margin-left: 16px;
+  }
+
+  .nav-trigger:checked ~ .trigger .dropdown-content {
+    display: block !important;
+  }
+}

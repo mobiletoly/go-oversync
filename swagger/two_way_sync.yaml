@@ -1,0 +1,417 @@
+openapi: 3.0.3
+info:
+  title: go-oversync Single-User Multi-Device Sync API
+  description: |
+    API for robust two-way synchronization using **single-user multi-device sync architecture**.
+
+    This API provides:
+    - **Single-User Multi-Device Sync**: Multiple devices for the same user can sync data
+    - **User Isolation**: Different users cannot see each other's data
+    - **Sidecar Architecture**: Business tables remain clean, sync metadata in separate tables
+    - **JWT Authentication**: User ID (sub) and Device ID (did) claims for identification
+    - **Optimistic Concurrency**: Version control via server_version
+    - **Idempotent Operations**: Using (user_id, source_id, source_change_id) uniqueness
+    - **Materialization**: Optional projection to business tables via handlers
+    - **Enhanced Status**: Applied, conflict, invalid, materialize_error statuses
+
+    ## Architecture Overview
+    - **User Scoping**: All data is scoped by user_id from JWT sub claim
+    - **Device Identification**: Each device has unique ID from JWT did claim
+    - **Cross-Device Sync**: Devices see changes from other devices of same user
+    - **Loop Prevention**: Devices don't see their own changes during download
+
+    ## Authentication
+    All endpoints require JWT authentication with Bearer token containing:
+    - `sub` (subject): User ID for data isolation
+    - `did` (device ID): Device identifier for change attribution
+
+    ## Sync Flow
+    1. **Upload**: Client sends changes → Server extracts user_id/device_id from JWT → Applies with user isolation
+    2. **Conflict Resolution**: Server detects version conflicts within user scope
+    3. **Download**: Client fetches changes for same user, excluding own device changes
+    4. **Apply**: Client applies non-conflicting changes locally
+
+  version: 1.0.0
+  contact:
+    name: go-oversync
+    url: https://github.com/mobiletoly/go-oversync
+servers:
+  - url: http://localhost:8080
+    description: Development server
+paths:
+  /sync/upload:
+    post:
+      summary: Upload changes to server
+      description: |
+        Upload client changes to the server with user isolation and conflict detection.
+
+        **Key Features:**
+        - Changes are processed atomically within a transaction
+        - User ID and Device ID are extracted from JWT token
+        - Only registered tables are accepted for sync operations
+        - Conflict detection using server_version optimistic locking
+        - Idempotent operations using (user_id, source_id, source_change_id) uniqueness
+
+        **Conflict Resolution:**
+        When server_version doesn't match, the server returns a conflict status with the current server state,
+        allowing the client to resolve the conflict and retry.
+      security:
+        - BearerAuth: [ ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadRequest'
+            example:
+              last_server_seq_seen: 42
+              changes:
+                - source_change_id: 1
+                  table: "users"
+                  op: "INSERT"
+                  pk: "550e8400-e29b-41d4-a716-446655440000"
+                  server_version: 0
+                  payload:
+                    id: "550e8400-e29b-41d4-a716-446655440000"
+                    name: "John Doe"
+                    email: "john@example.com"
+                    created_at: 1640995200
+      responses:
+        '200':
+          description: Upload processed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+        '400':
+          description: Invalid request format or unregistered table
+        '401':
+          description: Authentication required
+        '500':
+          description: Server error
+
+  /sync/download:
+    get:
+      summary: Download changes from server
+      description: |
+        Download server changes since a given sequence number for the authenticated user.
+        - **User Isolation**: Only returns changes for the same user (JWT `sub`)
+        - **Device Exclusion**: Excludes the caller’s own changes by default (JWT `did`)
+        - **Cross-Device Sync**: Includes changes from other devices of the same user
+        - **Ordering**: Results are in ascending `server_id`. The stream is **not** FK-topologically sorted; children may precede parents. Clients must stage until parents arrive.
+      security:
+        - BearerAuth: [ ]
+      parameters:
+        - name: after
+          in: query
+          description: Server sequence number to start after (must be >= 0)
+          required: false
+          schema:
+            type: integer
+            format: int64
+            default: 0
+            minimum: 0
+        - name: schema
+          in: query
+          description: Business schema name to filter by (required; lowercase letters, digits, and underscores only)
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z0-9_]+$'
+            example: "business"
+        - name: limit
+          in: query
+          description: Maximum number of changes to return
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: schema
+          in: query
+          description: Optional schema filter (defaults to all registered)
+          required: false
+          schema: { type: string, pattern: '^[a-z0-9_]+$' }
+        - name: include_self
+          in: query
+          description: Include changes originated by this device (default false)
+          required: false
+          schema: { type: boolean, default: false }
+        - name: until
+          in: query
+          description: Optional frozen upper bound for windowed paging (server_id). Must be >= 0. If omitted, server freezes a window for this response and returns it as `window_until`.
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        '200':
+          description: Changes retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadResponse'
+        '400':
+          description: Invalid parameters
+        '401':
+          description: Authentication required
+        '500':
+          description: Server error
+
+  /sync/schema-version:
+    get:
+      summary: Get current schema version
+      description: Returns the current schema version supported by the server
+      security:
+        - BearerAuth: [ ]
+      responses:
+        '200':
+          description: Schema version information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaVersionResponse'
+        '401':
+          description: Authentication required
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT token containing user and device identification claims:
+        - `sub` (subject): User ID for data isolation
+        - `did` (device ID): Device identifier for change attribution
+
+        Example: `Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...`
+
+        Token payload example:
+        ```json
+        {
+          "sub": "user-123",
+          "did": "device-456",
+          "exp": 1640995200,
+          "iat": 1640991600
+        }
+        ```
+
+  schemas:
+    UploadRequest:
+      type: object
+      required:
+        - last_server_seq_seen
+        - changes
+      properties:
+        last_server_seq_seen:
+          type: integer
+          format: int64
+          description: Highest server sequence number seen by client
+          example: 42
+        changes:
+          type: array
+          description: Array of changes to upload
+          items:
+            $ref: '#/components/schemas/ChangeUpload'
+
+    ChangeUpload:
+      type: object
+      required:
+        - source_change_id
+        - table
+        - op
+        - pk
+        - server_version
+      properties:
+        source_change_id:
+          type: integer
+          format: int64
+          description: Device-local change identifier (unique per device)
+          example: 1
+        schema:
+          type: string
+          pattern: '^[a-z0-9_]+$'
+          description: Schema name (optional, defaults to "public")
+          example: "business"
+        table:
+          type: string
+          pattern: '^[a-z0-9_]+$'
+          description: Table name (must be registered for sync)
+          example: "users"
+        op:
+          type: string
+          enum: [ INSERT, UPDATE, DELETE ]
+          description: Operation type
+          example: "INSERT"
+        pk:
+          type: string
+          format: uuid
+          description: Primary key as UUID string
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        server_version:
+          type: integer
+          format: int64
+          description: Expected server version for conflict detection
+          example: 0
+        payload:
+          type: object
+          description: JSON payload (null for DELETE operations)
+          example:
+            id: "550e8400-e29b-41d4-a716-446655440000"
+            name: "John Doe"
+            email: "john@example.com"
+
+    UploadResponse:
+      type: object
+      required:
+        - accepted
+        - highest_server_seq
+        - statuses
+      properties:
+        accepted:
+          type: boolean
+          description: Whether the upload was accepted for processing
+          example: true
+        highest_server_seq:
+          type: integer
+          format: int64
+          description: Current highest server sequence number
+          example: 45
+        statuses:
+          type: array
+          description: Status for each uploaded change
+          items:
+            $ref: '#/components/schemas/ChangeUploadStatus'
+
+    ChangeUploadStatus:
+      type: object
+      required: [ source_change_id, status ]
+      properties:
+        source_change_id:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [ applied, conflict, invalid, materialize_error ]
+        new_server_version:
+          type: integer
+          format: int64
+          description: New version if applied
+        message:
+          type: string
+        server_row:
+          type: object
+          description: Present for conflicts
+        invalid:
+          type: object
+          description: Structured details for `status=invalid`
+          properties:
+            reason:
+              type: string
+              enum: [ fk_missing, bad_payload, precheck_error, unregistered_table ]
+              example: fk_missing
+            missing_parents:
+              type: array
+              description: 'For `fk_missing`: parents not present in DB nor earlier in this batch'
+              items:
+                type: object
+                required: [ schema, table, column, value ]
+                properties:
+                  schema: { type: string, example: "public" }
+                  table: { type: string, example: "users" }
+                  column: { type: string, example: "id" }
+                  value: { type: string, example: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" }
+
+    DownloadResponse:
+      type: object
+      required:
+        - changes
+        - has_more
+        - next_after
+      properties:
+        changes:
+          type: array
+          description: Array of changes from server (user-scoped, excluding own device)
+          items:
+            $ref: '#/components/schemas/ChangeDownloadResponse'
+        has_more:
+          type: boolean
+          description: Whether more changes are available
+          example: false
+        next_after:
+          type: integer
+          format: int64
+          description: Server sequence number to use for next download request
+          example: 45
+        window_until:
+          type: integer
+          format: int64
+          description: Upper-bound snapshot for this paging session (server_id); clients should pass this back on subsequent pages (`until`) to keep a consistent window.
+
+    ChangeDownloadResponse:
+      type: object
+      required:
+        - server_id
+        - schema
+        - table
+        - op
+        - pk
+        - server_version
+        - source_id
+        - source_change_id
+        - ts
+      properties:
+        server_id:
+          type: integer
+          format: int64
+          description: Server sequence number
+        schema:
+          type: string
+          description: Schema name
+          example: "public"
+        table:
+          type: string
+          description: Table name
+          example: "users"
+        op:
+          type: string
+          enum: [ INSERT, UPDATE, DELETE ]
+        pk:
+          type: string
+          format: uuid
+        payload:
+          type: object
+          description: JSON payload (null for DELETE)
+        server_version:
+          type: integer
+          format: int64
+          description: Current server version from sync_row_meta
+        deleted:
+          type: boolean
+          description: Deletion status from sync_row_meta
+          example: false
+        source_id:
+          type: string
+          description: Originating device identifier (JWT `did`)
+        source_change_id:
+          type: integer
+          format: int64
+        ts:
+          type: string
+          format: date-time
+
+    SchemaVersionResponse:
+      type: object
+      required:
+        - schema_version
+      properties:
+        schema_version:
+          type: integer
+          description: Current schema version supported by the server
+          example: 1
+
+security:
+  - BearerAuth: [ ]

@@ -1,0 +1,20 @@
+<!-- Mermaid.js integration -->
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+  mermaid.initialize({ startOnLoad: false });
+
+  document.addEventListener('DOMContentLoaded', () => {
+    // Convert Jekyll code blocks to mermaid divs
+    document.querySelectorAll('pre > code.language-mermaid').forEach(code => {
+      const div = document.createElement('div');
+      div.className = 'mermaid';
+      div.textContent = code.textContent;
+      code.parentElement.replaceWith(div);
+    });
+
+    // Render all mermaid diagrams
+    mermaid.run();
+  });
+</script>
+

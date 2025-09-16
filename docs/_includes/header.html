@@ -1,0 +1,11 @@
+<header class="site-header" role="banner">
+
+  <div class="wrapper">
+    <a class="site-title" rel="author" href="{{ "/" | relative_url }}">{{ site.title | escape }}</a>
+
+    {%- if site.data.navigation.main -%}
+      {%- include navigation.html -%}
+    {%- endif -%}
+  </div>
+
+</header>

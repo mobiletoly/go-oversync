@@ -1,0 +1,17 @@
+source "https://rubygems.org"
+
+# Pin to the GitHub Pages gem so local builds match what GitHub runs
+gem "github-pages", group: :jekyll_plugins
+
+# Ruby 3 ships without WEBrick by default; add it for `jekyll serve`
+gem "webrick"
+
+# Ensure remote theme plugin is available locally
+gem "jekyll-remote-theme"
+
+# Additional plugins for better GitHub Pages compatibility
+group :jekyll_plugins do
+  gem "jekyll-feed"
+  gem "jekyll-sitemap"
+  gem "jekyll-seo-tag"
+end

@@ -1,0 +1,38 @@
+title: go-oversync
+description: Production-ready multi-device sync libraries for PostgreSQL and SQLite
+baseurl: "/go-oversync"
+url: "https://mobiletoly.github.io"
+
+theme: minima
+plugins:
+  - jekyll-feed
+  - jekyll-remote-theme
+  - jekyll-sitemap
+  - jekyll-seo-tag
+
+# Top navigation pages (now handled by _data/navigation.yml)
+# header_pages:
+#   - index.markdown
+#   - getting-started.md
+#   - documentation.md
+
+# GitHub repository info
+github_username: mobiletoly
+repository: go-oversync
+
+# Build settings
+markdown: kramdown
+highlighter: rouge
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+
+# Exclude from processing
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/

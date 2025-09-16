@@ -1,0 +1,14 @@
+main:
+  - title: "Home"
+    url: "/"
+  - title: "Getting Started"
+    url: "/getting-started/"
+  - title: "Documentation"
+    url: "/documentation/"
+  - title: "Architecture"
+    url: "/architecture/"
+    children:
+      - title: "Core Concepts"
+        url: "/documentation/core-concepts/"
+      - title: "Advanced Concepts"
+        url: "/documentation/advanced-concepts/"
