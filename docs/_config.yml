@@ -16,9 +16,12 @@ plugins:
 #   - getting-started.md
 #   - documentation.md
 
-# GitHub repository info
+# Repository information
+repository: mobiletoly/go-oversync
+github:
+  repository_url: https://github.com/mobiletoly/go-oversync
+  repository_name: go-oversync
 github_username: mobiletoly
-repository: go-oversync
 
 # Build settings
 markdown: kramdown
