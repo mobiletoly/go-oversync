@@ -5,7 +5,7 @@ title: Home
 
 # go-oversync — Production-Ready Multi-Device Sync
 
-**A set of libraries that add bulletproof two-way sync between client databases and PostgreSQL
+**A set of libraries that add two-way sync between client databases and PostgreSQL
 servers.**
 
 ## What is go-oversync?
