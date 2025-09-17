@@ -16,8 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// TableHandler interface for materializing changes to business tables
-type TableHandler interface {
+// MaterializationHandler interface for materializing changes to business tables
+type MaterializationHandler interface {
 	// ApplyUpsert materializes an INSERT or UPDATE operation to the business table
 	// Must be idempotent - safe to call multiple times for the same (schema, table, pk, server_version)
 	ApplyUpsert(ctx context.Context, tx pgx.Tx, schema, table string, pk uuid.UUID, payload []byte) error
@@ -38,9 +38,9 @@ type TableHandler interface {
 
 // RegisteredTable represents a table that is registered for sync operations
 type RegisteredTable struct {
-	Schema  string       `json:"schema"` // Schema name (e.g., "public", "crm", "business")
-	Table   string       `json:"table"`  // Table name (e.g., "users", "posts")
-	Handler TableHandler `json:"-"`      // Optional handler for materializing changes to business tables
+	Schema  string                 `json:"schema"` // Schema name (e.g., "public", "crm", "business")
+	Table   string                 `json:"table"`  // Table name (e.g., "users", "posts")
+	Handler MaterializationHandler `json:"-"`      // Optional handler for materializing changes to business tables
 }
 
 // SyncService provides the core synchronization functionality
@@ -49,8 +49,8 @@ type SyncService struct {
 	pool             *pgxpool.Pool
 	logger           *slog.Logger
 	config           *ServiceConfig
-	tableHandlers    map[string]TableHandler // Two-way sync table handlers
-	registeredTables map[string]bool         // Set of "schema.table" combinations allowed in sync operations
+	tableHandlers    map[string]MaterializationHandler // Two-way sync table handlers
+	registeredTables map[string]bool                   // Set of "schema.table" combinations allowed in sync operations
 
 	// Schema discovery for batch upload improvements
 	discoveredSchema *DiscoveredSchema
@@ -88,7 +88,7 @@ func NewSyncService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.Logg
 		pool:             pool,
 		logger:           logger,
 		config:           config,
-		tableHandlers:    make(map[string]TableHandler),
+		tableHandlers:    make(map[string]MaterializationHandler),
 		registeredTables: make(map[string]bool),
 	}
 

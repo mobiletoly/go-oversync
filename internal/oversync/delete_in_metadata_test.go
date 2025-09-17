@@ -241,7 +241,7 @@ func TestT02_DeletedMetadataPreventsResurrection(t *testing.T) {
 
 	recreateResp, _ := h.DoUpload(h.client2Token, recreateReq)
 	require.True(t, recreateResp.Accepted)
-	// Sidecar v2: INSERT after DELETE with same PK conflicts with deleted metadata
+	// Sidecar: INSERT after DELETE with same PK conflicts with deleted metadata
 	require.Equal(t, "conflict", recreateResp.Statuses[0].Status)
 
 	// Verify the conflict response includes the deleted metadata

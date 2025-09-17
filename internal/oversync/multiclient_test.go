@@ -128,14 +128,14 @@ func TestM02_BidirectionalSync(t *testing.T) {
 	require.True(t, uploadResp2.Accepted)
 	require.Equal(t, int64(2), uploadResp2.HighestServerSeq)
 
-	// Sidecar v2: Client 1 downloads changes (excludes own changes)
+	// Sidecar: Client 1 downloads changes (excludes own changes)
 	downloadResp1, _ := h.DoDownload(h.client1Token, 0, 100)
 	require.Len(t, downloadResp1.Changes, 1) // Only sees Client 2's change
 
 	// Verify Client 1 sees only Client 2's change
 	require.Equal(t, h.client2ID, downloadResp1.Changes[0].SourceID) // Client 2's change
 
-	// Sidecar v2: Client 2 downloads changes (excludes own changes)
+	// Sidecar: Client 2 downloads changes (excludes own changes)
 	downloadResp2, _ := h.DoDownload(h.client2Token, 0, 100)
 	require.Len(t, downloadResp2.Changes, 1) // Only sees Client 1's change
 
@@ -234,7 +234,7 @@ func TestM03_ConflictBetweenClients(t *testing.T) {
 	require.Nil(t, status.NewServerVersion)
 	require.NotNil(t, status.ServerRow)
 
-	// Parse and verify server row shows Client 1's update (sidecar v2 format)
+	// Parse and verify server row shows Client 1's update
 	var serverState map[string]interface{}
 	err := json.Unmarshal(status.ServerRow, &serverState)
 	require.NoError(t, err)
@@ -351,7 +351,7 @@ func TestM04_IncrementalSyncBetweenClients(t *testing.T) {
 	require.Equal(t, h.client1ID, downloadResp2Incremental.Changes[0].SourceID)
 	require.Equal(t, int64(3), downloadResp2Incremental.NextAfter)
 
-	// Final verification: Sidecar v2 - each client sees only other's changes
+	// Final verification: each client sees only other's changes
 	downloadRespFinal1, _ := h.DoDownload(h.client1Token, 0, 100)
 	downloadRespFinal2, _ := h.DoDownload(h.client2Token, 0, 100)
 	require.Len(t, downloadRespFinal1.Changes, 1) // Client 1 sees only Client 2's change
@@ -430,7 +430,7 @@ func TestM05_ConcurrentUploads(t *testing.T) {
 	finalHighest := max(uploadResp1.HighestServerSeq, uploadResp2.HighestServerSeq)
 	require.Equal(t, int64(2), finalHighest)
 
-	// Sidecar v2: Verify each client sees only the other's changes
+	// Sidecar: Verify each client sees only the other's changes
 	downloadResp1, _ := h.DoDownload(h.client1Token, 0, 100)
 	downloadResp2, _ := h.DoDownload(h.client2Token, 0, 100)
 	require.Len(t, downloadResp1.Changes, 1) // Client 1 sees only Client 2's change

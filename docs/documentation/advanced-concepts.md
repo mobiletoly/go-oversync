@@ -283,7 +283,7 @@ This maps “losers” of the uniqueness race to an idempotent outcome while let
   - in DB (`SELECT EXISTS(...) FROM parent_table WHERE ref_col=@val`).
 - If missing → status: invalid with reason `fk_missing` and details.
 
-- Payload key conversion: if a `TableHandler` is registered it may implement `ConvertReferenceKey(fieldName string, payloadValue any) (any, error)` to translate encoded payload values (e.g., base64-encoded UUIDs or hex blobs) into DB-comparable forms during FK checks. Conversion errors map to `invalid.bad_payload`.
+- Payload key conversion: if a `MaterializationHandler` is registered it may implement `ConvertReferenceKey(fieldName string, payloadValue any) (any, error)` to translate encoded payload values (e.g., base64-encoded UUIDs or hex blobs) into DB-comparable forms during FK checks. Conversion errors map to `invalid.bad_payload`.
 
 3.3 SAVEPOINT per change
 ```sql
@@ -342,7 +342,7 @@ SET payload = EXCLUDED.payload;
 ```
 
 3.7 Optional business materialization
-- If a `TableHandler` is registered for `schema.table`, call its idempotent upsert.
+- If a `MaterializationHandler` is registered for `schema.table`, call its idempotent upsert.
 - Any error → status: `materialize_error`; `ROLLBACK TO SAVEPOINT` and continue. Sidecar is NOT advanced; a row is recorded in `sync.materialize_failures` with `attempted_version` and details.
 
 3.8 Release SAVEPOINT → status: `applied` with `new_server_version`.
@@ -490,7 +490,7 @@ ALTER TABLE %I.%I RENAME CONSTRAINT %I TO %I;
 
 ## Materialization Hooks (Optional)
 
-- Register `TableHandler` per `schema.table` to project sidecar state into clean business tables.
+- Register `MaterializationHandler` per `schema.table` to project sidecar state into clean business tables.
 - Handlers receive `(ctx, tx, schema, table, pk_uuid, payload)` and must be idempotent.
 - Errors are mapped to `materialize_error` per change; the change SAVEPOINT is rolled back (sidecar not advanced) and the failure is recorded for diagnostics/admin retry.
 
@@ -501,6 +501,190 @@ ALTER TABLE %I.%I RENAME CONSTRAINT %I TO %I;
 - Idempotency: failures are upserted with `UNIQUE (user_id, schema_name, table_name, pk_uuid, attempted_version)`; repeated failures of the same attempt increment `retry_count`.
 - Admin retry operations: list failures for the authenticated user and retry a specific failure by id. Transport adapters (e.g., HTTP) may expose endpoints for these operations; see the adapter docs. On success the failure row is deleted and a corresponding `server_change_log` entry is written; on conflict or repeated failure, the row remains and `retry_count` increments.
 - Operations: the failure log enables monitoring and admin-driven retries. Since sidecar is not advanced on failure, a successful retry applies normally and future downloads will include the change.
+
+## Materialization Deep Dive
+
+Materialization is the optional process of converting sync data from the sidecar schema into your application's business tables. This enables server-side queries, reporting, and API endpoints while maintaining sync reliability.
+
+### Architecture Overview
+
+The materialization system operates in two phases during upload processing:
+
+1. **Sync Phase**: Changes are validated, versioned, and stored in the sidecar schema
+2. **Materialization Phase**: Changes are optionally projected into business tables
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant S as SyncService
+  participant SM as Sync Metadata
+  participant BT as Business Tables
+  participant FL as Failure Log
+
+  C->>S: upload(change)
+  S->>SM: 1. Store in sidecar (sync_row_meta, sync_state, server_change_log)
+
+  alt Materialization enabled
+    S->>BT: 2. Call MaterializationHandler.ApplyInsertOrUpdate()
+    alt Success
+      BT-->>S: ✓ Applied to business table
+      S-->>C: status=applied
+    else Failure
+      BT-->>S: ✗ Materialization failed
+      S->>SM: ROLLBACK TO SAVEPOINT (undo sidecar changes)
+      S->>FL: Record failure in materialize_failures
+      S-->>C: status=materialize_error
+    end
+  else No materialization
+    S-->>C: status=applied
+  end
+```
+
+### MaterializationHandler Interface
+
+Materialization is implemented through the `MaterializationHandler` interface:
+
+```go
+type MaterializationHandler interface {
+    // Apply insert or update to business table
+    ApplyInsertOrUpdate(ctx context.Context, tx *sql.Tx,
+                       schema, table, pk string, payload map[string]any) error
+
+    // Apply delete to business table
+    ApplyDelete(ctx context.Context, tx *sql.Tx,
+               schema, table, pk string) error
+
+    // Convert encoded reference keys (e.g., base64 UUIDs)
+    ConvertReferenceKey(fieldName string, payloadValue any) (any, error)
+}
+```
+
+### Materialization Flow Details
+
+**During Upload Processing:**
+
+1. **Sync Storage First**: Changes are always stored in sidecar schema first
+2. **Materialization Attempt**: If a MaterializationHandler is registered, call the appropriate method
+3. **Failure Isolation**: Materialization failures don't affect sync reliability
+4. **Atomic Rollback**: Failed materialization rolls back both sidecar and business changes
+
+**Key SQL Operations:**
+
+```sql
+-- 1. Store in sidecar (always succeeds if valid)
+INSERT INTO sync.sync_state (user_id, schema_name, table_name, pk_uuid, payload)
+VALUES (@user, @schema, @table, @pk, @payload)
+ON CONFLICT (user_id, schema_name, table_name, pk_uuid)
+DO UPDATE SET payload = EXCLUDED.payload;
+
+-- 2. Attempt materialization (may fail)
+-- This is handled by your MaterializationHandler implementation
+INSERT INTO business.users (id, name, email, updated_at)
+VALUES (@id, @name, @email, @timestamp)
+ON CONFLICT (id) DO UPDATE SET
+  name = EXCLUDED.name,
+  email = EXCLUDED.email,
+  updated_at = EXCLUDED.updated_at;
+```
+
+### Failure Handling and Recovery
+
+**Materialization Failure Process:**
+
+1. **Immediate Rollback**: `ROLLBACK TO SAVEPOINT` undoes both sidecar and business changes
+2. **Failure Recording**: Insert into `sync.materialize_failures` with error details
+3. **Status Response**: Return `materialize_error` with attempted version number
+4. **Client Behavior**: Client can retry the same change later
+
+**Failure Log Schema:**
+
+```sql
+CREATE TABLE sync.materialize_failures (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  schema_name TEXT NOT NULL,
+  table_name TEXT NOT NULL,
+  pk_uuid UUID NOT NULL,
+  attempted_version BIGINT NOT NULL,  -- Version that failed to materialize
+  op TEXT NOT NULL,                   -- INSERT, UPDATE, or DELETE
+  payload JSONB,                      -- The data that failed to materialize
+  error TEXT NOT NULL,                -- Error message from MaterializationHandler
+  first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+  retry_count INT NOT NULL DEFAULT 0,
+  UNIQUE (user_id, schema_name, table_name, pk_uuid, attempted_version)
+);
+```
+
+### Admin Operations
+
+**Retry Failed Materializations:**
+
+```sql
+-- List failures for a user
+SELECT schema_name, table_name, pk_uuid, attempted_version, error, retry_count
+FROM sync.materialize_failures
+WHERE user_id = @user_id
+ORDER BY first_seen DESC;
+
+-- Retry specific failure (pseudo-code)
+-- 1. Fetch failure record and sync_state
+-- 2. Re-attempt MaterializationHandler.Apply() in transaction
+-- 3. On success: delete failure record, write server_change_log entry
+-- 4. On failure: increment retry_count
+```
+
+### Design Principles
+
+**Reliability First:**
+- Sync operations never fail due to materialization issues
+- Sidecar schema is the authoritative source of truth
+- Business tables are derived views that can be rebuilt
+
+**Idempotency:**
+- MaterializationHandlers must be idempotent (safe to call multiple times)
+- Failed materializations can be retried without side effects
+- Same change produces same business table state
+
+**Isolation:**
+- Each change is materialized in its own SAVEPOINT
+- Materialization failures don't affect other changes in the batch
+- Business logic complexity doesn't impact sync reliability
+
+**Observability:**
+- All failures are logged with full context
+- Retry counts track persistent issues
+- Admin tools can monitor and resolve failures
+
+### Use Cases
+
+**Server-Side Queries:**
+```sql
+-- Query materialized business data directly
+SELECT u.name, COUNT(p.id) as post_count
+FROM business.users u
+LEFT JOIN business.posts p ON p.author_id = u.id
+GROUP BY u.id, u.name;
+```
+
+**REST API Endpoints:**
+```go
+// Serve data from materialized tables
+func GetUser(userID string) (*User, error) {
+    var user User
+    err := db.QueryRow(`
+        SELECT id, name, email, created_at
+        FROM business.users
+        WHERE id = $1
+    `, userID).Scan(&user.ID, &user.Name, &user.Email, &user.CreatedAt)
+    return &user, err
+}
+```
+
+**Analytics and Reporting:**
+- Business intelligence tools can query clean, structured tables
+- No need to parse JSON payloads from sync metadata
+- Standard SQL operations work as expected
 
 ## Status Semantics
 
@@ -715,7 +899,7 @@ return { TableOrder: order, OrderIdx: index(order), FKMap: fkMap, Dependencies: 
 Materializer interface
 
 ```
-type TableHandler interface {
+type MaterializationHandler interface {
   ApplyInsertOrUpdate(ctx, tx, schema, table, pk, payload) error
   ApplyDelete(ctx, tx, schema, table, pk) error
   ConvertReferenceKey(fieldName string, payloadValue any) (any, error)

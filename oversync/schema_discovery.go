@@ -536,7 +536,7 @@ func (d *DiscoveredSchema) ParentsMissing(
 	childSchema, childTable string,
 	payload map[string]any,
 	willExist map[string]map[string]struct{}, // batchIndex keyed by "schema.table"
-	tableHandler TableHandler,
+	tableHandler MaterializationHandler,
 ) ([]string, error) {
 	childKey := Key(childSchema, childTable)
 

@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Sidecar v2 Integration Tests
+// Sidecar vIntegration Tests
 // Based on docs/techreq/08_integration_tests_v2.md
 
 // Helper methods for sidecar tests
@@ -516,7 +516,7 @@ func TestSidecarTC10_DownloadAfterServerID(t *testing.T) {
 	require.False(t, resp.HasMore)
 	require.Equal(t, int64(2), resp.NextAfter)
 
-	// Verify sidecar v2 fields in response
+	// Verify sidecar fields in response
 	change1 := resp.Changes[0]
 	require.Equal(t, int64(1), change1.ServerID)
 	require.Equal(t, "note", change1.TableName)

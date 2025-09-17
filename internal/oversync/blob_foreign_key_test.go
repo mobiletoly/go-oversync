@@ -240,7 +240,7 @@ func (h *SimpleTestHarness) setupBlobForeignKeyTables() {
 // BlobFilesTableHandler handles files table with BLOB primary keys
 type BlobFilesTableHandler struct{}
 
-// ConvertReferenceKey implements the TableHandler interface
+// ConvertReferenceKey implements the MaterializationHandler interface
 func (h *BlobFilesTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))
 }
@@ -305,7 +305,7 @@ func (h *BlobFilesTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, sche
 // BlobFileReviewsTableHandler handles file_reviews table with BLOB foreign keys
 type BlobFileReviewsTableHandler struct{}
 
-// ConvertReferenceKey implements the TableHandler interface
+// ConvertReferenceKey implements the MaterializationHandler interface
 func (h *BlobFileReviewsTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))
 }

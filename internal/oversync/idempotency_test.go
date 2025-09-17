@@ -321,7 +321,7 @@ func TestI04_CrossClientIdempotency(t *testing.T) {
 	require.Equal(t, int64(2), response2.HighestServerSeq) // New change created
 	require.Equal(t, "applied", response2.Statuses[0].Status)
 
-	// Sidecar v2: Client 1 sees only Client 2's change (excludes own changes)
+	// Client 1 sees only Client 2's change (excludes own changes)
 	downloadResp, _ := h.DoDownload(h.client1Token, 0, 100)
 	require.Len(t, downloadResp.Changes, 1)
 

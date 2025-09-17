@@ -231,7 +231,7 @@ func TestS02_ClientRecoveryAfterOffline(t *testing.T) {
 		},
 	}
 
-	// Sidecar v2: Client 2 uploads initial change so Client 1 can see it
+	// Sidecar: Client 2 uploads initial change so Client 1 can see it
 	initialResp, _ := h.DoUpload(h.client2Token, initialReq)
 	require.True(t, initialResp.Accepted)
 	require.Equal(t, int64(1), initialResp.HighestServerSeq)

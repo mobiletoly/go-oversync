@@ -187,7 +187,7 @@ func (h *SimpleTestHarness) Cleanup() {
 // Reset flushes all data between tests
 func (h *SimpleTestHarness) Reset() {
 	err := pgx.BeginFunc(h.ctx, h.service.Pool(), func(tx pgx.Tx) error {
-		// Truncate all tables and reset sequences (schema-aware sidecar v3)
+		// Truncate all tables and reset sequences
 		syncTables := []string{"sync.server_change_log", "sync.sync_state", "sync.sync_row_meta", "sync.materialize_failures"}
 		businessTables := []string{"note", "task"} // Only tables that actually exist
 
@@ -459,7 +459,7 @@ func (h *SimpleTestHarness) MakeUUID(suffix string) uuid.UUID {
 
 // Simple table handlers for testing
 
-// SimpleNoteTableHandler handles note table operations (sidecar v2)
+// SimpleNoteTableHandler handles note table operations
 type SimpleNoteTableHandler struct{}
 
 // ConvertReferenceKey implements the TableHandler interface - no key conversion needed for this handler
@@ -528,10 +528,10 @@ func (h *SimpleNoteTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, sch
 	return nil
 }
 
-// SimpleTaskTableHandler handles task table operations (sidecar v2)
+// SimpleTaskTableHandler handles task table operations
 type SimpleTaskTableHandler struct{}
 
-// ConvertReferenceKey implements the TableHandler interface - no key conversion needed for this handler
+// ConvertReferenceKey implements the MaterializationHandler interface - no key conversion needed for this handler
 func (h *SimpleTaskTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return payloadValue, nil
 }
@@ -592,7 +592,7 @@ func (h *SimpleTaskTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, sch
 	return nil
 }
 
-// GetServerNote retrieves a note from the server (schema-aware sidecar v3)
+// GetServerNote retrieves a note from the server
 func (h *SimpleTestHarness) GetServerNote(id uuid.UUID) (*ServerNote, error) {
 	var note ServerNote
 
@@ -619,7 +619,7 @@ func (h *SimpleTestHarness) GetServerNote(id uuid.UUID) (*ServerNote, error) {
 	return &note, nil
 }
 
-// GetServerTask retrieves a task from the server (schema-aware sidecar v3)
+// GetServerTask retrieves a task from the server
 func (h *SimpleTestHarness) GetServerTask(id uuid.UUID) (*ServerTask, error) {
 	var task ServerTask
 

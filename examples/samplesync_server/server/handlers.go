@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS business.comment(
 // PersonHandler materializes payload into business."Person"
 type PersonHandler struct{ logger *slog.Logger }
 
-// ConvertReferenceKey implements the TableHandler interface - converts base64 encoded UUIDs
+// ConvertReferenceKey implements the MaterializationHandler interface - converts base64 encoded UUIDs
 func (h *PersonHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))
 }
@@ -197,7 +197,7 @@ func (h *PersonHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schema, tabl
 // PersonAddressHandler materializes payload into business.person_address
 type PersonAddressHandler struct{ logger *slog.Logger }
 
-// ConvertReferenceKey implements the TableHandler interface - convert base64 person_id to bytes
+// ConvertReferenceKey implements the MaterializationHandler interface - convert base64 person_id to bytes
 func (h *PersonAddressHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))
 }
@@ -285,7 +285,7 @@ func (h *PersonAddressHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schem
 // CommentHandler materializes payload into business."Comment"
 type CommentHandler struct{ logger *slog.Logger }
 
-// ConvertReferenceKey implements the TableHandler interface
+// ConvertReferenceKey implements the MaterializationHandler interface
 // This implementation decodes base64-encoded UUID key
 func (h *CommentHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))

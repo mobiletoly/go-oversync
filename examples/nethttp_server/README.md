@@ -203,7 +203,7 @@ POST /sync/upload
 GET /sync/download?after=42&limit=100
 ```
 
-Response (Sidecar v2 format):
+Response:
 ```json
 {
   "changes": [
@@ -230,7 +230,7 @@ Response (Sidecar v2 format):
 }
 ```
 
-## Conflict Resolution (Sidecar v2)
+## Conflict Resolution
 
 When a conflict occurs (server_version mismatch), the server returns the current sidecar state:
 
@@ -266,7 +266,7 @@ When a conflict occurs (server_version mismatch), the server returns the current
 - **invalid**: Validation failed (bad table name, UUID, JSON, etc.)
 - **materialize_error**: Sidecar applied but business table projection failed
 
-## Sidecar v2 Architecture
+## Sidecar Architecture
 
 The example demonstrates the new sidecar architecture:
 

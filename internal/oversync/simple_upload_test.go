@@ -155,7 +155,7 @@ func TestSimpleU04_ConflictOnUpdate(t *testing.T) {
 	require.Nil(t, status.NewServerVersion) // No new version on conflict
 	require.NotNil(t, status.ServerRow)     // Server state returned
 
-	// Parse and verify server row (sidecar v2 format)
+	// Parse and verify server row
 	var serverState map[string]interface{}
 	err := json.Unmarshal(status.ServerRow, &serverState)
 	require.NoError(t, err)
@@ -308,7 +308,7 @@ func TestSimpleU03_BasicDelete(t *testing.T) {
 	status := response.Statuses[0]
 	require.Equal(t, int64(2), status.SourceChangeID)
 	require.Equal(t, "applied", status.Status)
-	require.NotNil(t, status.NewServerVersion) // Sidecar v2: DELETE does return new version
+	require.NotNil(t, status.NewServerVersion) // DELETE does return new version
 	require.Equal(t, int64(2), *status.NewServerVersion)
 
 	t.Logf("✅ U03 Basic Delete test passed - note deleted successfully")
@@ -402,7 +402,7 @@ func TestSimpleU05_ConflictOnDelete(t *testing.T) {
 	require.Nil(t, status.NewServerVersion) // No new version on conflict
 	require.NotNil(t, status.ServerRow)     // Server state returned
 
-	// Parse and verify server row (sidecar v2 format)
+	// Parse and verify server row
 	var serverState map[string]interface{}
 	err := json.Unmarshal(status.ServerRow, &serverState)
 	require.NoError(t, err)

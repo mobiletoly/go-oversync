@@ -213,7 +213,7 @@ func TestO02_ErrorLoggingAndDebugging(t *testing.T) {
 	}
 
 	resp, httpResp := h.DoUpload(validToken, missingFieldReq)
-	// Sidecar v2: Returns HTTP 200 with "invalid" status for validation errors
+	// Sidecar: Returns HTTP 200 with "invalid" status for validation errors
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
 	require.True(t, resp.Accepted)
 	require.Len(t, resp.Statuses, 1)
@@ -309,7 +309,7 @@ func TestO02_ErrorLoggingAndDebugging(t *testing.T) {
 	}
 
 	resp, httpResp = h.DoUpload(validToken, invalidUUIDReq)
-	// Sidecar v2: Returns HTTP 200 with "invalid" status for validation errors
+	// Sidecar: Returns HTTP 200 with "invalid" status for validation errors
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
 	require.True(t, resp.Accepted)
 	require.Len(t, resp.Statuses, 1)
@@ -331,7 +331,7 @@ func TestO02_ErrorLoggingAndDebugging(t *testing.T) {
 	}
 
 	resp, httpResp = h.DoUpload(validToken, emptyTableReq)
-	// Sidecar v2: Returns HTTP 200 with "invalid" status for validation errors
+	// Sidecar: Returns HTTP 200 with "invalid" status for validation errors
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
 	require.True(t, resp.Accepted)
 	require.Len(t, resp.Statuses, 1)

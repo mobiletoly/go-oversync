@@ -180,14 +180,14 @@ func TestE05_InvalidUUID(t *testing.T) {
 
 	resp, httpResp := h.DoUpload(h.client1Token, uploadReq)
 
-	// Sidecar v2: Returns HTTP 200 with "invalid" status for validation errors
+	// Returns HTTP 200 with "invalid" status for validation errors
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
 	require.True(t, resp.Accepted)
 	require.Len(t, resp.Statuses, 1)
 	require.Equal(t, "invalid", resp.Statuses[0].Status)
 	require.Contains(t, resp.Statuses[0].Message, "invalid UUID format")
 
-	t.Logf("✅ E05 Invalid UUID test passed - sidecar v2 validation working correctly")
+	t.Logf("✅ E05 Invalid UUID test passed - sidecar validation working correctly")
 }
 
 func TestE06_DownloadWithInvalidParameters(t *testing.T) {
@@ -276,12 +276,12 @@ func TestE08_InvalidOperation(t *testing.T) {
 
 	resp, httpResp := h.DoUpload(h.client1Token, uploadReq)
 
-	// Sidecar v2: Returns HTTP 200 with "invalid" status for validation errors
+	// Returns HTTP 200 with "invalid" status for validation errors
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
 	require.True(t, resp.Accepted)
 	require.Len(t, resp.Statuses, 1)
 	require.Equal(t, "invalid", resp.Statuses[0].Status)
 	require.Contains(t, resp.Statuses[0].Message, "invalid operation")
 
-	t.Logf("✅ E08 Invalid Operation test passed - sidecar v2 validation working correctly")
+	t.Logf("✅ E08 Invalid Operation test passed - sidecar validation working correctly")
 }

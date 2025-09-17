@@ -102,7 +102,7 @@ func (s *SyncService) parentsMissing(ctx context.Context, tx pgx.Tx, ch ChangeUp
 	}
 
 	// Get table handler for key conversion if available
-	var tableHandler TableHandler
+	var tableHandler MaterializationHandler
 	s.mu.RLock()
 	handlerKey := schema + "." + ch.Table
 	if handler, exists := s.tableHandlers[handlerKey]; exists {

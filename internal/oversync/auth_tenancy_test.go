@@ -138,11 +138,11 @@ func TestA02_ClientIsolation(t *testing.T) {
 	require.True(t, client2Resp.Accepted)
 	require.Equal(t, int64(2), client2Resp.HighestServerSeq)
 
-	// Both clients download changes (sidecar v2: excludes own changes)
+	// Both clients download changes (excludes own changes)
 	client1Download, _ := h.DoDownload(h.client1Token, 0, 100)
 	client2Download, _ := h.DoDownload(h.client2Token, 0, 100)
 
-	// Sidecar v2: Each client should see only the OTHER client's changes
+	// Each client should see only the OTHER client's changes
 	require.Len(t, client1Download.Changes, 1) // Client 1 sees only Client 2's change
 	require.Len(t, client2Download.Changes, 1) // Client 2 sees only Client 1's change
 
@@ -157,8 +157,6 @@ func TestA02_ClientIsolation(t *testing.T) {
 	require.Equal(t, int64(1), client2Changes[0].ServerID)
 	require.Equal(t, h.client1ID, client2Changes[0].SourceID)
 	require.Equal(t, noteID1.String(), client2Changes[0].PK)
-
-	// Sidecar v2: Each client sees different changes (excludes own)
 
 	// Verify source_change_id isolation - each client can use same source_change_id
 	require.Equal(t, int64(1), client1Changes[0].SourceChangeID) // Client 2's SCID=1 (seen by Client 1)
@@ -261,11 +259,11 @@ func TestA03_JWTClaimsValidation(t *testing.T) {
 	require.Equal(t, validSourceID, sourceIDs[0]) // First change
 	require.Equal(t, validSourceID, sourceIDs[1]) // Second change (overridden from JWT)
 
-	// Test 5: Download should work with valid JWT (sidecar v2: excludes own changes)
+	// Test 5: Download should work with valid JWT (excludes own changes)
 	downloadResp, httpResp := h.DoDownload(validToken, 0, 100)
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
-	// Sidecar v2: Client doesn't see its own changes, so 0 changes expected
+	// Client doesn't see its own changes, so 0 changes expected
 	require.Len(t, downloadResp.Changes, 0)
 
-	t.Logf("✅ A03 JWT Claims Validation test passed - server overrides source_id with JWT claim, sidecar v2 excludes own changes")
+	t.Logf("✅ A03 JWT Claims Validation test passed - server overrides source_id with JWT claim, excludes own changes")
 }

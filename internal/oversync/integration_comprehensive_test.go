@@ -379,12 +379,12 @@ type ServerTask struct {
 	ServerVersion int64     `db:"server_version"`
 }
 
-// Table handlers implementing clisync.TableHandler (sidecar v2)
+// Table handlers implementing clisync.MaterializationHandler
 
 // NoteTableHandler handles note table operations
 type NoteTableHandler struct{}
 
-// ConvertReferenceKey implements the TableHandler interface - no key conversion needed for this handler
+// ConvertReferenceKey implements the MaterializationHandler interface - no key conversion needed for this handler
 func (h *NoteTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return payloadValue, nil
 }
@@ -448,7 +448,7 @@ func (h *NoteTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schema, t
 // TaskTableHandler handles task table operations
 type TaskTableHandler struct{}
 
-// ConvertReferenceKey implements the TableHandler interface - no key conversion needed for this handler
+// ConvertReferenceKey implements the MaterializationHandler interface - no key conversion needed for this handler
 func (h *TaskTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return payloadValue, nil
 }

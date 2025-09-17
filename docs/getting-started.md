@@ -22,7 +22,7 @@ Before building your sync server, it's important to understand the key component
 - **Example:** `"user-jane"`, `"user-123"`, or any string that uniquely identifies a user
 - **Source:** Extracted from your authentication system (JWT `sub` claim, session data, etc.)
 
-### Source ID (aka Device ID)
+### Device ID (aka Source ID)
 - **What it is:** A stable, unique identifier for each device/client installation
 - **Purpose:** Critical for sync reliability, idempotency, and preventing infinite loops
 - **Example:** `"device-123"`, `"phone-abc"`, or a UUID generated per app installation
@@ -75,7 +75,8 @@ go-oversync creates these tables automatically to manage sync metadata:
 - **`sync.sync_state`** — Stores current payload for each synced row
 - **`sync.server_change_log`** — Ordered log of all changes for download streams
 
-Your business tables (like `users` and `posts`) remain completely unchanged.
+Your business tables (like `users` and `posts`) remain completely unchanged. Well, almost
+unchanged, we migrate foreign keys to deferred to support deferred batch ordering.
 
 ### How Sync Works
 
@@ -220,7 +221,7 @@ func main() {
     mux.HandleFunc("POST /signin", func(w http.ResponseWriter, r *http.Request) {
         handleSignIn(w, r, jwtAuth)
     })
-	// If needed, add other authentication endpoints, e.g. to refresh tokens or to sign out
+    // If needed, add other authentication endpoints, e.g. to refresh tokens or to sign out
 
     // Sync endpoints (protected by JWT authentication)
     mux.Handle("POST /sync/upload", jwtAuth.Middleware(http.HandlerFunc(h.HandleUpload)))
@@ -277,7 +278,7 @@ func handleSignIn(w http.ResponseWriter, r *http.Request, jwtAuth *oversync.JWTA
     }
 
     // Validate req.Username and req.Password, you can allow empty password for demo
-	// ...
+    // ...
 
     // Generate User ID based on username (in production, this comes from your user database)
     // This becomes the JWT 'sub' claim and provides complete data isolation per user
@@ -308,10 +309,14 @@ func handleSignIn(w http.ResponseWriter, r *http.Request, jwtAuth *oversync.JWTA
 
 > Note on authentication
 >
-> For convenience, go-oversync provides a small helper package at `github.com/mobiletoly/go-oversync/oversync/jwt` with a ready-to-use JWT middleware and token utilities. It expects `sub` (user id) and `did` (device id) claims and works out of the box with the sync handlers.
+> For convenience, go-oversync provides a small helper package at
+`github.com/mobiletoly/go-oversync/oversync/jwt` with a ready-to-use JWT middleware and token
+> utilities. It expects `sub` (user id) and `did` (device id) claims and works out of the box with the
+> sync handlers.
 >
-> You are not required to use this package: you can plug in your own authorization and identity extraction (sessions, custom JWTs, API keys, etc.). Just ensure your middleware sets user and device identity consistently so uploads/downloads are scoped correctly and idempotency works as designed.
-
+> You are not required to use this package: you can plug in your own authorization and identity
+> extraction (sessions, custom JWTs, API keys, etc.). Just ensure your middleware sets user and device
+> identity consistently so uploads/downloads are scoped correctly and idempotency works as designed.
 
 ## Step 5: Run Your Server
 
@@ -558,21 +563,14 @@ func getOrCreateDeviceID() string {
 
 ### Run the Test Client
 
-First, make sure your server is running:
+Make sure your server is running:
 
 ```bash
 go run main.go
 ```
 
-In another terminal, install the required dependencies and run the test client:
-
-```bash
-go get github.com/google/uuid
-go get github.com/mattn/go-sqlite3
-go run client_test.go
-```
-
 This demonstrates:
+
 1. **Authentication** — Getting a JWT token from your `/signin` endpoint
 2. **Local data creation** — Inserting records into SQLite
 3. **Upload sync** — Sending changes to PostgreSQL server
@@ -581,12 +579,14 @@ This demonstrates:
 
 ## SQLite Primary Key Requirements
 
-For go-oversync to work with your SQLite database, **all primary key columns must be TEXT type containing UUID values**. This is a fundamental requirement for the sync system to properly track and identify records across devices.
+For go-oversync to work with your SQLite database, **all primary key columns must be TEXT (or BLOB)
+type containing UUID values**. This is a fundamental requirement for the sync system to properly
+track and identify records across devices.
 
 ### Supported Primary Key Formats
 
 **Option 1: TEXT with UUID strings**
-```sql
+```sqlite
 CREATE TABLE users (
     id TEXT PRIMARY KEY,           -- UUID as string: "550e8400-e29b-41d4-a716-446655440000"
     name TEXT NOT NULL,
@@ -603,12 +603,12 @@ CREATE TABLE posts (
 ```
 
 **Option 2: BLOB with random bytes**
-```sql
+```sqlite
 CREATE TABLE users (
     id BLOB PRIMARY KEY,           -- 16-byte random BLOB
     name TEXT NOT NULL,
     email TEXT UNIQUE NOT NULL
-);
+) WITHOUT ROWID;
 
 CREATE TABLE posts (
     id BLOB PRIMARY KEY,           -- 16-byte random BLOB
@@ -616,7 +616,7 @@ CREATE TABLE posts (
     title TEXT NOT NULL,
     content TEXT,
     FOREIGN KEY (author_id) REFERENCES users(id)
-);
+) WITHOUT ROWID;
 
 -- Insert with SQLite's randomblob() function
 INSERT INTO users (id, name, email) VALUES (randomblob(16), 'Alice', 'alice@example.com');
@@ -624,12 +624,12 @@ INSERT INTO users (id, name, email) VALUES (randomblob(16), 'Bob', 'bob@example.
 ```
 
 **Option 2b: BLOB with randomblob() as default value**
-```sql
+```sqlite
 CREATE TABLE users (
     id BLOB PRIMARY KEY DEFAULT (randomblob(16)),  -- Auto-generate random 16-byte BLOB
     name TEXT NOT NULL,
     email TEXT UNIQUE NOT NULL
-);
+) WITHOUT ROWID;
 
 CREATE TABLE posts (
     id BLOB PRIMARY KEY DEFAULT (randomblob(16)),  -- Auto-generate random 16-byte BLOB
@@ -637,7 +637,7 @@ CREATE TABLE posts (
     title TEXT NOT NULL,
     content TEXT,
     FOREIGN KEY (author_id) REFERENCES users(id)
-);
+) WITHOUT ROWID;
 
 -- Insert without specifying ID (uses randomblob(16) default)
 INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
@@ -685,6 +685,13 @@ _, err := db.Exec("INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
     userIDBytes, "Alice", "alice@example.com")
 ```
 
+It is up to you to decide which primary key format to use. TEXT UUIDs easier to work with,
+while BLOB UUIDs are a little more efficient in SQLite. Also technically speaking when you
+use BLOB primary keys with randomblob(), you are not using UUIDs at all. It's just random bytes.
+But it provides enough uniqueness for virtually any use case. To keep documentation simple,
+we'll refer to both as "UUIDs" even though technically BLOB with randomblob() are not UUIDs.
+
+
 ### Why UUID Primary Keys?
 
 1. **Global Uniqueness**: UUIDs prevent conflicts when multiple devices create records offline
@@ -693,7 +700,8 @@ _, err := db.Exec("INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
 4. **Idempotency**: Enables safe retry of sync operations
 
 > **Important**: Do not use INTEGER PRIMARY KEY or auto-incrementing IDs with go-oversync. These
-> will cause sync conflicts when multiple devices create records offline.
+> will cause sync conflicts when multiple devices create records offline. Also as of now
+> go-oversync expects UUID as the primary key format. This may change in the future.
 
 ## Custom Primary Key Columns
 

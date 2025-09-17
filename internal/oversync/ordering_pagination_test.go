@@ -78,7 +78,7 @@ func TestP01_StrictServerIDOrdering(t *testing.T) {
 
 	require.Equal(t, int64(totalChanges), currentSeq)
 
-	// Phase 2: Download changes and verify strict ordering (sidecar v2: excludes own changes)
+	// Phase 2: Download changes and verify strict ordering (excludes own changes)
 	downloadResp, httpResp := h.DoDownload(clients[0].token, 0, 100)
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
 	// Client 1 sees only other clients' changes (2/3 of total changes)
@@ -86,7 +86,7 @@ func TestP01_StrictServerIDOrdering(t *testing.T) {
 	require.Len(t, downloadResp.Changes, expectedChanges)
 	require.False(t, downloadResp.HasMore)
 
-	// Verify strict server_id ordering (sidecar v2: Client 1 sees only other clients' changes)
+	// Verify strict server_id ordering (Client 1 sees only other clients' changes)
 	// Expected server_ids: 2,3,5,6,8,9,11,12,14,15 (skipping Client 1's: 1,4,7,10,13)
 	expectedServerIDs := []int64{2, 3, 5, 6, 8, 9, 11, 12, 14, 15}
 	for i, change := range downloadResp.Changes {
@@ -95,7 +95,7 @@ func TestP01_StrictServerIDOrdering(t *testing.T) {
 	}
 
 	// Phase 3: Verify ordering is maintained across multiple download requests
-	// Download in smaller chunks (sidecar v2: Client 2 sees only other clients' changes)
+	// Download in smaller chunks (Client 2 sees only other clients' changes)
 	chunkSize := 4
 	var allChunks []oversync.ChangeDownloadResponse
 	after := int64(0)
@@ -216,7 +216,7 @@ func TestP02_PaginationConsistency(t *testing.T) {
 		after = pageResp.NextAfter
 	}
 
-	// Phase 5: Verify pagination consistency (sidecar v2: excludes own changes)
+	// Phase 5: Verify pagination consistency (excludes own changes)
 	// Client 2 sees only Client 1's changes, not its own concurrent uploads
 	// This is the current behavior - pagination doesn't provide snapshot isolation
 	totalExpectedInPagination := initialBatchSize // Only Client 1's 10 changes
@@ -250,12 +250,12 @@ func TestP02_PaginationConsistency(t *testing.T) {
 		}
 	}
 
-	// Phase 6: Verify new changes are available in fresh download (sidecar v2: excludes own changes)
+	// Phase 6: Verify new changes are available in fresh download (excludes own changes)
 	freshResp, _ := h.DoDownload(h.client2Token, 0, 100)
 	totalExpected := initialBatchSize // Only Client 1's changes
 	require.Len(t, freshResp.Changes, totalExpected)
 
-	// Sidecar v2: Client 2 doesn't see its own concurrent changes
+	// Sidecar: Client 2 doesn't see its own concurrent changes
 	// All changes in freshResp are from Client 1 (initial batch)
 	for _, change := range freshResp.Changes {
 		require.Equal(t, h.client1ID, change.SourceID)
@@ -310,7 +310,7 @@ func TestP03_LargeResultSetStability(t *testing.T) {
 	}
 
 	// Phase 2: Multiple devices download with different pagination patterns
-	// Sidecar v2: Device 1 won't see its own changes, so use other devices for same user
+	// Sidecar: Device 1 won't see its own changes, so use other devices for same user
 	testUserID := h.ExtractUserIDFromToken(h.client1Token)
 
 	// Create additional device tokens for the same user

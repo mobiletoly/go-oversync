@@ -357,7 +357,7 @@ func TestU08_MixedBatchAcrossTables(t *testing.T) {
 	// Note DELETE should be applied
 	require.Equal(t, int64(5), mixedResp.Statuses[2].SourceChangeID)
 	require.Equal(t, "applied", mixedResp.Statuses[2].Status)
-	require.NotNil(t, mixedResp.Statuses[2].NewServerVersion) // Sidecar v2: DELETE does return version
+	require.NotNil(t, mixedResp.Statuses[2].NewServerVersion) // DELETE does return version
 
 	// Verify highest_server_seq equals max SID in transaction
 	require.Equal(t, int64(5), mixedResp.HighestServerSeq)
@@ -545,7 +545,7 @@ func TestU10_MalformedPayloadValidation(t *testing.T) {
 	}
 
 	// This should be handled by the server validation
-	// Upload malformed request - should be rejected (sidecar v2: returns HTTP 200 with "invalid" status)
+	// Upload malformed request - should be rejected (returns HTTP 200 with "invalid" status)
 	resp, httpResp := h.DoUpload(h.client1Token, malformedReq)
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
 	require.True(t, resp.Accepted)

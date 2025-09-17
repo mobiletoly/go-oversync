@@ -33,7 +33,7 @@ It includes:
 
 ## Why go-oversync?
 
-- **Library, not framework** — Integrate with your existing server architecture
+- **Library, not server** — Integrate with your existing server architecture
 - **Bring your own auth** — Works with any authentication system (JWT, sessions, API keys)
 - **Clean architecture** — No invasive columns in your business tables
 - **Offline-first** — Works seamlessly with poor connectivity
@@ -45,7 +45,7 @@ It includes:
 server. You handle routing, middleware, authentication, and business logic.
 
 **Multiple client options:** Use the Go SQLite client for Go apps, or the Kotlin Multiplatform
-client for Android/iOS apps. Both sync with the same PostgreSQL backend. More client libraries
+client for Android/iOS apps. Both sync with the same PostgreSQL adapter. More client libraries
 are coming.
 
 **Simple integration:** Register your tables with go-oversync, add a few HTTP handlers to your

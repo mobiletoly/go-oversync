@@ -98,7 +98,7 @@ func TestX01_NoteAppScenario(t *testing.T) {
 	require.True(t, phoneResp.Accepted)
 	require.Equal(t, int64(2), phoneResp.HighestServerSeq)
 
-	// Phone downloads to see current state (sidecar v2: excludes own changes)
+	// Phone downloads to see current state (excludes own changes)
 	phoneDownload1, _ := h.DoDownload(phoneToken, 0, 100)
 	require.Len(t, phoneDownload1.Changes, 0) // Phone doesn't see its own changes
 
@@ -108,7 +108,7 @@ func TestX01_NoteAppScenario(t *testing.T) {
 	require.True(t, laptopResp.Accepted)
 	require.Equal(t, int64(3), laptopResp.HighestServerSeq)
 
-	// Laptop downloads to get all changes (sidecar v2: excludes own changes)
+	// Laptop downloads to get all changes (excludes own changes)
 	laptopDownload1, _ := h.DoDownload(laptopToken, 0, 100)
 	require.Len(t, laptopDownload1.Changes, 2) // Phone's 2 changes only (laptop doesn't see its own)
 
@@ -201,11 +201,11 @@ func TestX01_NoteAppScenario(t *testing.T) {
 	require.True(t, laptopMergeResp.Accepted)
 	require.Equal(t, "applied", laptopMergeResp.Statuses[0].Status)
 
-	// Phase 6: Both devices sync to final consistent state (sidecar v2: each sees other's changes)
+	// Phase 6: Both devices sync to final consistent state (each sees other's changes)
 	finalPhoneDownload, _ := h.DoDownload(phoneToken, 0, 100)
 	finalLaptopDownload, _ := h.DoDownload(laptopToken, 0, 100)
 
-	// Sidecar v2: Each device sees the OTHER device's changes
+	// Sidecar: Each device sees the OTHER device's changes
 	// Phone sees: laptop note, laptop merge (laptop's conflicting edit is not logged per new spec)
 	// Laptop sees: phone note, shared note, phone edit (all successful)
 	require.Len(t, finalPhoneDownload.Changes, 2)  // laptop's successful changes
@@ -243,7 +243,7 @@ func TestX01_NoteAppScenario(t *testing.T) {
 	}
 	require.True(t, foundPhoneNote, "Laptop should see phone's note")
 
-	t.Logf("✅ X01 Note App Scenario test passed - sidecar v2 sync with conflict resolution working correctly")
+	t.Logf("✅ X01 Note App Scenario test passed - sidecar sync with conflict resolution working correctly")
 }
 
 func TestX02_TaskManagerScenario(t *testing.T) {
@@ -471,11 +471,11 @@ func TestX02_TaskManagerScenario(t *testing.T) {
 	bobAssignTask3Resp, _ := h.DoUpload(bobToken, bobAssignTask3Req)
 	require.True(t, bobAssignTask3Resp.Accepted)
 
-	// Phase 6: Final sync - both team members download changes (sidecar v2: excludes own changes)
+	// Phase 6: Final sync - both team members download changes (sidecar: excludes own changes)
 	finalAliceDownload, _ := h.DoDownload(aliceToken, 0, 100)
 	finalBobDownload, _ := h.DoDownload(bobToken, 0, 100)
 
-	// Sidecar v2: Each client sees only the OTHER's changes
+	// Sidecar: Each client sees only the OTHER's changes
 	// Alice sees Bob's changes (initial 3 tasks + Bob's updates)
 	// Bob sees Alice's changes (Alice's updates)
 	totalChanges := len(finalAliceDownload.Changes) + len(finalBobDownload.Changes)

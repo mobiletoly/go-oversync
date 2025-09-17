@@ -138,7 +138,7 @@ func TestC01_UpdateVsUpdate(t *testing.T) {
 	require.Nil(t, status.NewServerVersion)
 	require.NotNil(t, status.ServerRow)
 
-	// Parse and verify server row shows C1's update (SVID=6) - sidecar v2 format
+	// Parse and verify server row shows C1's update (SVID=6) - sidecar
 	var serverState map[string]interface{}
 	err = json.Unmarshal(status.ServerRow, &serverState)
 	require.NoError(t, err)
@@ -352,7 +352,7 @@ func TestC03_InsertVsInsertSamePK(t *testing.T) {
 	require.True(t, c2InsertResp.Accepted)
 	require.Equal(t, "conflict", c2InsertResp.Statuses[0].Status)
 
-	// Server returns existing row (C1's insert) - sidecar v2 format
+	// Server returns existing row (C1's insert) - sidecar format
 	var serverState map[string]interface{}
 	err := json.Unmarshal(c2InsertResp.Statuses[0].ServerRow, &serverState)
 	require.NoError(t, err)
@@ -488,7 +488,7 @@ func TestC04_OutOfOrderUploadsFromSameClient(t *testing.T) {
 	// This should conflict because server_version is now 2, but client expects 1
 	require.Equal(t, "conflict", scid2Resp.Statuses[0].Status)
 
-	// Verify server state shows the result of SCID=3 (sidecar v2 format)
+	// Verify server state shows the result of SCID=3 (sidecar format)
 	var serverState map[string]interface{}
 	err := json.Unmarshal(scid2Resp.Statuses[0].ServerRow, &serverState)
 	require.NoError(t, err)

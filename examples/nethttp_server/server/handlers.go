@@ -13,7 +13,7 @@ import (
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
-// InitializeApplicationTables creates clean business tables for sidecar v3 sync
+// InitializeApplicationTables creates clean business tables for sidecar sync
 func InitializeApplicationTables(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
 	// Create application tables in a single transaction using pgx.BeginFunc
 	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS business.file_reviews (
 			return fmt.Errorf("failed to create posts author index: %w", err)
 		}
 
-		logger.Info("Clean business tables initialized successfully for sidecar v2 sync")
+		logger.Info("Clean business tables initialized successfully for sidecar sync")
 		logger.Info("Sync metadata will be stored in sidecar tables: sync_row_meta, sync_state, server_change_log")
 		return nil
 	})
@@ -122,13 +122,13 @@ type FileReviewData struct {
 	FileID string `json:"file_id"`
 }
 
-// UsersTableHandler implements oversync.TableHandler for the users table (sidecar v2)
+// UsersTableHandler implements oversync.MaterializationHandler for the users table
 // This handler materializes changes from sidecar tables to the business users table
 type UsersTableHandler struct {
 	logger *slog.Logger
 }
 
-// ConvertReferenceKey implements the TableHandler interface - converts base64 encoded UUIDs
+// ConvertReferenceKey implements the MaterializationHandler interface - converts base64 encoded UUIDs
 func (h *UsersTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))
 }
@@ -189,13 +189,13 @@ func (h *UsersTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schema, 
 	return nil
 }
 
-// PostsTableHandler implements oversync.TableHandler for the posts table (sidecar v2)
+// PostsTableHandler implements oversync.MaterializationHandler for the posts table
 // This handler materializes changes from sidecar tables to the business posts table
 type PostsTableHandler struct {
 	logger *slog.Logger
 }
 
-// ConvertReferenceKey implements the TableHandler interface - converts base64 encoded UUIDs
+// ConvertReferenceKey implements the MaterializationHandler interface - converts base64 encoded UUIDs
 func (h *PostsTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))
 }
@@ -261,7 +261,7 @@ type FilesTableHandler struct {
 	logger *slog.Logger
 }
 
-// ConvertReferenceKey implements the TableHandler interface - converts base64 encoded UUIDs
+// ConvertReferenceKey implements the MaterializationHandler interface - converts base64 encoded UUIDs
 func (h *FilesTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))
 }
@@ -301,7 +301,7 @@ type FileReviewsTableHandler struct {
 	logger *slog.Logger
 }
 
-// ConvertReferenceKey implements the TableHandler interface - converts base64 encoded UUIDs
+// ConvertReferenceKey implements the MaterializationHandler interface - converts base64 encoded UUIDs
 func (h *FileReviewsTableHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return oversync.OptionallyConvertBase64EncodedUUID(payloadValue.(string))
 }

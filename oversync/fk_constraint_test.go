@@ -20,7 +20,7 @@ type TestUsersHandler struct {
 	logger *slog.Logger
 }
 
-// ConvertReferenceKey implements the TableHandler interface - no key conversion needed for this handler
+// ConvertReferenceKey implements the MaterializationHandler interface - no key conversion needed for this handler
 func (h *TestUsersHandler) ConvertReferenceKey(fieldName string, payloadValue any) (any, error) {
 	return payloadValue, nil
 }

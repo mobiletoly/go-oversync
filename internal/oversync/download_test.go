@@ -367,7 +367,7 @@ func TestD06_UnknownTableForwardCompatibility(t *testing.T) {
 	}`, futureTableID.String(), time.Now().Unix()))
 
 	// Insert directly into sync.server_change_log to simulate unknown table
-	// Use a different source_id so Client 2 can see this change (sidecar v3: excludes own changes)
+	// Use a different source_id so Client 2 can see this change
 	// Extract user_id from the test harness token
 	testUserID := h.ExtractUserIDFromToken(h.client1Token)
 	_, err := h.service.Pool().Exec(h.ctx, `
@@ -400,7 +400,7 @@ func TestD06_UnknownTableForwardCompatibility(t *testing.T) {
 	afterUnknownResp, _ := h.DoUpload(h.client1Token, afterUnknownReq)
 	require.True(t, afterUnknownResp.Accepted)
 
-	// Phase 4: Client 2 downloads all changes (sidecar v2: excludes own changes)
+	// Phase 4: Client 2 downloads all changes (excludes own changes)
 	downloadResp, httpResp := h.DoDownload(h.client2Token, 0, 100)
 	require.Equal(t, http.StatusOK, httpResp.StatusCode)
 	require.Len(t, downloadResp.Changes, 3) // Client 1's note + future_table + Client 1's task
