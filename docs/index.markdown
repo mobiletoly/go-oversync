@@ -8,7 +8,7 @@ title: Home
 **A set of libraries that add two-way sync between client databases and PostgreSQL
 servers.**
 
-[## What is go-oversync?
+## What is go-oversync?
 
 go-oversync is a Go library suite designed for applications that need **reliable synchronization**
 between local client databases and a central PostgreSQL backend, across multiple devices and
@@ -84,9 +84,8 @@ compatibility across platforms.
 
 ## Ready to try it?
 
-- First get familiar with [Core Concepts](core-concepts.html) guide to understand the key components
+- First get familiar with [Core Concepts](documentation/core-concepts/) guide to understand the key components
   and vocabulary
 - Start with the [Getting Started](getting-started.html) guide to build your first sync-enabled
   server
-- Explore the [Documentation](documentation.html) for detailed server, client, and HTTP API
-  reference
+

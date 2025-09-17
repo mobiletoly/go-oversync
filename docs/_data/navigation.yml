@@ -3,8 +3,6 @@ main:
     url: "/"
   - title: "Getting Started"
     url: "/getting-started.html"
-  - title: "Documentation"
-    url: "/documentation/"
   - title: "Architecture"
     url: "/architecture/"
     children:

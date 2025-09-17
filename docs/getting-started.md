@@ -713,20 +713,3 @@ cfg := oversqlite.DefaultConfig("business", []oversqlite.SyncTable{
 // CREATE TABLE products (product_code TEXT PRIMARY KEY, name TEXT, price REAL)
 // CREATE TABLE posts (id TEXT PRIMARY KEY, title TEXT, content TEXT)
 ```
-
-**Important Notes:**
-- Primary key columns must be TEXT type containing UUID values
-- The server-side PostgreSQL tables can use any primary key column names (go-oversync is flexible)
-- Only the SQLite client (oversqlite) requires this configuration for trigger generation
-- Empty `SyncKeyColumnName` defaults to "id" for backward compatibility
-
-## Next Steps
-
-Congratulations! You've built a complete sync-enabled server. Here's what to explore next:
-
-- **Add Custom Authentication** — Replace JWT with your existing auth system
-- **Add Business Logic** — Use materialization handlers to process synced data
-- **Build a Client** — Use the Go SQLite client or Kotlin Multiplatform client
-- **Explore Advanced Features** — Conflict resolution, batch processing, and more
-
-Check out the [Documentation](documentation.html) for detailed guides on server configuration, client integration, and the HTTP API.
