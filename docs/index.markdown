@@ -3,28 +3,38 @@ layout: default
 title: Home
 ---
 
-# go-oversync — Production-Ready Multi-Device Sync
+# go-oversync — PostgreSQL adapter for multi-device sync
 
 **A set of libraries that add two-way sync between client databases and PostgreSQL
 servers.**
 
-## What is go-oversync?
+[## What is go-oversync?
 
-go-oversync is **not a server** — it's a collection of libraries that you integrate into your
-existing applications:
+go-oversync is a Go library suite designed for applications that need **reliable synchronization**
+between local client databases and a central PostgreSQL backend, across multiple devices and
+platforms.
 
-- **PostgreSQL server adapter** — Plugs into your HTTP server with any authentication system
-- **Go SQLite client** — For Go applications that need to sync with PostgreSQL (included in this
-  repo)
+Use it when you want to:
+
+- Sync changes bi-directionally between a client (e.g. mobile or embedded SQLite) and a server (
+  PostgreSQL).
+- Allow offline operation and automatic syncing once connectivity is restored.
+- Handle conflict resolution out of the box.
+- Plug into your existing HTTP server and authentication stack without needing a separate sync
+  server.
+
+It includes:
+
+- A **PostgreSQL adapter** that integrates with your server APIs.
+- A **Go SQLite client**, for desktop or backend usage.
 - **Kotlin Multiplatform client** — For Android/iOS apps
   via [sqlitenow-kmp](https://github.com/mobiletoly/sqlitenow-kmp)
-- **Flexible integration** — Works with your existing routes, middleware, and auth
+
 
 ## Why go-oversync?
 
 - **Library, not framework** — Integrate with your existing server architecture
 - **Bring your own auth** — Works with any authentication system (JWT, sessions, API keys)
-- **Battle-tested** — Production-ready with comprehensive conflict resolution
 - **Clean architecture** — No invasive columns in your business tables
 - **Offline-first** — Works seamlessly with poor connectivity
 - **Multi-device** — Perfect sync across phones, tablets, and web
@@ -35,7 +45,8 @@ existing applications:
 server. You handle routing, middleware, authentication, and business logic.
 
 **Multiple client options:** Use the Go SQLite client for Go apps, or the Kotlin Multiplatform
-client for Android/iOS apps. Both sync with the same PostgreSQL backend.
+client for Android/iOS apps. Both sync with the same PostgreSQL backend. More client libraries
+are coming.
 
 **Simple integration:** Register your tables with go-oversync, add a few HTTP handlers to your
 routes, and the library handles change tracking, conflict resolution, and sync protocol details.
@@ -45,13 +56,12 @@ authentication. You extract user/device IDs and pass them to go-oversync.
 
 ## Key Features
 
-- **Automatic Sync** — Changes tracked via database triggers, no manual instrumentation
 - **Conflict Resolution** — Optimistic concurrency with automatic conflict detection
 - **Batch Processing** — FK-aware ordering and efficient batch operations
 - **User Isolation** — Each user has completely isolated sync streams
 - **Multi-Platform** — Go client for servers/desktop, Kotlin Multiplatform for mobile
 - **Offline-First** — Works perfectly with intermittent connectivity
-- **Production Ready** — Comprehensive test suite with 100% scenario coverage
+
 
 ## Client Libraries
 
@@ -80,4 +90,3 @@ compatibility across platforms.
   server
 - Explore the [Documentation](documentation.html) for detailed server, client, and HTTP API
   reference
-w
