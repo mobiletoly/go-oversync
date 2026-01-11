@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -18,6 +19,7 @@ import (
 // Test table handlers for FK constraint testing
 type TestUsersHandler struct {
 	logger *slog.Logger
+	schema string
 }
 
 // ConvertReferenceKey implements the MaterializationHandler interface - no key conversion needed for this handler
@@ -33,24 +35,27 @@ func (h *TestUsersHandler) ApplyUpsert(ctx context.Context, tx pgx.Tx, schema, t
 		return fmt.Errorf("failed to parse user data: %w", err)
 	}
 
-	_, err := tx.Exec(ctx, `
-		INSERT INTO business.users (id, name, email)
+	schemaIdent := pgx.Identifier{h.schema}.Sanitize()
+	_, err := tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s.users (id, name, email)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (id) DO UPDATE SET
 			name = EXCLUDED.name,
 			email = EXCLUDED.email
-	`, pk, userData["name"], userData["email"])
+	`, schemaIdent), pk, userData["name"], userData["email"])
 
 	return err
 }
 
 func (h *TestUsersHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schema, table string, pk uuid.UUID) error {
-	_, err := tx.Exec(ctx, `DELETE FROM business.users WHERE id = $1`, pk)
+	schemaIdent := pgx.Identifier{h.schema}.Sanitize()
+	_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.users WHERE id = $1`, schemaIdent), pk)
 	return err
 }
 
 type TestPostsHandler struct {
 	logger *slog.Logger
+	schema string
 }
 
 // ConvertReferenceKey implements the TableHandler interface - no key conversion needed for this handler
@@ -66,20 +71,22 @@ func (h *TestPostsHandler) ApplyUpsert(ctx context.Context, tx pgx.Tx, schema, t
 		return fmt.Errorf("failed to parse post data: %w", err)
 	}
 
-	_, err := tx.Exec(ctx, `
-		INSERT INTO business.posts (id, title, content, author_id)
+	schemaIdent := pgx.Identifier{h.schema}.Sanitize()
+	_, err := tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s.posts (id, title, content, author_id)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (id) DO UPDATE SET
 			title = EXCLUDED.title,
 			content = EXCLUDED.content,
 			author_id = EXCLUDED.author_id
-	`, pk, postData["title"], postData["content"], postData["author_id"])
+	`, schemaIdent), pk, postData["title"], postData["content"], postData["author_id"])
 
 	return err
 }
 
 func (h *TestPostsHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schema, table string, pk uuid.UUID) error {
-	_, err := tx.Exec(ctx, `DELETE FROM business.posts WHERE id = $1`, pk)
+	schemaIdent := pgx.Identifier{h.schema}.Sanitize()
+	_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.posts WHERE id = $1`, schemaIdent), pk)
 	return err
 }
 
@@ -109,21 +116,24 @@ func TestFKConstraintRetryLogic(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 
-	// Clean up test data
-	_, err = pool.Exec(ctx, "DELETE FROM sync.server_change_log WHERE user_id = 'test-fk-user'")
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "business_fk_" + suffix
+	userID := "test-fk-user-" + suffix
+	sourceID := "test-fk-device-" + suffix
+
+	err = resetTestBusinessSchema(ctx, pool, schemaName)
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, "DELETE FROM business.posts WHERE author_id IN (SELECT id FROM business.users WHERE name LIKE 'FK Test User %')")
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, "DELETE FROM business.users WHERE name LIKE 'FK Test User %'")
-	require.NoError(t, err)
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
 
 	// Create sync service with test configuration
 	config := &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "fk-constraint-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: "business", Table: "users", Handler: &TestUsersHandler{logger: logger}},
-			{Schema: "business", Table: "posts", Handler: &TestPostsHandler{logger: logger}},
+			{Schema: schemaName, Table: "users", Handler: &TestUsersHandler{logger: logger, schema: schemaName}},
+			{Schema: schemaName, Table: "posts", Handler: &TestPostsHandler{logger: logger, schema: schemaName}},
 		},
 	}
 	service, err := NewSyncService(pool, config, logger)
@@ -134,8 +144,6 @@ func TestFKConstraintRetryLogic(t *testing.T) {
 		numUsers        = 5
 		postsPerUser    = 20
 		uploadBatchSize = 50 // Small batch size to force FK constraint violations
-		userID          = "test-fk-user"
-		sourceID        = "test-fk-device"
 	)
 
 	t.Logf("🎯 Testing FK constraint retry logic with %d users, %d posts each, batch size %d",
@@ -167,7 +175,7 @@ func TestFKConstraintRetryLogic(t *testing.T) {
 
 			changes = append(changes, ChangeUpload{
 				SourceChangeID: changeID,
-				Schema:         "business",
+				Schema:         schemaName,
 				Table:          "posts",
 				Op:             "INSERT",
 				PK:             postUUID,
@@ -187,7 +195,7 @@ func TestFKConstraintRetryLogic(t *testing.T) {
 
 		changes = append(changes, ChangeUpload{
 			SourceChangeID: changeID,
-			Schema:         "business",
+			Schema:         schemaName,
 			Table:          "users",
 			Op:             "INSERT",
 			PK:             userUUID,
@@ -314,9 +322,9 @@ func TestFKConstraintRetryLogic(t *testing.T) {
 
 	// Step 3: Verify all data was eventually uploaded
 	var actualUsers, actualPosts int
-	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM business.users WHERE name LIKE 'FK Test User %'").Scan(&actualUsers)
+	err = pool.QueryRow(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s.users WHERE name LIKE 'FK Test User %%'", pgx.Identifier{schemaName}.Sanitize())).Scan(&actualUsers)
 	require.NoError(t, err)
-	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM business.posts WHERE title LIKE 'FK Test Post %'").Scan(&actualPosts)
+	err = pool.QueryRow(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s.posts WHERE title LIKE 'FK Test Post %%'", pgx.Identifier{schemaName}.Sanitize())).Scan(&actualPosts)
 	require.NoError(t, err)
 
 	t.Logf("✅ Final results: %d users, %d posts (expected: %d users, %d posts)",
@@ -353,11 +361,12 @@ func TestFKConstraintRetryLogic(t *testing.T) {
 
 	// Step 5: Verify FK relationships are valid
 	var invalidFKCount int
-	err = pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM business.posts p 
-		LEFT JOIN business.users u ON p.author_id = u.id 
-		WHERE p.title LIKE 'FK Test Post %' AND u.id IS NULL
-	`).Scan(&invalidFKCount)
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	err = pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT COUNT(*) FROM %s.posts p
+		LEFT JOIN %s.users u ON p.author_id = u.id
+		WHERE p.title LIKE 'FK Test Post %%' AND u.id IS NULL
+	`, schemaIdent, schemaIdent)).Scan(&invalidFKCount)
 	require.NoError(t, err)
 
 	assert.Equal(t, 0, invalidFKCount, "All posts should have valid FK relationships")

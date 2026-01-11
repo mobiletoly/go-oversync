@@ -12,7 +12,7 @@ info:
     - **Optimistic Concurrency**: Version control via server_version
     - **Idempotent Operations**: Using (user_id, source_id, source_change_id) uniqueness
     - **Materialization**: Optional projection to business tables via handlers
-    - **Enhanced Status**: Applied, conflict, invalid, materialize_error statuses
+    - **Enhanced Status**: Applied, conflict, invalid statuses (materialize failures are recorded for admin retry)
 
     ## Architecture Overview
     - **User Scoping**: All data is scoped by user_id from JWT sub claim
@@ -111,14 +111,6 @@ paths:
             format: int64
             default: 0
             minimum: 0
-        - name: schema
-          in: query
-          description: Business schema name to filter by (required; lowercase letters, digits, and underscores only)
-          required: true
-          schema:
-            type: string
-            pattern: '^[a-z0-9_]+$'
-            example: "business"
         - name: limit
           in: query
           description: Maximum number of changes to return
@@ -175,6 +167,85 @@ paths:
                 $ref: '#/components/schemas/SchemaVersionResponse'
         '401':
           description: Authentication required
+
+  /admin/materialize-failures:
+    get:
+      summary: List materialization failures
+      description: |
+        Lists materialization failures recorded for the authenticated user.
+        This is an admin/diagnostics endpoint: it does not affect the sync stream.
+      security:
+        - BearerAuth: [ ]
+      parameters:
+        - name: schema
+          in: query
+          description: Optional schema filter
+          required: false
+          schema: { type: string, pattern: '^[a-z0-9_]+$' }
+        - name: table
+          in: query
+          description: Optional table filter
+          required: false
+          schema: { type: string, pattern: '^[a-z0-9_]+$' }
+        - name: limit
+          in: query
+          description: Maximum number of failures to return
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Failures retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MaterializeFailure'
+        '401':
+          description: Authentication required
+        '500':
+          description: Server error
+
+  /admin/materialize-failures/retry:
+    post:
+      summary: Retry a materialization failure
+      description: |
+        Retries a single failure by id for the authenticated user.
+        On success, the failure row is removed. On failure, retry_count increments.
+      security:
+        - BearerAuth: [ ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetryMaterializeFailureRequest'
+      parameters:
+        - name: id
+          in: query
+          description: Failure id (alternative to request body)
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '200':
+          description: Retry result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeUploadStatus'
+        '401':
+          description: Authentication required
+        '404':
+          description: Not found
+        '500':
+          description: Server error
 
 components:
   securitySchemes:
@@ -258,6 +329,7 @@ components:
           example: 0
         payload:
           type: object
+          nullable: true
           description: JSON payload (null for DELETE operations)
           example:
             id: "550e8400-e29b-41d4-a716-446655440000"
@@ -273,7 +345,7 @@ components:
       properties:
         accepted:
           type: boolean
-          description: Whether the upload was accepted for processing
+          description: Whether the upload was accepted for processing (false when the batch is rejected, e.g. `batch_too_large` or `unregistered_table`)
           example: true
         highest_server_seq:
           type: integer
@@ -286,6 +358,30 @@ components:
           items:
             $ref: '#/components/schemas/ChangeUploadStatus'
 
+    ConflictServerRow:
+      type: object
+      description: Current server state returned for conflict resolution
+      required: [ schema_name, table_name, id, server_version, deleted, payload ]
+      properties:
+        schema_name:
+          type: string
+          example: "public"
+        table_name:
+          type: string
+          example: "users"
+        id:
+          type: string
+          format: uuid
+        server_version:
+          type: integer
+          format: int64
+        deleted:
+          type: boolean
+        payload:
+          type: object
+          nullable: true
+          description: Business payload (may be null for deleted rows)
+
     ChangeUploadStatus:
       type: object
       required: [ source_change_id, status ]
@@ -295,6 +391,9 @@ components:
           format: int64
         status:
           type: string
+          description: |
+            Upload statuses are `applied`, `conflict`, or `invalid`.
+            `materialize_error` is returned by the admin retry endpoint.
           enum: [ applied, conflict, invalid, materialize_error ]
         new_server_version:
           type: integer
@@ -303,27 +402,78 @@ components:
         message:
           type: string
         server_row:
-          type: object
+          allOf:
+            - $ref: '#/components/schemas/ConflictServerRow'
           description: Present for conflicts
         invalid:
           type: object
           description: Structured details for `status=invalid`
+          required: [ reason ]
           properties:
             reason:
               type: string
-              enum: [ fk_missing, bad_payload, precheck_error, unregistered_table ]
+              enum: [ fk_missing, bad_payload, precheck_error, unregistered_table, internal_error, batch_too_large ]
               example: fk_missing
-            missing_parents:
-              type: array
-              description: 'For `fk_missing`: parents not present in DB nor earlier in this batch'
-              items:
-                type: object
-                required: [ schema, table, column, value ]
-                properties:
-                  schema: { type: string, example: "public" }
-                  table: { type: string, example: "users" }
-                  column: { type: string, example: "id" }
-                  value: { type: string, example: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" }
+            details:
+              type: object
+              additionalProperties: true
+              description: |
+                Reason-specific details.
+                - `fk_missing`: `{ "missing": ["schema.table:pk", ...] }`
+                - others: `{ "error": "..." }` (or other fields)
+
+    RetryMaterializeFailureRequest:
+      type: object
+      required: [ id ]
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+
+    MaterializeFailure:
+      type: object
+      required:
+        - id
+        - user_id
+        - schema
+        - table
+        - pk
+        - attempted_version
+        - op
+        - error
+        - first_seen
+        - retry_count
+      properties:
+        id:
+          type: integer
+          format: int64
+        user_id:
+          type: string
+        schema:
+          type: string
+        table:
+          type: string
+        pk:
+          type: string
+          format: uuid
+        attempted_version:
+          type: integer
+          format: int64
+        op:
+          type: string
+          enum: [ INSERT, UPDATE, DELETE ]
+        payload:
+          type: object
+          nullable: true
+          description: Payload that failed to materialize (null for DELETE)
+        error:
+          type: string
+        first_seen:
+          type: string
+          format: date-time
+        retry_count:
+          type: integer
 
     DownloadResponse:
       type: object
@@ -384,6 +534,7 @@ components:
           format: uuid
         payload:
           type: object
+          nullable: true
           description: JSON payload (null for DELETE)
         server_version:
           type: integer

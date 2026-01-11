@@ -13,6 +13,7 @@ Highlights
 - Optimistic concurrency with `server_version`.
 - FK‑safe batches: parent‑first ordering + deferrable constraints.
 - Snapshot‑consistent paging via `until`.
+- Optional FK auto-migration: can be disabled via `DisableAutoMigrateFKs`.
+- Upload guardrails: `MaxUploadBatchSize` (batch rejection) and `MaxPayloadBytes` (per-change invalid).
 
 See the deep‑dive spec in `/specs/oversync_flow.md` for SQL and invariants.
-

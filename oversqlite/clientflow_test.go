@@ -130,13 +130,15 @@ func TestClientFlowExample(t *testing.T) {
 	require.Equal(t, 0, deleted, "Row should not be marked as deleted")
 
 	// Client info should be updated
+	var currentWindowUntil int64
 	err = harness.client1DB.QueryRow(`
-		SELECT next_change_id, last_server_seq_seen
+		SELECT next_change_id, last_server_seq_seen, current_window_until
 		FROM _sync_client_info WHERE user_id = ?
-	`, harness.userID).Scan(&nextChangeID, &lastServerSeq)
+	`, harness.userID).Scan(&nextChangeID, &lastServerSeq, &currentWindowUntil)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), nextChangeID, "Next change ID should be incremented")
-	require.Greater(t, lastServerSeq, int64(0), "Last server seq should be updated")
+	require.Equal(t, int64(0), lastServerSeq, "Last server seq should remain 0 before any download")
+	require.Greater(t, currentWindowUntil, int64(0), "Upload watermark should be recorded")
 
 	// Step 2: Laptop downloads the insert
 	t.Log("=== Step 2: Laptop downloads the insert ===")

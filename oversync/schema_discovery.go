@@ -555,15 +555,9 @@ func (d *DiscoveredSchema) ParentsMissing(
 			continue // FK column not present - skip validation
 		}
 
-		// Apply key conversion if available
-		dbRefVal := refVal
-		if tableHandler != nil {
-			if converted, err := tableHandler.ConvertReferenceKey(fk.Col, refVal.(string)); err != nil {
-				// Conversion error - this is a parsing error, return it as bad payload
-				return []string{ReasonBadPayload}, nil
-			} else {
-				dbRefVal = converted
-			}
+		dbRefVal, badPayload := convertFKValueForHandler(tableHandler, fk.Col, refVal)
+		if badPayload {
+			return []string{ReasonBadPayload}, nil
 		}
 
 		// Convert to string for comparison with proper type handling
@@ -581,7 +575,7 @@ func (d *DiscoveredSchema) ParentsMissing(
 		// 2) Check if parent will be created in this request (and parent table sorts before this table)
 		parentKey := Key(fk.RefSchema, fk.RefTable)
 		if willExistSet, ok := willExist[parentKey]; ok {
-			if _, exists := willExistSet[refValStr]; exists {
+			if _, exists := willExistSet[dbRefValStr]; exists {
 				// Parent will be created - check if it comes before child in ordering
 				parentOrder, parentExists := d.OrderIdx[parentKey]
 				childOrder, childExists := d.OrderIdx[childKey]
@@ -646,6 +640,26 @@ func formatFKValue(value any) (string, bool) {
 		}
 		return str, true
 	}
+}
+
+// convertFKValueForHandler safely invokes the table handler for FK conversion without assuming payload type.
+// Returns converted value and a flag indicating whether the payload should be treated as bad.
+func convertFKValueForHandler(handler MaterializationHandler, fieldName string, payloadValue any) (any, bool) {
+	if handler == nil {
+		return payloadValue, false
+	}
+
+	incoming := payloadValue
+	// Common payload types from JSON unmarshalling are string/float64/bool/map; normalize []byte to string.
+	if b, ok := payloadValue.([]byte); ok {
+		incoming = string(b)
+	}
+
+	converted, err := handler.ConvertReferenceKey(fieldName, incoming)
+	if err != nil {
+		return nil, true
+	}
+	return converted, false
 }
 
 // RefreshTopology re-runs schema discovery and atomically updates the DiscoveredSchema

@@ -12,9 +12,15 @@ import (
 
 // initializeSchema creates the required sync tables if they don't exist
 func (s *SyncService) initializeSchema(ctx context.Context) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		return s.initializeSchemaInTx(ctx, tx)
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Run schema discovery outside the schema DDL transaction to avoid pool self-deadlocks
+	// (e.g., when max_conns=1) and to observe a committed view of constraints.
+	return s.discoverSchemaRelationships(ctx)
 }
 
 // initializeSchemaInTx creates the required sync tables within an existing transaction
@@ -100,8 +106,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 	}
 	s.logger.Info("Sidecar schema initialized successfully", "migrations", len(migrations))
 
-	// Discover schema relationships for batch upload improvements
-	return s.discoverSchemaRelationships(ctx)
+	return nil
 }
 
 // discoverSchemaRelationships analyzes registered tables and builds dependency graph

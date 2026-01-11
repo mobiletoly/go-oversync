@@ -874,7 +874,7 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 	}
 
 	// Capture upload watermark for watermark-based download termination
-	s.uploadWatermark, err = s.laptopApp.GetLastServerSeqSeen(ctx)
+	s.uploadWatermark, err = s.laptopApp.GetCurrentWindowUntil(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get upload watermark: %w", err)
 	}

@@ -26,7 +26,6 @@ type Session struct {
 
 // NewSession creates a new session manager
 func NewSession(userID, sourceID, jwtSecret string, logger *slog.Logger) *Session {
-	logger.Info("DEBUG: Mobile simulator JWT secret", "secret", jwtSecret, "length", len(jwtSecret))
 	return &Session{
 		userID:   userID,
 		sourceID: sourceID,

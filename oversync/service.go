@@ -130,6 +130,13 @@ func NewSyncService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.Logg
 		return nil, fmt.Errorf("failed to initialize sync service: %w", err)
 	}
 
+	// Discover schema relationships for batch upload improvements.
+	// Run this outside the initialization transaction to avoid pool self-deadlocks (e.g. max_conns=1)
+	// and to reflect any committed FK migrations.
+	if err := service.discoverSchemaRelationships(ctx); err != nil {
+		return nil, fmt.Errorf("failed to discover schema relationships: %w", err)
+	}
+
 	return service, nil
 }
 
@@ -198,18 +205,10 @@ func (s *SyncService) ProcessUpload(ctx context.Context, userID, sourceID string
 		statuses := make([]ChangeUploadStatus, len(req.Changes))
 		for i, ch := range req.Changes {
 			msg := fmt.Errorf("batch too large: changes=%d limit=%d", len(req.Changes), s.config.MaxUploadBatchSize)
-			statuses[i] = statusInvalidOther(ch.SourceChangeID, ReasonBadPayload, msg)
+			statuses[i] = statusInvalidOther(ch.SourceChangeID, ReasonBatchTooLarge, msg)
 		}
-		// Decide batch acceptance: if any unregistered_table invalids exist, mark not accepted.
-		accepted := true
-		for _, st := range statuses {
-			if st.Status == StInvalid {
-				if reason, ok := st.Invalid["reason"].(string); ok && reason == ReasonUnregisteredTable {
-					accepted = false
-					break
-				}
-			}
-		}
+		// Entire batch is rejected to prevent clients from dropping pending changes.
+		accepted := false
 
 		return &UploadResponse{
 			Accepted:         accepted,

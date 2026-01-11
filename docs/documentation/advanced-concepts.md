@@ -68,8 +68,11 @@ Each uploaded change is processed in isolation using database savepoints:
 ```sql
 BEGIN;  -- Start transaction
   SAVEPOINT sp_change_1;
-    -- Process change 1 (upsert metadata, update business table)
-    -- If business handler fails: ROLLBACK TO SAVEPOINT sp_change_1; record failure
+    -- Apply change 1 to the sidecar (meta/state/change_log)
+    SAVEPOINT sp_mat_1;
+      -- Optionally project to business tables (materializer)
+    -- If business handler fails: ROLLBACK TO SAVEPOINT sp_mat_1; record failure
+    RELEASE SAVEPOINT sp_mat_1;
   RELEASE SAVEPOINT sp_change_1;
 
   SAVEPOINT sp_change_2;
@@ -81,7 +84,8 @@ COMMIT;  -- All successful changes are committed together
 This ensures that:
 
 - Failed changes don't break the entire upload batch
-- Partial failures are recorded for admin retry
+- Materializer failures do not roll back sidecar state
+- Materializer failures are recorded for admin retry
 - The sync metadata stays consistent
 
 ### Foreign Key Aware Ordering
@@ -124,14 +128,16 @@ sequenceDiagram
   C->>A: upload(changes)
   A->>S: ProcessUpload(userID, sourceID, req)
   loop each change
-    S->>DB: SAVEPOINT sp
-    S->>DB: upsert meta/state, write change_log
+    S->>DB: SAVEPOINT sp_change
+    S->>DB: upsert meta/state, write change_log (sidecar)
+    S->>DB: SAVEPOINT sp_mat
     alt handler fails
-      S->>DB: ROLLBACK TO SAVEPOINT sp
+      S->>DB: ROLLBACK TO SAVEPOINT sp_mat
       S->>DB: INSERT materialize_failures
     else success
-      S->>DB: RELEASE SAVEPOINT sp
+      S->>DB: RELEASE SAVEPOINT sp_mat
     end
+    S->>DB: RELEASE SAVEPOINT sp_change
   end
   S-->>A: statuses + highest_server_seq
 ```
@@ -343,7 +349,8 @@ SET payload = EXCLUDED.payload;
 
 3.7 Optional business materialization
 - If a `MaterializationHandler` is registered for `schema.table`, call its idempotent upsert.
-- Any error → status: `materialize_error`; `ROLLBACK TO SAVEPOINT` and continue. Sidecar is NOT advanced; a row is recorded in `sync.materialize_failures` with `attempted_version` and details.
+- Materialization is best-effort and isolated under a dedicated SAVEPOINT (e.g. `sp_mat_*`).
+- Any error → `ROLLBACK TO SAVEPOINT sp_mat_*`, record a row in `sync.materialize_failures` with `attempted_version` and details, and continue. Sidecar remains advanced and the upload status stays `applied`.
 
 3.8 Release SAVEPOINT → status: `applied` with `new_server_version`.
 
@@ -382,7 +389,8 @@ WHERE user_id=@user AND schema_name=@schema AND table_name=@table_name AND pk_uu
 - If version gate returns 0 rows: check if the row exists at all; if not → applied (idempotent delete).
 
 5) Response assembly
-- Preserve original order; each change has one of: `applied`, `conflict`, `invalid`, `materialize_error`.
+- Preserve original order; each change has one of: `applied`, `conflict`, `invalid`.
+- Materializer failures do not change the upload status; they are recorded in `sync.materialize_failures` for admin retry.
 - Also return the user‑scoped watermark:
 ```sql
 SELECT COALESCE(MAX(server_id), 0)
@@ -492,15 +500,15 @@ ALTER TABLE %I.%I RENAME CONSTRAINT %I TO %I;
 
 - Register `MaterializationHandler` per `schema.table` to project sidecar state into clean business tables.
 - Handlers receive `(ctx, tx, schema, table, pk_uuid, payload)` and must be idempotent.
-- Errors are mapped to `materialize_error` per change; the change SAVEPOINT is rolled back (sidecar not advanced) and the failure is recorded for diagnostics/admin retry.
+- Materialization runs after sidecar/meta/state/log are updated and is isolated under a nested SAVEPOINT; failures roll back only business-table work, record `sync.materialize_failures`, and do not change the upload status (`applied`).
 
 ### Materializer Failures: Persist and Retry
 
-- Failure log: on any materializer error (including sync_state upsert or business handler failure), the server records a row in `sync.materialize_failures` with columns `(user_id, schema_name, table_name, pk_uuid, attempted_version, op, payload, error, first_seen, retry_count)`.
-- Semantics: the change SAVEPOINT is rolled back, so sidecar state is not advanced; the upload status is `materialize_error` and includes `new_server_version` (attempted_version) for diagnostics.
+- Failure log: on any materializer error (business handler failure), the server records a row in `sync.materialize_failures` with columns `(user_id, schema_name, table_name, pk_uuid, attempted_version, op, payload, error, first_seen, retry_count)`.
+- Semantics: sidecar state is already advanced and the upload status remains `applied`; `attempted_version` tracks the sidecar `server_version` that failed to project.
 - Idempotency: failures are upserted with `UNIQUE (user_id, schema_name, table_name, pk_uuid, attempted_version)`; repeated failures of the same attempt increment `retry_count`.
-- Admin retry operations: list failures for the authenticated user and retry a specific failure by id. Transport adapters (e.g., HTTP) may expose endpoints for these operations; see the adapter docs. On success the failure row is deleted and a corresponding `server_change_log` entry is written; on conflict or repeated failure, the row remains and `retry_count` increments.
-- Operations: the failure log enables monitoring and admin-driven retries. Since sidecar is not advanced on failure, a successful retry applies normally and future downloads will include the change.
+- Admin retry operations: list failures for the authenticated user and retry a specific failure by id. Retries materialize from the current sidecar state (source of truth). On success the failure row is deleted; on failure the row remains and `retry_count` increments.
+- Operations: the failure log enables monitoring and admin-driven retries without blocking sync or affecting the download stream.
 
 ## Materialization Deep Dive
 
@@ -526,15 +534,15 @@ sequenceDiagram
   S->>SM: 1. Store in sidecar (sync_row_meta, sync_state, server_change_log)
 
   alt Materialization enabled
-    S->>BT: 2. Call MaterializationHandler.ApplyInsertOrUpdate()
+    S->>BT: 2. Call MaterializationHandler.ApplyUpsert()/ApplyDelete()
     alt Success
       BT-->>S: ✓ Applied to business table
       S-->>C: status=applied
     else Failure
       BT-->>S: ✗ Materialization failed
-      S->>SM: ROLLBACK TO SAVEPOINT (undo sidecar changes)
+      S->>SM: ROLLBACK TO SAVEPOINT sp_mat (undo business work only)
       S->>FL: Record failure in materialize_failures
-      S-->>C: status=materialize_error
+      S-->>C: status=applied
     end
   else No materialization
     S-->>C: status=applied
@@ -547,13 +555,11 @@ Materialization is implemented through the `MaterializationHandler` interface:
 
 ```go
 type MaterializationHandler interface {
-    // Apply insert or update to business table
-    ApplyInsertOrUpdate(ctx context.Context, tx *sql.Tx,
-                       schema, table, pk string, payload map[string]any) error
+    // Apply insert or update to business table (idempotent)
+    ApplyUpsert(ctx context.Context, tx pgx.Tx, schema, table string, pk uuid.UUID, payload []byte) error
 
-    // Apply delete to business table
-    ApplyDelete(ctx context.Context, tx *sql.Tx,
-               schema, table, pk string) error
+    // Apply delete to business table (idempotent)
+    ApplyDelete(ctx context.Context, tx pgx.Tx, schema, table string, pk uuid.UUID) error
 
     // Convert encoded reference keys (e.g., base64 UUIDs)
     ConvertReferenceKey(fieldName string, payloadValue any) (any, error)
@@ -567,7 +573,7 @@ type MaterializationHandler interface {
 1. **Sync Storage First**: Changes are always stored in sidecar schema first
 2. **Materialization Attempt**: If a MaterializationHandler is registered, call the appropriate method
 3. **Failure Isolation**: Materialization failures don't affect sync reliability
-4. **Atomic Rollback**: Failed materialization rolls back both sidecar and business changes
+4. **Rollback Scope**: Failed materialization rolls back only business-table work; sidecar remains authoritative
 
 **Key SQL Operations:**
 
@@ -592,10 +598,10 @@ ON CONFLICT (id) DO UPDATE SET
 
 **Materialization Failure Process:**
 
-1. **Immediate Rollback**: `ROLLBACK TO SAVEPOINT` undoes both sidecar and business changes
+1. **Immediate Rollback**: `ROLLBACK TO SAVEPOINT sp_mat` undoes only business-table work
 2. **Failure Recording**: Insert into `sync.materialize_failures` with error details
-3. **Status Response**: Return `materialize_error` with attempted version number
-4. **Client Behavior**: Client can retry the same change later
+3. **Status Response**: Upload still returns `applied` (sidecar is authoritative)
+4. **Recovery**: Admin can retry projection later from sidecar
 
 **Failure Log Schema:**
 
@@ -692,7 +698,7 @@ func GetUser(userID string) (*User, error) {
 - `applied` (idempotent): duplicate `(user, source, scid)` skipped.
 - `conflict`: incoming `server_version` mismatch; returns `server_row` snapshot (schema, table, id, server_version, deleted, payload).
 - `invalid`: structured reason (e.g., `fk_missing`, `bad_payload`, `precheck_error`, `internal_error`).
-- `materialize_error`: business projection failed; the server rolls back to the change SAVEPOINT (sidecar is not persisted). `new_server_version` carries the attempted version for diagnostics.
+- Materializer failures do not change upload status; they are recorded in `sync.materialize_failures` for admin retry.
 
 ## Security & Safety
 
@@ -746,34 +752,35 @@ sequenceDiagram
   A->>S: ProcessUpload(userID, sourceID, req)
   S->>DB: BEGIN (RR)
   S->>DB: SET CONSTRAINTS ALL DEFERRED
-  loop each change
-    S->>DB: SAVEPOINT sp_scid
-    S->>DB: check idempotency (user, source, scid)
-    alt duplicate
-      S-->>A: status=applied (idempotent)
-      DB-->>S: (no write)
-    else new
-      S->>DB: ensure meta if sv=0 (INSERT ... ON CONFLICT DO NOTHING)
-      S->>DB: version gate (UPDATE ... WHERE server_version=incoming)
-      alt conflict (0 rows)
-        S->>DB: fetch server_row JSON
-        S-->>A: status=conflict(server_row)
-        S->>DB: ROLLBACK TO SAVEPOINT sp_scid
-      else ok
-        S->>DB: UPDATE server_change_log SET server_version=new_version
-        S->>DB: upsert sync_state(payload)
-        S->>S: call materializer (optional)
-        alt materializer error
-          S->>DB: ROLLBACK TO SAVEPOINT sp_scid
-          S->>DB: INSERT INTO sync.materialize_failures(...)
-          S-->>A: status=materialize_error(new_version)
-        else success
-          S->>DB: RELEASE SAVEPOINT sp_scid
-          S-->>A: status=applied(new_version)
-        end
-      end
-    end
-  end
+	  loop each change
+	    S->>DB: SAVEPOINT sp_scid
+	    S->>DB: check idempotency (user, source, scid)
+	    alt duplicate
+	      S-->>A: status=applied (idempotent)
+	      DB-->>S: (no write)
+	    else new
+	      S->>DB: ensure meta if sv=0 (INSERT ... ON CONFLICT DO NOTHING)
+	      S->>DB: version gate (UPDATE ... WHERE server_version=incoming)
+	      alt conflict (0 rows)
+	        S->>DB: fetch server_row JSON
+	        S-->>A: status=conflict(server_row)
+	        S->>DB: ROLLBACK TO SAVEPOINT sp_scid
+	      else ok
+	        S->>DB: UPDATE server_change_log SET server_version=new_version
+	        S->>DB: upsert sync_state(payload)
+	        S->>DB: SAVEPOINT sp_mat
+	        S->>S: call materializer (optional)
+	        alt materializer error
+	          S->>DB: ROLLBACK TO SAVEPOINT sp_mat
+	          S->>DB: INSERT INTO sync.materialize_failures(...)
+	        else success
+	          S->>DB: RELEASE SAVEPOINT sp_mat
+	        end
+	        S->>DB: RELEASE SAVEPOINT sp_scid
+	        S-->>A: status=applied(new_version)
+	      end
+	    end
+	  end
   S->>DB: COMMIT
   A-->>C: UploadResponse(statuses, highest_server_seq)
 ```
@@ -839,38 +846,56 @@ sortUpsertsParentFirst(upserts)
 sortDeletesChildFirst(deletes)
 willExist := buildBatchPKIndex(upserts, deletes)
 
-for ch in upserts {
-  savepoint()
-  // Gate-only idempotency: try to insert into change_log first with server_version=0
-  rows := insertChangeLogGate(user, source, ch, server_version=0) // ON CONFLICT DO NOTHING
-  if error is 40001/40P01 { rollback to savepoint; release; status=applied(idempotent); continue }
-  if rows == 0 { releaseSavepoint(); status = applied(idempotent); continue }
+	for ch in upserts {
+	  savepoint()
+	  // Gate-only idempotency: try to insert into change_log first with server_version=0
+	  rows := insertChangeLogGate(user, source, ch, server_version=0) // ON CONFLICT DO NOTHING
+	  if error is 40001/40P01 {
+	    rollback to savepoint; release
+	    if serverChangeLogHasTriplet(user, source, scid) { status=applied(idempotent); continue }
+	    status=invalid(internal_error) // retryable
+	    continue
+	  }
+	  if rows == 0 { releaseSavepoint(); status = applied(idempotent); continue }
 
   if err := validate(ch); err != nil { status = invalid(bad_payload); rollback(); continue }
   if miss := parentsMissing(ch, willExist); miss != nil { status = invalid(fk_missing, miss); rollback(); continue }
   ensureMetaIfSv0()
   newVer, ok := versionGateUpdate(ch)
   if !ok { serverRow := fetchServerRow(); status = conflict(serverRow); rollback(); continue }
-  updateChangeLogServerVersion(user, source, ch.scid, newVer)
-  upsertSyncState(ch.payload)
-  if handlerExists(schema.table) { if handler.Apply(...) fails { rollback(); recordMaterializeFailure(newVer, ch); status = materialize_error(newVer); continue } }
-  releaseSavepoint()
-  status = applied(newVer)
-}
+	  updateChangeLogServerVersion(user, source, ch.scid, newVer)
+	  upsertSyncState(ch.payload)
+	  if handlerExists(schema.table) {
+	    savepoint(sp_mat)
+	    if handler.Apply... fails { rollback(sp_mat); recordMaterializeFailure(newVer, ch) }
+	    release(sp_mat)
+	  }
+	  releaseSavepoint()
+	  status = applied(newVer)
+	}
 
-for ch in deletes {
-  savepoint()
-  rows := insertChangeLogGate(user, source, ch delete, server_version=0) // payload=NULL
-  if error is 40001/40P01 { rollback to savepoint; release; status=applied(idempotent); continue }
-  if rows == 0 { releaseSavepoint(); status = applied(idempotent); continue }
+	for ch in deletes {
+	  savepoint()
+	  rows := insertChangeLogGate(user, source, ch delete, server_version=0) // payload=NULL
+	  if error is 40001/40P01 {
+	    rollback to savepoint; release
+	    if serverChangeLogHasTriplet(user, source, scid) { status=applied(idempotent); continue }
+	    status=invalid(internal_error) // retryable
+	    continue
+	  }
+	  if rows == 0 { releaseSavepoint(); status = applied(idempotent); continue }
   newVer, ok := versionGateDelete(ch)
   if !ok { if rowMissing() { rollback(); status=applied(idempotent); continue } else { serverRow := fetchServerRow(); rollback(); status=conflict(serverRow); continue } }
-  updateChangeLogServerVersion(user, source, ch.scid, newVer)
-  deleteSyncState()
-  if handlerExists(schema.table) { if handler.Delete(...) fails { rollback(); recordMaterializeFailure(newVer, ch); status = materialize_error(newVer); continue } }
-  releaseSavepoint()
-  status = applied(newVer)
-}
+	  updateChangeLogServerVersion(user, source, ch.scid, newVer)
+	  deleteSyncState()
+	  if handlerExists(schema.table) {
+	    savepoint(sp_mat)
+	    if handler.Delete... fails { rollback(sp_mat); recordMaterializeFailure(newVer, ch) }
+	    release(sp_mat)
+	  }
+	  releaseSavepoint()
+	  status = applied(newVer)
+	}
 
 commit()
 return statuses, highestUserSeq()
@@ -898,17 +923,17 @@ return { TableOrder: order, OrderIdx: index(order), FKMap: fkMap, Dependencies: 
 
 Materializer interface
 
-```
+```go
 type MaterializationHandler interface {
-  ApplyInsertOrUpdate(ctx, tx, schema, table, pk, payload) error
-  ApplyDelete(ctx, tx, schema, table, pk) error
-  ConvertReferenceKey(fieldName string, payloadValue any) (any, error)
+	ApplyUpsert(ctx context.Context, tx pgx.Tx, schema, table string, pk uuid.UUID, payload []byte) error
+	ApplyDelete(ctx context.Context, tx pgx.Tx, schema, table string, pk uuid.UUID) error
+	ConvertReferenceKey(fieldName string, payloadValue any) (any, error)
 }
 ```
 
 ## Invariants and Proof Sketches
 
-- Idempotency (exactly-once materialization under retry):
+- Idempotency (exactly-once sidecar log under retry):
   - Invariant: For any `(user, source, scid)`, at most one row in `server_change_log`.
   - Enforcement: `UNIQUE(user_id, source_id, source_change_id)` and `isDuplicate(...)` precheck.
   - Sketch: Duplicate retries either hit `EXISTS` or `ON CONFLICT DO NOTHING`, producing status `applied` (idempotent) with no additional side effects.
@@ -937,8 +962,8 @@ type MaterializationHandler interface {
   - Enforcement: `ORDER BY server_id`, index-backed; `next_after` is MAX in page.
 
 - Atomic per-change effects (all-or-nothing within item):
-  - Invariant: Sidecar/meta/state/log/materialization for a change either commit together or not at all.
-  - Enforcement: SAVEPOINT per change; rollback on any error before release.
+  - Invariant: Sidecar/meta/state/log for a change either commit together or not at all.
+  - Enforcement: SAVEPOINT per change; rollback on any sidecar error before release. Materialization is isolated under a nested SAVEPOINT and may fail without rolling back sidecar.
 
 
 ## End-to-End Example (Two Devices)
@@ -972,13 +997,13 @@ Result
 
 Invariants
 - I1: For each (user, schema, table, pk), `server_version` is a strictly increasing integer starting at 0.
-- I2: For each (user, source, source_change_id), at most one log row exists (idempotency key ensures at-least-once upload becomes exactly-once materialization).
+- I2: For each (user, source, source_change_id), at most one log row exists (idempotency key ensures at-least-once upload becomes exactly-once sidecar application).
 - I3: Download stream per user is totally ordered by `server_id`.
 - I4: Every applied upload advances either `sync_row_meta` (sv++ and deleted flag) and, for non-deletes, `sync_state`.
 
 Consistency model
 - Per-user eventual consistency across devices; each device follows the ordered stream and applies changes atomically per page.
-- Business tables (if materialized) are transactionally consistent with sidecar changes for each change item.
+- Business tables (if materialized) are best-effort projections from sidecar; failures are recorded for admin retry.
 
 Transaction isolation rationale
 - REPEATABLE READ prevents a parent inserted by a concurrent later transaction from “rescuing” missing-FK cases within this batch.
@@ -988,7 +1013,7 @@ Transaction isolation rationale
 
 Upload failures
 - Network failure before response: client retries; idempotency collapses duplicates → status `applied` (idempotent).
-- Materializer error: sidecar NOT advanced (rolled back to change SAVEPOINT); status `materialize_error` includes `new_server_version` and failure is recorded.
+- Materializer error: sidecar is still advanced (upload returns `applied`); failure is recorded for admin retry.
 - FK invalid: status `invalid` with reason `fk_missing`; retry after parents are uploaded.
 
 Download failures

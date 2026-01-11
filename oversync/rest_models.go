@@ -39,7 +39,7 @@ type UploadResponse struct {
 // ChangeUploadStatus represents the result of processing a single change
 type ChangeUploadStatus struct {
 	SourceChangeID   int64           `json:"source_change_id"`             // Echo back the client's ID
-	Status           string          `json:"status"`                       // "applied", "conflict", "invalid", "materialize_error"
+	Status           string          `json:"status"`                       // "applied", "conflict", "invalid" (and "materialize_error" for admin retry)
 	NewServerVersion *int64          `json:"new_server_version,omitempty"` // New version if applied
 	ServerRow        json.RawMessage `json:"server_row,omitempty"`         // Current server state if conflict
 	Message          string          `json:"message,omitempty"`            // Optional details for errors

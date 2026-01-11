@@ -187,25 +187,7 @@ func (c *Client) uploadBatch(ctx context.Context) error {
 		return nil // Nothing to upload
 	}
 
-	// Create upload request
-	uploadReq := &oversync.UploadRequest{
-		LastServerSeqSeen: lastServerSeq,
-		Changes:           changes,
-	}
-
-	// Send to server
-	response, err := c.sendUploadRequest(ctx, uploadReq)
-	if err != nil {
-		return fmt.Errorf("failed to send upload request: %w", err)
-	}
-
-	// Process response and update local state
-	err = c.processUploadResponse(ctx, response, changeIDStart, changes)
-	if err != nil {
-		return fmt.Errorf("failed to process upload response: %w", err)
-	}
-
-	return nil
+	return c.uploadChangesAdaptive(ctx, changes, lastServerSeq, changeIDStart)
 }
 
 // downloaderLoop runs the downloader in a loop
@@ -603,12 +585,17 @@ func (c *Client) processUploadResponse(ctx context.Context, response *oversync.U
 	}
 	defer tx.Rollback() // Safe to call even after commit
 
-	// Update last_server_seq_seen (next_change_id is now managed by triggers)
+	// Track latest known server watermark from uploads without advancing the download cursor.
+	// The download cursor (`last_server_seq_seen`) must only advance when we actually download/apply
+	// server changes, otherwise we can permanently skip peer changes when server_id gaps are large.
 	_, err = tx.ExecContext(ctx, `
 		UPDATE _sync_client_info
-		SET last_server_seq_seen = ?
+		SET current_window_until = CASE
+			WHEN current_window_until < ? THEN ?
+			ELSE current_window_until
+		END
 		WHERE user_id = ?
-	`, response.HighestServerSeq, c.UserID)
+	`, response.HighestServerSeq, response.HighestServerSeq, c.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to update client info: %w", err)
 	}
@@ -777,18 +764,19 @@ func (c *Client) processUploadResponse(ctx context.Context, response *oversync.U
 			}
 
 		case "invalid":
-			// Check if this is a retryable FK constraint violation
-			if isRetryableFKError(status) {
-				// Keep FK constraint violations in pending queue for retry
-				// These will be retried in the next sync cycle
-			} else {
-				// Remove permanently invalid changes from pending
+			// Only drop clearly non-recoverable invalids (bad payload or unregistered table).
+			if shouldDropInvalid(status) {
 				_, err = tx.ExecContext(ctx, `
 					DELETE FROM _sync_pending WHERE table_name = ? AND pk_uuid = ?
 				`, change.Table, change.PK)
 				if err != nil {
 					return fmt.Errorf("failed to remove invalid from pending: %w", err)
 				}
+			} else {
+				// Keep retryable invalids (FK missing, batch too large, transient errors)
+				c.logger.Warn("Retaining pending change after invalid status",
+					"table", change.Table, "pk", change.PK, "reason", getInvalidReason(status),
+					"message", status.Message)
 			}
 
 		case "materialize_error":
@@ -809,6 +797,74 @@ func (c *Client) processUploadResponse(ctx context.Context, response *oversync.U
 	return nil
 }
 
+// uploadChangesAdaptive retries with smaller chunks when the server signals batch_too_large.
+func (c *Client) uploadChangesAdaptive(ctx context.Context, changes []oversync.ChangeUpload, lastServerSeq int64, changeIDStart int64) error {
+	if len(changes) == 0 {
+		return nil
+	}
+
+	chunkSize := len(changes)
+	if c.config.UploadLimit > 0 && c.config.UploadLimit < chunkSize {
+		chunkSize = c.config.UploadLimit
+	}
+	if chunkSize <= 0 {
+		chunkSize = len(changes)
+	}
+
+	for start := 0; start < len(changes); {
+		if chunkSize <= 0 {
+			chunkSize = 1
+		}
+		if chunkSize > len(changes)-start {
+			chunkSize = len(changes) - start
+		}
+		chunk := changes[start : start+chunkSize]
+
+		uploadReq := &oversync.UploadRequest{
+			LastServerSeqSeen: lastServerSeq,
+			Changes:           chunk,
+		}
+
+		response, err := c.sendUploadRequest(ctx, uploadReq)
+		if err != nil {
+			return fmt.Errorf("failed to send upload request: %w", err)
+		}
+
+		// If server says batch too large, shrink and retry this window.
+		if !response.Accepted && containsBatchTooLarge(response) && chunkSize > 1 {
+			newSize := chunkSize / 2
+			if newSize < 1 {
+				newSize = 1
+			}
+			c.logger.Warn("Server rejected batch as too large; reducing chunk size",
+				"from", chunkSize, "to", newSize, "pending", len(changes)-start)
+			chunkSize = newSize
+			continue
+		}
+
+		if err := c.processUploadResponse(ctx, response, changeIDStart, chunk); err != nil {
+			return fmt.Errorf("failed to process upload response: %w", err)
+		}
+
+		// Advance window and update lastServerSeq with server watermark
+		lastServerSeq = response.HighestServerSeq
+		start += chunkSize
+		// Optionally increase chunk size back up slowly? Keep current to avoid thrash.
+	}
+	return nil
+}
+
+func containsBatchTooLarge(resp *oversync.UploadResponse) bool {
+	for _, st := range resp.Statuses {
+		if st.Invalid != nil {
+			if reason, ok := st.Invalid["reason"].(string); ok && reason == oversync.ReasonBatchTooLarge {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // isRetryableFKError checks if an invalid status represents a retryable FK constraint violation
 func isRetryableFKError(status oversync.ChangeUploadStatus) bool {
 	if status.Status != "invalid" {
@@ -823,6 +879,27 @@ func isRetryableFKError(status oversync.ChangeUploadStatus) bool {
 	}
 
 	return false
+}
+
+// shouldDropInvalid returns true only for non-recoverable invalid reasons.
+func shouldDropInvalid(status oversync.ChangeUploadStatus) bool {
+	reason := getInvalidReason(status)
+	switch reason {
+	case oversync.ReasonBadPayload, oversync.ReasonUnregisteredTable:
+		return true
+	default:
+		return false
+	}
+}
+
+func getInvalidReason(status oversync.ChangeUploadStatus) string {
+	if status.Invalid == nil {
+		return ""
+	}
+	if reason, ok := status.Invalid["reason"].(string); ok {
+		return reason
+	}
+	return ""
 }
 
 // processPayloadForUpload converts hex-encoded BLOB data from triggers to base64 for server communication

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -26,7 +27,10 @@ func TestLargeScaleUploadDownload(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Setup PostgreSQL connection
-	dbURL := os.Getenv("DATABASE_URL")
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("DATABASE_URL")
+	}
 	if dbURL == "" {
 		dbURL = "postgres://postgres:password@localhost:5432/clisync_example?sslmode=disable"
 	}
@@ -35,17 +39,24 @@ func TestLargeScaleUploadDownload(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 
-	// Clean up database before test
-	err = cleanupTestDatabase(ctx, pool)
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "business_ls_" + suffix
+	userID := "test-user-large-scale-" + suffix
+	sourceID := "test-device-large-" + suffix
+
+	err = resetTestBusinessSchema(ctx, pool, schemaName)
 	require.NoError(t, err)
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
 
 	// Initialize sync service
 	config := &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "integration-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: "business", Table: "users"},
-			{Schema: "business", Table: "posts"},
+			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "posts"},
 		},
 	}
 
@@ -54,9 +65,6 @@ func TestLargeScaleUploadDownload(t *testing.T) {
 	defer syncService.Close()
 
 	// Test configuration
-	userID := "test-user-large-scale"
-	sourceID := "test-device-large"
-
 	// Test parameters - start smaller to focus on core functionality
 	const (
 		totalUsers        = 500 // 500 users
@@ -75,7 +83,7 @@ func TestLargeScaleUploadDownload(t *testing.T) {
 			totalUsers, uploadBatchSize)
 
 		// Create users
-		userChanges, _ := createUserChanges(totalUsers, sourceID)
+		userChanges, _ := createUserChanges(totalUsers, schemaName, sourceID)
 		allUploadedChanges = append(allUploadedChanges, userChanges...)
 
 		// Upload users in batches
@@ -91,7 +99,7 @@ func TestLargeScaleUploadDownload(t *testing.T) {
 		}
 
 		// Verify server has all the data
-		serverUserCount, serverPostCount := getServerRecordCounts(t, ctx, pool, userID)
+		serverUserCount, serverPostCount := getServerRecordCounts(t, ctx, pool, userID, schemaName)
 		require.Equal(t, totalUsers, serverUserCount, "Server should have all uploaded users")
 		if totalPosts > 0 {
 			require.Equal(t, totalPosts, serverPostCount, "Server should have all uploaded posts")
@@ -151,7 +159,7 @@ func TestLargeScaleUploadDownload(t *testing.T) {
 		require.Equal(t, 0, len(response.Changes), "Should get 0 changes when includeSelf=false with same sourceID")
 
 		// Test download with schema filter
-		response, err = syncService.ProcessDownloadWindowed(ctx, userID, sourceID, 0, 1000, "business", true, 0)
+		response, err = syncService.ProcessDownloadWindowed(ctx, userID, sourceID, 0, 1000, schemaName, true, 0)
 		require.NoError(t, err)
 		expectedTotal := totalUsers + totalPosts
 		require.Equal(t, expectedTotal, len(response.Changes), "Should get all changes with business schema filter")
@@ -167,7 +175,7 @@ func TestLargeScaleUploadDownload(t *testing.T) {
 
 // Helper functions
 
-func createUserChanges(count int, sourceID string) ([]ChangeUpload, []string) {
+func createUserChanges(count int, schemaName string, sourceID string) ([]ChangeUpload, []string) {
 	changes := make([]ChangeUpload, count)
 	userUUIDs := make([]string, count)
 
@@ -185,7 +193,7 @@ func createUserChanges(count int, sourceID string) ([]ChangeUpload, []string) {
 
 		changes[i] = ChangeUpload{
 			SourceChangeID: int64(i + 1),
-			Schema:         "business",
+			Schema:         schemaName,
 			Table:          "users",
 			Op:             OpInsert,
 			PK:             userID,
@@ -196,7 +204,7 @@ func createUserChanges(count int, sourceID string) ([]ChangeUpload, []string) {
 	return changes, userUUIDs
 }
 
-func createPostChanges(count int, userUUIDs []string, sourceID string, startChangeID int) []ChangeUpload {
+func createPostChanges(count int, schemaName string, userUUIDs []string, sourceID string, startChangeID int) []ChangeUpload {
 	changes := make([]ChangeUpload, count)
 
 	for i := 0; i < count; i++ {
@@ -214,7 +222,7 @@ func createPostChanges(count int, userUUIDs []string, sourceID string, startChan
 
 		changes[i] = ChangeUpload{
 			SourceChangeID: int64(startChangeID + i + 1), // Continue from user changes
-			Schema:         "business",
+			Schema:         schemaName,
 			Table:          "posts",
 			Op:             OpInsert,
 			PK:             postID,
@@ -303,43 +311,19 @@ func verifyDataIntegrity(t *testing.T, uploaded []ChangeUpload, downloaded []Cha
 	t.Logf("Data integrity verified: all %d uploaded changes match downloaded changes", len(uploaded))
 }
 
-func getServerRecordCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID string) (users, posts int) {
+func getServerRecordCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID string, schemaName string) (users, posts int) {
 	// Count records in sync.server_change_log for this user
 	err := pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM sync.server_change_log
-		WHERE user_id = $1 AND schema_name = 'business' AND table_name = 'users'
-	`, userID).Scan(&users)
+		WHERE user_id = $1 AND schema_name = $2 AND table_name = 'users'
+	`, userID, schemaName).Scan(&users)
 	require.NoError(t, err)
 
 	err = pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM sync.server_change_log
-		WHERE user_id = $1 AND schema_name = 'business' AND table_name = 'posts'
-	`, userID).Scan(&posts)
+		WHERE user_id = $1 AND schema_name = $2 AND table_name = 'posts'
+	`, userID, schemaName).Scan(&posts)
 	require.NoError(t, err)
 
 	return users, posts
-}
-
-func cleanupTestDatabase(ctx context.Context, pool *pgxpool.Pool) error {
-	// Clean up business tables
-	_, err := pool.Exec(ctx, "DELETE FROM business.posts")
-	if err != nil {
-		return err
-	}
-	_, err = pool.Exec(ctx, "DELETE FROM business.users")
-	if err != nil {
-		return err
-	}
-
-	// Clean up sync tables
-	_, err = pool.Exec(ctx, "DELETE FROM sync.server_change_log")
-	if err != nil {
-		return err
-	}
-	_, err = pool.Exec(ctx, "DELETE FROM sync.sync_row_meta")
-	if err != nil {
-		return err
-	}
-
-	return nil
 }

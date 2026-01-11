@@ -46,6 +46,14 @@ Business Tables           Client Sync Tables (local)
 Business tables stay clean. Triggers coalesce pending changes per PK and capture payloads. BLOB
 columns are hex-encoded in triggers and converted to base64 on upload.
 
+Notes on cursors and watermarks:
+
+- `last_server_seq_seen` is the **download cursor** (last applied `server_id`). It must advance only
+  when a download page is successfully applied; fast-forwarding it from upload responses can skip
+  peer changes when `server_id` gaps are large under high parallelism.
+- `current_window_until` tracks the latest known server watermark (e.g., from upload/download
+  responses) and can be used as the `until` ceiling for windowed paging.
+
 ## Quick Start
 
 ```go
@@ -187,4 +195,3 @@ Tests cover trigger creation, BLOB handling, pagination, hydration, conflict flo
 
 - Keep a stable `source_id` per install and per user. Use `EnsureSourceID` to generate/persist.
 - Ensure your HTTP server exposes `/sync/upload` and `/sync/download` per the go-oversync spec and returns per-change statuses.
-

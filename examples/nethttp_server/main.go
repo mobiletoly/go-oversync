@@ -35,7 +35,6 @@ func main() {
 		jwtSecret = "your-secret-key-change-in-production"
 		logger.Warn("Using default JWT secret - change in production!")
 	}
-	logger.Info("DEBUG: Server JWT secret", "secret", jwtSecret, "length", len(jwtSecret))
 
 	// Setup server components using shared logic
 	serverConfig := &server.ServerConfig{

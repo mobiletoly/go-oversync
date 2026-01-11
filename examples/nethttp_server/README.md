@@ -12,7 +12,7 @@ This example demonstrates how to build a two-way sync server using go-oversync w
 - **Optimistic concurrency control** via sidecar tables
 - **Idempotent operations** using `(user_id, source_id, source_change_id)` uniqueness
 - **Optional materialization** to business tables via handlers
-- **Enhanced status types** - applied, conflict, invalid, materialize_error
+- **Enhanced status types** - applied, conflict, invalid (materialize failures are recorded for admin retry)
 - **Graceful shutdown** with proper cleanup
 
 ## Single-User Multi-Device Sync Architecture
@@ -261,10 +261,10 @@ When a conflict occurs (server_version mismatch), the server returns the current
 
 ### Status Types
 
-- **applied**: Change successfully applied to sidecar and business table
+- **applied**: Change successfully applied to sidecar (materialization is best-effort)
 - **conflict**: Version mismatch, see server_row for current state
 - **invalid**: Validation failed (bad table name, UUID, JSON, etc.)
-- **materialize_error**: Sidecar applied but business table projection failed
+- Materialization failures are recorded in `sync.materialize_failures` for admin retry; upload still returns `applied`.
 
 ## Sidecar Architecture
 

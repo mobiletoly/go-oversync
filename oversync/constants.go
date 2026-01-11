@@ -25,4 +25,5 @@ const (
 	ReasonPrecheckError     = "precheck_error"
 	ReasonInternalError     = "internal_error"
 	ReasonUnregisteredTable = "unregistered_table"
+	ReasonBatchTooLarge     = "batch_too_large"
 )

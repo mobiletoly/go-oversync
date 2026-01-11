@@ -38,16 +38,25 @@ func TestMF01_RecordFailureOnMaterializerError(t *testing.T) {
 		Payload:        b,
 	}})
 
-	// Verify materialize_error status and attempted version present
+	// Sync must still apply (sidecar is authoritative); materialization failures are logged for admin retry.
 	require.True(t, resp.Accepted)
 	require.Len(t, resp.Statuses, 1)
-	require.Equal(t, "materialize_error", resp.Statuses[0].Status)
+	require.Equal(t, "applied", resp.Statuses[0].Status)
 	require.NotNil(t, resp.Statuses[0].NewServerVersion)
 	require.Equal(t, int64(1), *resp.Statuses[0].NewServerVersion)
 
-	// Verify sidecar not advanced (no meta row)
-	_, err := h.GetSyncRowMeta("public", "note", noteID)
-	require.Error(t, err)
+	// Verify sidecar advanced (meta + state exist)
+	meta, err := h.GetSyncRowMeta("public", "note", noteID)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.ServerVersion)
+	state, err := h.GetSyncState("public", "note", noteID)
+	require.NoError(t, err)
+	require.NotEmpty(t, state.Payload)
+
+	// Verify business table NOT updated due to forced handler failure
+	var businessCount int
+	require.NoError(t, h.service.Pool().QueryRow(h.ctx, `SELECT COUNT(*) FROM note WHERE id=$1`, noteID).Scan(&businessCount))
+	require.Equal(t, 0, businessCount)
 
 	// Verify failure persisted
 	var count int
@@ -77,7 +86,7 @@ func TestMF02_RetryIncrementsRetryCount(t *testing.T) {
 	b, _ := json.Marshal(payload)
 
 	// First failing attempt
-	_ = h.Upload([]oversync.ChangeUpload{{
+	resp := h.Upload([]oversync.ChangeUpload{{
 		SourceChangeID: 1,
 		Table:          "note",
 		Op:             "INSERT",
@@ -85,23 +94,24 @@ func TestMF02_RetryIncrementsRetryCount(t *testing.T) {
 		ServerVersion:  0,
 		Payload:        b,
 	}})
+	require.True(t, resp.Accepted)
+	require.Equal(t, "applied", resp.Statuses[0].Status)
 
-	// Second failing attempt (same version 0 → attempted version 1 again)
-	_ = h.Upload([]oversync.ChangeUpload{{
-		SourceChangeID: 2,
-		Table:          "note",
-		Op:             "INSERT",
-		PK:             noteID.String(),
-		ServerVersion:  0,
-		Payload:        b,
-	}})
-
-	// Verify a single row exists with retry_count incremented to 1
-	var retryCount int
+	// Find failure id
+	var failureID int64
 	err := h.service.Pool().QueryRow(h.ctx, `
-        SELECT retry_count FROM sync.materialize_failures
-        WHERE user_id=$1 AND schema_name='public' AND table_name='note'
-          AND pk_uuid=$2 AND attempted_version=1`, userID, noteID).Scan(&retryCount)
+		SELECT id FROM sync.materialize_failures
+		WHERE user_id=$1 AND schema_name='public' AND table_name='note' AND pk_uuid=$2 AND attempted_version=1`,
+		userID, noteID,
+	).Scan(&failureID)
+	require.NoError(t, err)
+	require.NotZero(t, failureID)
+
+	// Retry (still failing) should increment retry_count
+	_, _ = h.service.RetryMaterializeFailure(h.ctx, userID, failureID)
+
+	var retryCount int
+	err = h.service.Pool().QueryRow(h.ctx, `SELECT retry_count FROM sync.materialize_failures WHERE id=$1`, failureID).Scan(&retryCount)
 	require.NoError(t, err)
 	require.Equal(t, 1, retryCount)
 }

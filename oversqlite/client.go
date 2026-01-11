@@ -239,7 +239,12 @@ func (c *Client) Stop(ctx context.Context) error {
 	return nil
 }
 
-// UploadOnce performs a single upload operation with post-upload lookback strategy
+// UploadOnce performs a single upload operation.
+//
+// It also performs a bounded post-upload download drain (include_self=false) to pick up any peer
+// changes that arrived since the last download cursor, without ever fast-forwarding the cursor based
+// on `highest_server_seq`. This avoids permanently skipping peer changes under high parallelism where
+// server_id gaps can be large.
 func (c *Client) UploadOnce(ctx context.Context) error {
 	// Allow callers to pause uploads deterministically (prevents mid-creation drains)
 	if atomic.LoadInt32(&c.uploadPaused) == 1 {
@@ -248,76 +253,21 @@ func (c *Client) UploadOnce(ctx context.Context) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	// Phase 1: Upload local changes first
-	err := c.uploadBatch(ctx)
-	if err != nil {
+	// Phase 1: upload local changes.
+	if err := c.uploadBatch(ctx); err != nil {
 		return err
 	}
 
-	// Phase 2: Post-upload lookback drain to catch any missed peer changes
-	// This prevents issues where upload advances watermark but misses concurrent changes
+	// Phase 2: post-upload download drain (peer changes only).
 	if atomic.LoadInt32(&c.downloadPaused) == 0 {
-		// Get current sync state after upload
-		var target int64
-		err := c.DB.QueryRowContext(ctx, `
-			SELECT last_server_seq_seen FROM _sync_client_info WHERE user_id = ?
-		`, c.UserID).Scan(&target)
-		if err != nil {
-			return fmt.Errorf("failed to get current sync state: %w", err)
-		}
-
-		// Calculate lookback window (max of 1000 or 2x download limit)
-		lookbackWindow := int64(1000)
-		if c.config.DownloadLimit*2 > 1000 {
-			lookbackWindow = int64(c.config.DownloadLimit * 2)
-		}
-		windowStart := target - lookbackWindow
-		if windowStart < 0 {
-			windowStart = 0
-		}
-
-		// Temporarily reset sync state to window start
-		_, err = c.DB.ExecContext(ctx, `
-			UPDATE _sync_client_info SET last_server_seq_seen = ? WHERE user_id = ?
-		`, windowStart, c.UserID)
-		if err != nil {
-			return fmt.Errorf("failed to set lookback window: %w", err)
-		}
-
-		// Download from window start to target with includeSelf=false (don't re-apply our own changes)
 		maxPasses := 50
-		passes := 0
-		nextAfter := windowStart
-
-		for passes < maxPasses {
-			prev := nextAfter
-			applied, na, err := c.downloadBatch(ctx, c.config.DownloadLimit, false)
+		for passes := 0; passes < maxPasses; passes++ {
+			applied, _, err := c.downloadBatch(ctx, c.config.DownloadLimit, false)
 			if err != nil {
-				return fmt.Errorf("post-upload lookback failed: %w", err)
+				return fmt.Errorf("post-upload download drain failed: %w", err)
 			}
-
-			nextAfter = na
-			passes++
-
-			// Stop if: no changes applied, caught up to target, or stagnated
-			caughtUp := nextAfter >= target
-			stagnated := nextAfter == prev
-			if applied == 0 || caughtUp || stagnated {
+			if applied == 0 {
 				break
-			}
-		}
-
-		// Restore cursor to target to avoid leaving it behind
-		var current int64
-		err = c.DB.QueryRowContext(ctx, `
-			SELECT last_server_seq_seen FROM _sync_client_info WHERE user_id = ?
-		`, c.UserID).Scan(&current)
-		if err == nil && current < target {
-			_, err = c.DB.ExecContext(ctx, `
-				UPDATE _sync_client_info SET last_server_seq_seen = ? WHERE user_id = ?
-			`, target, c.UserID)
-			if err != nil {
-				return fmt.Errorf("failed to restore sync cursor: %w", err)
 			}
 		}
 	}

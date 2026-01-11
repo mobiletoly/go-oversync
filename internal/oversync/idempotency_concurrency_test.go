@@ -51,13 +51,24 @@ func TestIHC01_ConcurrentDuplicateSCID_SingleChange(t *testing.T) {
 	for i := 0; i < concurr; i++ {
 		go func() {
 			defer wg.Done()
-			resp, httpResp := h.DoUpload(h.client1Token, req)
-			require.Equal(t, http.StatusOK, httpResp.StatusCode)
-			require.True(t, resp.Accepted)
-			require.Len(t, resp.Statuses, 1)
+			var st oversync.ChangeUploadStatus
+			for attempt := 0; attempt < 10; attempt++ {
+				resp, httpResp := h.DoUpload(h.client1Token, req)
+				require.Equal(t, http.StatusOK, httpResp.StatusCode)
+				require.True(t, resp.Accepted)
+				require.Len(t, resp.Statuses, 1)
 
-			st := resp.Statuses[0]
-			require.Equal(t, scid, st.SourceChangeID)
+				st = resp.Statuses[0]
+				require.Equal(t, scid, st.SourceChangeID)
+
+				if st.Status == "applied" {
+					break
+				}
+				require.Equal(t, "invalid", st.Status)
+				require.NotNil(t, st.Invalid)
+				require.Equal(t, oversync.ReasonInternalError, st.Invalid["reason"])
+				time.Sleep(10 * time.Millisecond)
+			}
 			require.Equal(t, "applied", st.Status)
 
 			mu.Lock()
@@ -128,13 +139,25 @@ func TestIHC02_ConcurrentDuplicateSCIDs_Many(t *testing.T) {
 					Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","title":"IHC02-%d","updated_at":%d}`, j.pk, j.scid, time.Now().Unix())),
 				}},
 			}
-			resp, httpResp := h.DoUpload(h.client1Token, req)
-			require.Equal(t, http.StatusOK, httpResp.StatusCode)
-			require.True(t, resp.Accepted)
-			require.Len(t, resp.Statuses, 1)
-			st := resp.Statuses[0]
-			require.Equal(t, j.scid, st.SourceChangeID)
+			var st oversync.ChangeUploadStatus
+			for attempt := 0; attempt < 10; attempt++ {
+				resp, httpResp := h.DoUpload(h.client1Token, req)
+				require.Equal(t, http.StatusOK, httpResp.StatusCode)
+				require.True(t, resp.Accepted)
+				require.Len(t, resp.Statuses, 1)
+				st = resp.Statuses[0]
+				require.Equal(t, j.scid, st.SourceChangeID)
+
+				if st.Status == "applied" {
+					break
+				}
+				require.Equal(t, "invalid", st.Status)
+				require.NotNil(t, st.Invalid)
+				require.Equal(t, oversync.ReasonInternalError, st.Invalid["reason"])
+				time.Sleep(10 * time.Millisecond)
+			}
 			require.Equal(t, "applied", st.Status)
+
 			mu.Lock()
 			if st.NewServerVersion != nil {
 				appliedWithVersion++

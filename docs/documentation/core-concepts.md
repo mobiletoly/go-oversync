@@ -134,8 +134,8 @@ sequenceDiagram
     - applied: accepted and version advanced
     - conflict: version expectation failed; client must pull latest and re‑apply
     - invalid: bad payload or validation failure
-    - materialize_error: accepted into sync state but failed secondary materialization (recorded for
-      admin retry)
+- Materialization failures do **not** change the upload status: the server still returns `applied`
+  (so clients can drop the pending change) and records the failure for admin retry.
 
 ### Download (Windowed and Paged)
 

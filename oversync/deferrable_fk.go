@@ -5,6 +5,8 @@ package oversync
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -63,16 +65,28 @@ func (m *DeferrableFKManager) MigrateToDeferredInTx(ctx context.Context, tx pgx.
 
 	// Collect all FKs that need migration first
 	var allFKsToMigrate []ForeignKeyInfo
-	for _, regTable := range m.registeredTables {
+	for i, regTable := range m.registeredTables {
 		m.logger.Debug("Processing FK migration for table",
 			"schema", regTable.Schema,
 			"table", regTable.Table)
 
+		spName := fmt.Sprintf("sp_fk_list_%d", i)
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SAVEPOINT %s", pgx.Identifier{spName}.Sanitize())); err != nil {
+			return fmt.Errorf("create fk discovery savepoint: %w", err)
+		}
+
 		// Find non-deferrable FKs for this specific table
 		fks, err := m.getNonDeferrableFKsForTableInTx(ctx, tx, regTable.Schema, regTable.Table)
 		if err != nil {
-			return fmt.Errorf("failed to get FKs for %s.%s: %w", regTable.Schema, regTable.Table, err)
+			m.logger.Error("Failed to list foreign keys for table; skipping table",
+				"schema", regTable.Schema,
+				"table", regTable.Table,
+				"error", err)
+			_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+			_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+			continue
 		}
+		_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
 
 		allFKsToMigrate = append(allFKsToMigrate, fks...)
 	}
@@ -86,31 +100,52 @@ func (m *DeferrableFKManager) MigrateToDeferredInTx(ctx context.Context, tx pgx.
 		"count", len(allFKsToMigrate))
 
 	// Migrate all FKs within the provided transaction
-	var upgraded, recreated int
-	for _, fk := range allFKsToMigrate {
+	var upgraded, recreated, failed int
+	var firstFailure error
+	for i, fk := range allFKsToMigrate {
+		spName := fmt.Sprintf("sp_fk_mig_%d", i)
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SAVEPOINT %s", pgx.Identifier{spName}.Sanitize())); err != nil {
+			return fmt.Errorf("create fk migration savepoint: %w", err)
+		}
+
 		if err := m.migrateToDeferrableInTx(ctx, tx, fk); err != nil {
-			// Log warning but continue with other FKs
+			failed++
+			if firstFailure == nil {
+				firstFailure = err
+			}
+
+			// Log error but continue with other FKs.
 			m.logger.Error("Failed to migrate FK to deferrable",
 				"constraint", fk.ConstraintName,
 				"table", fk.SchemaName+"."+fk.TableName,
 				"error", err)
-			return err
+
+			_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+			_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+			continue
+		}
+
+		if _, err := tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize())); err != nil {
+			return fmt.Errorf("release fk migration savepoint: %w", err)
+		}
+
+		if fk.IsDeferrableFK() && !fk.IsDeferredFK() {
+			upgraded++
+			m.logger.Info("Upgraded FK to initially deferred",
+				"constraint", fk.ConstraintName,
+				"table", fk.SchemaName+"."+fk.TableName)
 		} else {
-			if fk.IsDeferrableFK() && !fk.IsDeferredFK() {
-				upgraded++
-				m.logger.Info("Upgraded FK to initially deferred",
-					"constraint", fk.ConstraintName,
-					"table", fk.SchemaName+"."+fk.TableName)
-			} else {
-				recreated++
-				m.logger.Info("Recreated FK as deferrable",
-					"constraint", fk.ConstraintName,
-					"table", fk.SchemaName+"."+fk.TableName)
-			}
+			recreated++
+			m.logger.Info("Recreated FK as deferrable",
+				"constraint", fk.ConstraintName,
+				"table", fk.SchemaName+"."+fk.TableName)
 		}
 	}
 
-	m.logger.Info("FK migration summary", "upgraded", upgraded, "recreated", recreated)
+	m.logger.Info("FK migration summary", "upgraded", upgraded, "recreated", recreated, "failed", failed)
+	if failed > 0 {
+		return fmt.Errorf("fk migration failed for %d constraints (first error: %w)", failed, firstFailure)
+	}
 	return nil
 }
 
@@ -248,14 +283,14 @@ func (m *DeferrableFKManager) migrateToDeferrableInTx(
 	case "RESTRICT":
 		onUpdateClause = "ON UPDATE RESTRICT"
 	case "SET DEFAULT":
-		onDeleteClause = "ON UPDATE SET DEFAULT"
+		onUpdateClause = "ON UPDATE SET DEFAULT"
 	default:
 		onUpdateClause = "" // NO ACTION
 	}
 
 	// Combine clauses
 	actionClause := strings.TrimSpace(onDeleteClause + " " + onUpdateClause)
-	tempName := fk.ConstraintName + "_deferrable"
+	tempName := makeTempConstraintName(fk.ConstraintName)
 
 	// Step 1: Add new deferrable constraint (NOT VALID)
 	addSQL := fmt.Sprintf(`
@@ -325,4 +360,29 @@ func (m *DeferrableFKManager) migrateToDeferrableInTx(
 		return fmt.Errorf("failed to rename constraint: %w", err)
 	}
 	return nil
+}
+
+func makeTempConstraintName(canonical string) string {
+	const (
+		maxIdentBytes = 63
+		suffix        = "_deferrable"
+	)
+
+	if len(canonical)+len(suffix) <= maxIdentBytes {
+		return canonical + suffix
+	}
+
+	sum := sha256.Sum256([]byte(canonical))
+	hash := hex.EncodeToString(sum[:4]) // 8 hex chars
+
+	keep := maxIdentBytes - len(suffix) - 1 - len(hash)
+	if keep < 1 {
+		name := hash + suffix
+		if len(name) > maxIdentBytes {
+			return name[:maxIdentBytes]
+		}
+		return name
+	}
+
+	return canonical[:keep] + "_" + hash + suffix
 }

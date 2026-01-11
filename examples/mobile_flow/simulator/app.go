@@ -203,6 +203,15 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 
 		app.logger.Info("Session restored successfully", "user_id", app.session.GetUserID())
 
+		// Ensure the local oversqlite client is bootstrapped before starting background sync loops.
+		// Under high parallelism, background loops can tick before SignIn/Bootstrap runs and hit
+		// sql.ErrNoRows on _sync_client_info.
+		if err := app.client.Bootstrap(ctx, false); err != nil {
+			app.logger.Error("Failed to bootstrap client after session restore", "error", err)
+			app.ui.SetBanner("Setup failed")
+			return fmt.Errorf("bootstrap after restore failed: %w", err)
+		}
+
 		if err := app.sync.Start(ctx); err != nil {
 			app.logger.Error("Failed to start sync", "error", err)
 			app.ui.SetBanner("Sync failed to start")
@@ -742,7 +751,7 @@ func (app *MobileApp) PerformSyncDownload(ctx context.Context, limit int) (appli
 	const retryDelay = 500 * time.Millisecond
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		applied, nextAfter, err = app.client.DownloadWithSelf(ctx, limit)
+		applied, nextAfter, err = app.client.DownloadOnce(ctx, limit)
 		if err == nil {
 			break
 		}
@@ -779,6 +788,19 @@ func (app *MobileApp) GetLastServerSeqSeen(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("failed to get last server seq seen: %w", err)
 	}
 	return lastSeq, nil
+}
+
+// GetCurrentWindowUntil returns the latest known server watermark from the client_info row.
+// This is updated from upload/download responses and is intended for windowed paging (`until`).
+func (app *MobileApp) GetCurrentWindowUntil(ctx context.Context) (int64, error) {
+	var until int64
+	err := app.db.QueryRowContext(ctx, `
+		SELECT current_window_until FROM _sync_client_info WHERE user_id = ?
+	`, app.config.UserID).Scan(&until)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get current window until: %w", err)
+	}
+	return until, nil
 }
 
 // SyncDownloadToWatermark downloads pages until the server-side ceiling `until` is reached.

@@ -36,6 +36,12 @@ Response:
 }
 ```
 
+Notes:
+
+- `accepted=false` means the server rejected the whole batch (e.g. `batch_too_large`); clients should keep all pending changes and retry with a smaller batch.
+- `status=invalid` includes an `invalid.reason` and a free-form `invalid.details` object. Some invalid reasons are retryable (`fk_missing`, `precheck_error`, `internal_error`, `batch_too_large`); others are not (`bad_payload`, `unregistered_table`).
+- Materialization (optional server-side projection) is best-effort: upload still returns `status=applied` and failures are recorded for admin retry.
+
 ## GET `/sync/download`
 
 Query: `after`, `limit`, `schema`, `include_self`, `until`
@@ -63,4 +69,3 @@ Response:
   "window_until": 43
 }
 ```
-

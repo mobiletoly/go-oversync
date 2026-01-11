@@ -149,6 +149,9 @@ SELECT changes, next_after, has_more FROM agg;`
 
 // getHighestServerSeq returns the highest server_id across all users
 func (s *SyncService) getHighestServerSeq(ctx context.Context) int64 {
+	if s.pool == nil {
+		return 0
+	}
 	var maxSeq int64
 	// This query doesn't need named args since it has no parameters
 	err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(server_id), 0) FROM sync.server_change_log`).Scan(&maxSeq)
@@ -162,6 +165,9 @@ func (s *SyncService) getHighestServerSeq(ctx context.Context) int64 {
 // getUserHighestServerSeq returns the highest server_id for a specific user
 // This provides a more accurate watermark for per-user downloads
 func (s *SyncService) getUserHighestServerSeq(ctx context.Context, userID string) int64 {
+	if s.pool == nil {
+		return 0
+	}
 	var maxSeq int64
 	err := s.pool.QueryRow(ctx,
 		`SELECT COALESCE(MAX(server_id), 0) FROM sync.server_change_log WHERE user_id = @user_id`,

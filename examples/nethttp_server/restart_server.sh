@@ -5,6 +5,7 @@ set -e
 
 SERVER_DIR="."
 LOG_FILE="/tmp/server.log"
+DB_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable}"
 
 echo "Restarting nethttp_server..."
 
@@ -20,7 +21,7 @@ rm -f "$LOG_FILE"
 
 # Clean up test data from database
 echo "Cleaning up test data from database..."
-psql "postgres://postgres:postgres@localhost:5432/clisync_example" -c "
+psql "$DB_URL" -c "
   DELETE FROM sync.server_change_log WHERE user_id LIKE 'user-fresh-%' OR user_id LIKE 'user-%';
   DELETE FROM sync.sync_row_meta WHERE schema_name = 'business';
   DELETE FROM business.posts;
@@ -57,7 +58,9 @@ fi
 # Step 7: Show initial logs
 echo "✅ Server is running on port 8080"
 echo "Initial server logs:"
-head -20 "$LOG_FILE" 2>/dev/null || echo "No logs yet" && exit 1
+if ! head -20 "$LOG_FILE" 2>/dev/null; then
+    echo "No logs yet"
+fi
 
 echo ""
 echo "Server restart complete!"

@@ -41,9 +41,22 @@ func (s *SyncService) insertChangeLog(ctx context.Context, tx pgx.Tx, userID, so
 	return err
 }
 
+func (s *SyncService) serverChangeLogHasTriplet(ctx context.Context, tx pgx.Tx, userID, sourceID string, scid int64) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM sync.server_change_log
+			WHERE user_id = $1 AND source_id = $2 AND source_change_id = $3
+		)`, userID, sourceID, scid).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 // applyUpsert applies an INSERT/UPDATE operation with SAVEPOINT isolation
 func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, sourceID string, change ChangeUpload) (ChangeUploadStatus, error) {
-	s.logger.Info("Starting applyUpsert",
+	s.logger.Debug("Starting applyUpsert",
 		"schema", change.Schema, "table", change.Table, "pk", change.PK,
 		"source_change_id", change.SourceChangeID, "server_version", change.ServerVersion,
 		"payload_size", len(change.Payload))
@@ -69,9 +82,17 @@ func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, source
 		if errors.As(err, &pgErr) && (pgErr.SQLState() == "40001" || pgErr.SQLState() == "40P01") {
 			// Clear error state within the SAVEPOINT scope
 			_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-			// Optionally drop the savepoint
+			// Only treat as idempotent if the (user, source, scid) row exists.
+			// Otherwise, return a retryable internal error to avoid dropping a change if the other txn aborts.
+			exists, checkErr := s.serverChangeLogHasTriplet(ctx, tx, userID, sourceID, change.SourceChangeID)
 			_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-			return statusAppliedIdempotent(change.SourceChangeID), nil
+			if checkErr != nil {
+				return statusInvalidOther(change.SourceChangeID, ReasonInternalError, fmt.Errorf("idempotency gate check failed: %w", checkErr)), nil
+			}
+			if exists {
+				return statusAppliedIdempotent(change.SourceChangeID), nil
+			}
+			return statusInvalidOther(change.SourceChangeID, ReasonInternalError, fmt.Errorf("idempotency gate failed with %s but row is missing; retry", pgErr.SQLState())), nil
 		}
 		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
 		return ChangeUploadStatus{}, fmt.Errorf("failed to insert change log (gate): %w", err)
@@ -90,7 +111,7 @@ func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, source
 			s.logger.Error("Failed to ensure meta for brand-new row", "error", err,
 				"schema", change.Schema, "table", change.Table, "pk", change.PK)
 			_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-			return statusInvalidOther(change.SourceChangeID, ReasonBadPayload, err), nil
+			return statusInvalidOther(change.SourceChangeID, ReasonInternalError, err), nil
 		}
 	}
 
@@ -110,11 +131,12 @@ func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, source
 			serverRow, fetchErr := s.fetchServerRowJSON(ctx, tx, userID, change.Schema, change.Table, change.PK)
 			if fetchErr != nil {
 				if errors.Is(fetchErr, pgx.ErrNoRows) {
-					// Row was deleted - still a conflict, but with no current server state
-					s.logger.Warn("Conflict: Row was deleted on server",
+					// No server state exists for this row, so the client cannot resolve a conflict.
+					// Return a retryable internal error instead of conflict(server_row=null) to avoid client stalls.
+					s.logger.Warn("Conflict: No server row found for conflict resolution",
 						"schema", change.Schema, "table", change.Table, "pk", change.PK)
 					_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-					return statusConflict(change.SourceChangeID, nil), nil
+					return statusInvalidOther(change.SourceChangeID, ReasonInternalError, fmt.Errorf("conflict without server_row for %s.%s pk=%s", change.Schema, change.Table, change.PK)), nil
 				}
 				_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
 				return ChangeUploadStatus{}, fmt.Errorf("failed to fetch server row for conflict: %w", fetchErr)
@@ -133,18 +155,7 @@ func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, source
 	_, err = tx.Exec(ctx, stmtUpsertState, userID, change.Schema, change.Table, change.PK, change.Payload)
 	if err != nil {
 		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-		// Record failure for diagnostics and admin retry visibility
-		_ = s.recordMaterializeFailure(ctx, tx, userID, change.Schema, change.Table, change.PK, newServerVersion, err, change.Op, change.Payload)
-		return statusMaterializeError(change.SourceChangeID, newServerVersion, err), nil
-	}
-
-	// Business projection (optional materialization)
-	if err := s.applyBusinessProjection(ctx, tx, change, false); err != nil {
-		s.logger.Error("Failed to apply business projection", "error", err, "schema", change.Schema, "table", change.Table, "pk", change.PK)
-		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-		// Record failure for diagnostics and admin retry visibility
-		_ = s.recordMaterializeFailure(ctx, tx, userID, change.Schema, change.Table, change.PK, newServerVersion, err, change.Op, change.Payload)
-		return statusMaterializeError(change.SourceChangeID, newServerVersion, err), nil
+		return statusInvalidOther(change.SourceChangeID, ReasonInternalError, err), nil
 	}
 
 	// Update the server_change_log with the correct server_version (it was inserted with 0 as placeholder)
@@ -156,6 +167,15 @@ func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, source
 	if err != nil {
 		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
 		return ChangeUploadStatus{}, fmt.Errorf("failed to update server_change_log with server_version: %w", err)
+	}
+
+	// Business projection (optional materialization).
+	// Materialization MUST NOT block sync: sidecar/meta/state/log changes remain committed,
+	// and failures are recorded for admin retry.
+	if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, change, false, newServerVersion); err != nil {
+		s.logger.Warn("Business projection failed; sync still applied",
+			"error", err, "schema", change.Schema, "table", change.Table, "pk", change.PK,
+			"server_version", newServerVersion, "source_change_id", change.SourceChangeID)
 	}
 
 	// Release SAVEPOINT
@@ -190,8 +210,15 @@ func (s *SyncService) applyDelete(ctx context.Context, tx pgx.Tx, userID, source
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) && (pgErr.SQLState() == "40001" || pgErr.SQLState() == "40P01") {
 				_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+				exists, checkErr := s.serverChangeLogHasTriplet(ctx, tx, userID, sourceID, change.SourceChangeID)
 				_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-				return statusAppliedIdempotent(change.SourceChangeID), nil
+				if checkErr != nil {
+					return statusInvalidOther(change.SourceChangeID, ReasonInternalError, fmt.Errorf("idempotency gate check failed: %w", checkErr)), nil
+				}
+				if exists {
+					return statusAppliedIdempotent(change.SourceChangeID), nil
+				}
+				return statusInvalidOther(change.SourceChangeID, ReasonInternalError, fmt.Errorf("idempotency gate failed with %s but row is missing; retry", pgErr.SQLState())), nil
 			}
 			_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
 			return ChangeUploadStatus{}, fmt.Errorf("failed to insert change log (gate): %w", err)
@@ -245,14 +272,6 @@ func (s *SyncService) applyDelete(ctx context.Context, tx pgx.Tx, userID, source
 		// Non-fatal - continue processing
 	}
 
-	// Business projection (optional materialization)
-	if err := s.applyBusinessProjection(ctx, tx, change, true); err != nil {
-		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-		// Record failure for diagnostics and admin retry visibility
-		_ = s.recordMaterializeFailure(ctx, tx, userID, change.Schema, change.Table, change.PK, newServerVersion, err, change.Op, nil)
-		return statusMaterializeError(change.SourceChangeID, newServerVersion, err), nil
-	}
-
 	// Update the server_change_log with the correct server_version (it was inserted with 0 as placeholder)
 	_, err = tx.Exec(ctx, `
 		UPDATE sync.server_change_log
@@ -264,6 +283,13 @@ func (s *SyncService) applyDelete(ctx context.Context, tx pgx.Tx, userID, source
 		return ChangeUploadStatus{}, fmt.Errorf("failed to update server_change_log with server_version: %w", err)
 	}
 
+	// Business projection (optional materialization) - best effort.
+	if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, change, true, newServerVersion); err != nil {
+		s.logger.Warn("Business projection failed; sync still applied",
+			"error", err, "schema", change.Schema, "table", change.Table, "pk", change.PK,
+			"server_version", newServerVersion, "source_change_id", change.SourceChangeID)
+	}
+
 	// Release SAVEPOINT
 	_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
 	if err != nil {
@@ -271,6 +297,48 @@ func (s *SyncService) applyDelete(ctx context.Context, tx pgx.Tx, userID, source
 	}
 
 	return statusApplied(change.SourceChangeID, newServerVersion), nil
+}
+
+// applyBusinessProjectionBestEffort runs the optional business-table projection in a nested SAVEPOINT.
+// On failure, it rolls back only business-table effects and records a retryable failure row,
+// while leaving sidecar/meta/state/log changes intact.
+func (s *SyncService) applyBusinessProjectionBestEffort(
+	ctx context.Context,
+	tx pgx.Tx,
+	userID string,
+	change ChangeUpload,
+	deleted bool,
+	attemptedVersion int64,
+) error {
+	s.mu.RLock()
+	handlerKey := change.Schema + "." + change.Table
+	_, exists := s.tableHandlers[handlerKey]
+	s.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+
+	spName := fmt.Sprintf("sp_mat_%d", change.SourceChangeID)
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SAVEPOINT %s", pgx.Identifier{spName}.Sanitize())); err != nil {
+		return fmt.Errorf("create materialize savepoint: %w", err)
+	}
+
+	err := s.applyBusinessProjection(ctx, tx, change, deleted)
+	if err == nil {
+		_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		return nil
+	}
+
+	// Roll back business-table work but keep sidecar/meta/state/log.
+	_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+	_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+
+	var payload []byte
+	if !deleted {
+		payload = change.Payload
+	}
+	_ = s.recordMaterializeFailure(ctx, tx, userID, change.Schema, change.Table, change.PK, attemptedVersion, err, change.Op, payload)
+	return err
 }
 
 // applyBusinessProjection handles optional business table materialization

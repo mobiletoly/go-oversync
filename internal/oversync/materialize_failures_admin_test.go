@@ -54,13 +54,15 @@ func TestMF_AdminListAndRetry(t *testing.T) {
 	require.Equal(t, "INSERT", f.Op)
 	require.True(t, f.RetryCount >= 0)
 
-	// Update stored payload to remove force_fail so retry can succeed
-	var newPayload map[string]any
-	_ = json.Unmarshal(b, &newPayload)
-	delete(newPayload, "force_fail")
-	fixed, _ := json.Marshal(newPayload)
-	// Best-effort; ignore RETURNING scan error on some drivers
-	_, _ = h.service.Pool().Exec(h.ctx, `UPDATE sync.materialize_failures SET payload=$1 WHERE id=$2`, fixed, f.ID)
+	// Fix sidecar payload to remove force_fail so retry can succeed.
+	// (In production you would typically fix handler/business constraints; this is test-only.)
+	_, err := h.service.Pool().Exec(h.ctx, `
+		UPDATE sync.sync_state
+		SET payload = payload - 'force_fail'
+		WHERE user_id=$1 AND schema_name='public' AND table_name='note' AND pk_uuid=$2`,
+		userID, noteID,
+	)
+	require.NoError(t, err)
 
 	// Retry via HTTP
 	retryReq := h.createHTTPRequest("POST", fmt.Sprintf("/admin/materialize-failures/retry?id=%d", f.ID), nil)
@@ -80,4 +82,9 @@ func TestMF_AdminListAndRetry(t *testing.T) {
 	meta, err2 := h.GetSyncRowMeta("public", "note", noteID)
 	require.NoError(t, err2)
 	require.Equal(t, int64(1), meta.ServerVersion)
+
+	// Verify business row materialized
+	var cnt2 int
+	require.NoError(t, h.service.Pool().QueryRow(h.ctx, `SELECT COUNT(*) FROM note WHERE id=$1`, noteID).Scan(&cnt2))
+	require.Equal(t, 1, cnt2)
 }

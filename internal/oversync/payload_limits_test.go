@@ -23,11 +23,11 @@ func TestPL01_BatchSizeLimit(t *testing.T) {
 	c3 := oversync.ChangeUpload{SourceChangeID: 3, Table: "note", Op: "INSERT", PK: h.MakeUUID("pl01-3").String(), ServerVersion: 0, Payload: h.MakeNotePayload(h.MakeUUID("pl01-3"), "t3", "c3", time.Now())}
 
 	resp, _ := h.DoUpload(h.client1Token, &oversync.UploadRequest{Changes: []oversync.ChangeUpload{c1, c2, c3}})
-	require.True(t, resp.Accepted)
+	require.False(t, resp.Accepted)
 	require.Len(t, resp.Statuses, 3)
 	for _, st := range resp.Statuses {
 		require.Equal(t, oversync.StInvalid, st.Status)
-		require.Equal(t, oversync.ReasonBadPayload, st.Invalid["reason"])
+		require.Equal(t, oversync.ReasonBatchTooLarge, st.Invalid["reason"])
 	}
 
 	// At boundary (limit=2) should succeed

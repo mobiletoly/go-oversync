@@ -28,6 +28,7 @@ bin/*
 .docker_build/
 
 tmp/
+.cache/
 
 example.db
 example_twoway.db
@@ -39,3 +40,5 @@ sqlitenow_server/
 examples/nethttp_server/nethttp_server
 examples/samplesync_server/samplesync_server
 example/mobile_flow/mobile_flow
+
+AGENTS.md

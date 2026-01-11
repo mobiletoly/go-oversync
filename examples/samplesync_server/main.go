@@ -35,10 +35,10 @@ func main() {
 
 	logger.Info("Samplesync server listening", "addr", addr)
 	logger.Info("Endpoints:")
-	logger.Info("  POST /sync/upload        - Upload changes with conflict resolution")
-	logger.Info("  GET  /sync/download      - Download changes from server")
+	logger.Info("  POST /sync/upload         - Upload changes with conflict resolution")
+	logger.Info("  GET  /sync/download       - Download changes from server")
 	logger.Info("  GET  /sync/schema-version - Get current schema version")
-	logger.Info("  POST /dummy-signin       - Dummy signin to obtain JWT (user/device)")
+	logger.Info("  POST /dummy-signin        - Dummy signin to obtain JWT (user/device)")
 
 	// Create HTTP server with custom timeout settings
 	server := &http.Server{

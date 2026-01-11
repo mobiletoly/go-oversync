@@ -2,6 +2,7 @@ package simulator
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -169,6 +170,9 @@ func (u *Uploader) runOnce(ctx context.Context) {
 	}
 
 	if err := client.UploadOnce(ctx); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		u.logger.Error("Upload failed", "error", err)
 		if isAuthError(err) {
 			u.app.GetUI().SetBanner("Session expired. Sign in.")
@@ -240,6 +244,9 @@ func (d *Downloader) runOnce(ctx context.Context) {
 
 	_, _, err := client.DownloadOnce(ctx, 1000)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		d.logger.Error("Download failed", "error", err)
 		if isAuthError(err) {
 			d.app.GetUI().SetBanner("Session expired. Sign in.")
