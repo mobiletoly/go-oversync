@@ -636,9 +636,12 @@ ORDER BY first_seen DESC;
 -- Retry specific failure (pseudo-code)
 -- 1. Fetch failure record and sync_state
 -- 2. Re-attempt MaterializationHandler.Apply() in transaction
--- 3. On success: delete failure record, write server_change_log entry
+-- 3. On success: delete failure record (sidecar already contains the change)
 -- 4. On failure: increment retry_count
 ```
+
+Concurrency
+- The retry endpoint locks the failure row; concurrent retries for the same failure return HTTP 409 (`retry_in_progress`).
 
 ### Design Principles
 

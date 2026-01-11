@@ -5,6 +5,7 @@ package oversync
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -238,6 +239,14 @@ func (h *HTTPSyncHandlers) HandleRetryFailure(w http.ResponseWriter, r *http.Req
 	}
 	status, err := h.service.RetryMaterializeFailure(r.Context(), userID, id)
 	if err != nil {
+		if errors.Is(err, errMaterializeFailureNotFound) {
+			h.writeError(w, http.StatusNotFound, "not_found", "materialize failure not found")
+			return
+		}
+		if errors.Is(err, errMaterializeFailureRetryInProgress) {
+			h.writeError(w, http.StatusConflict, "retry_in_progress", "materialize failure retry is already in progress")
+			return
+		}
 		h.logger.Error("Retry failure error", "error", err, "id", id)
 		h.writeError(w, http.StatusInternalServerError, "retry_failed", err.Error())
 		return

@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // MaterializeFailure represents a row in sync.materialize_failures
@@ -28,6 +29,11 @@ type MaterializeFailure struct {
 	FirstSeen        time.Time       `json:"first_seen"`
 	RetryCount       int             `json:"retry_count"`
 }
+
+var (
+	errMaterializeFailureNotFound        = errors.New("materialize failure not found")
+	errMaterializeFailureRetryInProgress = errors.New("materialize failure retry in progress")
+)
 
 // ListMaterializeFailures returns failures for the given user filtered by optional schema/table.
 func (s *SyncService) ListMaterializeFailures(
@@ -71,36 +77,47 @@ func (s *SyncService) ListMaterializeFailures(
 func (s *SyncService) RetryMaterializeFailure(
 	ctx context.Context, userID string, id int64,
 ) (*ChangeUploadStatus, error) {
-	var f MaterializeFailure
-	err := s.pool.QueryRow(ctx, `
-        SELECT id, user_id, schema_name, table_name, pk_uuid::text, attempted_version, op, payload, error, first_seen, retry_count
-        FROM sync.materialize_failures WHERE id=$1`, id).Scan(
-		&f.ID, &f.UserID, &f.SchemaName, &f.TableName, &f.PK, &f.AttemptedVersion, &f.Op, &f.Payload, &f.Error, &f.FirstSeen, &f.RetryCount)
-	if err != nil {
-		return nil, fmt.Errorf("load failure: %w", err)
-	}
-	if f.UserID != userID {
-		return nil, errors.New("not found")
-	}
-
-	// Resolve handler
-	s.mu.RLock()
-	handlerKey := f.SchemaName + "." + f.TableName
-	handler, ok := s.tableHandlers[handlerKey]
-	s.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("no materialization handler registered for %s", handlerKey)
-	}
-
-	pkUUID, parseErr := uuid.Parse(f.PK)
-	if parseErr != nil {
-		return nil, fmt.Errorf("invalid pk uuid: %w", parseErr)
-	}
-
 	var status ChangeUploadStatus
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadWrite}, func(tx pgx.Tx) error {
+	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadWrite}, func(tx pgx.Tx) error {
 		if _, e := tx.Exec(ctx, "SET CONSTRAINTS ALL DEFERRED"); e != nil {
 			return e
+		}
+
+		// Lock the failure row so concurrent retries for the same id cannot run at the same time.
+		// We use NOWAIT to return a clear "in progress" signal instead of blocking.
+		var f MaterializeFailure
+		if err := tx.QueryRow(ctx, `
+			SELECT id, user_id, schema_name, table_name, pk_uuid::text, attempted_version, op, payload, error, first_seen, retry_count
+			FROM sync.materialize_failures
+			WHERE id=$1
+			FOR UPDATE NOWAIT`, id).Scan(
+			&f.ID, &f.UserID, &f.SchemaName, &f.TableName, &f.PK, &f.AttemptedVersion, &f.Op, &f.Payload, &f.Error, &f.FirstSeen, &f.RetryCount,
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errMaterializeFailureNotFound
+			}
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+				return errMaterializeFailureRetryInProgress
+			}
+			return fmt.Errorf("load failure: %w", err)
+		}
+		if f.UserID != userID {
+			return errMaterializeFailureNotFound
+		}
+
+		// Resolve handler
+		s.mu.RLock()
+		handlerKey := f.SchemaName + "." + f.TableName
+		handler, ok := s.tableHandlers[handlerKey]
+		s.mu.RUnlock()
+		if !ok {
+			return fmt.Errorf("no materialization handler registered for %s", handlerKey)
+		}
+
+		pkUUID, parseErr := uuid.Parse(f.PK)
+		if parseErr != nil {
+			return fmt.Errorf("invalid pk uuid: %w", parseErr)
 		}
 
 		// Materialize from current sidecar state (source of truth).
@@ -187,6 +204,12 @@ func (s *SyncService) RetryMaterializeFailure(
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errMaterializeFailureNotFound) {
+			return nil, errMaterializeFailureNotFound
+		}
+		if errors.Is(err, errMaterializeFailureRetryInProgress) {
+			return nil, errMaterializeFailureRetryInProgress
+		}
 		return nil, err
 	}
 	return &status, nil

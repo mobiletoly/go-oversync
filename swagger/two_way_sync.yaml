@@ -244,6 +244,8 @@ paths:
           description: Authentication required
         '404':
           description: Not found
+        '409':
+          description: Retry already in progress
         '500':
           description: Server error
 
