@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -984,17 +985,36 @@ func (c *Client) processPayloadForUpload(tableName, payloadStr string) (json.Raw
 		return nil, fmt.Errorf("failed to get table info: %w", err)
 	}
 
-	// Convert hex-encoded BLOB data to base64
+	// Convert trigger hex encoding to wire format:
+	// - For BLOB UUID PK tables: payload PK becomes UUID string (KMP parity; server pk is UUID string).
+	// - For all other BLOB columns: payload values become base64.
+	pkColLower := ""
+	if tableInfo.PrimaryKey != nil {
+		pkColLower = strings.ToLower(tableInfo.PrimaryKey.Name)
+	}
 	for _, col := range tableInfo.Columns {
 		if col.IsBlob() {
 			colNameLower := strings.ToLower(col.Name)
 			if hexValue, ok := payloadData[colNameLower].(string); ok && hexValue != "" {
-				// Convert hex to bytes
+				// Primary key: convert to UUID string for wire protocol.
+				if tableInfo.PrimaryKeyIsBlob && pkColLower != "" && colNameLower == pkColLower {
+					uuidBytes, err := decodeUUIDBytesFromString(hexValue)
+					if err != nil {
+						return nil, fmt.Errorf("failed to decode blob UUID pk for column %s: %w", col.Name, err)
+					}
+					id, err := uuid.FromBytes(uuidBytes)
+					if err != nil {
+						return nil, fmt.Errorf("invalid UUID bytes for column %s: %w", col.Name, err)
+					}
+					payloadData[colNameLower] = id.String()
+					continue
+				}
+
+				// Other BLOB columns: encode bytes as base64 for server.
 				hexBytes, err := hex.DecodeString(hexValue)
 				if err != nil {
 					return nil, fmt.Errorf("failed to decode hex for column %s: %w", col.Name, err)
 				}
-				// Encode as base64 for server
 				payloadData[colNameLower] = base64.StdEncoding.EncodeToString(hexBytes)
 			}
 		}
