@@ -166,3 +166,8 @@ func isValidTableName(name string) bool {
 	}
 	return true
 }
+
+// isValidColumnName checks if column name matches ^[a-z0-9_]+$
+func isValidColumnName(name string) bool {
+	return isValidTableName(name)
+}

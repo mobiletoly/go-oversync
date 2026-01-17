@@ -6,6 +6,7 @@ package oversync
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -126,11 +127,104 @@ func (s *SyncService) discoverSchemaRelationships(ctx context.Context) error {
 		return fmt.Errorf("failed to discover schema relationships: %w", err)
 	}
 
+	if err := s.validateTenantScopeColumn(ctx, discoveredSchema); err != nil {
+		return err
+	}
+
 	s.discoveredSchema = discoveredSchema
 	s.logger.Info("Schema relationships discovered",
 		"table_count", len(discoveredSchema.TableOrder),
 		"fk_constraints", len(discoveredSchema.FKMap),
 		"table_order", discoveredSchema.TableOrder)
+
+	return nil
+}
+
+func (s *SyncService) validateTenantScopeColumn(ctx context.Context, discoveredSchema *DiscoveredSchema) error {
+	if s.config == nil {
+		return nil
+	}
+	if s.config.FKPrecheckMode == FKPrecheckDisabled {
+		return nil
+	}
+
+	tenantCol := strings.ToLower(strings.TrimSpace(s.config.TenantScopeColumn))
+	if tenantCol == "" {
+		return nil
+	}
+	if !isValidColumnName(tenantCol) {
+		return fmt.Errorf("TenantScopeColumn must match ^[a-z0-9_]+$, got %q", s.config.TenantScopeColumn)
+	}
+
+	// Validate tenant column exists on all registered tables and all FK parent tables referenced by precheck.
+	toCheck := make(map[string]struct{}, len(s.registeredTables))
+	for k := range s.registeredTables {
+		toCheck[k] = struct{}{}
+	}
+	if discoveredSchema != nil {
+		for _, fks := range discoveredSchema.FKMap {
+			for _, fk := range fks {
+				toCheck[Key(fk.RefSchema, fk.RefTable)] = struct{}{}
+			}
+		}
+	}
+	if len(toCheck) == 0 {
+		return nil
+	}
+
+	schemas := make([]string, 0, len(toCheck))
+	tables := make([]string, 0, len(toCheck))
+	for st := range toCheck {
+		parts := strings.SplitN(st, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		schemas = append(schemas, parts[0])
+		tables = append(tables, parts[1])
+	}
+	if len(schemas) == 0 {
+		return nil
+	}
+
+	query := `
+		WITH t AS (
+			SELECT * FROM unnest(@schemas::text[], @tables::text[]) AS x(schema_name, table_name)
+		)
+		SELECT t.schema_name, t.table_name
+		FROM t
+		LEFT JOIN information_schema.columns c
+		  ON c.table_schema = t.schema_name
+		 AND c.table_name = t.table_name
+		 AND lower(c.column_name) = @col::text
+		WHERE c.column_name IS NULL
+		ORDER BY 1, 2`
+
+	rows, err := s.pool.Query(ctx, query, pgx.NamedArgs{
+		"schemas": schemas,
+		"tables":  tables,
+		"col":     tenantCol,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to validate TenantScopeColumn %q: %w", tenantCol, err)
+	}
+	defer rows.Close()
+
+	var missing []string
+	for rows.Next() {
+		var schemaName, tableName string
+		if scanErr := rows.Scan(&schemaName, &tableName); scanErr != nil {
+			return fmt.Errorf("failed to scan tenant scope column validation row: %w", scanErr)
+		}
+		missing = append(missing, Key(schemaName, tableName))
+	}
+	if rows.Err() != nil {
+		return fmt.Errorf("tenant scope column validation failed: %w", rows.Err())
+	}
+
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("TenantScopeColumn=%q is configured, but the column is missing on: %s", tenantCol, strings.Join(missing, ", "))
+	}
 
 	return nil
 }

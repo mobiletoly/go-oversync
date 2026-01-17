@@ -136,6 +136,48 @@ func TestFKPrecheck_TenantScopeColumn_ScopesParentExistence(t *testing.T) {
 	})
 }
 
+func TestNewSyncService_TenantScopeColumn_MissingColumnFailsFast(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("DATABASE_URL")
+	}
+	if dbURL == "" {
+		dbURL = "postgresql://postgres:password@localhost:5432/clisync_example"
+	}
+
+	pool, err := pgxpool.New(ctx, dbURL)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "tenant_fk_missing_tenant_col_" + suffix
+
+	require.NoError(t, createTenantFKPrecheckSchemaMissingTenantColumn(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	_, err = NewSyncService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "tenant-scope-fk-precheck-missing-column-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "parent_docs"},
+			{Schema: schemaName, Table: "child_docs"},
+		},
+		DisableAutoMigrateFKs: true,
+		FKPrecheckMode:        FKPrecheckRefColumnAware,
+		TenantScopeColumn:     "owner_user_id",
+	}, logger)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "TenantScopeColumn")
+	require.Contains(t, err.Error(), schemaName+".parent_docs")
+}
+
 func createTenantFKPrecheckSchema(ctx context.Context, pool *pgxpool.Pool, schema string) error {
 	schemaIdent := pgx.Identifier{schema}.Sanitize()
 
@@ -146,6 +188,38 @@ func createTenantFKPrecheckSchema(ctx context.Context, pool *pgxpool.Pool, schem
 			CREATE TABLE %s.parent_docs (
 				id UUID PRIMARY KEY,
 				owner_user_id TEXT NOT NULL,
+				doc_id TEXT NOT NULL,
+				UNIQUE (doc_id)
+			)`, schemaIdent),
+		fmt.Sprintf(`
+			CREATE TABLE %s.child_docs (
+				id UUID PRIMARY KEY,
+				owner_user_id TEXT NOT NULL,
+				parent_doc_id TEXT NOT NULL,
+				CONSTRAINT child_docs_parent_doc_id_fkey
+					FOREIGN KEY (parent_doc_id)
+					REFERENCES %s.parent_docs(doc_id)
+					ON DELETE CASCADE
+			)`, schemaIdent, schemaIdent),
+	}
+
+	for _, sql := range stmts {
+		if _, err := pool.Exec(ctx, sql); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func createTenantFKPrecheckSchemaMissingTenantColumn(ctx context.Context, pool *pgxpool.Pool, schema string) error {
+	schemaIdent := pgx.Identifier{schema}.Sanitize()
+
+	stmts := []string{
+		fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, schemaIdent),
+		fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent),
+		fmt.Sprintf(`
+			CREATE TABLE %s.parent_docs (
+				id UUID PRIMARY KEY,
 				doc_id TEXT NOT NULL,
 				UNIQUE (doc_id)
 			)`, schemaIdent),
