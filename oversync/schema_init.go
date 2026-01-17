@@ -117,7 +117,7 @@ func (s *SyncService) discoverSchemaRelationships(ctx context.Context) error {
 	}
 
 	discovery := NewSchemaDiscovery(s.pool, s.logger)
-	discoveredSchema, err := discovery.DiscoverSchema(ctx, s.registeredTables)
+	discoveredSchema, err := discovery.DiscoverSchemaWithDependencyOverrides(ctx, s.registeredTables, s.config.DependencyOverrides)
 	if err != nil {
 		return fmt.Errorf("failed to discover schema relationships: %w", err)
 	}

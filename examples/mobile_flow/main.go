@@ -28,6 +28,7 @@ func main() {
 		verboseFlag    = flag.Bool("verbose", false, "Enable verbose logging")
 		serverFlag     = flag.String("server", "http://localhost:8080", "Server URL")
 		dbFlag         = flag.String("db", "postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable", "Database URL for verification")
+		jwtSecretFlag  = flag.String("jwt-secret", "", "JWT secret for local token generation (defaults to env JWT_SECRET, else server default)")
 		parallelFlag   = flag.Int("parallel", 1, "Number of parallel users to simulate (1-100)")
 		cleanupFlag    = flag.Bool("cleanup", true, "Clean up server database before starting")
 		preserveDBFlag = flag.Bool("preserve-db", false, "Preserve SQLite database files for manual inspection")
@@ -46,10 +47,18 @@ func main() {
 		log.Fatalf("Parallel users must be between 1 and 500, got: %d", *parallelFlag)
 	}
 
+	jwtSecret := *jwtSecretFlag
+	if jwtSecret == "" {
+		jwtSecret = os.Getenv("JWT_SECRET")
+	}
+	if jwtSecret == "" {
+		jwtSecret = "your-secret-key-change-in-production" // Match nethttp_server default
+	}
+
 	cfg := &config.Config{
 		ServerURL:    *serverFlag,
 		DatabaseURL:  *dbFlag,
-		JWTSecret:    "your-secret-key-change-in-production", // Match server default
+		JWTSecret:    jwtSecret,
 		EnableVerify: *verifyFlag,
 		OutputFile:   *outputFlag,
 		PreserveDB:   *preserveDBFlag || *verifyFlag, // Auto-preserve when verification is enabled

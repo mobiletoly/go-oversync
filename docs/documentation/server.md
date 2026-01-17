@@ -14,6 +14,8 @@ Highlights
 - FK‑safe batches: parent‑first ordering + deferrable constraints.
 - Snapshot‑consistent paging via `until`.
 - Optional FK auto-migration: can be disabled via `DisableAutoMigrateFKs`.
+- FK precheck controls: `FKPrecheckMode` (`enabled`, `disabled`, `ref_column_aware`).
+- Manual ordering: `DependencyOverrides` (adds parent-first edges for ordering only).
 - Upload guardrails: `MaxUploadBatchSize` (batch rejection) and `MaxPayloadBytes` (per-change invalid).
 
-See the deep‑dive spec in `/specs/oversync_flow.md` for SQL and invariants.
+See `docs/documentation/advanced-concepts.md` for SQL, invariants, and edge cases.

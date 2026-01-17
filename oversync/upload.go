@@ -17,6 +17,16 @@ import (
 type pkset map[string]struct{}
 type batchIndex map[string]pkset // table -> set(pk)
 
+type refKey struct {
+	table string // schema.table
+	col   string // referenced column name
+}
+
+type inBatchIndex struct {
+	pk  batchIndex
+	ref map[refKey]pkset
+}
+
 // splitAndOrder splits changes into upserts and deletes, ordering them appropriately
 func (s *SyncService) splitAndOrder(changes []ChangeUpload) (upserts, deletes []ChangeUpload) {
 	for _, ch := range changes {
@@ -80,8 +90,110 @@ func buildBatchPKIndex(ups, dels []ChangeUpload) batchIndex {
 	return m
 }
 
+func (s *SyncService) buildInBatchIndex(ups, dels []ChangeUpload) inBatchIndex {
+	idx := inBatchIndex{
+		pk:  buildBatchPKIndex(ups, dels),
+		ref: nil,
+	}
+
+	if s.discoveredSchema == nil || s.config == nil || s.config.FKPrecheckMode != FKPrecheckRefColumnAware {
+		return idx
+	}
+
+	// Build a map of parent tables -> referenced columns (RefCol) that appear in FK constraints.
+	neededRefCols := make(map[string]map[string]struct{})
+	for _, fks := range s.discoveredSchema.FKMap {
+		for _, fk := range fks {
+			parentKey := Key(fk.RefSchema, fk.RefTable)
+			col := strings.ToLower(fk.RefCol)
+			m := neededRefCols[parentKey]
+			if m == nil {
+				m = make(map[string]struct{})
+				neededRefCols[parentKey] = m
+			}
+			m[col] = struct{}{}
+		}
+	}
+	if len(neededRefCols) == 0 {
+		return idx
+	}
+
+	// If a row is upserted and deleted within the same batch, treat it as "will not exist" for ref-column indexing.
+	type rowKey struct {
+		table string
+		pk    string
+	}
+	deletedRows := make(map[rowKey]struct{}, len(dels))
+	for _, ch := range dels {
+		schema := ch.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		deletedRows[rowKey{table: Key(schema, ch.Table), pk: ch.PK}] = struct{}{}
+	}
+
+	idx.ref = make(map[refKey]pkset)
+
+	for _, ch := range ups {
+		schema := ch.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		tableKey := Key(schema, ch.Table)
+
+		cols := neededRefCols[tableKey]
+		if len(cols) == 0 {
+			continue
+		}
+		if _, deleted := deletedRows[rowKey{table: tableKey, pk: ch.PK}]; deleted {
+			continue
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal(ch.Payload, &payload); err != nil {
+			continue
+		}
+
+		// Optional table handler conversion (allows payload encoding differences).
+		var tableHandler MaterializationHandler
+		s.mu.RLock()
+		tableHandler = s.tableHandlers[tableKey]
+		s.mu.RUnlock()
+
+		for col := range cols {
+			raw, ok := payload[col]
+			if !ok {
+				continue
+			}
+
+			dbVal, badPayload := convertFKValueForHandler(tableHandler, col, raw)
+			if badPayload {
+				continue
+			}
+
+			valStr, hasValue := formatFKValue(dbVal)
+			if !hasValue {
+				continue
+			}
+			if parsed, err := uuid.Parse(valStr); err == nil {
+				valStr = parsed.String()
+			}
+
+			key := refKey{table: tableKey, col: col}
+			set := idx.ref[key]
+			if set == nil {
+				set = pkset{}
+				idx.ref[key] = set
+			}
+			set[valStr] = struct{}{}
+		}
+	}
+
+	return idx
+}
+
 // parentsMissing checks if referenced parents exist now or will exist via this request
-func (s *SyncService) parentsMissing(ctx context.Context, tx pgx.Tx, ch ChangeUpload, inBatch batchIndex) (missing []string) {
+func (s *SyncService) parentsMissing(ctx context.Context, tx pgx.Tx, ch ChangeUpload, inBatch inBatchIndex) (missing []string) {
 	// Parse JSON payload once
 	var payload map[string]any
 	if err := json.Unmarshal(ch.Payload, &payload); err != nil {
@@ -90,10 +202,13 @@ func (s *SyncService) parentsMissing(ctx context.Context, tx pgx.Tx, ch ChangeUp
 	if s.discoveredSchema == nil {
 		return nil // No schema discovery available
 	}
+	if s.config != nil && s.config.FKPrecheckMode == FKPrecheckDisabled {
+		return nil
+	}
 
 	// Convert batchIndex to the expected type
 	willExist := make(map[string]map[string]struct{})
-	for table, pkSet := range inBatch {
+	for table, pkSet := range inBatch.pk {
 		willExist[table] = pkSet
 	}
 
@@ -140,15 +255,18 @@ func (s *SyncService) parentsMissingBatch(
 	tx pgx.Tx,
 	upserts []ChangeUpload,
 	validIdx []int,
-	inBatch batchIndex,
+	inBatch inBatchIndex,
 ) map[int][]string {
 	if s.discoveredSchema == nil || len(validIdx) == 0 {
 		return nil
 	}
+	if s.config != nil && s.config.FKPrecheckMode == FKPrecheckDisabled {
+		return nil
+	}
 
 	// Convert batchIndex to the expected type
-	willExist := make(map[string]map[string]struct{}, len(inBatch))
-	for table, pkSet := range inBatch {
+	willExist := make(map[string]map[string]struct{}, len(inBatch.pk))
+	for table, pkSet := range inBatch.pk {
 		willExist[table] = pkSet
 	}
 
@@ -212,6 +330,19 @@ func (s *SyncService) parentsMissingBatch(
 
 			// 2) Check if parent will be created in this request (and parent table sorts before this table)
 			parentKey := Key(fk.RefSchema, fk.RefTable)
+			if s.config != nil && s.config.FKPrecheckMode == FKPrecheckRefColumnAware {
+				if inBatch.ref != nil {
+					if refSet, ok := inBatch.ref[refKey{table: parentKey, col: strings.ToLower(fk.RefCol)}]; ok {
+						if _, exists := refSet[dbRefValStr]; exists {
+							parentOrder, parentExists := s.discoveredSchema.OrderIdx[parentKey]
+							childOrder, childExists := s.discoveredSchema.OrderIdx[childKey]
+							if parentExists && childExists && (parentKey == childKey || parentOrder < childOrder) {
+								continue
+							}
+						}
+					}
+				}
+			}
 			if willExistSet, ok := willExist[parentKey]; ok {
 				if _, exists := willExistSet[dbRefValStr]; exists {
 					// Parent will be created - check if it comes before child in ordering
@@ -333,7 +464,7 @@ func (s *SyncService) parentsMissingBatch(
 }
 
 // processUpserts processes INSERT/UPDATE operations with FK precheck and SAVEPOINTs
-func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sourceID string, upserts []ChangeUpload, inBatch batchIndex) ([]ChangeUploadStatus, error) {
+func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sourceID string, upserts []ChangeUpload, inBatch inBatchIndex) ([]ChangeUploadStatus, error) {
 	var statuses []ChangeUploadStatus
 
 	s.logger.Info("Processing upserts batch", "count", len(upserts), "user_id", userID, "source_id", sourceID)

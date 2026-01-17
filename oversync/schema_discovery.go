@@ -114,6 +114,132 @@ func (sd *SchemaDiscovery) DiscoverSchema(ctx context.Context, registeredTables 
 	}, nil
 }
 
+// DiscoverSchemaWithDependencyOverrides runs schema discovery and merges explicit dependencies
+// (ordering constraints) into the discovered dependency graph.
+// Overrides only affect ordering (TableOrder/OrderIdx/Dependencies) and do not add FK validation rules.
+func (sd *SchemaDiscovery) DiscoverSchemaWithDependencyOverrides(
+	ctx context.Context,
+	registeredTables map[string]bool,
+	dependencyOverrides map[string][]string,
+) (*DiscoveredSchema, error) {
+	// Step 1: Get all foreign key constraints for registered tables
+	fkConstraints, err := sd.getForeignKeyConstraints(ctx, registeredTables)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get foreign key constraints: %w", err)
+	}
+
+	// Step 2: Build dependency graph
+	dependencies := sd.buildDependencyGraph(fkConstraints, registeredTables)
+	applyDependencyOverrides(dependencies, registeredTables, dependencyOverrides)
+
+	// Step 3: Perform topological sort to get table ordering
+	tableOrder, err := sd.topologicalSort(dependencies, registeredTables)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sort tables topologically: %w", err)
+	}
+
+	// Step 4: Build FK map for runtime use
+	fkMap := sd.buildFKMap(fkConstraints, registeredTables)
+
+	// Step 5: Validate FK constraints are deferrable (important for batch processing)
+	sd.validateDeferrableConstraints(ctx, fkConstraints, registeredTables)
+
+	// Step 6: Build order index for O(1) lookups
+	orderIdx := make(map[string]int, len(tableOrder))
+	for i, table := range tableOrder {
+		orderIdx[table] = i
+	}
+
+	// Log detailed discovery results
+	fkCounts := make(map[string]int)
+	for table, fks := range fkMap {
+		fkCounts[table] = len(fks)
+	}
+
+	sd.logger.Info("Schema discovery completed",
+		"table_count", len(tableOrder),
+		"fk_constraints_found", len(fkConstraints),
+		"fk_map_entries", len(fkMap),
+		"fk_counts_per_table", fkCounts,
+		"table_order", tableOrder)
+	return &DiscoveredSchema{
+		TableOrder:   tableOrder,
+		OrderIdx:     orderIdx,
+		FKMap:        fkMap,
+		Dependencies: dependencies,
+	}, nil
+}
+
+func applyDependencyOverrides(
+	dependencies map[string][]string,
+	registeredTables map[string]bool,
+	overrides map[string][]string,
+) {
+	if len(overrides) == 0 {
+		return
+	}
+
+	depSets := make(map[string]map[string]struct{}, len(dependencies))
+	for child, deps := range dependencies {
+		m := make(map[string]struct{}, len(deps))
+		for _, parent := range deps {
+			m[parent] = struct{}{}
+		}
+		depSets[child] = m
+	}
+
+	for childRaw, parentsRaw := range overrides {
+		childKey, ok := normalizeSchemaTableKey(childRaw)
+		if !ok || !registeredTables[childKey] {
+			continue
+		}
+
+		if depSets[childKey] == nil {
+			depSets[childKey] = make(map[string]struct{})
+		}
+
+		for _, parentRaw := range parentsRaw {
+			parentKey, ok := normalizeSchemaTableKey(parentRaw)
+			if !ok || !registeredTables[parentKey] {
+				continue
+			}
+			if childKey == parentKey {
+				continue
+			}
+			if _, exists := depSets[childKey][parentKey]; exists {
+				continue
+			}
+			depSets[childKey][parentKey] = struct{}{}
+			dependencies[childKey] = append(dependencies[childKey], parentKey)
+		}
+	}
+}
+
+func normalizeSchemaTableKey(raw string) (string, bool) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return "", false
+	}
+
+	var schema, table string
+	parts := strings.Split(raw, ".")
+	switch len(parts) {
+	case 1:
+		schema = "public"
+		table = parts[0]
+	case 2:
+		schema = parts[0]
+		table = parts[1]
+	default:
+		return "", false
+	}
+
+	if !isValidSchemaName(schema) || !isValidTableName(table) {
+		return "", false
+	}
+	return Key(schema, table), true
+}
+
 // getForeignKeyConstraints queries the database for FK constraints
 func (sd *SchemaDiscovery) getForeignKeyConstraints(ctx context.Context, registeredTables map[string]bool) ([]ForeignKeyConstraint, error) {
 	// Build list of registered schema.table combinations for parameterized query
@@ -497,11 +623,11 @@ func (d *DiscoveredSchema) SortDeletes(changes []ChangeUpload) {
 
 // HasDependencies returns true if there are any FK dependencies among the given tables that require ordering
 func (d *DiscoveredSchema) HasDependencies(changes []ChangeUpload) bool {
-	if len(d.FKMap) == 0 {
+	if len(d.Dependencies) == 0 {
 		return false
 	}
 
-	// Check if any of the tables in the changes have FK dependencies
+	// Check if any of the tables in the changes have dependencies
 	tablesInBatch := make(map[string]bool)
 	for _, ch := range changes {
 		// Default schema to "public" if not provided (same as validation)
@@ -512,14 +638,11 @@ func (d *DiscoveredSchema) HasDependencies(changes []ChangeUpload) bool {
 		tablesInBatch[Key(schema, ch.Table)] = true
 	}
 
-	// Check if any table in the batch has FKs to other tables in the batch
+	// Check if any table in the batch depends on another table in the batch
 	for tableKey := range tablesInBatch {
-		if fks, exists := d.FKMap[tableKey]; exists {
-			for _, fk := range fks {
-				refKey := Key(fk.RefSchema, fk.RefTable)
-				if tablesInBatch[refKey] {
-					return true // Found a dependency within the batch
-				}
+		for _, parentKey := range d.Dependencies[tableKey] {
+			if tablesInBatch[parentKey] {
+				return true
 			}
 		}
 	}

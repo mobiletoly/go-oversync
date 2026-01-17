@@ -258,6 +258,8 @@ SET LOCAL lock_timeout = '3s';        -- optional
 - Upserts vs Deletes.
 - Sort upserts parent‑first; deletes child‑first, using discovered topology (see Schema Discovery).
 - Build `will_exist` index for FK precheck (upserts added, deletes subtracted).
+  - Default (`FKPrecheckMode=enabled`): track by parent PK only.
+  - Optional (`FKPrecheckMode=ref_column_aware`): also track parent referenced-column values (e.g. natural keys) extracted from parent payloads for in-batch FK checks.
 
 3) For each upsert change (INSERT/UPDATE)
 
@@ -288,6 +290,7 @@ This maps “losers” of the uniqueness race to an idempotent outcome while let
   - within this request (`will_exist` index, parent table must order before child), or
   - in DB (`SELECT EXISTS(...) FROM parent_table WHERE ref_col=@val`).
 - If missing → status: invalid with reason `fk_missing` and details.
+- FK precheck can be disabled with `FKPrecheckMode=disabled` (ordering still applies).
 
 - Payload key conversion: if a `MaterializationHandler` is registered it may implement `ConvertReferenceKey(fieldName string, payloadValue any) (any, error)` to translate encoded payload values (e.g., base64-encoded UUIDs or hex blobs) into DB-comparable forms during FK checks. Conversion errors map to `invalid.bad_payload`.
 
@@ -473,6 +476,7 @@ Purpose
 Discovery
 - Query information_schema to collect FKs for the registered tables, build dependency graph, topologically sort, and build an FK map per table.
 - Composite FKs are detected and skipped for precheck (PostgreSQL will enforce at COMMIT).
+- `DependencyOverrides` can add explicit ordering edges when you cannot rely on FK discovery (ordering only; it does not add FK validation rules).
 
 Validation of deferrability
 - The discovery process checks pg_catalog for `condeferrable`/`condeferred` and logs warnings if constraints are not deferrable.
@@ -726,7 +730,8 @@ Recommended indexes
 
 - Delete of nonexistent row: treated as idempotent success.
 - include_self=true: allows recovery (e.g., reinstall); client should request with a frozen `until` for consistent paging.
-- Composite FKs: precheck skips; rely on PostgreSQL at COMMIT with deferrable constraints.
+- Composite FKs: precheck skips and auto-migration skips. Ordering still uses the discovered dependency graph, but a violated composite FK will fail at COMMIT and reject the whole upload transaction.
+  - Future work: composite-FK precheck (per-change invalid statuses) and composite FK auto-migration.
 - Ordering guarantees: upload returns statuses in the original request order; download is ordered by `server_id`.
 
 ## Why Sidecar Design

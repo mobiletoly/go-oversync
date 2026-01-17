@@ -60,6 +60,19 @@ type SyncService struct {
 	closed bool
 }
 
+type FKPrecheckMode string
+
+const (
+	// FKPrecheckEnabled keeps current behavior: FK precheck runs and in-batch "will exist"
+	// is tracked by parent PK only.
+	FKPrecheckEnabled FKPrecheckMode = "enabled"
+	// FKPrecheckDisabled skips FK precheck entirely (ordering still applies).
+	FKPrecheckDisabled FKPrecheckMode = "disabled"
+	// FKPrecheckRefColumnAware extends in-batch "will exist" tracking to include referenced
+	// parent columns (non-PK FKs), using values extracted from parent payloads.
+	FKPrecheckRefColumnAware FKPrecheckMode = "ref_column_aware"
+)
+
 // ServiceConfig holds configuration for the sync service
 type ServiceConfig struct {
 	MaxSupportedSchemaVersion int               // Current schema version to return
@@ -69,6 +82,15 @@ type ServiceConfig struct {
 
 	MaxUploadBatchSize int // Maximum number of changes allowed in a single upload (0 = unlimited)
 	MaxPayloadBytes    int // Maximum JSON payload size per change in bytes (0 = unlimited)
+
+	// FKPrecheckMode controls whether FK precheck runs and whether in-batch existence
+	// tracking supports referenced columns (non-PK FKs). Empty means "enabled" for backwards
+	// compatibility.
+	FKPrecheckMode FKPrecheckMode
+
+	// DependencyOverrides optionally adds explicit ordering constraints on top of discovered
+	// DB FKs. Keys and values are "schema.table". Only affects ordering, not FK validation.
+	DependencyOverrides map[string][]string
 }
 
 // NewSyncService creates a new sync service instance from an existing pool
@@ -241,8 +263,8 @@ func (s *SyncService) ProcessUpload(ctx context.Context, userID, sourceID string
 		s.convertPrimaryKeysSkipInvalid(upserts)
 		s.convertPrimaryKeysSkipInvalid(deletes)
 
-		// Step 3: Build batch PK index for FK precheck
-		inBatch := buildBatchPKIndex(upserts, deletes)
+		// Step 3: Build in-batch index for FK precheck
+		inBatch := s.buildInBatchIndex(upserts, deletes)
 
 		// Step 4: Process upserts (parent-first)
 		upsertStatuses, err := s.processUpserts(ctx, tx, userID, sourceID, upserts, inBatch)

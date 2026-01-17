@@ -32,12 +32,6 @@ type MultiDeviceSyncScenario struct {
 	personBID  string     // Person record ID created by device 2
 }
 
-// Constants for the scenario
-const (
-	multiDeviceServerURL = "http://localhost:8080"
-	multiDeviceJWTSecret = "your-secret-key-change-in-production"
-)
-
 // NewMultiDeviceSyncScenario creates a new multi-device sync scenario
 func NewMultiDeviceSyncScenario(simulator *Simulator) Scenario {
 	return &MultiDeviceSyncScenario{
@@ -97,6 +91,8 @@ func (s *MultiDeviceSyncScenario) Setup(ctx context.Context) error {
 
 // createDeviceApp creates a mobile app for a specific device
 func (s *MultiDeviceSyncScenario) createDeviceApp(scenarioConfig *config.ScenarioConfig, deviceID, deviceName string) (*MobileApp, error) {
+	simCfg := s.simulator.GetConfig()
+
 	// Create unique database file path using device ID and timestamp to prevent collisions
 	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, scenarioConfig.UserID, time.Now().UnixNano()))
 
@@ -116,11 +112,11 @@ func (s *MultiDeviceSyncScenario) createDeviceApp(scenarioConfig *config.Scenari
 	// Create mobile app config
 	appConfig := &MobileAppConfig{
 		DatabaseFile:     dbFile,
-		ServerURL:        multiDeviceServerURL,
+		ServerURL:        simCfg.ServerURL,
 		UserID:           scenarioConfig.UserID,
 		SourceID:         deviceID,
 		DeviceName:       deviceName,
-		JWTSecret:        multiDeviceJWTSecret,
+		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: oversqliteConfig,
 		Logger:           s.simulator.GetLogger(),
 	}

@@ -87,6 +87,8 @@ func (s *MultiDeviceComplexScenario) Setup(ctx context.Context) error {
 }
 
 func (s *MultiDeviceComplexScenario) createDeviceApp(scenarioConfig *config.ScenarioConfig, deviceID, deviceName string) (*MobileApp, error) {
+	simCfg := s.simulator.GetConfig()
+
 	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, scenarioConfig.UserID, time.Now().UnixNano()))
 	overs := &oversqlite.Config{
 		Schema: "business",
@@ -99,7 +101,16 @@ func (s *MultiDeviceComplexScenario) createDeviceApp(scenarioConfig *config.Scen
 		UploadLimit:   100,
 		DownloadLimit: 100,
 	}
-	appCfg := &MobileAppConfig{DatabaseFile: dbFile, ServerURL: multiDeviceServerURL, UserID: scenarioConfig.UserID, SourceID: deviceID, DeviceName: deviceName, JWTSecret: multiDeviceJWTSecret, OversqliteConfig: overs, Logger: s.simulator.GetLogger()}
+	appCfg := &MobileAppConfig{
+		DatabaseFile:     dbFile,
+		ServerURL:        simCfg.ServerURL,
+		UserID:           scenarioConfig.UserID,
+		SourceID:         deviceID,
+		DeviceName:       deviceName,
+		JWTSecret:        simCfg.JWTSecret,
+		OversqliteConfig: overs,
+		Logger:           s.simulator.GetLogger(),
+	}
 	return NewMobileApp(appCfg)
 }
 

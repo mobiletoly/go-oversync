@@ -50,8 +50,6 @@ const (
 	newPostsPerUser = 20 // Posts per new user
 	batchSize       = 50
 	maxRounds       = 15 // Increased for multi-stage testing
-	serverURL       = "http://localhost:8080"
-	jwtSecret       = "your-secret-key-change-in-production"
 )
 
 // NewComplexMultiBatchScenario creates a new complex multi-batch scenario
@@ -110,6 +108,8 @@ func (s *ComplexMultiBatchScenario) createAppWithSmallBatches(scenarioConfig *co
 
 // createMobileApp creates a mobile app with the given configuration (DRY helper)
 func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePrefix string) (*MobileApp, error) {
+	simCfg := s.simulator.GetConfig()
+
 	// Create unique database file path using user ID and timestamp to prevent collisions in parallel execution
 	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", sourcePrefix, config.UserID, time.Now().UnixNano()))
 
@@ -129,11 +129,11 @@ func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePre
 	// Create mobile app config
 	appConfig := &MobileAppConfig{
 		DatabaseFile:     dbFile,
-		ServerURL:        serverURL,
+		ServerURL:        simCfg.ServerURL,
 		UserID:           config.UserID,
 		SourceID:         config.SourceID,
 		DeviceName:       config.DeviceName,
-		JWTSecret:        jwtSecret,
+		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: oversqliteConfig,
 		Logger:           s.simulator.GetLogger(),
 	}
