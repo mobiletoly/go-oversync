@@ -15,6 +15,7 @@ Highlights
 - Snapshot‑consistent paging via `until`.
 - Optional FK auto-migration: can be disabled via `DisableAutoMigrateFKs`.
 - FK precheck controls: `FKPrecheckMode` (`enabled`, `disabled`, `ref_column_aware`).
+- Optional tenant scoping for FK precheck: `TenantScopeColumn` (filters parent existence by authenticated `user_id`).
 - Manual ordering: `DependencyOverrides` (adds parent-first edges for ordering only).
 - Upload guardrails: `MaxUploadBatchSize` (batch rejection) and `MaxPayloadBytes` (per-change invalid).
 

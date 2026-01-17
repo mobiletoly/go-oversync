@@ -83,6 +83,13 @@ type ServiceConfig struct {
 	MaxUploadBatchSize int // Maximum number of changes allowed in a single upload (0 = unlimited)
 	MaxPayloadBytes    int // Maximum JSON payload size per change in bytes (0 = unlimited)
 
+	// TenantScopeColumn optionally scopes FK precheck "parent exists" queries to the authenticated user.
+	// When set (non-empty), FK existence checks add a filter on the parent table:
+	//   parent.<TenantScopeColumn> = userID (from the authenticated request)
+	// This is useful for multi-tenant schemas where business tables are partitioned by a tenant/user column.
+	// Empty means disabled (backwards-compatible default).
+	TenantScopeColumn string
+
 	// FKPrecheckMode controls whether FK precheck runs and whether in-batch existence
 	// tracking supports referenced columns (non-PK FKs). Empty means "enabled" for backwards
 	// compatibility.

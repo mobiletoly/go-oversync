@@ -253,6 +253,7 @@ type fkPrecheckRef struct {
 func (s *SyncService) parentsMissingBatch(
 	ctx context.Context,
 	tx pgx.Tx,
+	userID string,
 	upserts []ChangeUpload,
 	validIdx []int,
 	inBatch inBatchIndex,
@@ -272,6 +273,11 @@ func (s *SyncService) parentsMissingBatch(
 
 	missingByIdx := make(map[int][]string, len(validIdx))
 	groups := make(map[string]*fkPrecheckGroup)
+
+	tenantCol := ""
+	if s.config != nil {
+		tenantCol = strings.ToLower(strings.TrimSpace(s.config.TenantScopeColumn))
+	}
 
 	for _, idx := range validIdx {
 		ch := upserts[idx]
@@ -400,12 +406,18 @@ func (s *SyncService) parentsMissingBatch(
 			schemaIdent := pgx.Identifier{g.refSchema}.Sanitize()
 			tableIdent := pgx.Identifier{g.refTable}.Sanitize()
 
-			query := fmt.Sprintf(
-				`SELECT DISTINCT %s::text FROM %s.%s WHERE %s::text = ANY(@vals::text[])`,
-				colIdent, schemaIdent, tableIdent, colIdent,
-			)
+			args := pgx.NamedArgs{"vals": chunk}
 
-			rows, err := tx.Query(ctx, query, pgx.NamedArgs{"vals": chunk})
+			where := fmt.Sprintf(`%s::text = ANY(@vals::text[])`, colIdent)
+			if tenantCol != "" {
+				tenantIdent := pgx.Identifier{tenantCol}.Sanitize()
+				where += fmt.Sprintf(` AND %s::text = @tenant::text`, tenantIdent)
+				args["tenant"] = userID
+			}
+
+			query := fmt.Sprintf(`SELECT DISTINCT %s::text FROM %s.%s WHERE %s`, colIdent, schemaIdent, tableIdent, where)
+
+			rows, err := tx.Query(ctx, query, args)
 			if err != nil {
 				s.logger.Error("FK precheck batch failed", "error", err, "parent", g.refSchema+"."+g.refTable, "column", g.refCol)
 				for _, ref := range g.refs {
@@ -510,7 +522,7 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 		validIdx = append(validIdx, i)
 	}
 
-	missingByIdx := s.parentsMissingBatch(ctx, tx, upserts, validIdx, inBatch)
+	missingByIdx := s.parentsMissingBatch(ctx, tx, userID, upserts, validIdx, inBatch)
 
 	for i := range upserts {
 		change := upserts[i]

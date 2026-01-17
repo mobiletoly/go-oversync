@@ -291,6 +291,7 @@ This maps “losers” of the uniqueness race to an idempotent outcome while let
   - in DB (`SELECT EXISTS(...) FROM parent_table WHERE ref_col=@val`).
 - If missing → status: invalid with reason `fk_missing` and details.
 - FK precheck can be disabled with `FKPrecheckMode=disabled` (ordering still applies).
+- Optional multi-tenant scoping: set `TenantScopeColumn` to include `parent.<tenant_col> = user_id` in the DB existence checks.
 
 - Payload key conversion: if a `MaterializationHandler` is registered it may implement `ConvertReferenceKey(fieldName string, payloadValue any) (any, error)` to translate encoded payload values (e.g., base64-encoded UUIDs or hex blobs) into DB-comparable forms during FK checks. Conversion errors map to `invalid.bad_payload`.
 
