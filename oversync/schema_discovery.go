@@ -26,6 +26,8 @@ type FK struct {
 type SchemaDiscovery struct {
 	pool   *pgxpool.Pool
 	logger *slog.Logger
+
+	tenantScopeColumn string
 }
 
 // ForeignKeyConstraint represents a foreign key relationship
@@ -63,6 +65,13 @@ func NewSchemaDiscovery(pool *pgxpool.Pool, logger *slog.Logger) *SchemaDiscover
 		pool:   pool,
 		logger: logger,
 	}
+}
+
+// SetTenantScopeColumn configures the column name used for tenant-scoped FK precheck reductions.
+// When set, composite FKs of the form (tenant_col, x) can be reduced to a single-column precheck
+// on x, relying on tenant-scoped DB existence queries for correctness.
+func (sd *SchemaDiscovery) SetTenantScopeColumn(col string) {
+	sd.tenantScopeColumn = strings.ToLower(strings.TrimSpace(col))
 }
 
 // DiscoverSchema analyzes registered tables and builds dependency graph
@@ -443,16 +452,54 @@ func (sd *SchemaDiscovery) buildFKMap(fkConstraints []ForeignKeyConstraint, regi
 
 		// Handle composite FKs (multiple columns in same constraint)
 		if len(cols) > 1 {
+			tenantCol := sd.tenantScopeColumn
+			if tenantCol != "" {
+				nonTenant := make([]ForeignKeyConstraint, 0, len(cols))
+				for _, col := range cols {
+					if strings.EqualFold(col.RefColumn, tenantCol) {
+						continue
+					}
+					nonTenant = append(nonTenant, col)
+				}
+
+				// For common multi-tenant schemas, composite FKs are often (tenant_col, natural_key).
+				// When the service applies tenant-scoped DB existence checks, we can safely reduce
+				// such constraints to a single-column precheck on the non-tenant key.
+				if len(nonTenant) == 1 {
+					c := nonTenant[0]
+					fk := FK{
+						Col:       c.ColumnName,
+						RefSchema: c.RefSchema,
+						RefTable:  c.RefTable,
+						RefCol:    c.RefColumn,
+					}
+					fkMap[childTableKey] = append(fkMap[childTableKey], fk)
+
+					sd.logger.Info("Composite FK reduced to tenant-scoped precheck",
+						"table", childTableKey,
+						"constraint", k.constraintName,
+						"tenant_column", tenantCol,
+						"validated_column", c.ColumnName,
+						"referenced_table", key(c.RefSchema, c.RefTable),
+						"referenced_column", c.RefColumn,
+					)
+					continue
+				}
+			}
+
 			var columnNames []string
+			var refColumnNames []string
 			for _, col := range cols {
 				columnNames = append(columnNames, col.ColumnName)
+				refColumnNames = append(refColumnNames, col.RefColumn)
 			}
 			sd.logger.Warn("Composite FK skipped for precheck",
 				"table", childTableKey,
 				"constraint", k.constraintName,
 				"column_count", len(cols),
-				"columns", columnNames)
-			continue // Skip composite FKs - let PostgreSQL enforce at COMMIT
+				"columns", columnNames,
+				"ref_columns", refColumnNames)
+			continue // Skip unsupported composite FKs - let PostgreSQL enforce at COMMIT
 		}
 
 		// Single-column FK

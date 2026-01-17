@@ -6,6 +6,7 @@ package oversync
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -117,6 +118,9 @@ func (s *SyncService) discoverSchemaRelationships(ctx context.Context) error {
 	}
 
 	discovery := NewSchemaDiscovery(s.pool, s.logger)
+	if s.config != nil && strings.TrimSpace(s.config.TenantScopeColumn) != "" {
+		discovery.SetTenantScopeColumn(s.config.TenantScopeColumn)
+	}
 	discoveredSchema, err := discovery.DiscoverSchemaWithDependencyOverrides(ctx, s.registeredTables, s.config.DependencyOverrides)
 	if err != nil {
 		return fmt.Errorf("failed to discover schema relationships: %w", err)

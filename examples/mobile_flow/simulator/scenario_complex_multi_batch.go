@@ -85,6 +85,7 @@ func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 	}
 
 	s.app = app
+	s.simulator.currentApp = s.app // enable sqlite path reporting for parallel runs
 
 	// Launch the app
 	if err := s.app.OnLaunch(ctx); err != nil {
@@ -135,6 +136,7 @@ func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePre
 		DeviceName:       config.DeviceName,
 		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: oversqliteConfig,
+		PreserveDB:       simCfg.PreserveDB,
 		Logger:           s.simulator.GetLogger(),
 	}
 

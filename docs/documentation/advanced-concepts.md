@@ -731,8 +731,9 @@ Recommended indexes
 
 - Delete of nonexistent row: treated as idempotent success.
 - include_self=true: allows recovery (e.g., reinstall); client should request with a frozen `until` for consistent paging.
-- Composite FKs: precheck skips and auto-migration skips. Ordering still uses the discovered dependency graph, but a violated composite FK will fail at COMMIT and reject the whole upload transaction.
-  - Future work: composite-FK precheck (per-change invalid statuses) and composite FK auto-migration.
+- Composite FKs: ordering uses the discovered dependency graph. Auto-migration to deferrable still skips composites.
+  - FK precheck supports the common multi-tenant shape `(TenantScopeColumn, x)` by reducing it to a tenant-scoped existence check on `x`.
+  - Other composite FKs are skipped by precheck and may surface as DB constraint failures (including at COMMIT if deferred).
 - Ordering guarantees: upload returns statuses in the original request order; download is ordered by `server_id`.
 
 ## Why Sidecar Design

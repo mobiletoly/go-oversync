@@ -596,6 +596,14 @@ func (c *Client) processUploadResponse(ctx context.Context, response *oversync.U
 		return fmt.Errorf("status count mismatch: sent %d changes, got %d statuses", len(changes), len(response.Statuses))
 	}
 
+	// Accumulate retryable invalids for summary logging to avoid per-row WARN spam
+	// (e.g., fk_missing in scenarios that intentionally create child rows before parents).
+	type retainedInvalidSummary struct {
+		count   int
+		samples []string
+	}
+	retainedInvalids := make(map[string]*retainedInvalidSummary)
+
 	// Start transaction for atomic upload response processing
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -791,10 +799,21 @@ func (c *Client) processUploadResponse(ctx context.Context, response *oversync.U
 					return fmt.Errorf("failed to remove invalid from pending: %w", err)
 				}
 			} else {
-				// Keep retryable invalids (FK missing, batch too large, transient errors)
-				c.logger.Warn("Retaining pending change after invalid status",
-					"table", change.Table, "pk", change.PK, "reason", getInvalidReason(status),
-					"message", status.Message)
+				// Keep retryable invalids (FK missing, batch too large, transient errors).
+				// Summarize after processing the whole response instead of logging each row.
+				reason := getInvalidReason(status)
+				if reason == "" {
+					reason = "unknown"
+				}
+				summary := retainedInvalids[reason]
+				if summary == nil {
+					summary = &retainedInvalidSummary{}
+					retainedInvalids[reason] = summary
+				}
+				summary.count++
+				if len(summary.samples) < 3 {
+					summary.samples = append(summary.samples, fmt.Sprintf("%s:%s", change.Table, change.PK))
+				}
 			}
 
 		case "materialize_error":
@@ -810,6 +829,36 @@ func (c *Client) processUploadResponse(ctx context.Context, response *oversync.U
 
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	if len(retainedInvalids) > 0 {
+		countsByReason := make(map[string]int, len(retainedInvalids))
+		samplesByReason := make(map[string][]string, len(retainedInvalids))
+		total := 0
+		expectedOnly := true
+
+		for reason, summary := range retainedInvalids {
+			countsByReason[reason] = summary.count
+			samplesByReason[reason] = summary.samples
+			total += summary.count
+
+			if reason != oversync.ReasonFKMissing && reason != oversync.ReasonBatchTooLarge {
+				expectedOnly = false
+			}
+		}
+
+		if expectedOnly {
+			c.logger.Debug("Retained pending changes after invalid upload statuses (will retry)",
+				"count", total,
+				"counts_by_reason", countsByReason,
+			)
+		} else {
+			c.logger.Warn("Retained pending changes after invalid upload statuses (will retry)",
+				"count", total,
+				"counts_by_reason", countsByReason,
+				"samples", samplesByReason,
+			)
+		}
 	}
 
 	return nil

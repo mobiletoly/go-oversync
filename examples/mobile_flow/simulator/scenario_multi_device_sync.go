@@ -52,13 +52,23 @@ func (s *MultiDeviceSyncScenario) Setup(ctx context.Context) error {
 	logger := s.simulator.GetLogger()
 	logger.Info("🔧 Setting up multi-device sync scenario for SAME user")
 
-	// Generate a single user identifier
-	s.userA = "userA-" + uuid.New().String()[:8]
+	// Prefer simulator-provided user/source IDs (used by parallel runner), but keep a random fallback for
+	// interactive runs where this scenario doesn't have a dedicated ScenarioConfig entry.
+	if s.config != nil && s.config.UserID != "" && s.config.UserID != "user-unknown" {
+		s.userA = s.config.UserID
+	} else {
+		// Generate a single user identifier
+		s.userA = "userA-" + uuid.New().String()[:8]
+	}
 	logger.Info("👤 Generated user ID", "userA", s.userA)
 
 	// Generate device identifiers (both for the same user)
-	s.device1ID = fmt.Sprintf("device1-%s", s.userA)
-	s.device2ID = fmt.Sprintf("device2-%s", s.userA)
+	sourceBase := fmt.Sprintf("device-%s", s.userA)
+	if s.config != nil && s.config.SourceID != "" && s.config.SourceID != "device-unknown-001" {
+		sourceBase = s.config.SourceID
+	}
+	s.device1ID = sourceBase + "-d1"
+	s.device2ID = sourceBase + "-d2"
 	logger.Info("📱 Generated device IDs", "device1_id", s.device1ID, "device2_id", s.device2ID)
 
 	// Create device 1 for user A
@@ -68,6 +78,7 @@ func (s *MultiDeviceSyncScenario) Setup(ctx context.Context) error {
 		return fmt.Errorf("failed to create device 1 app: %w", err)
 	}
 	s.app = device1App
+	s.simulator.currentApp = s.app // enable sqlite path reporting for parallel runs
 
 	// Create device 2 for the SAME user A
 	device2Config := &config.ScenarioConfig{UserID: s.userA}
@@ -118,6 +129,7 @@ func (s *MultiDeviceSyncScenario) createDeviceApp(scenarioConfig *config.Scenari
 		DeviceName:       deviceName,
 		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: oversqliteConfig,
+		PreserveDB:       simCfg.PreserveDB,
 		Logger:           s.simulator.GetLogger(),
 	}
 

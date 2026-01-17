@@ -59,9 +59,20 @@ func (s *MultiDeviceComplexScenario) Setup(ctx context.Context) error {
 	logger := s.simulator.GetLogger()
 	logger.Info("🔧 Setting up complex multi-device scenario for SAME user")
 
-	s.userID = "user-" + uuid.New().String()[:8]
-	s.device1ID = "d1-" + s.userID
-	s.device2ID = "d2-" + s.userID
+	// Prefer simulator-provided user/source IDs (used by parallel runner), but keep a random fallback for
+	// interactive runs where this scenario doesn't have a dedicated ScenarioConfig entry.
+	if s.config != nil && s.config.UserID != "" && s.config.UserID != "user-unknown" {
+		s.userID = s.config.UserID
+	} else {
+		s.userID = "user-" + uuid.New().String()[:8]
+	}
+
+	sourceBase := "device-" + s.userID
+	if s.config != nil && s.config.SourceID != "" && s.config.SourceID != "device-unknown-001" {
+		sourceBase = s.config.SourceID
+	}
+	s.device1ID = sourceBase + "-d1"
+	s.device2ID = sourceBase + "-d2"
 
 	cfg1 := &config.ScenarioConfig{UserID: s.userID}
 	cfg2 := &config.ScenarioConfig{UserID: s.userID}
@@ -76,6 +87,7 @@ func (s *MultiDeviceComplexScenario) Setup(ctx context.Context) error {
 	}
 	s.app = app1
 	s.device2App = app2
+	s.simulator.currentApp = s.app // enable sqlite path reporting for parallel runs
 
 	if err := s.app.OnLaunch(ctx); err != nil {
 		return err
@@ -109,6 +121,7 @@ func (s *MultiDeviceComplexScenario) createDeviceApp(scenarioConfig *config.Scen
 		DeviceName:       deviceName,
 		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: overs,
+		PreserveDB:       simCfg.PreserveDB,
 		Logger:           s.simulator.GetLogger(),
 	}
 	return NewMobileApp(appCfg)

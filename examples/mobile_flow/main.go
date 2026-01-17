@@ -42,6 +42,8 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
+	// Ensure libraries using slog.Default() (e.g., oversqlite) share the same handler + level.
+	slog.SetDefault(logger)
 
 	if *parallelFlag < 1 || *parallelFlag > 500 {
 		log.Fatalf("Parallel users must be between 1 and 500, got: %d", *parallelFlag)
@@ -310,6 +312,13 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 					Duration:           result.duration.String(),
 				}
 			}
+
+			// Fold scenario execution result into the verification summary to keep the report consistent
+			// with the parallel runner's success/failure counts.
+			if result.err != nil {
+				userReport.VerificationPassed = false
+				userReport.Errors = append(userReport.Errors, fmt.Sprintf("Scenario failed: %v", result.err))
+			}
 			userReports = append(userReports, *userReport)
 		}
 	}
@@ -327,6 +336,7 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 		"scenario", scenarioName)
 
 	// Generate comprehensive test report
+	var verificationFailures int
 	if baseCfg.EnableVerify && len(userReports) > 0 {
 		testName := fmt.Sprintf("parallel_%dusers", numUsers)
 		completeReport := reportGenerator.GenerateCompleteReport(testName, scenarioName, userReports, totalTime)
@@ -368,11 +378,17 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 
 		fmt.Printf("\n📈 Total Records Verified: %d\n", completeReport.Summary.TotalRecords)
 		fmt.Printf("═══════════════════════════════════════════════════════════════\n")
+
+		verificationFailures = completeReport.FailedUsers
 	}
 
 	if failureCount > 0 {
 		baseCfg.Logger.Error("❌ Some simulations failed", "failures", errors)
 		return fmt.Errorf("%d out of %d users failed", failureCount, numUsers)
+	}
+
+	if verificationFailures > 0 {
+		return fmt.Errorf("%d out of %d users failed verification", verificationFailures, numUsers)
 	}
 
 	fmt.Printf("\n🎉 All %d users completed successfully!\n", numUsers)
