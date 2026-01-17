@@ -176,7 +176,11 @@ func (c *Client) uploadBatch(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("failed to serialize row %s.%s (missing stored payload): %w", pending.tableName, pending.pkUUID, err)
 			}
-			change.Payload = payload
+			processedPayload, err := c.processPayloadForUpload(pending.tableName, string(payload))
+			if err != nil {
+				return fmt.Errorf("failed to process serialized payload for %s.%s: %w", pending.tableName, pending.pkUUID, err)
+			}
+			change.Payload = processedPayload
 		}
 		// For DELETE operations, payload can be nil (server doesn't need it)
 
@@ -485,7 +489,21 @@ type ConflictDetail struct {
 
 // sendUploadRequest sends an upload request to the server
 func (c *Client) sendUploadRequest(ctx context.Context, req *oversync.UploadRequest) (*oversync.UploadResponse, error) {
-	jsonData, err := json.Marshal(req)
+	// Convert local PK representations to server/wire format:
+	// - For BLOB UUID PK tables, local metadata stores PK as hex; server expects UUID string.
+	wireReq := *req
+	wireReq.Changes = make([]oversync.ChangeUpload, len(req.Changes))
+	for i := range req.Changes {
+		ch := req.Changes[i]
+		pk, err := c.normalizePKForServer(ch.Table, ch.PK)
+		if err != nil {
+			return nil, fmt.Errorf("failed to normalize PK for upload (%s.%s): %w", ch.Table, ch.PK, err)
+		}
+		ch.PK = pk
+		wireReq.Changes[i] = ch
+	}
+
+	jsonData, err := json.Marshal(&wireReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal upload request: %w", err)
 	}

@@ -10,6 +10,10 @@ import (
 	"sync"
 )
 
+type tableInfoQueryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
 // ColumnInfo holds information about a table column
 type ColumnInfo struct {
 	Name         string
@@ -48,7 +52,7 @@ func NewTableInfoProvider() *TableInfoProvider {
 }
 
 // Get retrieves table information, using cache when available
-func (p *TableInfoProvider) Get(db *sql.DB, tableName string) (*TableInfo, error) {
+func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*TableInfo, error) {
 	key := strings.ToLower(tableName)
 
 	// Check cache first
@@ -69,7 +73,7 @@ func (p *TableInfoProvider) Get(db *sql.DB, tableName string) (*TableInfo, error
 	}
 
 	// Query table info using PRAGMA table_info
-	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", key))
+	rows, err := queryer.Query(fmt.Sprintf("PRAGMA table_info(%s)", key))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get table info for %s: %w", tableName, err)
 	}
@@ -151,6 +155,12 @@ var globalTableInfoProvider = NewTableInfoProvider()
 // GetTableInfo is a convenience function that uses the global provider
 func GetTableInfo(db *sql.DB, tableName string) (*TableInfo, error) {
 	return globalTableInfoProvider.Get(db, tableName)
+}
+
+// GetTableInfoTx is a convenience function that uses the global provider via a transaction.
+// Use this when running under a single-connection DB (MaxOpenConns=1) and holding an open tx.
+func GetTableInfoTx(tx *sql.Tx, tableName string) (*TableInfo, error) {
+	return globalTableInfoProvider.Get(tx, tableName)
 }
 
 // ClearGlobalTableInfoCache clears the global table info cache

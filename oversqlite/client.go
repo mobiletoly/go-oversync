@@ -637,11 +637,18 @@ func (c *Client) restoreLocalDeletions(ctx context.Context, deletions []LocalDel
 	defer tx.Rollback()
 
 	for _, deletion := range deletions {
+		pkColumn := c.getPrimaryKeyColumn(deletion.Table)
+		// Use tx-aware table info lookups to avoid deadlocks when MaxOpenConns=1.
+		pkValue, err := c.convertPKForQueryInTx(tx, deletion.Table, deletion.ID)
+		if err != nil {
+			return fmt.Errorf("failed to convert primary key for query: %w", err)
+		}
+
 		// Check if the record was restored by sync window download
 		var exists bool
-		err := tx.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE id = ?)", deletion.Table),
-			deletion.ID).Scan(&exists)
+		err = tx.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM \"%s\" WHERE \"%s\" = ?)", deletion.Table, pkColumn),
+			pkValue).Scan(&exists)
 		if err != nil {
 			return fmt.Errorf("failed to check if record exists: %w", err)
 		}
@@ -660,8 +667,8 @@ func (c *Client) restoreLocalDeletions(ctx context.Context, deletions []LocalDel
 			if !hasPendingInsert {
 				// Record was restored by sync window and not re-added locally - delete it again
 				_, err = tx.ExecContext(ctx,
-					fmt.Sprintf("DELETE FROM %s WHERE id = ?", deletion.Table),
-					deletion.ID)
+					fmt.Sprintf("DELETE FROM \"%s\" WHERE \"%s\" = ?", deletion.Table, pkColumn),
+					pkValue)
 				if err != nil {
 					return fmt.Errorf("failed to restore deletion for %s.%s: %w", deletion.Table, deletion.ID, err)
 				}

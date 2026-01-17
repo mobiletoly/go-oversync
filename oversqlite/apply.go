@@ -6,7 +6,6 @@ package oversqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -24,6 +23,14 @@ func (r *DefaultResolver) Merge(table string, pk string, server json.RawMessage,
 
 // applyServerChange applies a change received from the server to the local database
 func (c *Client) applyServerChange(ctx context.Context, change *oversync.ChangeDownloadResponse) error {
+	// Normalize PK from wire/server format to local metadata format.
+	// For BLOB UUID PK tables, server sends UUID string, while local meta stores hex.
+	if pk, err := c.normalizePKForMeta(change.TableName, change.PK); err == nil {
+		change.PK = pk
+	} else {
+		return fmt.Errorf("failed to normalize PK for apply: %w", err)
+	}
+
 	switch change.Op {
 	case "INSERT":
 		return c.applyInsert(ctx, change)
@@ -38,6 +45,14 @@ func (c *Client) applyServerChange(ctx context.Context, change *oversync.ChangeD
 
 // applyServerChangeInTx applies a change received from the server to the local database within a transaction
 func (c *Client) applyServerChangeInTx(ctx context.Context, tx *sql.Tx, change *oversync.ChangeDownloadResponse) error {
+	// Normalize PK from wire/server format to local metadata format.
+	// Use tx-aware lookup to avoid deadlocks when MaxOpenConns=1 and a tx is held.
+	if pk, err := c.normalizePKForMetaInTx(tx, change.TableName, change.PK); err == nil {
+		change.PK = pk
+	} else {
+		return fmt.Errorf("failed to normalize PK for apply: %w", err)
+	}
+
 	switch change.Op {
 	case "INSERT":
 		return c.applyInsertInTx(ctx, tx, change)
@@ -154,12 +169,34 @@ func (c *Client) applyDelete(ctx context.Context, change *oversync.ChangeDownloa
 
 // upsertRow performs an INSERT OR REPLACE operation
 func (c *Client) upsertRow(ctx context.Context, table, pk string, payload map[string]interface{}) error {
+	// Convert encoded BLOB payload fields (base64/hex/uuid string) back to bytes for SQLite.
+	blobCols := map[string]struct{}(nil)
+	if tableInfo, err := GetTableInfo(c.DB, strings.ToLower(table)); err == nil {
+		blobCols = make(map[string]struct{})
+		for _, col := range tableInfo.Columns {
+			if col.IsBlob() {
+				blobCols[strings.ToLower(col.Name)] = struct{}{}
+			}
+		}
+	}
+
 	// Build column list and values
 	columns := make([]string, 0, len(payload))
 	placeholders := make([]string, 0, len(payload))
 	values := make([]interface{}, 0, len(payload))
 
 	for col, val := range payload {
+		if blobCols != nil {
+			if _, isBlob := blobCols[strings.ToLower(col)]; isBlob && val != nil {
+				if s, ok := val.(string); ok {
+					decoded, err := decodeBlobBytesFromString(s)
+					if err != nil {
+						return fmt.Errorf("failed to decode blob payload field %s: %w", col, err)
+					}
+					val = decoded
+				}
+			}
+		}
 		columns = append(columns, col)
 		placeholders = append(placeholders, "?")
 		values = append(values, val)
@@ -198,7 +235,7 @@ func (c *Client) upsertRow(ctx context.Context, table, pk string, payload map[st
 // getPrimaryKeyColumn returns the primary key column name for a given table
 func (c *Client) getPrimaryKeyColumn(tableName string) string {
 	for _, syncTable := range c.config.Tables {
-		if syncTable.TableName == tableName {
+		if strings.EqualFold(syncTable.TableName, tableName) {
 			if syncTable.SyncKeyColumnName == "" {
 				return "id" // Default to "id"
 			}
@@ -222,16 +259,37 @@ func (c *Client) convertPKForQuery(tableName, pkValue string) (interface{}, erro
 	// Check if the primary key column is BLOB
 	for _, col := range tableInfo.Columns {
 		if strings.EqualFold(col.Name, pkColumn) && col.IsBlob() {
-			// Convert hex string back to binary data
-			binaryData, err := hex.DecodeString(pkValue)
+			// Convert encoded PK back to bytes (accept UUID string, base64, or hex).
+			binaryData, err := decodeBlobBytesFromString(pkValue)
 			if err != nil {
-				return nil, fmt.Errorf("failed to decode hex primary key %s: %w", pkValue, err)
+				return nil, fmt.Errorf("failed to decode primary key %s: %w", pkValue, err)
 			}
 			return binaryData, nil
 		}
 	}
 
 	// Not a BLOB primary key, return as string
+	return pkValue, nil
+}
+
+func (c *Client) convertPKForQueryInTx(tx *sql.Tx, tableName, pkValue string) (interface{}, error) {
+	tableInfo, err := GetTableInfoTx(tx, strings.ToLower(tableName))
+	if err != nil {
+		return pkValue, nil // Fallback to string if we can't get table info
+	}
+
+	pkColumn := c.getPrimaryKeyColumn(tableName)
+
+	for _, col := range tableInfo.Columns {
+		if strings.EqualFold(col.Name, pkColumn) && col.IsBlob() {
+			binaryData, err := decodeBlobBytesFromString(pkValue)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode primary key %s: %w", pkValue, err)
+			}
+			return binaryData, nil
+		}
+	}
+
 	return pkValue, nil
 }
 
@@ -372,7 +430,7 @@ func (c *Client) applyDeleteInTx(ctx context.Context, tx *sql.Tx, change *oversy
 	pkColumn := c.getPrimaryKeyColumn(change.TableName)
 
 	// Convert PK value for query (handles BLOB primary keys)
-	pkValue, err := c.convertPKForQuery(change.TableName, change.PK)
+	pkValue, err := c.convertPKForQueryInTx(tx, change.TableName, change.PK)
 	if err != nil {
 		return fmt.Errorf("failed to convert primary key for query: %w", err)
 	}
@@ -390,11 +448,33 @@ func (c *Client) applyDeleteInTx(ctx context.Context, tx *sql.Tx, change *oversy
 
 // upsertRowInTx performs an INSERT OR REPLACE operation within a transaction
 func (c *Client) upsertRowInTx(ctx context.Context, tx *sql.Tx, table, pk string, payload map[string]interface{}) error {
+	// Convert encoded BLOB payload fields (base64/hex/uuid string) back to bytes for SQLite.
+	blobCols := map[string]struct{}(nil)
+	if tableInfo, err := GetTableInfoTx(tx, strings.ToLower(table)); err == nil {
+		blobCols = make(map[string]struct{})
+		for _, col := range tableInfo.Columns {
+			if col.IsBlob() {
+				blobCols[strings.ToLower(col.Name)] = struct{}{}
+			}
+		}
+	}
+
 	// Build column list and values
 	columns := make([]string, 0, len(payload))
 	values := make([]interface{}, 0, len(payload))
 
 	for col, val := range payload {
+		if blobCols != nil {
+			if _, isBlob := blobCols[strings.ToLower(col)]; isBlob && val != nil {
+				if s, ok := val.(string); ok {
+					decoded, err := decodeBlobBytesFromString(s)
+					if err != nil {
+						return fmt.Errorf("failed to decode blob payload field %s: %w", col, err)
+					}
+					val = decoded
+				}
+			}
+		}
 		columns = append(columns, col)
 		values = append(values, val)
 	}
