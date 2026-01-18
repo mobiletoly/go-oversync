@@ -74,16 +74,18 @@ func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, source
 		return ChangeUploadStatus{}, fmt.Errorf("failed to apply upsert: %w", err)
 	}
 
-	// Release SAVEPOINT (normal path)
-	_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-	if err != nil {
-		return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
-	}
-
 	switch code {
 	case 0:
+		_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		if err != nil {
+			return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
+		}
 		return statusAppliedIdempotent(change.SourceChangeID), nil
 	case 1:
+		_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		if err != nil {
+			return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
+		}
 		if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, change, false, newServerVer64); err != nil {
 			s.logger.Warn("Business projection failed; sync still applied",
 				"error", err, "schema", change.Schema, "table", change.Table, "pk", change.PK,
@@ -91,6 +93,11 @@ func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, source
 		}
 		return statusApplied(change.SourceChangeID, newServerVer64), nil
 	case 2:
+		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		if err != nil {
+			return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
+		}
 		serverRow, fetchErr := s.fetchServerRowJSON(ctx, tx, userID, change.Schema, change.Table, change.PK)
 		if fetchErr != nil {
 			if errors.Is(fetchErr, pgx.ErrNoRows) {
@@ -100,8 +107,15 @@ func (s *SyncService) applyUpsert(ctx context.Context, tx pgx.Tx, userID, source
 		}
 		return statusConflict(change.SourceChangeID, serverRow), nil
 	case 3:
+		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		if err != nil {
+			return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
+		}
 		return statusInvalidOther(change.SourceChangeID, ReasonInternalError, fmt.Errorf("conflict without server_row for %s.%s pk=%s", change.Schema, change.Table, change.PK)), nil
 	default:
+		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
 		return ChangeUploadStatus{}, fmt.Errorf("unknown apply upsert code %d", code)
 	}
 }
@@ -152,16 +166,21 @@ func (s *SyncService) applyDelete(ctx context.Context, tx pgx.Tx, userID, source
 		return ChangeUploadStatus{}, fmt.Errorf("failed to apply delete: %w", err)
 	}
 
-	// Release SAVEPOINT (normal path)
-	_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
-	if err != nil {
-		return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
-	}
-
 	switch code {
 	case 0, 3:
+		if code == 3 {
+			_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		}
+		_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		if err != nil {
+			return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
+		}
 		return statusAppliedIdempotent(change.SourceChangeID), nil
 	case 1:
+		_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		if err != nil {
+			return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
+		}
 		if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, change, true, newServerVer64); err != nil {
 			s.logger.Warn("Business projection failed; sync still applied",
 				"error", err, "schema", change.Schema, "table", change.Table, "pk", change.PK,
@@ -169,6 +188,11 @@ func (s *SyncService) applyDelete(ctx context.Context, tx pgx.Tx, userID, source
 		}
 		return statusApplied(change.SourceChangeID, newServerVer64), nil
 	case 2:
+		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		_, err = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		if err != nil {
+			return ChangeUploadStatus{}, fmt.Errorf("failed to release savepoint: %w", err)
+		}
 		serverRow, fetchErr := s.fetchServerRowJSON(ctx, tx, userID, change.Schema, change.Table, change.PK)
 		if fetchErr != nil {
 			if errors.Is(fetchErr, pgx.ErrNoRows) {
