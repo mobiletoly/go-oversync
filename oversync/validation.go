@@ -22,6 +22,16 @@ var (
 
 // validateChange validates a single change upload
 func (s *SyncService) validateChange(change *ChangeUpload) error {
+	_, err := s.validateChangeAndMaybeParsePayload(change, nil)
+	return err
+}
+
+// validateChangeAndMaybeParsePayload validates a single change upload and optionally reuses a
+// pre-parsed JSON payload object for INSERT/UPDATE.
+//
+// If payloadObj is nil for an INSERT/UPDATE, it will parse change.Payload.
+// On success, it returns the parsed payload object for INSERT/UPDATE, or nil for DELETE.
+func (s *SyncService) validateChangeAndMaybeParsePayload(change *ChangeUpload, payloadObj map[string]any) (map[string]any, error) {
 	// Normalize case and whitespace
 	change.Schema = strings.ToLower(strings.TrimSpace(change.Schema))
 	change.Table = strings.ToLower(strings.TrimSpace(change.Table))
@@ -34,17 +44,17 @@ func (s *SyncService) validateChange(change *ChangeUpload) error {
 
 	// Validate schema name (must match ^[a-z0-9_]+$)
 	if !isValidSchemaName(change.Schema) {
-		return fmt.Errorf("%w: invalid schema name %q", ErrBadPayload, change.Schema)
+		return nil, fmt.Errorf("%w: invalid schema name %q", ErrBadPayload, change.Schema)
 	}
 
 	// Validate table name (must match ^[a-z0-9_]+$)
 	if !isValidTableName(change.Table) {
-		return fmt.Errorf("%w: invalid table name %q", ErrBadPayload, change.Table)
+		return nil, fmt.Errorf("%w: invalid table name %q", ErrBadPayload, change.Table)
 	}
 
 	// Validate schema.table combination is registered for sync operations
 	if !s.IsTableRegistered(change.Schema, change.Table) {
-		return fmt.Errorf("%w: table not registered %s.%s", ErrUnregisteredTable, change.Schema, change.Table)
+		return nil, fmt.Errorf("%w: table not registered %s.%s", ErrUnregisteredTable, change.Schema, change.Table)
 	}
 
 	// Validate operation
@@ -52,37 +62,38 @@ func (s *SyncService) validateChange(change *ChangeUpload) error {
 	case OpInsert, OpUpdate, OpDelete:
 		// Valid operations
 	default:
-		return fmt.Errorf("invalid operation: %s", change.Op)
+		return nil, fmt.Errorf("invalid operation: %s", change.Op)
 	}
 
 	// Validate UUID format (PK should already be converted by this point, unless it was invalid)
 	if _, err := uuid.Parse(change.PK); err != nil {
-		return fmt.Errorf("%w: invalid UUID format: %s", ErrBadPayload, change.PK)
+		return nil, fmt.Errorf("%w: invalid UUID format: %s", ErrBadPayload, change.PK)
 	}
 
 	// Payload rules
 	if change.Op == OpInsert || change.Op == OpUpdate {
 		if len(change.Payload) == 0 {
-			return fmt.Errorf("payload required for %s operation", change.Op)
-		}
-
-		// Must be a JSON object
-		var obj map[string]any
-		if err := json.Unmarshal(change.Payload, &obj); err != nil || obj == nil {
-			return fmt.Errorf("invalid JSON payload")
+			return nil, fmt.Errorf("payload required for %s operation", change.Op)
 		}
 
 		// Enforce per-change payload size limit (bytes of raw JSON)
 		if s.config.MaxPayloadBytes > 0 && len(change.Payload) > s.config.MaxPayloadBytes {
-			return fmt.Errorf("%w: payload too large: %d > %d", ErrBadPayload, len(change.Payload), s.config.MaxPayloadBytes)
+			return nil, fmt.Errorf("%w: payload too large: %d > %d", ErrBadPayload, len(change.Payload), s.config.MaxPayloadBytes)
+		}
+
+		// Must be a JSON object
+		if payloadObj == nil {
+			if err := json.Unmarshal(change.Payload, &payloadObj); err != nil || payloadObj == nil {
+				return nil, fmt.Errorf("invalid JSON payload")
+			}
 		}
 
 		// Disallow reserved keys
-		if _, ok := obj["server_version"]; ok {
-			return fmt.Errorf("payload may not contain server_version")
+		if _, ok := payloadObj["server_version"]; ok {
+			return nil, fmt.Errorf("payload may not contain server_version")
 		}
-		if _, ok := obj["deleted"]; ok {
-			return fmt.Errorf("payload may not contain deleted")
+		if _, ok := payloadObj["deleted"]; ok {
+			return nil, fmt.Errorf("payload may not contain deleted")
 		}
 
 		// Optional: enforce payload.id == pk if present
@@ -91,13 +102,14 @@ func (s *SyncService) validateChange(change *ChangeUpload) error {
 		//		return fmt.Errorf("payload.id must equal pk %s", change.PK)
 		//	}
 		//}
+		return payloadObj, nil
 	} else { // DELETE
 		if len(change.Payload) != 0 {
-			return fmt.Errorf("DELETE must not include payload")
+			return nil, fmt.Errorf("DELETE must not include payload")
 		}
 	}
 
-	return nil
+	return nil, nil
 }
 
 // fetchServerRowJSON fetches current server state for conflict resolution (user-scoped and schema-aware)

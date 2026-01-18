@@ -119,7 +119,9 @@ func (s *Simulator) RunScenario(ctx context.Context, scenarioName string) error 
 		return fmt.Errorf("unknown scenario: %s", scenarioName)
 	}
 
-	s.logger.Info("Starting scenario", "name", scenarioName, "description", scenario.Description())
+	if verboseLog {
+		s.logger.Info("Starting scenario", "name", scenarioName, "description", scenario.Description())
+	}
 
 	// Start timing
 	startTime := time.Now()
@@ -128,14 +130,18 @@ func (s *Simulator) RunScenario(ctx context.Context, scenarioName string) error 
 	report := s.reporter.StartScenario(scenarioName, scenario.Description())
 
 	// Setup phase
-	s.logger.Info("Setting up scenario", "name", scenarioName)
+	if verboseLog {
+		s.logger.Info("Setting up scenario", "name", scenarioName)
+	}
 	if err := scenario.Setup(ctx); err != nil {
 		report.SetError(fmt.Errorf("setup failed: %w", err))
 		return err
 	}
 
 	// Execute phase
-	s.logger.Info("Executing scenario", "name", scenarioName)
+	if verboseLog {
+		s.logger.Info("Executing scenario", "name", scenarioName)
+	}
 	if err := scenario.Execute(ctx); err != nil {
 		report.SetError(fmt.Errorf("execution failed: %w", err))
 		return err
@@ -143,7 +149,9 @@ func (s *Simulator) RunScenario(ctx context.Context, scenarioName string) error 
 
 	// Verify phase
 	if s.verifier != nil {
-		s.logger.Info("Verifying scenario", "name", scenarioName)
+		if verboseLog {
+			s.logger.Info("Verifying scenario", "name", scenarioName)
+		}
 		if err := scenario.Verify(ctx, s.verifier); err != nil {
 			report.SetError(fmt.Errorf("verification failed: %w", err))
 			return err
@@ -151,7 +159,9 @@ func (s *Simulator) RunScenario(ctx context.Context, scenarioName string) error 
 	}
 
 	// Cleanup phase
-	s.logger.Info("Cleaning up scenario", "name", scenarioName)
+	if verboseLog {
+		s.logger.Info("Cleaning up scenario", "name", scenarioName)
+	}
 	if err := scenario.Cleanup(ctx); err != nil {
 		s.logger.Warn("Cleanup failed", "name", scenarioName, "error", err)
 		// Don't fail the scenario for cleanup errors
@@ -162,9 +172,11 @@ func (s *Simulator) RunScenario(ctx context.Context, scenarioName string) error 
 	report.SetDuration(duration)
 	report.SetSuccess()
 
-	s.logger.Info("Scenario completed successfully",
-		"name", scenarioName,
-		"duration", duration.String())
+	if verboseLog {
+		s.logger.Info("Scenario completed successfully",
+			"name", scenarioName,
+			"duration", duration.String())
+	}
 
 	return nil
 }

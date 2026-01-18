@@ -258,8 +258,6 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 
 			if err != nil {
 				baseCfg.Logger.Error("⏱️ Scenario failed for user", "user_id", userID, "duration", duration, "error", err)
-			} else {
-				baseCfg.Logger.Info("⏱️ Scenario completed for user", "user_id", userID, "duration", duration)
 			}
 
 			results <- userResult{userID: userID, duration: duration, err: err, sqliteDBPath: sqliteDBPath}

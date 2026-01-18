@@ -36,7 +36,9 @@ func (ui *UISimulator) SetBanner(message string) {
 
 	if ui.banner != message {
 		ui.banner = message
-		ui.logger.Info("📱 UI Banner", "message", message)
+		if verboseLog {
+			ui.logger.Info("📱 UI Banner", "message", message)
+		}
 	}
 }
 
@@ -57,7 +59,9 @@ func (ui *UISimulator) SetPendingBadge(count int) {
 		if count > 0 {
 			//ui.logger.Info("🔄 Pending Changes", "count", count)
 		} else {
-			ui.logger.Info("✅ All Changes Synced")
+			if verboseLog {
+				ui.logger.Info("✅ All Changes Synced")
+			}
 		}
 	}
 }

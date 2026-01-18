@@ -14,6 +14,8 @@ import (
 	"github.com/mobiletoly/go-oversync/oversqlite"
 )
 
+var verboseLog = false
+
 // MobileAppConfig holds configuration for a mobile app instance
 type MobileAppConfig struct {
 	DatabaseFile     string
@@ -101,10 +103,12 @@ func (app *MobileApp) initializeDatabase() error {
 	}
 	app.client = client
 
-	app.logger.Info("Database initialized successfully",
-		"file", app.config.DatabaseFile,
-		"user_id", app.config.UserID,
-		"source_id", app.config.SourceID)
+	if verboseLog {
+		app.logger.Info("Database initialized successfully",
+			"file", app.config.DatabaseFile,
+			"user_id", app.config.UserID,
+			"source_id", app.config.SourceID)
+	}
 
 	return nil
 }
@@ -188,12 +192,16 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 	if app.isRunning {
 		return fmt.Errorf("app is already running")
 	}
-	app.logger.Info("🚀 App launching", "device", app.config.DeviceName)
+	if verboseLog {
+		app.logger.Info("🚀 App launching", "device", app.config.DeviceName)
+	}
 	app.ui.SetBanner("Starting up...")
 
 	// Try to restore session
 	if app.session.CanRestore() {
-		app.logger.Info("Restoring previous session")
+		if verboseLog {
+			app.logger.Info("Restoring previous session")
+		}
 		if err := app.session.Restore(); err != nil {
 			app.logger.Warn("Failed to restore session", "error", err)
 			app.ui.SetBanner("Session expired. Sign in to sync.")
@@ -201,7 +209,9 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 			return nil
 		}
 
-		app.logger.Info("Session restored successfully", "user_id", app.session.GetUserID())
+		if verboseLog {
+			app.logger.Info("Session restored successfully", "user_id", app.session.GetUserID())
+		}
 
 		// Ensure the local oversqlite client is bootstrapped before starting background sync loops.
 		// Under high parallelism, background loops can tick before SignIn/Bootstrap runs and hit
@@ -226,14 +236,18 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 	}
 
 	app.isRunning = true
-	app.logger.Info("✅ App launched successfully")
+	if verboseLog {
+		app.logger.Info("✅ App launched successfully")
+	}
 
 	return nil
 }
 
 // OnSignIn simulates user sign-in
 func (app *MobileApp) OnSignIn(ctx context.Context, userID string) error {
-	app.logger.Info("👤 User signing in", "user_id", userID)
+	if verboseLog {
+		app.logger.Info("👤 User signing in", "user_id", userID)
+	}
 
 	// Create new session
 	if err := app.session.SignIn(userID, app.config.SourceID); err != nil {
@@ -241,7 +255,9 @@ func (app *MobileApp) OnSignIn(ctx context.Context, userID string) error {
 		return fmt.Errorf("sign in failed: %w", err)
 	}
 
-	app.ui.SetBanner("Setting up sync...")
+	if verboseLog {
+		app.ui.SetBanner("Setting up sync...")
+	}
 	if err := app.client.Bootstrap(ctx, false); err != nil {
 		app.logger.Error("Failed to bootstrap client", "error", err)
 		app.ui.SetBanner("Setup failed")
@@ -257,7 +273,9 @@ func (app *MobileApp) OnSignIn(ctx context.Context, userID string) error {
 	app.ui.SetBanner("Syncing...")
 	app.ui.SetPendingBadge(app.getPendingCount())
 
-	app.logger.Info("✅ User signed in successfully", "user_id", userID)
+	if verboseLog {
+		app.logger.Info("✅ User signed in successfully", "user_id", userID)
+	}
 	return nil
 }
 
@@ -495,7 +513,9 @@ func (app *MobileApp) Close() error {
 		return nil
 	}
 
-	app.logger.Info("🔄 App shutting down")
+	if verboseLog {
+		app.logger.Info("🔄 App shutting down")
+	}
 
 	if app.sync != nil {
 		app.sync.Stop()
@@ -513,11 +533,15 @@ func (app *MobileApp) Close() error {
 	if app.config.DatabaseFile != ":memory:" && !app.config.PreserveDB {
 		os.Remove(app.config.DatabaseFile)
 	} else if app.config.PreserveDB && app.config.DatabaseFile != ":memory:" {
-		app.logger.Info("📁 Database file preserved for manual inspection", "path", app.config.DatabaseFile)
+		if verboseLog {
+			app.logger.Info("📁 Database file preserved for manual inspection", "path", app.config.DatabaseFile)
+		}
 	}
 
 	app.isRunning = false
-	app.logger.Info("✅ App shutdown complete")
+	if verboseLog {
+		app.logger.Info("✅ App shutdown complete")
+	}
 
 	return nil
 }

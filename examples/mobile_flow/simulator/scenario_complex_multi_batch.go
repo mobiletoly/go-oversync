@@ -71,12 +71,16 @@ func (s *ComplexMultiBatchScenario) Description() string {
 // Setup creates a mobile app with small batch sizes for FK constraint testing
 func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 	logger := s.simulator.GetLogger()
-	logger.Info("🔧 Setting up mobile app with small batch sizes for FK constraint testing")
+	if verboseLog {
+		logger.Info("🔧 Setting up mobile app with small batch sizes for FK constraint testing")
+	}
 
 	// Generate source IDs once and store for reuse throughout scenario
 	s.phoneSourceID = fmt.Sprintf("phone-%s", s.config.UserID)
 	s.laptopSourceID = fmt.Sprintf("laptop-%s", s.config.UserID)
-	logger.Info("📱 Generated source IDs", "phone_source_id", s.phoneSourceID, "laptop_source_id", s.laptopSourceID)
+	if verboseLog {
+		logger.Info("📱 Generated source IDs", "phone_source_id", s.phoneSourceID, "laptop_source_id", s.laptopSourceID)
+	}
 
 	// Create mobile app with small batch sizes to force multi-batch operations
 	app, err := s.createAppWithSmallBatches(s.config)
@@ -92,7 +96,9 @@ func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 		return fmt.Errorf("failed to launch app: %w", err)
 	}
 
-	logger.Info("✅ Mobile app setup complete with small batch sizes")
+	if verboseLog {
+		logger.Info("✅ Mobile app setup complete with small batch sizes")
+	}
 	return nil
 }
 
@@ -153,26 +159,36 @@ func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePre
 func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	logger := s.simulator.GetLogger()
 
-	logger.Info("🎯 Starting FK Constraint Testing Scenario")
-	logger.Info("📊 Strategy: Create posts BEFORE users to trigger server-side FK constraint violations")
+	if verboseLog {
+		logger.Info("🎯 Starting FK Constraint Testing Scenario")
+		logger.Info("📊 Strategy: Create posts BEFORE users to trigger server-side FK constraint violations")
+	}
 
 	// Step 1: Sign in user to initialize sync system
-	logger.Info("👤 Signing in user to initialize sync system")
+	if verboseLog {
+		logger.Info("👤 Signing in user to initialize sync system")
+	}
 	err := s.app.SignIn(ctx, s.config.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to sign in user: %w", err)
 	}
 
 	// Step 2: Create FK-challenging data (we'll work offline by not calling sync)
-	logger.Info("📱 Creating FK-challenging data offline")
+	if verboseLog {
+		logger.Info("📱 Creating FK-challenging data offline")
+	}
 
 	// Step 2: Create data in FK-challenging order using SQLite PRAGMA
-	logger.Info("👤📝 Creating FK-challenging data in SQLite")
+	if verboseLog {
+		logger.Info("👤📝 Creating FK-challenging data in SQLite")
+	}
 
 	// Configuration for this test
 	totalPosts := totalUsers * postsPerUser
 
-	logger.Info("📊 Test configuration", "users", totalUsers, "posts_per_user", postsPerUser, "total_posts", totalPosts)
+	if verboseLog {
+		logger.Info("📊 Test configuration", "users", totalUsers, "posts_per_user", postsPerUser, "total_posts", totalPosts)
+	}
 
 	s.testData.UserIDs = make([]string, totalUsers)
 	s.testData.PostIDs = make([]string, totalPosts)
@@ -180,7 +196,9 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	// Prevent background sync from draining pending changes during creation
 	s.app.StopSync()
 	s.app.PauseSync()
-	logger.Info("⏸️ Paused phone client sync during offline creation")
+	if verboseLog {
+		logger.Info("⏸️ Paused phone client sync during offline creation")
+	}
 
 	// Ensure apply_mode=0 so local triggers capture pending changes deterministically
 	if err := s.app.ResetApplyMode(ctx); err != nil {
@@ -191,18 +209,24 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	db := s.app.GetDatabase()
 	// Best-effort clear any stray transaction
 	_, _ = db.Exec("ROLLBACK")
-	logger.Info("⏱️ About to begin phone creation transaction")
+	if verboseLog {
+		logger.Info("⏱️ About to begin phone creation transaction")
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin tx for FK-challenging creation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	logger.Info("✅ Phone creation transaction begun")
+	if verboseLog {
+		logger.Info("✅ Phone creation transaction begun")
+	}
 	if _, err := tx.Exec("PRAGMA defer_foreign_keys = ON"); err != nil {
 		return fmt.Errorf("failed to enable deferred FKs in tx: %w", err)
 	}
 
-	logger.Info("🔄 Creating data in FK-challenging order (tx): posts BEFORE users, FK checks deferred to COMMIT")
+	if verboseLog {
+		logger.Info("🔄 Creating data in FK-challenging order (tx): posts BEFORE users, FK checks deferred to COMMIT")
+	}
 
 	for userGroup := 0; userGroup < totalUsers; userGroup++ {
 		// Pre-generate user UUID
@@ -229,22 +253,30 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 		}
 		s.testData.UserIDs[userGroup] = futureUserID
 
-		logger.Info("✅ FK-challenging group complete", "group", userGroup+1, "posts_created", postsPerUser, "user_created", 1)
+		if verboseLog {
+			logger.Info("✅ FK-challenging group complete", "group", userGroup+1, "posts_created", postsPerUser, "user_created", 1)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit FK-challenging creation tx: %w", err)
 	}
-	logger.Info("✅ FK-challenging data creation committed (FKs verified at COMMIT)")
+	if verboseLog {
+		logger.Info("✅ FK-challenging data creation committed (FKs verified at COMMIT)")
+	}
 
 	actualUsers := len(s.testData.UserIDs)
 	actualPosts := len(s.testData.PostIDs)
-	logger.Info("✅ FK-challenging data creation complete")
-	logger.Info("📊 Data created", "users", actualUsers, "posts", actualPosts, "total_changes", actualUsers+actualPosts)
-	logger.Info("🎯 FK challenge strategy", "approach", "posts created BEFORE their users", "pragma", "foreign_keys OFF/ON")
+	if verboseLog {
+		logger.Info("✅ FK-challenging data creation complete")
+		logger.Info("📊 Data created", "users", actualUsers, "posts", actualPosts, "total_changes", actualUsers+actualPosts)
+		logger.Info("🎯 FK challenge strategy", "approach", "posts created BEFORE their users", "pragma", "foreign_keys OFF/ON")
+	}
 
 	// Step 3: Upload FK-challenging data (this should trigger FK constraint violations and retries)
-	logger.Info("📱 Uploading FK-challenging data to server")
+	if verboseLog {
+		logger.Info("📱 Uploading FK-challenging data to server")
+	}
 
 	// Ensure apply_mode=0 before reading pending (safety against interrupted flows)
 	if err := s.app.ResetApplyMode(ctx); err != nil {
@@ -255,15 +287,21 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get pending changes count: %w", err)
 	}
-	logger.Info("📊 Pending changes before upload", "count", pendingCount)
+	if verboseLog {
+		logger.Info("📊 Pending changes before upload", "count", pendingCount)
+	}
 
 	// Resume uploads and trigger upload - this should cause FK constraint violations and retries
-	logger.Info("🚀 Starting upload with small batch sizes (will trigger FK constraint violations)")
+	if verboseLog {
+		logger.Info("🚀 Starting upload with small batch sizes (will trigger FK constraint violations)")
+	}
 
 	if client := s.app.GetClient(); client != nil {
 		client.ResumeUploads()
 		// Keep downloads paused; not needed for this phase
-		logger.Info("▶️ Resumed client uploads for FK-challenge upload phase")
+		if verboseLog {
+			logger.Info("▶️ Resumed client uploads for FK-challenge upload phase")
+		}
 	}
 
 	// Upload all pending changes in multiple small batches
@@ -277,7 +315,9 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get pending changes count after upload: %w", err)
 	}
-	logger.Info("📊 Pending changes after upload", "count", pendingCountAfter)
+	if verboseLog {
+		logger.Info("📊 Pending changes after upload", "count", pendingCountAfter)
+	}
 
 	// Wait a moment for any async operations to complete
 	time.Sleep(1 * time.Second)
@@ -285,7 +325,9 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	// Step 5: Test download sync with "phone" source ID (should get 0 records)
 	if client := s.app.GetClient(); client != nil {
 		client.ResumeDownloads()
-		logger.Info("▶️ Resumed phone client downloads for verification")
+		if verboseLog {
+			logger.Info("▶️ Resumed phone client downloads for verification")
+		}
 	}
 	err = s.testDownloadWithPhoneSourceID(ctx, logger)
 	if err != nil {
@@ -299,8 +341,10 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	}
 
 	// Multi-Stage Sync Testing
-	logger.Info("🚀 Starting Multi-Stage Sync Testing")
-	logger.Info("📊 Multi-stage test: Create new data on laptop, upload to server, verify phone downloads it")
+	if verboseLog {
+		logger.Info("🚀 Starting Multi-Stage Sync Testing")
+		logger.Info("📊 Multi-stage test: Create new data on laptop, upload to server, verify phone downloads it")
+	}
 
 	// Stage 1: Create additional data on laptop
 	err = s.stage1CreateAdditionalDataOnLaptop(ctx, logger)
@@ -332,8 +376,10 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("failed stage 5 - data verification: %w", err)
 	}
 
-	logger.Info("🎉 Multi-Stage Sync Testing completed successfully!")
-	logger.Info("🎉 FK Constraint Testing Scenario completed successfully!")
+	if verboseLog {
+		logger.Info("🎉 Multi-Stage Sync Testing completed successfully!")
+		logger.Info("🎉 FK Constraint Testing Scenario completed successfully!")
+	}
 	return nil
 }
 
@@ -342,33 +388,40 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 // This external verification is a no-op to avoid duplicate verification
 func (s *ComplexMultiBatchScenario) Verify(ctx context.Context, verifier *DatabaseVerifier) error {
 	logger := s.simulator.GetLogger()
-	logger.Info("✅ Complex scenario verification handled internally during execution")
+	if verboseLog {
+		logger.Info("✅ Complex scenario verification handled internally during execution")
+	}
 	return nil
 }
 
 // testDownloadWithPhoneSourceID tests download sync with phone's source ID (should get 0 records)
 func (s *ComplexMultiBatchScenario) testDownloadWithPhoneSourceID(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("📥 Testing download sync with phone source ID", "source_id", s.phoneSourceID)
-	logger.Info("📊 Expected result: 0 records (data already synced from this source)")
+	if verboseLog {
+		logger.Info("📥 Testing download sync with phone source ID", "source_id", s.phoneSourceID)
+		logger.Info("📊 Expected result: 0 records (data already synced from this source)")
+	}
 
 	// Perform download sync - should get 0 records since we uploaded from this phone
 	applied, nextAfter, err := s.app.PerformSyncDownload(ctx, batchSize)
 	if err != nil {
-		logger.Info("❌ Download with phone source ID failed", "error", err.Error())
+		logger.Warn("❌ Download with phone source ID failed", "error", err.Error())
 		return fmt.Errorf("download sync with phone source ID failed: %w", err)
 	}
 
-	logger.Info("📊 Download results", "applied", applied, "next_after", nextAfter)
-
-	logger.Info("✅ Download sync with phone source ID completed", "source_id", s.phoneSourceID)
-	logger.Info("📊 Result: No new records downloaded (expected behavior)")
+	if verboseLog {
+		logger.Info("📊 Download results", "applied", applied, "next_after", nextAfter)
+		logger.Info("✅ Download sync with phone source ID completed", "source_id", s.phoneSourceID)
+		logger.Info("📊 Result: No new records downloaded (expected behavior)")
+	}
 	return nil
 }
 
 // testDownloadWithLaptopSourceID tests download sync with laptop downloading from phone's data
 func (s *ComplexMultiBatchScenario) testDownloadWithLaptopSourceID(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("📥 Testing laptop download from phone's data", "laptop_source_id", s.laptopSourceID, "phone_source_id", s.phoneSourceID)
-	logger.Info("📊 Expected result: All 105 records (5 users + 100 posts)")
+	if verboseLog {
+		logger.Info("📥 Testing laptop download from phone's data", "laptop_source_id", s.laptopSourceID, "phone_source_id", s.phoneSourceID)
+		logger.Info("📊 Expected result: All 105 records (5 users + 100 posts)")
+	}
 
 	// Create a new mobile app with laptop source ID for download testing
 	err := s.createLaptopApp(ctx, logger)
@@ -388,13 +441,17 @@ func (s *ComplexMultiBatchScenario) testDownloadWithLaptopSourceID(ctx context.C
 		return fmt.Errorf("failed to verify downloaded data: %w", err)
 	}
 
-	logger.Info("✅ Laptop download from phone's data completed successfully", "laptop_source_id", s.laptopSourceID)
+	if verboseLog {
+		logger.Info("✅ Laptop download from phone's data completed successfully", "laptop_source_id", s.laptopSourceID)
+	}
 	return nil
 }
 
 // createLaptopApp creates a new mobile app with "laptop" source ID for download testing
 func (s *ComplexMultiBatchScenario) createLaptopApp(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("💻 Creating laptop app for download testing")
+	if verboseLog {
+		logger.Info("💻 Creating laptop app for download testing")
+	}
 
 	appConfig := &AppConfig{
 		SourceID:   s.laptopSourceID,
@@ -416,13 +473,17 @@ func (s *ComplexMultiBatchScenario) createLaptopApp(ctx context.Context, logger 
 
 	// Store the laptop app for later use
 	s.laptopApp = laptopApp
-	logger.Info("✅ Laptop app created successfully", "source_id", s.laptopSourceID)
+	if verboseLog {
+		logger.Info("✅ Laptop app created successfully", "source_id", s.laptopSourceID)
+	}
 	return nil
 }
 
 // performMultiBatchDownload performs multiple download requests until all data is received
 func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("📥 Starting multi-batch download with small batch sizes")
+	if verboseLog {
+		logger.Info("📥 Starting multi-batch download with small batch sizes")
+	}
 
 	// Get initial counts
 	initialUserCount, initialPostCount, err := s.getDataCounts(s.laptopApp)
@@ -430,7 +491,9 @@ func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Contex
 		return fmt.Errorf("failed to get initial laptop data counts: %w", err)
 	}
 
-	logger.Info("📊 Initial laptop database state", "users", initialUserCount, "posts", initialPostCount)
+	if verboseLog {
+		logger.Info("📊 Initial laptop database state", "users", initialUserCount, "posts", initialPostCount)
+	}
 
 	// Download all data in multiple small batches
 	downloadRound := 1
@@ -438,7 +501,9 @@ func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Contex
 	totalPostsDownloaded := 0
 
 	for {
-		logger.Info("📤 Download round", "round", downloadRound)
+		if verboseLog {
+			logger.Info("📤 Download round", "round", downloadRound)
+		}
 
 		// Get counts before this download round
 		usersBefore, postsBefore, err := s.getDataCounts(s.laptopApp)
@@ -449,11 +514,13 @@ func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Contex
 		// Perform one download batch
 		applied, nextAfter, err := s.laptopApp.PerformSyncDownload(ctx, batchSize)
 		if err != nil {
-			logger.Info("❌ Download round failed", "round", downloadRound, "error", err.Error())
+			logger.Warn("❌ Download round failed", "round", downloadRound, "error", err.Error())
 			return fmt.Errorf("failed to download in round %d: %w", downloadRound, err)
 		}
 
-		logger.Info("📊 Download batch results", "applied", applied, "next_after", nextAfter)
+		if verboseLog {
+			logger.Info("📊 Download batch results", "applied", applied, "next_after", nextAfter)
+		}
 
 		// Get counts after this download round
 		usersAfter, postsAfter, err := s.getDataCounts(s.laptopApp)
@@ -467,21 +534,25 @@ func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Contex
 		totalUsersDownloaded += usersDownloaded
 		totalPostsDownloaded += postsDownloaded
 
-		logger.Info("📈 Download round completed",
-			"round", downloadRound,
-			"users_downloaded", usersDownloaded,
-			"posts_downloaded", postsDownloaded,
-			"total_users", usersAfter,
-			"total_posts", postsAfter)
+		if verboseLog {
+			logger.Info("📈 Download round completed",
+				"round", downloadRound,
+				"users_downloaded", usersDownloaded,
+				"posts_downloaded", postsDownloaded,
+				"total_users", usersAfter,
+				"total_posts", postsAfter)
+		}
 
 		// Check if we got any new data in this round
 		if usersDownloaded == 0 && postsDownloaded == 0 {
-			logger.Info("✅ All data downloaded successfully")
-			logger.Info("📊 Download summary",
-				"total_rounds", downloadRound,
-				"total_users_downloaded", totalUsersDownloaded,
-				"total_posts_downloaded", totalPostsDownloaded,
-				"batch_size", batchSize)
+			if verboseLog {
+				logger.Info("✅ All data downloaded successfully")
+				logger.Info("📊 Download summary",
+					"total_rounds", downloadRound,
+					"total_users_downloaded", totalUsersDownloaded,
+					"total_posts_downloaded", totalPostsDownloaded,
+					"batch_size", batchSize)
+			}
 			break
 		}
 
@@ -498,7 +569,9 @@ func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Contex
 
 // verifyDownloadedData verifies that downloaded data matches the originally uploaded data
 func (s *ComplexMultiBatchScenario) verifyDownloadedData(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("🔍 Verifying downloaded data matches uploaded data")
+	if verboseLog {
+		logger.Info("🔍 Verifying downloaded data matches uploaded data")
+	}
 
 	// Get final counts
 	userCount, postCount, err := s.getDataCounts(s.laptopApp)
@@ -510,9 +583,11 @@ func (s *ComplexMultiBatchScenario) verifyDownloadedData(ctx context.Context, lo
 	expectedUsers := len(s.testData.UserIDs)
 	expectedPosts := len(s.testData.PostIDs)
 
-	logger.Info("📊 Data count verification",
-		"expected_users", expectedUsers, "actual_users", userCount,
-		"expected_posts", expectedPosts, "actual_posts", postCount)
+	if verboseLog {
+		logger.Info("📊 Data count verification",
+			"expected_users", expectedUsers, "actual_users", userCount,
+			"expected_posts", expectedPosts, "actual_posts", postCount)
+	}
 
 	if userCount != expectedUsers {
 		return fmt.Errorf("user count mismatch: expected %d, got %d", expectedUsers, userCount)
@@ -540,8 +615,10 @@ func (s *ComplexMultiBatchScenario) verifyDownloadedData(ctx context.Context, lo
 		return fmt.Errorf("FK relationship verification failed: %w", err)
 	}
 
-	logger.Info("✅ Downloaded data verification completed successfully")
-	logger.Info("📊 All user IDs, post IDs, and FK relationships verified")
+	if verboseLog {
+		logger.Info("✅ Downloaded data verification completed successfully")
+		logger.Info("📊 All user IDs, post IDs, and FK relationships verified")
+	}
 	return nil
 }
 
@@ -549,7 +626,9 @@ func (s *ComplexMultiBatchScenario) verifyDownloadedData(ctx context.Context, lo
 func (s *ComplexMultiBatchScenario) verifyUserIDs(logger *slog.Logger) error {
 	db := s.laptopApp.GetDatabase()
 
-	logger.Info("🔍 Verifying user IDs", "expected_count", len(s.testData.UserIDs))
+	if verboseLog {
+		logger.Info("🔍 Verifying user IDs", "expected_count", len(s.testData.UserIDs))
+	}
 
 	for i, expectedUserID := range s.testData.UserIDs {
 		var count int
@@ -562,10 +641,14 @@ func (s *ComplexMultiBatchScenario) verifyUserIDs(logger *slog.Logger) error {
 			return fmt.Errorf("user ID %s not found in laptop database", expectedUserID)
 		}
 
-		logger.Info("✅ User ID verified", "index", i+1, "user_id", expectedUserID)
+		if verboseLog {
+			logger.Info("✅ User ID verified", "index", i+1, "user_id", expectedUserID)
+		}
 	}
 
-	logger.Info("✅ All user IDs verified successfully")
+	if verboseLog {
+		logger.Info("✅ All user IDs verified successfully")
+	}
 	return nil
 }
 
@@ -573,7 +656,9 @@ func (s *ComplexMultiBatchScenario) verifyUserIDs(logger *slog.Logger) error {
 func (s *ComplexMultiBatchScenario) verifyPostIDs(logger *slog.Logger) error {
 	db := s.laptopApp.GetDatabase()
 
-	logger.Info("🔍 Verifying post IDs", "expected_count", len(s.testData.PostIDs))
+	if verboseLog {
+		logger.Info("🔍 Verifying post IDs", "expected_count", len(s.testData.PostIDs))
+	}
 
 	for i, expectedPostID := range s.testData.PostIDs {
 		var count int
@@ -587,11 +672,15 @@ func (s *ComplexMultiBatchScenario) verifyPostIDs(logger *slog.Logger) error {
 		}
 
 		if (i+1)%20 == 0 { // Log every 20 posts to avoid spam
-			logger.Info("✅ Post IDs verified", "verified_count", i+1, "total", len(s.testData.PostIDs))
+			if verboseLog {
+				logger.Info("✅ Post IDs verified", "verified_count", i+1, "total", len(s.testData.PostIDs))
+			}
 		}
 	}
 
-	logger.Info("✅ All post IDs verified successfully")
+	if verboseLog {
+		logger.Info("✅ All post IDs verified successfully")
+	}
 	return nil
 }
 
@@ -599,7 +688,9 @@ func (s *ComplexMultiBatchScenario) verifyPostIDs(logger *slog.Logger) error {
 func (s *ComplexMultiBatchScenario) verifyFKRelationships(logger *slog.Logger) error {
 	db := s.laptopApp.GetDatabase()
 
-	logger.Info("🔍 Verifying FK relationships")
+	if verboseLog {
+		logger.Info("🔍 Verifying FK relationships")
+	}
 
 	// Count posts with valid FK relationships
 	var validFKCount int
@@ -616,7 +707,9 @@ func (s *ComplexMultiBatchScenario) verifyFKRelationships(logger *slog.Logger) e
 		return fmt.Errorf("FK relationship mismatch: expected %d posts with valid FKs, got %d", expectedPosts, validFKCount)
 	}
 
-	logger.Info("✅ All FK relationships verified successfully", "valid_relationships", validFKCount)
+	if verboseLog {
+		logger.Info("✅ All FK relationships verified successfully", "valid_relationships", validFKCount)
+	}
 	return nil
 }
 
@@ -641,17 +734,21 @@ func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Co
 		}
 
 		if pendingBefore == 0 {
-			logger.Info("✅ All changes uploaded successfully", "device", deviceName)
-			logger.Info("📊 Upload summary", "device", deviceName, "total_rounds", uploadRound-1, "batch_size", batchSize, "strategy", "FK constraint retry logic")
+			if verboseLog {
+				logger.Info("✅ All changes uploaded successfully", "device", deviceName)
+				logger.Info("📊 Upload summary", "device", deviceName, "total_rounds", uploadRound-1, "batch_size", batchSize, "strategy", "FK constraint retry logic")
+			}
 			break
 		}
 
-		logger.Info("📤 Upload round", "device", deviceName, "round", uploadRound, "pending_changes", pendingBefore)
+		if verboseLog {
+			logger.Info("📤 Upload round", "device", deviceName, "round", uploadRound, "pending_changes", pendingBefore)
+		}
 
 		// Upload one batch and inspect the response
 		err = app.PerformSyncUpload(ctx)
 		if err != nil {
-			logger.Info("❌ Upload round failed", "device", deviceName, "round", uploadRound, "error", err.Error())
+			logger.Warn("❌ Upload round failed", "device", deviceName, "round", uploadRound, "error", err.Error())
 			return fmt.Errorf("failed to upload changes in round %d: %w", uploadRound, err)
 		}
 
@@ -662,7 +759,9 @@ func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Co
 		}
 
 		uploaded := pendingBefore - pendingAfter
-		logger.Info("📈 Upload round completed", "device", deviceName, "round", uploadRound, "uploaded", uploaded, "remaining", pendingAfter)
+		if verboseLog {
+			logger.Info("📈 Upload round completed", "device", deviceName, "round", uploadRound, "uploaded", uploaded, "remaining", pendingAfter)
+		}
 
 		// Safety check to prevent infinite loops
 		if uploadRound > maxRounds {
@@ -680,12 +779,16 @@ func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Co
 	if err := app.DebugVerifyPendingCleared(ctx); err != nil {
 		logger.Warn("Post-upload pending verification failed", "device", deviceName, "error", err.Error())
 	} else {
-		logger.Info("✅ Pending queue cleared after upload", "device", deviceName)
+		if verboseLog {
+			logger.Info("✅ Pending queue cleared after upload", "device", deviceName)
+		}
 	}
 	if err := app.DebugVerifyBusinessFKIntegrity(ctx); err != nil {
 		logger.Warn("Business FK integrity check failed", "device", deviceName, "error", err.Error())
 	} else {
-		logger.Info("✅ Business FK integrity verified (simulator check)", "device", deviceName)
+		if verboseLog {
+			logger.Info("✅ Business FK integrity verified (simulator check)", "device", deviceName)
+		}
 	}
 	return nil
 }
@@ -710,9 +813,11 @@ func (s *ComplexMultiBatchScenario) getDataCounts(app *MobileApp) (int, int, err
 
 // stage1CreateAdditionalDataOnLaptop creates 20 new users and 400 new posts on laptop
 func (s *ComplexMultiBatchScenario) stage1CreateAdditionalDataOnLaptop(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("🏁 STAGE 1: Creating Additional Data on Laptop")
-	logger.Info("📊 Target: 20 new users + 400 new posts (20 posts per user) = 420 total records")
-	logger.Info("🎯 Strategy: Create posts BEFORE users to test FK constraint handling")
+	if verboseLog {
+		logger.Info("🏁 STAGE 1: Creating Additional Data on Laptop")
+		logger.Info("📊 Target: 20 new users + 400 new posts (20 posts per user) = 420 total records")
+		logger.Info("🎯 Strategy: Create posts BEFORE users to test FK constraint handling")
+	}
 
 	// Verify laptop app is ready
 	if s.laptopApp == nil {
@@ -724,19 +829,25 @@ func (s *ComplexMultiBatchScenario) stage1CreateAdditionalDataOnLaptop(ctx conte
 	if err != nil {
 		return fmt.Errorf("failed to get current laptop data counts: %w", err)
 	}
-	logger.Info("📊 Current laptop state", "users", currentUsers, "posts", currentPosts)
+	if verboseLog {
+		logger.Info("📊 Current laptop state", "users", currentUsers, "posts", currentPosts)
+	}
 
 	// Initialize storage for new data
 	totalNewPosts := newUsersStage2 * newPostsPerUser
 	s.testData.NewUserIDs = make([]string, newUsersStage2)
 	s.testData.NewPostIDs = make([]string, totalNewPosts)
 
-	logger.Info("📊 Stage 1 configuration", "new_users", newUsersStage2, "posts_per_user", newPostsPerUser, "total_new_posts", totalNewPosts)
+	if verboseLog {
+		logger.Info("📊 Stage 1 configuration", "new_users", newUsersStage2, "posts_per_user", newPostsPerUser, "total_new_posts", totalNewPosts)
+	}
 
 	// Prevent background sync from draining pending changes during laptop creation
 	s.laptopApp.StopSync()  // ensure no in-flight txs or loops
 	s.laptopApp.PauseSync() // belt-and-suspenders: pause at client layer too
-	logger.Info("⏸️ Paused laptop client sync during offline creation")
+	if verboseLog {
+		logger.Info("⏸️ Paused laptop client sync during offline creation")
+	}
 
 	// Ensure apply_mode=0 so local triggers capture pending changes deterministically
 	if err := s.laptopApp.ResetApplyMode(ctx); err != nil {
@@ -747,19 +858,25 @@ func (s *ComplexMultiBatchScenario) stage1CreateAdditionalDataOnLaptop(ctx conte
 	db := s.laptopApp.GetDatabase()
 	// Best-effort clear any stray transaction
 	_, _ = db.Exec("ROLLBACK")
-	logger.Info("⏱️ About to begin laptop creation transaction")
+	if verboseLog {
+		logger.Info("⏱️ About to begin laptop creation transaction")
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin tx for laptop creation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	logger.Info("✅ Laptop creation transaction begun")
+	if verboseLog {
+		logger.Info("✅ Laptop creation transaction begun")
+	}
 	if _, err := tx.Exec("PRAGMA defer_foreign_keys = ON"); err != nil {
 		return fmt.Errorf("failed to enable deferred FKs in tx (laptop): %w", err)
 	}
 
 	// Create data in FK-challenging order using deferred FKs within the tx
-	logger.Info("🔄 Creating new data in FK-challenging order (tx): posts BEFORE users")
+	if verboseLog {
+		logger.Info("🔄 Creating new data in FK-challenging order (tx): posts BEFORE users")
+	}
 
 	postIndex := 0
 	for userGroup := 0; userGroup < newUsersStage2; userGroup++ {
@@ -782,8 +899,8 @@ func (s *ComplexMultiBatchScenario) stage1CreateAdditionalDataOnLaptop(ctx conte
 			//logger.Info("📝 New post created", "id", newPostID, "title", title, "author_id", newUserID)
 			postIndex++
 
-			// Log progress every 50 posts
-			if postIndex%50 == 0 {
+			// Log progress every 100 posts
+			if postIndex%100 == 0 && verboseLog {
 				logger.Info("📈 New posts creation progress", "created", postIndex, "total", totalNewPosts)
 			}
 		}
@@ -794,32 +911,40 @@ func (s *ComplexMultiBatchScenario) stage1CreateAdditionalDataOnLaptop(ctx conte
 			return fmt.Errorf("failed to create new user %d: %w", userGroup+1, err)
 		}
 
-		logger.Info("👤 New user created", "id", newUserID, "name", userName)
-		logger.Info("✅ FK-challenging group complete", "group", userGroup+1, "posts_created", newPostsPerUser, "user_created", 1)
+		if verboseLog {
+			logger.Info("👤 New user created", "id", newUserID, "name", userName)
+			logger.Info("✅ FK-challenging group complete", "group", userGroup+1, "posts_created", newPostsPerUser, "user_created", 1)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit laptop creation tx: %w", err)
 	}
-	logger.Info("✅ Laptop FK-challenging data creation committed (FKs verified at COMMIT)")
+	if verboseLog {
+		logger.Info("✅ Laptop FK-challenging data creation committed (FKs verified at COMMIT)")
+	}
 
 	// Verify data creation
 	actualNewUsers := len(s.testData.NewUserIDs)
 	actualNewPosts := len(s.testData.NewPostIDs)
 	totalNewRecords := actualNewUsers + actualNewPosts
 
-	logger.Info("✅ Stage 1 completed successfully")
-	logger.Info("📊 New data created", "users", actualNewUsers, "posts", actualNewPosts, "total_records", totalNewRecords)
-	logger.Info("🎯 FK challenge strategy", "approach", "posts created BEFORE their users", "pragma", "foreign_keys OFF/ON")
+	if verboseLog {
+		logger.Info("✅ Stage 1 completed successfully")
+		logger.Info("📊 New data created", "users", actualNewUsers, "posts", actualNewPosts, "total_records", totalNewRecords)
+		logger.Info("🎯 FK challenge strategy", "approach", "posts created BEFORE their users", "pragma", "foreign_keys OFF/ON")
+	}
 
 	return nil
 }
 
 // stage2UploadNewDataFromLaptop uploads the 420 new records from laptop to server
 func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("🏁 STAGE 2: Upload New Data from Laptop")
-	logger.Info("📊 Target: Upload 420 new records (20 users + 400 posts) using 50-record batches")
-	logger.Info("🎯 Expected: Multiple upload rounds due to FK constraints and batch size limits")
+	if verboseLog {
+		logger.Info("🏁 STAGE 2: Upload New Data from Laptop")
+		logger.Info("📊 Target: Upload 420 new records (20 users + 400 posts) using 50-record batches")
+		logger.Info("🎯 Expected: Multiple upload rounds due to FK constraints and batch size limits")
+	}
 
 	// Ensure apply_mode=0 before reading pending (safety against interrupted flows)
 	if err := s.laptopApp.ResetApplyMode(ctx); err != nil {
@@ -833,7 +958,9 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 	}
 
 	expectedNewRecords := newUsersStage2 + (newUsersStage2 * newPostsPerUser)
-	logger.Info("📊 Pending changes before upload", "count", pendingBefore, "expected", expectedNewRecords)
+	if verboseLog {
+		logger.Info("📊 Pending changes before upload", "count", pendingBefore, "expected", expectedNewRecords)
+	}
 
 	// Allow some flexibility in pending count due to sync system behavior
 	if pendingBefore < expectedNewRecords {
@@ -847,16 +974,20 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 	// INVESTIGATION: Check what's actually in the pending changes
 	err = s.investigatePendingChanges(ctx, logger)
 	if err != nil {
-		logger.Info("⚠️ Failed to investigate pending changes", "error", err.Error())
+		logger.Warn("⚠️ Failed to investigate pending changes", "error", err.Error())
 	}
 
-	logger.Info("🚀 Starting upload with small batch sizes (will trigger FK constraint violations)")
+	if verboseLog {
+		logger.Info("🚀 Starting upload with small batch sizes (will trigger FK constraint violations)")
+	}
 
 	// Resume uploads now that creation is complete and pending has been verified
 	if client := s.laptopApp.GetClient(); client != nil {
 		client.ResumeUploads()
 		// Keep downloads paused to avoid noisy interference; download verification happens later explicitly
-		logger.Info("▶️ Resumed laptop client uploads for Stage 2")
+		if verboseLog {
+			logger.Info("▶️ Resumed laptop client uploads for Stage 2")
+		}
 	}
 
 	// Perform multi-batch upload using existing helper
@@ -881,20 +1012,26 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 		return fmt.Errorf("failed to get upload watermark: %w", err)
 	}
 
-	logger.Info("✅ Stage 2 completed successfully")
-	logger.Info("📊 Upload summary", "total_uploaded", expectedNewRecords, "remaining_pending", pendingAfter, "watermark", s.uploadWatermark)
+	if verboseLog {
+		logger.Info("✅ Stage 2 completed successfully")
+		logger.Info("📊 Upload summary", "total_uploaded", expectedNewRecords, "remaining_pending", pendingAfter, "watermark", s.uploadWatermark)
+	}
 
 	return nil
 }
 
 // stage3DownloadVerificationLaptop verifies laptop gets 0 records (already fully synced)
 func (s *ComplexMultiBatchScenario) stage3DownloadVerificationLaptop(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("🏁 STAGE 3: Download Verification - Laptop (Should Get 0 Records)")
-	logger.Info("📊 Expected result: 0 records downloaded (laptop is already fully synced)")
+	if verboseLog {
+		logger.Info("🏁 STAGE 3: Download Verification - Laptop (Should Get 0 Records)")
+		logger.Info("📊 Expected result: 0 records downloaded (laptop is already fully synced)")
+	}
 
 	if client := s.laptopApp.GetClient(); client != nil {
 		client.ResumeDownloads()
-		logger.Info("▶️ Resumed laptop client downloads for Stage 3")
+		if verboseLog {
+			logger.Info("▶️ Resumed laptop client downloads for Stage 3")
+		}
 	}
 
 	// Get data counts before download
@@ -903,16 +1040,20 @@ func (s *ComplexMultiBatchScenario) stage3DownloadVerificationLaptop(ctx context
 		return fmt.Errorf("failed to get laptop data counts before download: %w", err)
 	}
 
-	logger.Info("📊 Laptop data before download", "users", usersBefore, "posts", postsBefore)
+	if verboseLog {
+		logger.Info("📊 Laptop data before download", "users", usersBefore, "posts", postsBefore)
+	}
 
 	// Perform download sync - should get 0 records since laptop uploaded the data
 	applied, nextAfter, err := s.laptopApp.PerformSyncDownload(ctx, batchSize)
 	if err != nil {
-		logger.Info("❌ Download verification on laptop failed", "error", err.Error())
+		logger.Warn("❌ Download verification on laptop failed", "error", err.Error())
 		return fmt.Errorf("download sync on laptop failed: %w", err)
 	}
 
-	logger.Info("📊 Download results", "device", "laptop", "applied", applied, "next_after", nextAfter)
+	if verboseLog {
+		logger.Info("📊 Download results", "device", "laptop", "applied", applied, "next_after", nextAfter)
+	}
 
 	// Get data counts after download
 	usersAfter, postsAfter, err := s.getDataCounts(s.laptopApp)
@@ -932,19 +1073,25 @@ func (s *ComplexMultiBatchScenario) stage3DownloadVerificationLaptop(ctx context
 		return fmt.Errorf("unexpected data downloaded: %d users, %d posts (expected 0, 0)", usersDownloaded, postsDownloaded)
 	}
 
-	logger.Info("✅ Stage 3 completed successfully")
-	logger.Info("📊 Verification result", "device", "laptop", "users_downloaded", usersDownloaded, "posts_downloaded", postsDownloaded, "expected", "0, 0")
+	if verboseLog {
+		logger.Info("✅ Stage 3 completed successfully")
+		logger.Info("📊 Verification result", "device", "laptop", "users_downloaded", usersDownloaded, "posts_downloaded", postsDownloaded, "expected", "0, 0")
+	}
 
 	return nil
 }
 
 // stage4DownloadVerificationPhone verifies phone gets all new records from laptop (progress-based paging)
 func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("🏁 STAGE 4: Download Verification - Phone (Should Get All New Records)")
+	if verboseLog {
+		logger.Info("🏁 STAGE 4: Download Verification - Phone (Should Get All New Records)")
+	}
 
 	if client := s.app.GetClient(); client != nil {
 		client.ResumeDownloads()
-		logger.Info("▶️ Ensured phone client downloads are resumed for Stage 4")
+		if verboseLog {
+			logger.Info("▶️ Ensured phone client downloads are resumed for Stage 4")
+		}
 	}
 
 	// Compute the expected delta based on the phone's current snapshot.
@@ -972,30 +1119,38 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 	}
 	expectedNewRecords := expUsersDelta + expPostsDelta
 
-	logger.Info("📊 Expected result (dynamic)",
-		"target_total_users", targetTotalUsers,
-		"target_total_posts", targetTotalPosts,
-		"phone_users_before", usersBefore,
-		"phone_posts_before", postsBefore,
-		"expected_users_delta", expUsersDelta,
-		"expected_posts_delta", expPostsDelta,
-		"expected_total_delta", expectedNewRecords)
+	if verboseLog {
+		logger.Info("📊 Expected result (dynamic)",
+			"target_total_users", targetTotalUsers,
+			"target_total_posts", targetTotalPosts,
+			"phone_users_before", usersBefore,
+			"phone_posts_before", postsBefore,
+			"expected_users_delta", expUsersDelta,
+			"expected_posts_delta", expPostsDelta,
+			"expected_total_delta", expectedNewRecords)
 
-	logger.Info("📊 Phone data before download", "users", usersBefore, "posts", postsBefore)
+		logger.Info("📊 Phone data before download", "users", usersBefore, "posts", postsBefore)
+	}
 
 	// If there's nothing new expected, we're done.
 	if expectedNewRecords == 0 {
-		logger.Info("✅ No new records expected for download; skipping Stage 4")
+		if verboseLog {
+			logger.Info("✅ No new records expected for download; skipping Stage 4")
+		}
 		return nil
 	}
 
 	// Use a frozen server-side ceiling to avoid interleaving with concurrent writes
-	logger.Info("📥 Starting windowed multi-batch download to upload watermark", "until", s.uploadWatermark)
+	if verboseLog {
+		logger.Info("📥 Starting windowed multi-batch download to upload watermark", "until", s.uploadWatermark)
+	}
 	totalApplied, lastAfter, err := s.app.SyncDownloadToWatermark(ctx, batchSize, s.uploadWatermark)
 	if err != nil {
 		return fmt.Errorf("download to watermark failed: %w", err)
 	}
-	logger.Info("📊 Windowed download complete", "applied", totalApplied, "last_after", lastAfter, "until", s.uploadWatermark)
+	if verboseLog {
+		logger.Info("📊 Windowed download complete", "applied", totalApplied, "last_after", lastAfter, "until", s.uploadWatermark)
+	}
 
 	// Verify we reached the target totals (stronger check than deltas)
 	usersAfter, postsAfter, err := s.getDataCounts(s.app)
@@ -1007,16 +1162,20 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 			targetTotalUsers, targetTotalPosts, usersAfter, postsAfter)
 	}
 
-	logger.Info("✅ Stage 4 completed successfully")
-	logger.Info("📊 Download verification", "device", "phone", "users_total", usersAfter, "posts_total", postsAfter, "targets", fmt.Sprintf("users=%d posts=%d", targetTotalUsers, targetTotalPosts))
+	if verboseLog {
+		logger.Info("✅ Stage 4 completed successfully")
+		logger.Info("📊 Download verification", "device", "phone", "users_total", usersAfter, "posts_total", postsAfter, "targets", fmt.Sprintf("users=%d posts=%d", targetTotalUsers, targetTotalPosts))
+	}
 
 	return nil
 }
 
 // stage5DataVerification performs comprehensive verification of the multi-stage sync
 func (s *ComplexMultiBatchScenario) stage5DataVerification(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("🏁 STAGE 5: Data Verification")
-	logger.Info("📊 Comprehensive verification of multi-stage sync results")
+	if verboseLog {
+		logger.Info("🏁 STAGE 5: Data Verification")
+		logger.Info("📊 Comprehensive verification of multi-stage sync results")
+	}
 
 	// Get final counts on phone
 	finalUsers, finalPosts, err := s.getDataCounts(s.app)
@@ -1028,9 +1187,11 @@ func (s *ComplexMultiBatchScenario) stage5DataVerification(ctx context.Context, 
 	expectedTotalUsers := totalUsers + newUsersStage2
 	expectedTotalPosts := (totalUsers * postsPerUser) + (newUsersStage2 * newPostsPerUser)
 
-	logger.Info("📊 Final data count verification",
-		"expected_total_users", expectedTotalUsers, "actual_users", finalUsers,
-		"expected_total_posts", expectedTotalPosts, "actual_posts", finalPosts)
+	if verboseLog {
+		logger.Info("📊 Final data count verification",
+			"expected_total_users", expectedTotalUsers, "actual_users", finalUsers,
+			"expected_total_posts", expectedTotalPosts, "actual_posts", finalPosts)
+	}
 
 	// Verify total counts
 	if finalUsers != expectedTotalUsers {
@@ -1065,9 +1226,11 @@ func (s *ComplexMultiBatchScenario) stage5DataVerification(ctx context.Context, 
 		return fmt.Errorf("original data integrity verification failed: %w", err)
 	}
 
-	logger.Info("✅ Stage 5 completed successfully")
-	logger.Info("📊 All verification checks passed")
-	logger.Info("🎯 Multi-stage sync test: FULLY SUCCESSFUL")
+	if verboseLog {
+		logger.Info("✅ Stage 5 completed successfully")
+		logger.Info("📊 All verification checks passed")
+		logger.Info("🎯 Multi-stage sync test: FULLY SUCCESSFUL")
+	}
 
 	return nil
 }
@@ -1076,7 +1239,9 @@ func (s *ComplexMultiBatchScenario) stage5DataVerification(ctx context.Context, 
 func (s *ComplexMultiBatchScenario) verifyNewUserIDsOnPhone(logger *slog.Logger) error {
 	db := s.app.GetDatabase()
 
-	logger.Info("🔍 Verifying new user IDs on phone", "expected_count", len(s.testData.NewUserIDs))
+	if verboseLog {
+		logger.Info("🔍 Verifying new user IDs on phone", "expected_count", len(s.testData.NewUserIDs))
+	}
 
 	for _, expectedNewUserID := range s.testData.NewUserIDs {
 		var count int
@@ -1092,7 +1257,9 @@ func (s *ComplexMultiBatchScenario) verifyNewUserIDsOnPhone(logger *slog.Logger)
 		//logger.Info("✅ New user ID verified on phone", "index", i+1, "user_id", expectedNewUserID)
 	}
 
-	logger.Info("✅ All new user IDs verified successfully on phone")
+	if verboseLog {
+		logger.Info("✅ All new user IDs verified successfully on phone")
+	}
 	return nil
 }
 
@@ -1100,7 +1267,9 @@ func (s *ComplexMultiBatchScenario) verifyNewUserIDsOnPhone(logger *slog.Logger)
 func (s *ComplexMultiBatchScenario) verifyNewPostIDsOnPhone(logger *slog.Logger) error {
 	db := s.app.GetDatabase()
 
-	logger.Info("🔍 Verifying new post IDs on phone", "expected_count", len(s.testData.NewPostIDs))
+	if verboseLog {
+		logger.Info("🔍 Verifying new post IDs on phone", "expected_count", len(s.testData.NewPostIDs))
+	}
 
 	for _, expectedNewPostID := range s.testData.NewPostIDs {
 		var count int
@@ -1118,7 +1287,9 @@ func (s *ComplexMultiBatchScenario) verifyNewPostIDsOnPhone(logger *slog.Logger)
 		//}
 	}
 
-	logger.Info("✅ All new post IDs verified successfully on phone")
+	if verboseLog {
+		logger.Info("✅ All new post IDs verified successfully on phone")
+	}
 	return nil
 }
 
@@ -1126,7 +1297,9 @@ func (s *ComplexMultiBatchScenario) verifyNewPostIDsOnPhone(logger *slog.Logger)
 func (s *ComplexMultiBatchScenario) verifyNewFKRelationshipsOnPhone(logger *slog.Logger) error {
 	db := s.app.GetDatabase()
 
-	logger.Info("🔍 Verifying new FK relationships on phone")
+	if verboseLog {
+		logger.Info("🔍 Verifying new FK relationships on phone")
+	}
 
 	// Count new posts with valid FK relationships to new users
 	var validNewFKCount int
@@ -1145,7 +1318,9 @@ func (s *ComplexMultiBatchScenario) verifyNewFKRelationshipsOnPhone(logger *slog
 		return fmt.Errorf("new FK relationship mismatch: expected %d new posts with valid FKs, got %d", expectedNewPosts, validNewFKCount)
 	}
 
-	logger.Info("✅ All new FK relationships verified successfully on phone", "valid_new_relationships", validNewFKCount)
+	if verboseLog {
+		logger.Info("✅ All new FK relationships verified successfully on phone", "valid_new_relationships", validNewFKCount)
+	}
 	return nil
 }
 
@@ -1153,7 +1328,9 @@ func (s *ComplexMultiBatchScenario) verifyNewFKRelationshipsOnPhone(logger *slog
 func (s *ComplexMultiBatchScenario) verifyOriginalDataIntegrity(logger *slog.Logger) error {
 	db := s.app.GetDatabase()
 
-	logger.Info("🔍 Verifying original data integrity on phone")
+	if verboseLog {
+		logger.Info("🔍 Verifying original data integrity on phone")
+	}
 
 	// Verify all original user IDs are still present
 	for i, originalUserID := range s.testData.UserIDs {
@@ -1168,7 +1345,9 @@ func (s *ComplexMultiBatchScenario) verifyOriginalDataIntegrity(logger *slog.Log
 		}
 
 		if i == 0 || i == len(s.testData.UserIDs)-1 { // Log first and last
-			logger.Info("✅ Original user ID verified", "index", i+1, "user_id", originalUserID)
+			if verboseLog {
+				logger.Info("✅ Original user ID verified", "index", i+1, "user_id", originalUserID)
+			}
 		}
 	}
 
@@ -1185,7 +1364,9 @@ func (s *ComplexMultiBatchScenario) verifyOriginalDataIntegrity(logger *slog.Log
 		}
 
 		if (i+1)%50 == 0 { // Log every 50 posts
-			logger.Info("✅ Original post IDs verified", "verified_count", i+1, "total", len(s.testData.PostIDs))
+			if verboseLog {
+				logger.Info("✅ Original post IDs verified", "verified_count", i+1, "total", len(s.testData.PostIDs))
+			}
 		}
 	}
 
@@ -1206,8 +1387,10 @@ func (s *ComplexMultiBatchScenario) verifyOriginalDataIntegrity(logger *slog.Log
 		return fmt.Errorf("original FK relationship mismatch: expected %d original posts with valid FKs, got %d", expectedOriginalPosts, validOriginalFKCount)
 	}
 
-	logger.Info("✅ Original data integrity verified successfully on phone")
-	logger.Info("📊 Original data counts", "users", len(s.testData.UserIDs), "posts", len(s.testData.PostIDs), "valid_fk_relationships", validOriginalFKCount)
+	if verboseLog {
+		logger.Info("✅ Original data integrity verified successfully on phone")
+		logger.Info("📊 Original data counts", "users", len(s.testData.UserIDs), "posts", len(s.testData.PostIDs), "valid_fk_relationships", validOriginalFKCount)
+	}
 	return nil
 }
 
@@ -1233,16 +1416,17 @@ func (s *ComplexMultiBatchScenario) stringSliceToInterface(slice []string) []int
 
 // investigatePendingChanges investigates what's in the pending changes to understand the issue
 func (s *ComplexMultiBatchScenario) investigatePendingChanges(ctx context.Context, logger *slog.Logger) error {
-	logger.Info("🔍 INVESTIGATION: Analyzing pending changes on laptop")
+	if verboseLog {
+		logger.Info("🔍 INVESTIGATION: Analyzing pending changes on laptop")
+	}
 
 	db := s.laptopApp.GetDatabase()
 
-	// Query the sync metadata to see what changes are pending
+	// Query the oversqlite pending queue to see what changes are pending
 	rows, err := db.Query(`
-		SELECT table_name, operation, primary_key, status, created_at
-		FROM oversync_changes
-		WHERE status = 'pending'
-		ORDER BY created_at DESC
+		SELECT table_name, op, pk_uuid, base_version, change_id, queued_at
+		FROM _sync_pending
+		ORDER BY queued_at DESC
 		LIMIT 50
 	`)
 	if err != nil {
@@ -1251,29 +1435,33 @@ func (s *ComplexMultiBatchScenario) investigatePendingChanges(ctx context.Contex
 	defer rows.Close()
 
 	var pendingChanges []struct {
-		Table     string
-		Operation string
-		PK        string
-		Status    string
-		CreatedAt string
+		Table       string
+		Operation   string
+		PK          string
+		BaseVersion int64
+		ChangeID    *int64
+		QueuedAt    string
 	}
 
 	for rows.Next() {
 		var change struct {
-			Table     string
-			Operation string
-			PK        string
-			Status    string
-			CreatedAt string
+			Table       string
+			Operation   string
+			PK          string
+			BaseVersion int64
+			ChangeID    *int64
+			QueuedAt    string
 		}
-		err := rows.Scan(&change.Table, &change.Operation, &change.PK, &change.Status, &change.CreatedAt)
+		err := rows.Scan(&change.Table, &change.Operation, &change.PK, &change.BaseVersion, &change.ChangeID, &change.QueuedAt)
 		if err != nil {
 			return fmt.Errorf("failed to scan pending change: %w", err)
 		}
 		pendingChanges = append(pendingChanges, change)
 	}
 
-	logger.Info("📊 Pending changes analysis", "total_found", len(pendingChanges))
+	if verboseLog {
+		logger.Info("📊 Pending changes analysis", "total_found", len(pendingChanges))
+	}
 
 	// Count by table and operation
 	userInserts := 0
@@ -1291,20 +1479,25 @@ func (s *ComplexMultiBatchScenario) investigatePendingChanges(ctx context.Contex
 
 		// Log first 10 changes for detailed analysis
 		if i < 10 {
-			logger.Info("🔍 Pending change detail",
-				"index", i+1,
-				"table", change.Table,
-				"operation", change.Operation,
-				"pk", change.PK,
-				"status", change.Status,
-				"created_at", change.CreatedAt)
+			if verboseLog {
+				logger.Info("🔍 Pending change detail",
+					"index", i+1,
+					"table", change.Table,
+					"operation", change.Operation,
+					"pk", change.PK,
+					"base_version", change.BaseVersion,
+					"change_id", change.ChangeID,
+					"queued_at", change.QueuedAt)
+			}
 		}
 	}
 
-	logger.Info("📊 Pending changes breakdown",
-		"user_inserts", userInserts,
-		"post_inserts", postInserts,
-		"other_changes", otherChanges)
+	if verboseLog {
+		logger.Info("📊 Pending changes breakdown",
+			"user_inserts", userInserts,
+			"post_inserts", postInserts,
+			"other_changes", otherChanges)
+	}
 
 	// Check if any of the pending changes match our original data
 	originalDataInPending := 0
@@ -1313,7 +1506,7 @@ func (s *ComplexMultiBatchScenario) investigatePendingChanges(ctx context.Contex
 		for _, originalUserID := range s.testData.UserIDs {
 			if change.PK == originalUserID {
 				originalDataInPending++
-				logger.Info("⚠️ FOUND ORIGINAL DATA IN PENDING",
+				logger.Warn("⚠️ FOUND ORIGINAL DATA IN PENDING",
 					"table", change.Table,
 					"pk", change.PK,
 					"operation", change.Operation)
@@ -1325,7 +1518,7 @@ func (s *ComplexMultiBatchScenario) investigatePendingChanges(ctx context.Contex
 		for _, originalPostID := range s.testData.PostIDs {
 			if change.PK == originalPostID {
 				originalDataInPending++
-				logger.Info("⚠️ FOUND ORIGINAL DATA IN PENDING",
+				logger.Warn("⚠️ FOUND ORIGINAL DATA IN PENDING",
 					"table", change.Table,
 					"pk", change.PK,
 					"operation", change.Operation)
@@ -1339,7 +1532,9 @@ func (s *ComplexMultiBatchScenario) investigatePendingChanges(ctx context.Contex
 			"original_data_in_pending", originalDataInPending)
 		logger.Info("💡 This suggests oversqlite is incorrectly marking downloaded records as local changes")
 	} else {
-		logger.Info("✅ No original data found in pending changes - this is expected")
+		if verboseLog {
+			logger.Info("✅ No original data found in pending changes - this is expected")
+		}
 	}
 
 	return nil

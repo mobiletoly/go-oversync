@@ -43,7 +43,9 @@ func (r *Reporter) StartScenario(name, description string) *ScenarioReport {
 
 	r.reports = append(r.reports, *report)
 
-	r.logger.Info("📊 Started scenario report", "name", name)
+	if verboseLog {
+		r.logger.Info("📊 Started scenario report", "name", name)
+	}
 
 	return report
 }

@@ -39,7 +39,9 @@ func (s *Session) SignIn(userID, sourceID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.logger.Info("Creating new session", "user_id", userID, "source_id", sourceID)
+	if verboseLog {
+		s.logger.Info("Creating new session", "user_id", userID, "source_id", sourceID)
+	}
 
 	token, expiresAt, err := s.generateToken(userID, sourceID)
 	if err != nil {
@@ -52,10 +54,12 @@ func (s *Session) SignIn(userID, sourceID string) error {
 	s.expiresAt = expiresAt
 	s.isActive = true
 
-	s.logger.Info("Session created successfully",
-		"user_id", userID,
-		"source_id", sourceID,
-		"expires_at", expiresAt.Format(time.RFC3339))
+	if verboseLog {
+		s.logger.Info("Session created successfully",
+			"user_id", userID,
+			"source_id", sourceID,
+			"expires_at", expiresAt.Format(time.RFC3339))
+	}
 
 	return nil
 }
@@ -65,13 +69,17 @@ func (s *Session) SignOut() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.logger.Info("Signing out", "user_id", s.userID)
+	if verboseLog {
+		s.logger.Info("Signing out", "user_id", s.userID)
+	}
 
 	s.token = ""
 	s.expiresAt = time.Time{}
 	s.isActive = false
 
-	s.logger.Info("Session cleared")
+	if verboseLog {
+		s.logger.Info("Session cleared")
+	}
 }
 
 // IsActive returns whether there's an active session
@@ -154,7 +162,9 @@ func (s *Session) Restore() error {
 		return fmt.Errorf("no session to restore")
 	}
 
-	s.logger.Info("Restoring session", "user_id", s.userID, "source_id", s.sourceID)
+	if verboseLog {
+		s.logger.Info("Restoring session", "user_id", s.userID, "source_id", s.sourceID)
+	}
 
 	token, expiresAt, err := s.generateToken(s.userID, s.sourceID)
 	if err != nil {
@@ -165,7 +175,9 @@ func (s *Session) Restore() error {
 	s.expiresAt = expiresAt
 	s.isActive = true
 
-	s.logger.Info("Session restored successfully", "expires_at", expiresAt.Format(time.RFC3339))
+	if verboseLog {
+		s.logger.Info("Session restored successfully", "expires_at", expiresAt.Format(time.RFC3339))
+	}
 
 	return nil
 }

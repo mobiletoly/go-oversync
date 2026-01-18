@@ -118,6 +118,7 @@ func TestBuildInBatchIndex_RefColumnAwareIndexesParentRefColumns(t *testing.T) {
 			},
 		},
 		nil,
+		nil,
 	)
 
 	set := idx.ref[refKey{table: Key("public", "parents"), col: "code"}]
@@ -141,6 +142,7 @@ func TestBuildInBatchIndex_RefColumnAwareIndexesParentRefColumns(t *testing.T) {
 		[]ChangeUpload{
 			{SourceChangeID: 2, Schema: "public", Table: "parents", Op: OpDelete, PK: parentPK},
 		},
+		nil,
 	)
 	if set2, ok := idx2.ref[refKey{table: Key("public", "parents"), col: "code"}]; ok && len(set2) > 0 {
 		t.Fatalf("expected ref index to exclude deleted row values, got %v", set2)
@@ -160,6 +162,7 @@ func TestBuildInBatchIndex_RefColumnAwareIndexesParentRefColumns(t *testing.T) {
 				Payload:        []byte(`{"id":"` + parentPK + `","code":"abc"}`),
 			},
 		},
+		nil,
 		nil,
 	)
 	if idx3.ref != nil {

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -248,66 +249,106 @@ func (s *SyncService) ProcessUpload(ctx context.Context, userID, sourceID string
 
 	var statuses []ChangeUploadStatus
 
-	// Process changes in a transaction using pgx.BeginTxFunc at REPEATABLE READ
-	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadWrite}, func(tx pgx.Tx) error {
-		// Defer FK checks to COMMIT (RI evaluated against this tx snapshot) and run the tx under REPEATABLE READ so cross-session parents committed later cannot "rescue" missing FKs in this batch.
-		_, err := tx.Exec(ctx, "SET CONSTRAINTS ALL DEFERRED")
-		if err != nil {
-			return fmt.Errorf("failed to set constraints deferred: %w", err)
-		}
-		// Optional: bound lock wait times during stress
-		_, _ = tx.Exec(ctx, "SET LOCAL lock_timeout = '3s'")
+	runUploadTx := func(useBatchedApply bool) error {
+		var txStatuses []ChangeUploadStatus
 
-		// Prepare hot-path statements to reduce parse/plan overhead for per-item operations
-		if err := s.prepareUploadStatements(ctx, tx); err != nil {
-			return fmt.Errorf("failed to prepare statements: %w", err)
-		}
-
-		// Step 1: Split and order changes
-		upserts, deletes := s.splitAndOrder(req.Changes)
-
-		// Step 2: Convert primary keys using table handlers (skip invalid UUIDs, they'll be caught in validation)
-		s.convertPrimaryKeysSkipInvalid(upserts)
-		s.convertPrimaryKeysSkipInvalid(deletes)
-
-		// Step 3: Build in-batch index for FK precheck
-		inBatch := s.buildInBatchIndex(upserts, deletes)
-
-		// Step 4: Process upserts (parent-first)
-		upsertStatuses, err := s.processUpserts(ctx, tx, userID, sourceID, upserts, inBatch)
-		if err != nil {
-			return fmt.Errorf("failed to process upserts: %w", err)
-		}
-
-		// Step 5: Process deletes (child-first)
-		deleteStatuses, err := s.processDeletes(ctx, tx, userID, sourceID, deletes)
-		if err != nil {
-			return fmt.Errorf("failed to process deletes: %w", err)
-		}
-
-		// Step 6: Combine statuses in original order with safety guard
-		statuses = make([]ChangeUploadStatus, len(req.Changes))
-		statusMap := make(map[int64]ChangeUploadStatus)
-		for _, status := range upsertStatuses {
-			statusMap[status.SourceChangeID] = status
-		}
-		for _, status := range deleteStatuses {
-			statusMap[status.SourceChangeID] = status
-		}
-
-		for i, change := range req.Changes {
-			st, ok := statusMap[change.SourceChangeID]
-			if !ok {
-				st = statusInternalError(change.SourceChangeID, fmt.Errorf("missing status for scid"))
+		// Process changes in a transaction using pgx.BeginTxFunc at REPEATABLE READ
+		err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadWrite}, func(tx pgx.Tx) error {
+			// Defer FK checks to COMMIT (RI evaluated against this tx snapshot) and run the tx under REPEATABLE READ so cross-session parents committed later cannot "rescue" missing FKs in this batch.
+			_, err := tx.Exec(ctx, "SET CONSTRAINTS ALL DEFERRED")
+			if err != nil {
+				return fmt.Errorf("failed to set constraints deferred: %w", err)
 			}
-			statuses[i] = st
+			// Optional: bound lock wait times during stress
+			_, _ = tx.Exec(ctx, "SET LOCAL lock_timeout = '3s'")
+
+			// Prepare hot-path statements to reduce parse/plan overhead for per-item operations
+			if err := s.prepareUploadStatements(ctx, tx); err != nil {
+				return fmt.Errorf("failed to prepare statements: %w", err)
+			}
+
+			// Step 1: Split and order changes
+			upserts, deletes := s.splitAndOrder(req.Changes)
+
+			// Step 2: Convert primary keys using table handlers (skip invalid UUIDs, they'll be caught in validation)
+			s.convertPrimaryKeysSkipInvalid(upserts)
+			s.convertPrimaryKeysSkipInvalid(deletes)
+
+			// Step 3: Process upserts (parent-first)
+			upsertStatuses, err := s.processUpserts(ctx, tx, userID, sourceID, upserts, deletes, useBatchedApply)
+			if err != nil {
+				return fmt.Errorf("failed to process upserts: %w", err)
+			}
+
+			// Step 4: Process deletes (child-first)
+			deleteStatuses, err := s.processDeletes(ctx, tx, userID, sourceID, deletes, useBatchedApply)
+			if err != nil {
+				return fmt.Errorf("failed to process deletes: %w", err)
+			}
+
+			// Step 5: Combine statuses in original order with safety guard
+			txStatuses = make([]ChangeUploadStatus, len(req.Changes))
+			statusMap := make(map[int64]ChangeUploadStatus)
+			for _, status := range upsertStatuses {
+				statusMap[status.SourceChangeID] = status
+			}
+			for _, status := range deleteStatuses {
+				statusMap[status.SourceChangeID] = status
+			}
+
+			for i, change := range req.Changes {
+				st, ok := statusMap[change.SourceChangeID]
+				if !ok {
+					st = statusInternalError(change.SourceChangeID, fmt.Errorf("missing status for scid"))
+				}
+				txStatuses[i] = st
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to process upload transaction: %w", err)
 		}
 
+		statuses = txStatuses
 		return nil
-	})
+	}
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to process upload transaction: %w", err)
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Small, bounded backoff for transient serialization/deadlock failures under concurrency.
+		// Keep this very short to avoid inflating latencies; clients also retry on failures.
+		if attempt > 1 {
+			backoff := time.Duration(attempt*attempt) * 10 * time.Millisecond
+			_ = sleepWithContext(ctx, backoff)
+		}
+
+		err := runUploadTx(true)
+		if err == nil {
+			lastErr = nil
+			break
+		}
+
+		// If batched apply fails (e.g., due to a mid-batch error that would otherwise poison the tx),
+		// retry once with the slower per-change path to preserve correctness.
+		if errors.Is(err, errUploadBatchedApplyFailed) {
+			if err2 := runUploadTx(false); err2 == nil {
+				lastErr = nil
+				break
+			} else {
+				err = err2
+			}
+		}
+
+		lastErr = err
+		if !isRetryablePGTxError(err) || attempt == maxAttempts {
+			break
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 
 	// Decide batch acceptance: mark false if any status signals unregistered table

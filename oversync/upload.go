@@ -30,7 +30,7 @@ type inBatchIndex struct {
 // splitAndOrder splits changes into upserts and deletes, ordering them appropriately
 func (s *SyncService) splitAndOrder(changes []ChangeUpload) (upserts, deletes []ChangeUpload) {
 	for _, ch := range changes {
-		if strings.ToUpper(ch.Op) == OpDelete {
+		if strings.ToUpper(strings.TrimSpace(ch.Op)) == OpDelete {
 			deletes = append(deletes, ch)
 		} else {
 			upserts = append(upserts, ch)
@@ -90,7 +90,7 @@ func buildBatchPKIndex(ups, dels []ChangeUpload) batchIndex {
 	return m
 }
 
-func (s *SyncService) buildInBatchIndex(ups, dels []ChangeUpload) inBatchIndex {
+func (s *SyncService) buildInBatchIndex(ups, dels []ChangeUpload, upPayloadObjs []map[string]any) inBatchIndex {
 	idx := inBatchIndex{
 		pk:  buildBatchPKIndex(ups, dels),
 		ref: nil,
@@ -134,7 +134,9 @@ func (s *SyncService) buildInBatchIndex(ups, dels []ChangeUpload) inBatchIndex {
 
 	idx.ref = make(map[refKey]pkset)
 
-	for _, ch := range ups {
+	usePayloadCache := upPayloadObjs != nil && len(upPayloadObjs) == len(ups)
+
+	for i, ch := range ups {
 		schema := ch.Schema
 		if schema == "" {
 			schema = "public"
@@ -150,8 +152,15 @@ func (s *SyncService) buildInBatchIndex(ups, dels []ChangeUpload) inBatchIndex {
 		}
 
 		var payload map[string]any
-		if err := json.Unmarshal(ch.Payload, &payload); err != nil {
-			continue
+		if usePayloadCache {
+			payload = upPayloadObjs[i]
+			if payload == nil {
+				continue
+			}
+		} else {
+			if err := json.Unmarshal(ch.Payload, &payload); err != nil {
+				continue
+			}
 		}
 
 		// Optional table handler conversion (allows payload encoding differences).
@@ -257,6 +266,7 @@ func (s *SyncService) parentsMissingBatch(
 	upserts []ChangeUpload,
 	validIdx []int,
 	inBatch inBatchIndex,
+	payloadObjs []map[string]any,
 ) map[int][]string {
 	if s.discoveredSchema == nil || len(validIdx) == 0 {
 		return nil
@@ -293,9 +303,14 @@ func (s *SyncService) parentsMissingBatch(
 		}
 
 		var payload map[string]any
-		if err := json.Unmarshal(ch.Payload, &payload); err != nil {
-			missingByIdx[idx] = []string{ReasonBadPayload}
-			continue
+		if payloadObjs != nil && idx >= 0 && idx < len(payloadObjs) {
+			payload = payloadObjs[idx]
+		}
+		if payload == nil {
+			if err := json.Unmarshal(ch.Payload, &payload); err != nil {
+				missingByIdx[idx] = []string{ReasonBadPayload}
+				continue
+			}
 		}
 
 		// Get table handler for key conversion if available
@@ -514,13 +529,12 @@ func (s *SyncService) parentsMissingBatch(
 }
 
 // processUpserts processes INSERT/UPDATE operations with FK precheck and SAVEPOINTs
-func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sourceID string, upserts []ChangeUpload, inBatch inBatchIndex) ([]ChangeUploadStatus, error) {
-	var statuses []ChangeUploadStatus
-
+func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sourceID string, upserts, deletes []ChangeUpload, useBatchedApply bool) ([]ChangeUploadStatus, error) {
 	s.logger.Info("Processing upserts batch", "count", len(upserts), "user_id", userID, "source_id", sourceID)
 
 	validIdx := make([]int, 0, len(upserts))
 	statusesByIdx := make([]*ChangeUploadStatus, len(upserts))
+	payloadObjs := make([]map[string]any, len(upserts))
 
 	for i := range upserts {
 		change := &upserts[i]
@@ -528,11 +542,9 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 		s.logger.Debug("Processing upsert", "index", i, "schema", change.Schema, "table", change.Table,
 			"pk", change.PK, "source_change_id", change.SourceChangeID)
 
-		// Rely on insert-first idempotency gate in applyUpsert; no pre-check here.
-
 		// Validate change (PK should already be converted by this point)
-		if err := s.validateChange(change); err != nil {
-			// Log validation failure with helpful context
+		payloadObj, err := s.validateChangeAndMaybeParsePayload(change, payloadObjs[i])
+		if err != nil {
 			reason := ReasonBadPayload
 			if errors.Is(err, ErrUnregisteredTable) {
 				reason = ReasonUnregisteredTable
@@ -557,47 +569,127 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 			continue
 		}
 
+		// splitAndOrder should have separated deletes, but guard against whitespace/invalid ops.
+		if change.Op == OpDelete {
+			msg := fmt.Errorf("unexpected delete in upserts batch")
+			st := statusInvalidOther(change.SourceChangeID, ReasonBadPayload, msg)
+			statusesByIdx[i] = &st
+			continue
+		}
+
+		payloadObjs[i] = payloadObj
 		validIdx = append(validIdx, i)
 	}
 
-	missingByIdx := s.parentsMissingBatch(ctx, tx, userID, upserts, validIdx, inBatch)
+	inBatch := s.buildInBatchIndex(upserts, deletes, payloadObjs)
+	missingByIdx := s.parentsMissingBatch(ctx, tx, userID, upserts, validIdx, inBatch, payloadObjs)
+
+	applyIdx := make([]int, 0, len(validIdx))
 
 	for i := range upserts {
 		change := upserts[i]
 
 		if statusesByIdx[i] != nil {
-			statuses = append(statuses, *statusesByIdx[i])
 			continue
 		}
 
 		// FK precheck - handle both bad payload and precheck errors explicitly.
 		missing := missingByIdx[i]
 		if len(missing) > 0 {
+			var st ChangeUploadStatus
 			if len(missing) == 1 {
 				switch missing[0] {
 				case ReasonPrecheckError:
-					statuses = append(statuses, statusInvalidOther(change.SourceChangeID, ReasonPrecheckError, fmt.Errorf("FK precheck failed for %s.%s pk=%s", change.Schema, change.Table, change.PK)))
-					continue
+					st = statusInvalidOther(change.SourceChangeID, ReasonPrecheckError, fmt.Errorf("FK precheck failed for %s.%s pk=%s", change.Schema, change.Table, change.PK))
 				case ReasonBadPayload:
-					statuses = append(statuses, statusInvalidOther(change.SourceChangeID, ReasonBadPayload, fmt.Errorf("bad payload for %s.%s pk=%s", change.Schema, change.Table, change.PK)))
-					continue
+					st = statusInvalidOther(change.SourceChangeID, ReasonBadPayload, fmt.Errorf("bad payload for %s.%s pk=%s", change.Schema, change.Table, change.PK))
+				default:
+					st = statusInvalidFKMissing(change.SourceChangeID, missing)
 				}
+			} else {
+				st = statusInvalidFKMissing(change.SourceChangeID, missing)
 			}
-			statuses = append(statuses, statusInvalidFKMissing(change.SourceChangeID, missing))
+			statusesByIdx[i] = &st
 			continue
 		}
 
-		// Process with SAVEPOINT
-		status, err := s.applyUpsert(ctx, tx, userID, sourceID, change)
+		applyIdx = append(applyIdx, i)
+	}
+
+	type matItem struct {
+		change           ChangeUpload
+		deleted          bool
+		attemptedVersion int64
+	}
+	var mats []matItem
+
+	if useBatchedApply && len(applyIdx) > 1 {
+		outcomes, err := s.applyUpsertsSidecarBatched(ctx, tx, userID, sourceID, upserts, applyIdx)
 		if err != nil {
-			s.logger.Error("Failed to apply upsert", "error", err, "source_change_id", change.SourceChangeID,
-				"schema", change.Schema, "table", change.Table, "pk", change.PK)
-			return nil, fmt.Errorf("failed to apply upsert for change %d: %w", change.SourceChangeID, err)
+			return nil, err
+		}
+		if len(outcomes) != len(applyIdx) {
+			return nil, fmt.Errorf("batched upsert apply outcomes mismatch: got=%d want=%d", len(outcomes), len(applyIdx))
 		}
 
-		s.logger.Debug("Upsert completed", "source_change_id", change.SourceChangeID,
-			"status", status.Status, "schema", change.Schema, "table", change.Table, "pk", change.PK)
-		statuses = append(statuses, status)
+		for i, idx := range applyIdx {
+			ch := upserts[idx]
+			o := outcomes[i]
+
+			var st ChangeUploadStatus
+			switch o.code {
+			case 0:
+				st = statusAppliedIdempotent(ch.SourceChangeID)
+			case 1:
+				st = statusApplied(ch.SourceChangeID, o.newServerVer64)
+				mats = append(mats, matItem{change: ch, deleted: false, attemptedVersion: o.newServerVer64})
+			case 2:
+				serverRow, fetchErr := s.fetchServerRowJSON(ctx, tx, userID, ch.Schema, ch.Table, ch.PK)
+				if fetchErr != nil {
+					if errors.Is(fetchErr, pgx.ErrNoRows) {
+						st = statusInvalidOther(ch.SourceChangeID, ReasonInternalError, fmt.Errorf("conflict without server_row for %s.%s pk=%s", ch.Schema, ch.Table, ch.PK))
+					} else {
+						return nil, fmt.Errorf("failed to fetch server row for conflict: %w", fetchErr)
+					}
+				} else {
+					st = statusConflict(ch.SourceChangeID, serverRow)
+				}
+			case 3:
+				st = statusInvalidOther(ch.SourceChangeID, ReasonInternalError, fmt.Errorf("conflict without server_row for %s.%s pk=%s", ch.Schema, ch.Table, ch.PK))
+			default:
+				return nil, fmt.Errorf("unknown apply upsert code %d", o.code)
+			}
+			statusesByIdx[idx] = &st
+		}
+	} else {
+		for _, idx := range applyIdx {
+			ch := upserts[idx]
+
+			st, err := s.applyUpsert(ctx, tx, userID, sourceID, ch)
+			if err != nil {
+				s.logger.Error("Failed to apply upsert", "error", err, "source_change_id", ch.SourceChangeID,
+					"schema", ch.Schema, "table", ch.Table, "pk", ch.PK)
+				return nil, fmt.Errorf("failed to apply upsert for change %d: %w", ch.SourceChangeID, err)
+			}
+			statusesByIdx[idx] = &st
+		}
+	}
+
+	for _, m := range mats {
+		if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, m.change, m.deleted, m.attemptedVersion); err != nil {
+			s.logger.Warn("Business projection failed; sync still applied",
+				"error", err, "schema", m.change.Schema, "table", m.change.Table, "pk", m.change.PK,
+				"server_version", m.attemptedVersion, "source_change_id", m.change.SourceChangeID)
+		}
+	}
+
+	statuses := make([]ChangeUploadStatus, 0, len(upserts))
+	for i, st := range statusesByIdx {
+		if st == nil {
+			statuses = append(statuses, statusInternalError(upserts[i].SourceChangeID, fmt.Errorf("missing status for scid")))
+			continue
+		}
+		statuses = append(statuses, *st)
 	}
 
 	return statuses, nil
@@ -606,15 +698,16 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 // processDeletes processes DELETE operations with SAVEPOINTs
 func (s *SyncService) processDeletes(
 	ctx context.Context, tx pgx.Tx, userID, sourceID string, deletes []ChangeUpload,
+	useBatchedApply bool,
 ) ([]ChangeUploadStatus, error) {
-	var statuses []ChangeUploadStatus
+	statusesByIdx := make([]*ChangeUploadStatus, len(deletes))
+	applyIdx := make([]int, 0, len(deletes))
 
-	for _, change := range deletes {
-		// Rely on insert-first idempotency gate in applyDelete; no pre-check here.
+	for i := range deletes {
+		change := &deletes[i]
 
 		// Validate change (PK should already be converted by this point)
-		if err := s.validateChange(&change); err != nil {
-			// Log validation failure with helpful context
+		if err := s.validateChange(change); err != nil {
 			reason := ReasonBadPayload
 			if errors.Is(err, ErrUnregisteredTable) {
 				reason = ReasonUnregisteredTable
@@ -629,20 +722,88 @@ func (s *SyncService) processDeletes(
 				"reason", reason,
 				"error", err,
 			)
+			var st ChangeUploadStatus
 			if errors.Is(err, ErrUnregisteredTable) {
-				statuses = append(statuses, statusInvalidUnregisteredTable(change.SourceChangeID, change.Schema, change.Table))
+				st = statusInvalidUnregisteredTable(change.SourceChangeID, change.Schema, change.Table)
 			} else {
-				statuses = append(statuses, statusInvalidOther(change.SourceChangeID, ReasonBadPayload, err))
+				st = statusInvalidOther(change.SourceChangeID, ReasonBadPayload, err)
 			}
+			statusesByIdx[i] = &st
 			continue
 		}
 
-		// Process with SAVEPOINT
-		status, err := s.applyDelete(ctx, tx, userID, sourceID, change)
+		applyIdx = append(applyIdx, i)
+	}
+
+	type matItem struct {
+		change           ChangeUpload
+		deleted          bool
+		attemptedVersion int64
+	}
+	var mats []matItem
+
+	if useBatchedApply && len(applyIdx) > 1 {
+		outcomes, err := s.applyDeletesSidecarBatched(ctx, tx, userID, sourceID, deletes, applyIdx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to apply delete for change %d: %w", change.SourceChangeID, err)
+			return nil, err
 		}
-		statuses = append(statuses, status)
+		if len(outcomes) != len(applyIdx) {
+			return nil, fmt.Errorf("batched delete apply outcomes mismatch: got=%d want=%d", len(outcomes), len(applyIdx))
+		}
+		for i, idx := range applyIdx {
+			ch := deletes[idx]
+			o := outcomes[i]
+
+			var st ChangeUploadStatus
+			switch o.code {
+			case 0, 3:
+				st = statusAppliedIdempotent(ch.SourceChangeID)
+			case 1:
+				st = statusApplied(ch.SourceChangeID, o.newServerVer64)
+				mats = append(mats, matItem{change: ch, deleted: true, attemptedVersion: o.newServerVer64})
+			case 2:
+				serverRow, fetchErr := s.fetchServerRowJSON(ctx, tx, userID, ch.Schema, ch.Table, ch.PK)
+				if fetchErr != nil {
+					if errors.Is(fetchErr, pgx.ErrNoRows) {
+						st = statusAppliedIdempotent(ch.SourceChangeID)
+					} else {
+						return nil, fmt.Errorf("failed to fetch server row for conflict: %w", fetchErr)
+					}
+				} else {
+					st = statusConflict(ch.SourceChangeID, serverRow)
+				}
+			default:
+				return nil, fmt.Errorf("unknown apply delete code %d", o.code)
+			}
+			statusesByIdx[idx] = &st
+		}
+	} else {
+		for _, idx := range applyIdx {
+			ch := deletes[idx]
+
+			st, err := s.applyDelete(ctx, tx, userID, sourceID, ch)
+			if err != nil {
+				return nil, fmt.Errorf("failed to apply delete for change %d: %w", ch.SourceChangeID, err)
+			}
+			statusesByIdx[idx] = &st
+		}
+	}
+
+	for _, m := range mats {
+		if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, m.change, m.deleted, m.attemptedVersion); err != nil {
+			s.logger.Warn("Business projection failed; sync still applied",
+				"error", err, "schema", m.change.Schema, "table", m.change.Table, "pk", m.change.PK,
+				"server_version", m.attemptedVersion, "source_change_id", m.change.SourceChangeID)
+		}
+	}
+
+	statuses := make([]ChangeUploadStatus, 0, len(deletes))
+	for i, st := range statusesByIdx {
+		if st == nil {
+			statuses = append(statuses, statusInternalError(deletes[i].SourceChangeID, fmt.Errorf("missing status for scid")))
+			continue
+		}
+		statuses = append(statuses, *st)
 	}
 
 	return statuses, nil

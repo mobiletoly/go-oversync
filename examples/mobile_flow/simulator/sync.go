@@ -41,7 +41,9 @@ func (sm *SyncManager) Start(ctx context.Context) error {
 		return nil
 	}
 
-	sm.logger.Info("🔄 Starting sync loops")
+	if verboseLog {
+		sm.logger.Info("🔄 Starting sync loops")
+	}
 
 	syncCtx, cancel := context.WithCancel(ctx)
 	sm.cancel = cancel
@@ -61,7 +63,9 @@ func (sm *SyncManager) Start(ctx context.Context) error {
 	}()
 
 	sm.running = true
-	sm.logger.Info("✅ Sync loops started")
+	if verboseLog {
+		sm.logger.Info("✅ Sync loops started")
+	}
 
 	return nil
 }
@@ -75,7 +79,9 @@ func (sm *SyncManager) Stop() {
 		return
 	}
 
-	sm.logger.Info("🛑 Stopping sync loops")
+	if verboseLog {
+		sm.logger.Info("🛑 Stopping sync loops")
+	}
 
 	if sm.cancel != nil {
 		sm.cancel()
@@ -88,7 +94,9 @@ func (sm *SyncManager) Stop() {
 	sm.uploader = nil
 	sm.downloader = nil
 
-	sm.logger.Info("✅ Sync loops stopped")
+	if verboseLog {
+		sm.logger.Info("✅ Sync loops stopped")
+	}
 }
 
 // IsRunning returns whether sync loops are running

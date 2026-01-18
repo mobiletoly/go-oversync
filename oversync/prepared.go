@@ -23,6 +23,10 @@ func (s *SyncService) prepareUploadStatements(ctx context.Context, tx pgx.Tx) er
 	// s_apply_upsert: single-statement apply for INSERT/UPDATE, including idempotency gate,
 	// optimistic version gate, sync_state upsert, and server_change_log insertion.
 	//
+	// NOTE: server_change_log is inserted only when the change is actually applied. We use an
+	// advisory xact lock keyed by (user_id, source_id, source_change_id) to ensure idempotency
+	// under concurrent duplicate uploads without needing an insert-first "gate" row.
+	//
 	// Returns:
 	//   code:
 	//     0 = idempotent (triplet already exists)
@@ -31,12 +35,16 @@ func (s *SyncService) prepareUploadStatements(ctx context.Context, tx pgx.Tx) er
 	//     3 = internal error (missing server row for non-zero base version)
 	//   new_server_version: (base_version + 1) when applied, else 0
 	if _, err := tx.Prepare(ctx, stmtApplyUpsert, `
-WITH gate AS (
-  INSERT INTO sync.server_change_log
-      (user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
-  VALUES ($1, $2, $3, $4, $5::uuid, $6::jsonb, $7, $8, ($9 + 1))
-  ON CONFLICT (user_id, source_id, source_change_id) DO NOTHING
-  RETURNING 1
+WITH lock_triplet AS MATERIALIZED (
+  SELECT pg_advisory_xact_lock(hashtextextended($1 || '|' || $7 || '|' || ($8::bigint)::text, 0))
+),
+already AS MATERIALIZED (
+  SELECT 1
+  FROM lock_triplet, sync.server_change_log
+  WHERE user_id = $1
+    AND source_id = $7
+    AND source_change_id = $8::bigint
+  LIMIT 1
 ),
 meta_upd AS (
   UPDATE sync.sync_row_meta
@@ -48,14 +56,14 @@ meta_upd AS (
     AND table_name = $3
     AND pk_uuid = $5::uuid
     AND server_version = $9
-    AND EXISTS (SELECT 1 FROM gate)
+    AND NOT EXISTS (SELECT 1 FROM already)
   RETURNING server_version
 ),
 meta_ins AS (
   INSERT INTO sync.sync_row_meta (user_id, schema_name, table_name, pk_uuid, server_version, deleted, updated_at)
   SELECT $1, $2, $3, $5::uuid, ($9 + 1), FALSE, now()
   WHERE $9 = 0
-    AND EXISTS (SELECT 1 FROM gate)
+    AND NOT EXISTS (SELECT 1 FROM already)
     AND NOT EXISTS (
       SELECT 1
       FROM sync.sync_row_meta
@@ -76,10 +84,19 @@ state_upsert AS (
   ON CONFLICT (user_id, schema_name, table_name, pk_uuid) DO UPDATE
   SET payload = EXCLUDED.payload
   RETURNING 1
+),
+log_ins AS (
+  INSERT INTO sync.server_change_log
+      (user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
+  SELECT $1, $2, $3, $4, $5::uuid, $6::jsonb, $7, $8::bigint, (SELECT new_server_version FROM applied LIMIT 1)
+  WHERE EXISTS (SELECT 1 FROM applied)
+    AND NOT EXISTS (SELECT 1 FROM already)
+  ON CONFLICT (user_id, source_id, source_change_id) DO NOTHING
+  RETURNING 1
 )
 SELECT
   CASE
-    WHEN NOT EXISTS (SELECT 1 FROM gate) THEN 0
+    WHEN EXISTS (SELECT 1 FROM already) THEN 0
     WHEN EXISTS (SELECT 1 FROM applied) THEN 1
     WHEN $9 = 0 THEN 2
     WHEN EXISTS (
@@ -96,6 +113,10 @@ SELECT
 	// s_apply_delete: single-statement apply for DELETE, including idempotency gate,
 	// optimistic version gate, sync_state delete, and server_change_log insertion.
 	//
+	// NOTE: server_change_log is inserted only when the change is actually applied. We use an
+	// advisory xact lock keyed by (user_id, source_id, source_change_id) to ensure idempotency
+	// under concurrent duplicate uploads without needing an insert-first "gate" row.
+	//
 	// Returns:
 	//   code:
 	//     0 = idempotent (triplet already exists)
@@ -104,12 +125,16 @@ SELECT
 	//     3 = idempotent (row does not exist / already deleted)
 	//   new_server_version: (base_version + 1) when applied, else 0
 	if _, err := tx.Prepare(ctx, stmtApplyDelete, `
-WITH gate AS (
-  INSERT INTO sync.server_change_log
-      (user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
-  VALUES ($1, $2, $3, $4, $5::uuid, NULL, $6, $7, ($8 + 1))
-  ON CONFLICT (user_id, source_id, source_change_id) DO NOTHING
-  RETURNING 1
+WITH lock_triplet AS MATERIALIZED (
+  SELECT pg_advisory_xact_lock(hashtextextended($1 || '|' || $6 || '|' || ($7::bigint)::text, 0))
+),
+already AS MATERIALIZED (
+  SELECT 1
+  FROM lock_triplet, sync.server_change_log
+  WHERE user_id = $1
+    AND source_id = $6
+    AND source_change_id = $7::bigint
+  LIMIT 1
 ),
 meta_upd AS (
   UPDATE sync.sync_row_meta
@@ -121,7 +146,7 @@ meta_upd AS (
     AND table_name = $3
     AND pk_uuid = $5::uuid
     AND server_version = $8
-    AND EXISTS (SELECT 1 FROM gate)
+    AND NOT EXISTS (SELECT 1 FROM already)
   RETURNING server_version
 ),
 state_delete AS (
@@ -132,10 +157,19 @@ state_delete AS (
     AND pk_uuid = $5::uuid
     AND EXISTS (SELECT 1 FROM meta_upd)
   RETURNING 1
+),
+log_ins AS (
+  INSERT INTO sync.server_change_log
+      (user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
+  SELECT $1, $2, $3, $4, $5::uuid, NULL, $6, $7::bigint, (SELECT server_version FROM meta_upd LIMIT 1)
+  WHERE EXISTS (SELECT 1 FROM meta_upd)
+    AND NOT EXISTS (SELECT 1 FROM already)
+  ON CONFLICT (user_id, source_id, source_change_id) DO NOTHING
+  RETURNING 1
 )
 SELECT
   CASE
-    WHEN NOT EXISTS (SELECT 1 FROM gate) THEN 0
+    WHEN EXISTS (SELECT 1 FROM already) THEN 0
     WHEN EXISTS (SELECT 1 FROM meta_upd) THEN 1
     WHEN EXISTS (
       SELECT 1 FROM sync.sync_row_meta
