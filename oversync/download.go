@@ -30,7 +30,16 @@ func (s *SyncService) ProcessDownloadWindowed(
 	schemaFilter string,
 	includeSelf bool,
 	until int64,
-) (*DownloadResponse, error) {
+) (resp *DownloadResponse, err error) {
+	totalStart := s.stageStart()
+	defer func() {
+		changeCount := 0
+		if resp != nil {
+			changeCount = len(resp.Changes)
+		}
+		s.observeStage(ctx, MetricsOpDownload, MetricsStageTotal, totalStart, changeCount, 0, err != nil)
+	}()
+
 	if err := s.checkClosed(); err != nil {
 		return nil, err
 	}
@@ -45,7 +54,9 @@ func (s *SyncService) ProcessDownloadWindowed(
 
 	// Freeze the window upper bound if not provided by the caller.
 	if until <= 0 {
+		wmStart := s.stageStart()
 		until = s.getUserHighestServerSeq(ctx, userID)
+		s.observeStage(ctx, MetricsOpDownload, MetricsStageDownloadWatermark, wmStart, 1, 0, false)
 	}
 	// Capture the frozen window for this response.
 	windowUntil := until
@@ -115,8 +126,16 @@ WHERE l.user_id   = $1
 		}
 	}
 
+	fetchCount := 0
+	fetchHadError := false
+	fetchStart := s.stageStart()
+	defer func() {
+		s.observeStage(ctx, MetricsOpDownload, MetricsStageDownloadFetch, fetchStart, fetchCount, 0, fetchHadError)
+	}()
+
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
+		fetchHadError = true
 		return nil, fmt.Errorf("failed to fetch download page: %w", err)
 	}
 	defer rows.Close()
@@ -138,11 +157,14 @@ WHERE l.user_id   = $1
 			&c.SourceChangeID,
 			&c.Timestamp,
 		); scanErr != nil {
+			fetchHadError = true
 			return nil, fmt.Errorf("failed to scan download row: %w", scanErr)
 		}
 		changes = append(changes, c)
+		fetchCount++
 	}
 	if rows.Err() != nil {
+		fetchHadError = true
 		return nil, fmt.Errorf("failed to fetch download page rows: %w", rows.Err())
 	}
 

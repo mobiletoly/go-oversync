@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -94,6 +95,9 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			{Schema: "business", Table: "comment", Handler: &CommentHandler{logger: logger}},
 		},
 		DisableAutoMigrateFKs: false,
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
+		svcCfg.LogStageTimings = true
 	}
 
 	syncService, err := oversync.NewSyncService(pool, svcCfg, logger)

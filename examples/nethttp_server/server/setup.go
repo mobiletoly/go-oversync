@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -111,6 +112,9 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			{Schema: "business", Table: "file_reviews", Handler: &FileReviewsTableHandler{logger: logger}},
 		},
 		DisableAutoMigrateFKs: false, // Enable automatic FK migration to deferrable
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
+		serviceConfig.LogStageTimings = true
 	}
 
 	logger.Info("DEBUG: Registering table handlers",

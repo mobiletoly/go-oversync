@@ -536,6 +536,7 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 	statusesByIdx := make([]*ChangeUploadStatus, len(upserts))
 	payloadObjs := make([]map[string]any, len(upserts))
 
+	validateStart := s.stageStart()
 	for i := range upserts {
 		change := &upserts[i]
 
@@ -580,9 +581,27 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 		payloadObjs[i] = payloadObj
 		validIdx = append(validIdx, i)
 	}
+	s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsValidate, validateStart, len(upserts), 0, false)
 
+	indexStart := s.stageStart()
 	inBatch := s.buildInBatchIndex(upserts, deletes, payloadObjs)
+	s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsInBatchIndex, indexStart, len(upserts), 0, false)
+
+	fkStart := s.stageStart()
 	missingByIdx := s.parentsMissingBatch(ctx, tx, userID, upserts, validIdx, inBatch, payloadObjs)
+	hadPrecheckError := false
+	for _, missing := range missingByIdx {
+		for _, m := range missing {
+			if m == ReasonPrecheckError {
+				hadPrecheckError = true
+				break
+			}
+		}
+		if hadPrecheckError {
+			break
+		}
+	}
+	s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsFKPrecheck, fkStart, len(validIdx), 0, hadPrecheckError)
 
 	applyIdx := make([]int, 0, len(validIdx))
 
@@ -624,11 +643,14 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 	var mats []matItem
 
 	if useBatchedApply && len(applyIdx) > 1 {
+		applyStart := s.stageStart()
 		outcomes, err := s.applyUpsertsSidecarBatched(ctx, tx, userID, sourceID, upserts, applyIdx)
 		if err != nil {
+			s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsApplyBatched, applyStart, len(applyIdx), 0, true)
 			return nil, err
 		}
 		if len(outcomes) != len(applyIdx) {
+			s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsApplyBatched, applyStart, len(applyIdx), 0, true)
 			return nil, fmt.Errorf("batched upsert apply outcomes mismatch: got=%d want=%d", len(outcomes), len(applyIdx))
 		}
 
@@ -649,6 +671,7 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 					if errors.Is(fetchErr, pgx.ErrNoRows) {
 						st = statusInvalidOther(ch.SourceChangeID, ReasonInternalError, fmt.Errorf("conflict without server_row for %s.%s pk=%s", ch.Schema, ch.Table, ch.PK))
 					} else {
+						s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsApplyBatched, applyStart, len(applyIdx), 0, true)
 						return nil, fmt.Errorf("failed to fetch server row for conflict: %w", fetchErr)
 					}
 				} else {
@@ -657,30 +680,41 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 			case 3:
 				st = statusInvalidOther(ch.SourceChangeID, ReasonInternalError, fmt.Errorf("conflict without server_row for %s.%s pk=%s", ch.Schema, ch.Table, ch.PK))
 			default:
+				s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsApplyBatched, applyStart, len(applyIdx), 0, true)
 				return nil, fmt.Errorf("unknown apply upsert code %d", o.code)
 			}
 			statusesByIdx[idx] = &st
 		}
+		s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsApplyBatched, applyStart, len(applyIdx), 0, false)
 	} else {
+		applyStart := s.stageStart()
 		for _, idx := range applyIdx {
 			ch := upserts[idx]
 
 			st, err := s.applyUpsert(ctx, tx, userID, sourceID, ch)
 			if err != nil {
+				s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsApplySlow, applyStart, len(applyIdx), 0, true)
 				s.logger.Error("Failed to apply upsert", "error", err, "source_change_id", ch.SourceChangeID,
 					"schema", ch.Schema, "table", ch.Table, "pk", ch.PK)
 				return nil, fmt.Errorf("failed to apply upsert for change %d: %w", ch.SourceChangeID, err)
 			}
 			statusesByIdx[idx] = &st
 		}
+		s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsApplySlow, applyStart, len(applyIdx), 0, false)
 	}
 
+	matStart := s.stageStart()
+	hadMatError := false
 	for _, m := range mats {
 		if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, m.change, m.deleted, m.attemptedVersion); err != nil {
+			hadMatError = true
 			s.logger.Warn("Business projection failed; sync still applied",
 				"error", err, "schema", m.change.Schema, "table", m.change.Table, "pk", m.change.PK,
 				"server_version", m.attemptedVersion, "source_change_id", m.change.SourceChangeID)
 		}
+	}
+	if len(mats) > 0 {
+		s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsMaterialize, matStart, len(mats), 0, hadMatError)
 	}
 
 	statuses := make([]ChangeUploadStatus, 0, len(upserts))
@@ -703,6 +737,7 @@ func (s *SyncService) processDeletes(
 	statusesByIdx := make([]*ChangeUploadStatus, len(deletes))
 	applyIdx := make([]int, 0, len(deletes))
 
+	validateStart := s.stageStart()
 	for i := range deletes {
 		change := &deletes[i]
 
@@ -734,6 +769,7 @@ func (s *SyncService) processDeletes(
 
 		applyIdx = append(applyIdx, i)
 	}
+	s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesValidate, validateStart, len(deletes), 0, false)
 
 	type matItem struct {
 		change           ChangeUpload
@@ -743,11 +779,14 @@ func (s *SyncService) processDeletes(
 	var mats []matItem
 
 	if useBatchedApply && len(applyIdx) > 1 {
+		applyStart := s.stageStart()
 		outcomes, err := s.applyDeletesSidecarBatched(ctx, tx, userID, sourceID, deletes, applyIdx)
 		if err != nil {
+			s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesApplyBatched, applyStart, len(applyIdx), 0, true)
 			return nil, err
 		}
 		if len(outcomes) != len(applyIdx) {
+			s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesApplyBatched, applyStart, len(applyIdx), 0, true)
 			return nil, fmt.Errorf("batched delete apply outcomes mismatch: got=%d want=%d", len(outcomes), len(applyIdx))
 		}
 		for i, idx := range applyIdx {
@@ -767,34 +806,46 @@ func (s *SyncService) processDeletes(
 					if errors.Is(fetchErr, pgx.ErrNoRows) {
 						st = statusAppliedIdempotent(ch.SourceChangeID)
 					} else {
+						s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesApplyBatched, applyStart, len(applyIdx), 0, true)
 						return nil, fmt.Errorf("failed to fetch server row for conflict: %w", fetchErr)
 					}
 				} else {
 					st = statusConflict(ch.SourceChangeID, serverRow)
 				}
 			default:
+				s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesApplyBatched, applyStart, len(applyIdx), 0, true)
 				return nil, fmt.Errorf("unknown apply delete code %d", o.code)
 			}
 			statusesByIdx[idx] = &st
 		}
+		s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesApplyBatched, applyStart, len(applyIdx), 0, false)
 	} else {
+		applyStart := s.stageStart()
 		for _, idx := range applyIdx {
 			ch := deletes[idx]
 
 			st, err := s.applyDelete(ctx, tx, userID, sourceID, ch)
 			if err != nil {
+				s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesApplySlow, applyStart, len(applyIdx), 0, true)
 				return nil, fmt.Errorf("failed to apply delete for change %d: %w", ch.SourceChangeID, err)
 			}
 			statusesByIdx[idx] = &st
 		}
+		s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesApplySlow, applyStart, len(applyIdx), 0, false)
 	}
 
+	matStart := s.stageStart()
+	hadMatError := false
 	for _, m := range mats {
 		if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, m.change, m.deleted, m.attemptedVersion); err != nil {
+			hadMatError = true
 			s.logger.Warn("Business projection failed; sync still applied",
 				"error", err, "schema", m.change.Schema, "table", m.change.Table, "pk", m.change.PK,
 				"server_version", m.attemptedVersion, "source_change_id", m.change.SourceChangeID)
 		}
+	}
+	if len(mats) > 0 {
+		s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesMaterialize, matStart, len(mats), 0, hadMatError)
 	}
 
 	statuses := make([]ChangeUploadStatus, 0, len(deletes))

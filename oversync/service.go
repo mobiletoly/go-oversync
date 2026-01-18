@@ -99,6 +99,14 @@ type ServiceConfig struct {
 	// DependencyOverrides optionally adds explicit ordering constraints on top of discovered
 	// DB FKs. Keys and values are "schema.table". Only affects ordering, not FK validation.
 	DependencyOverrides map[string][]string
+
+	// StageMetrics optionally records per-stage timings for upload/download hot paths.
+	// The recorder is called synchronously; it must be fast and concurrency-safe.
+	StageMetrics StageMetricsRecorder
+
+	// LogStageTimings logs per-stage timings via the service logger at DEBUG.
+	// Useful for profiling; keep disabled in production.
+	LogStageTimings bool
 }
 
 // NewSyncService creates a new sync service instance from an existing pool
@@ -217,7 +225,16 @@ func (s *SyncService) checkClosed() error {
 }
 
 // ProcessUpload handles a batch upload request with improved ordering, FK precheck, and SAVEPOINTs
-func (s *SyncService) ProcessUpload(ctx context.Context, userID, sourceID string, req *UploadRequest) (*UploadResponse, error) {
+func (s *SyncService) ProcessUpload(ctx context.Context, userID, sourceID string, req *UploadRequest) (resp *UploadResponse, err error) {
+	changeCount := 0
+	if req != nil {
+		changeCount = len(req.Changes)
+	}
+	totalStart := s.stageStart()
+	defer func() {
+		s.observeStage(ctx, MetricsOpUpload, MetricsStageTotal, totalStart, changeCount, 0, err != nil)
+	}()
+
 	if err := s.checkClosed(); err != nil {
 		return nil, err
 	}
@@ -325,25 +342,30 @@ func (s *SyncService) ProcessUpload(ctx context.Context, userID, sourceID string
 			_ = sleepWithContext(ctx, backoff)
 		}
 
-		err := runUploadTx(true)
-		if err == nil {
+		txStart := s.stageStart()
+		txErr := runUploadTx(true)
+		s.observeStage(ctx, MetricsOpUpload, MetricsStageUploadTxBatched, txStart, changeCount, attempt, txErr != nil)
+		if txErr == nil {
 			lastErr = nil
 			break
 		}
 
 		// If batched apply fails (e.g., due to a mid-batch error that would otherwise poison the tx),
 		// retry once with the slower per-change path to preserve correctness.
-		if errors.Is(err, errUploadBatchedApplyFailed) {
-			if err2 := runUploadTx(false); err2 == nil {
+		if errors.Is(txErr, errUploadBatchedApplyFailed) {
+			txSlowStart := s.stageStart()
+			txErr2 := runUploadTx(false)
+			s.observeStage(ctx, MetricsOpUpload, MetricsStageUploadTxSlow, txSlowStart, changeCount, attempt, txErr2 != nil)
+			if txErr2 == nil {
 				lastErr = nil
 				break
 			} else {
-				err = err2
+				txErr = txErr2
 			}
 		}
 
-		lastErr = err
-		if !isRetryablePGTxError(err) || attempt == maxAttempts {
+		lastErr = txErr
+		if !isRetryablePGTxError(txErr) || attempt == maxAttempts {
 			break
 		}
 	}
