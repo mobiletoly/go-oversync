@@ -74,8 +74,11 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 		)`,
 
 		// Indexes for performance (user-scoped)
-		`CREATE INDEX IF NOT EXISTS scl_seq_idx ON sync.server_change_log(server_id)`,
-		`CREATE INDEX IF NOT EXISTS scl_triplet_idx ON sync.server_change_log(user_id, schema_name, table_name, pk_uuid)`,
+		// Drop redundant historical indexes (safe even if absent).
+		// - server_id is already indexed by the PRIMARY KEY.
+		// - scl_user_pk_seq_idx covers the (user_id,schema_name,table_name,pk_uuid) prefix.
+		`DROP INDEX IF EXISTS sync.scl_seq_idx`,
+		`DROP INDEX IF EXISTS sync.scl_triplet_idx`,
 		`CREATE INDEX IF NOT EXISTS scl_user_seq_idx ON sync.server_change_log(user_id, server_id)`,                     // Optimizes per-user tail-follow downloads
 		`CREATE INDEX IF NOT EXISTS scl_user_schema_seq_idx ON sync.server_change_log(user_id, schema_name, server_id)`, // Optimizes schema-filtered paging
 		`CREATE INDEX IF NOT EXISTS scl_user_pk_seq_idx ON sync.server_change_log(user_id, schema_name, table_name, pk_uuid, server_id)`,

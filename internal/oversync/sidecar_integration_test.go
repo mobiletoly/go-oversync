@@ -74,17 +74,33 @@ func TestSidecarTC01_SchemaInitialization(t *testing.T) {
 	}
 
 	// Verify indexes exist (user-scoped architecture)
-	indexes := []string{
-		"scl_seq_idx",
-		"scl_triplet_idx",
+	requiredIndexes := []string{
+		"scl_user_seq_idx",
+		"scl_user_schema_seq_idx",
+		"scl_user_pk_seq_idx",
+		"scl_user_delete_seq_idx",
 	}
-	for _, index := range indexes {
+	for _, index := range requiredIndexes {
 		var exists bool
 		err := h.service.Pool().QueryRow(h.ctx,
 			`SELECT EXISTS (SELECT FROM pg_indexes WHERE indexname = $1)`,
 			index).Scan(&exists)
 		require.NoError(t, err)
 		require.True(t, exists, "Index %s should exist", index)
+	}
+
+	// Verify redundant historical indexes are not present.
+	redundantIndexes := []string{
+		"scl_seq_idx",     // redundant with server_change_log_pkey
+		"scl_triplet_idx", // redundant with scl_user_pk_seq_idx prefix
+	}
+	for _, index := range redundantIndexes {
+		var exists bool
+		err := h.service.Pool().QueryRow(h.ctx,
+			`SELECT EXISTS (SELECT FROM pg_indexes WHERE indexname = $1)`,
+			index).Scan(&exists)
+		require.NoError(t, err)
+		require.False(t, exists, "Index %s should not exist", index)
 	}
 
 	t.Log("✅ TC1: Schema initialization test passed")

@@ -63,11 +63,6 @@ meta_ins AS (
   SELECT $1, $2, $3, $5::uuid, ($9 + 1), FALSE, now()
   WHERE $9 = 0
     AND EXISTS (SELECT 1 FROM gate)
-    AND NOT EXISTS (
-      SELECT 1
-      FROM sync.sync_row_meta
-      WHERE user_id = $1 AND schema_name = $2 AND table_name = $3 AND pk_uuid = $5::uuid
-    )
   ON CONFLICT (user_id, schema_name, table_name, pk_uuid) DO NOTHING
   RETURNING server_version
 ),
