@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS sync.sync_state (
   schema_name TEXT NOT NULL,
   table_name  TEXT NOT NULL,
   pk_uuid     UUID NOT NULL,
-  payload     JSONB NOT NULL,
+  payload     JSON NOT NULL,
   PRIMARY KEY (user_id, schema_name, table_name, pk_uuid)
 );
 
@@ -191,7 +191,7 @@ CREATE TABLE IF NOT EXISTS sync.server_change_log (
   table_name       TEXT      NOT NULL,
   op               TEXT      NOT NULL CHECK (op IN ('INSERT','UPDATE','DELETE')),
   pk_uuid          UUID      NOT NULL,
-  payload          JSONB,
+  payload          JSON,
   source_id        TEXT      NOT NULL,
   source_change_id BIGINT    NOT NULL,
   server_version   BIGINT    NOT NULL DEFAULT 0,
@@ -201,9 +201,7 @@ CREATE TABLE IF NOT EXISTS sync.server_change_log (
     CHECK ((op = 'DELETE' AND payload IS NULL) OR (op IN ('INSERT','UPDATE') AND payload IS NOT NULL))
 );
 
-CREATE INDEX IF NOT EXISTS scl_seq_idx      ON sync.server_change_log(server_id);
 CREATE INDEX IF NOT EXISTS scl_user_seq_idx ON sync.server_change_log(user_id, server_id);
-CREATE INDEX IF NOT EXISTS scl_triplet_idx  ON sync.server_change_log(user_id, schema_name, table_name, pk_uuid);
 CREATE INDEX IF NOT EXISTS scl_user_schema_seq_idx  ON sync.server_change_log(user_id, schema_name, server_id);
 CREATE INDEX IF NOT EXISTS scl_user_pk_seq_idx      ON sync.server_change_log(user_id, schema_name, table_name, pk_uuid, server_id);
 CREATE INDEX IF NOT EXISTS scl_user_delete_seq_idx  ON sync.server_change_log(user_id, server_id) WHERE op='DELETE';
@@ -218,7 +216,7 @@ CREATE TABLE IF NOT EXISTS sync.materialize_failures (
   pk_uuid UUID NOT NULL,
   attempted_version BIGINT NOT NULL,
   op TEXT NOT NULL,
-  payload JSONB,
+  payload JSON,
   error TEXT NOT NULL,
   first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
   retry_count INT NOT NULL DEFAULT 0,

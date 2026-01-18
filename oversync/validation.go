@@ -123,7 +123,7 @@ func (s *SyncService) fetchServerRowJSON(ctx context.Context, tx pgx.Tx, userID,
 				   m.pk_uuid::text AS id,
 				   m.server_version,
 				   m.deleted,
-				   COALESCE(s.payload, 'null'::jsonb) AS payload
+				   COALESCE(s.payload, 'null'::json) AS payload
 			FROM sync.sync_row_meta m
 			LEFT JOIN sync.sync_state s
 			  ON s.user_id = m.user_id

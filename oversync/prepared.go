@@ -41,7 +41,7 @@ func (s *SyncService) prepareUploadStatements(ctx context.Context, tx pgx.Tx) er
 WITH gate AS MATERIALIZED (
   INSERT INTO sync.server_change_log
       (user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
-  VALUES ($1, $2, $3, $4, $5::uuid, $6::jsonb, $7, $8::bigint, ($9 + 1))
+  VALUES ($1, $2, $3, $4, $5::uuid, $6::json, $7, $8::bigint, ($9 + 1))
   ON CONFLICT (user_id, source_id, source_change_id) DO NOTHING
   RETURNING 1
 ),
@@ -73,7 +73,7 @@ applied AS (
 ),
 state_upsert AS (
   INSERT INTO sync.sync_state (user_id, schema_name, table_name, pk_uuid, payload)
-  SELECT $1, $2, $3, $5::uuid, $6::jsonb
+  SELECT $1, $2, $3, $5::uuid, $6::json
   WHERE EXISTS (SELECT 1 FROM applied)
   ON CONFLICT (user_id, schema_name, table_name, pk_uuid) DO UPDATE
   SET payload = EXCLUDED.payload

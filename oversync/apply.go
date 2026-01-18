@@ -302,7 +302,7 @@ func (s *SyncService) recordMaterializeFailure(ctx context.Context, tx pgx.Tx, u
 	_, err := tx.Exec(ctx, `
         INSERT INTO sync.materialize_failures
             (user_id, schema_name, table_name, pk_uuid, attempted_version, op, payload, error)
-        VALUES (@user_id, @schema_name, @table_name, @pk_uuid::uuid, @attempted_version, @op, @payload::jsonb, @error)
+        VALUES (@user_id, @schema_name, @table_name, @pk_uuid::uuid, @attempted_version, @op, @payload::json, @error)
         ON CONFLICT (user_id, schema_name, table_name, pk_uuid, attempted_version)
         DO UPDATE SET
             retry_count = sync.materialize_failures.retry_count + 1,

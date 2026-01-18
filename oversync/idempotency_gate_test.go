@@ -54,7 +54,7 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		_, err = tx.Exec(ctx, `
 			CREATE OR REPLACE FUNCTION pg_temp.fail_apply_upsert(
 				user_id text, schema_name text, table_name text, op text,
-				pk uuid, payload jsonb, source_id text, source_change_id bigint, base_version bigint
+				pk uuid, payload json, source_id text, source_change_id bigint, base_version bigint
 			) RETURNS void AS $$
 			BEGIN
 				RAISE EXCEPTION 'forced' USING ERRCODE = '40001';
@@ -62,7 +62,7 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		$$ LANGUAGE plpgsql`)
 		require.NoError(t, err)
 
-		_, err = tx.Prepare(ctx, stmtApplyUpsert, `SELECT pg_temp.fail_apply_upsert($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)`)
+		_, err = tx.Prepare(ctx, stmtApplyUpsert, `SELECT pg_temp.fail_apply_upsert($1,$2,$3,$4,$5::uuid,$6::json,$7,$8,$9)`)
 		require.NoError(t, err)
 
 		change := ChangeUpload{
@@ -98,7 +98,7 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		_, err = tx.Exec(ctx, `
 			CREATE OR REPLACE FUNCTION pg_temp.fail_apply_upsert(
 				user_id text, schema_name text, table_name text, op text,
-				pk uuid, payload jsonb, source_id text, source_change_id bigint, base_version bigint
+				pk uuid, payload json, source_id text, source_change_id bigint, base_version bigint
 			) RETURNS void AS $$
 			BEGIN
 				RAISE EXCEPTION 'forced' USING ERRCODE = '40001';
@@ -106,14 +106,14 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		$$ LANGUAGE plpgsql`)
 		require.NoError(t, err)
 
-		_, err = tx.Prepare(ctx, stmtApplyUpsert, `SELECT pg_temp.fail_apply_upsert($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)`)
+		_, err = tx.Prepare(ctx, stmtApplyUpsert, `SELECT pg_temp.fail_apply_upsert($1,$2,$3,$4,$5::uuid,$6::json,$7,$8,$9)`)
 		require.NoError(t, err)
 
 		pk := uuid.New().String()
 		_, err = tx.Exec(ctx, `
 			INSERT INTO sync.server_change_log
 				(user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
-			VALUES ($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)
+			VALUES ($1,$2,$3,$4,$5::uuid,$6::json,$7,$8,$9)
 		`, userID, "public", "t", OpInsert, pk, `{"id":"`+pk+`"}`, sourceID, scid, int64(1))
 		require.NoError(t, err)
 
@@ -208,7 +208,7 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO sync.server_change_log
 				(user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
-			VALUES ($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)
+			VALUES ($1,$2,$3,$4,$5::uuid,$6::json,$7,$8,$9)
 		`, userID, "public", "t", OpDelete, pk, nil, sourceID, scid, int64(1))
 		require.NoError(t, err)
 
@@ -264,7 +264,7 @@ func TestServerChangeLogHasTriplet(t *testing.T) {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO sync.server_change_log
 				(user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
-			VALUES ($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)
+			VALUES ($1,$2,$3,$4,$5::uuid,$6::json,$7,$8,$9)
 		`, userID, "public", "t", OpInsert, pk, fmt.Sprintf(`{"id":"%s"}`, pk), sourceID, scid, int64(1))
 		if err != nil {
 			return err

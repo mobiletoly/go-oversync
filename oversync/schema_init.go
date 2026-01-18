@@ -51,9 +51,25 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			schema_name  TEXT   NOT NULL,
 			table_name   TEXT   NOT NULL,
 			pk_uuid      UUID   NOT NULL,
-			payload      JSONB  NOT NULL,
+			payload      JSON   NOT NULL,
 			PRIMARY KEY (user_id, schema_name, table_name, pk_uuid)
 		)`,
+		// Migrate payload to JSON (write-optimized) if previous schema used JSONB.
+		/*language=postgresql*/ `DO $$
+		BEGIN
+		  IF EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'sync'
+			  AND table_name = 'sync_state'
+			  AND column_name = 'payload'
+			  AND data_type = 'jsonb'
+		  ) THEN
+			ALTER TABLE sync.sync_state
+			  ALTER COLUMN payload TYPE json
+			  USING payload::json;
+		  END IF;
+		END $$;`,
 
 		// 3) Distribution log (idempotency & download stream) - user-scoped
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.server_change_log (
@@ -63,15 +79,31 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			table_name       TEXT      NOT NULL,
 			op               TEXT      NOT NULL CHECK (op IN ('INSERT','UPDATE','DELETE')),
 			pk_uuid          UUID      NOT NULL,
-			payload          JSONB,
+			payload          JSON,
 			source_id        TEXT      NOT NULL,
 			source_change_id BIGINT    NOT NULL,
 			server_version   BIGINT    NOT NULL DEFAULT 0,
 			ts               TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE (user_id, source_id, source_change_id),
 			CONSTRAINT server_change_payload_by_op_chk
-  				CHECK ((op = 'DELETE' AND payload IS NULL) OR (op IN ('INSERT','UPDATE') AND payload IS NOT NULL))
+  			CHECK ((op = 'DELETE' AND payload IS NULL) OR (op IN ('INSERT','UPDATE') AND payload IS NOT NULL))
 		)`,
+		// Migrate payload to JSON (write-optimized) if previous schema used JSONB.
+		/*language=postgresql*/ `DO $$
+		BEGIN
+		  IF EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'sync'
+			  AND table_name = 'server_change_log'
+			  AND column_name = 'payload'
+			  AND data_type = 'jsonb'
+		  ) THEN
+			ALTER TABLE sync.server_change_log
+			  ALTER COLUMN payload TYPE json
+			  USING payload::json;
+		  END IF;
+		END $$;`,
 
 		// Indexes for performance (user-scoped)
 		// Drop redundant historical indexes (safe even if absent).
@@ -93,12 +125,28 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
             pk_uuid UUID NOT NULL,
             attempted_version BIGINT NOT NULL,
             op TEXT NOT NULL,
-            payload JSONB,
+            payload JSON,
             error TEXT NOT NULL,
             first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
             retry_count INT NOT NULL DEFAULT 0,
             UNIQUE (user_id, schema_name, table_name, pk_uuid, attempted_version)
         )`,
+		// Migrate payload to JSON (write-optimized) if previous schema used JSONB.
+		/*language=postgresql*/ `DO $$
+		BEGIN
+		  IF EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'sync'
+			  AND table_name = 'materialize_failures'
+			  AND column_name = 'payload'
+			  AND data_type = 'jsonb'
+		  ) THEN
+			ALTER TABLE sync.materialize_failures
+			  ALTER COLUMN payload TYPE json
+			  USING payload::json;
+		  END IF;
+		END $$;`,
 		`CREATE INDEX IF NOT EXISTS mf_user_table_idx ON sync.materialize_failures(user_id, schema_name, table_name)`,
 	}
 

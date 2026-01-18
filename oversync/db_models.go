@@ -39,7 +39,7 @@ type ServerChangeLogEntity struct {
 	TableName      string          `db:"table_name"`       // Table name
 	Op             string          `db:"op"`               // INSERT, UPDATE, DELETE
 	PkUUID         string          `db:"pk_uuid"`          // UUID as string
-	Payload        json.RawMessage `db:"payload"`          // JSONB payload
+	Payload        json.RawMessage `db:"payload"`          // JSON payload
 	SourceID       string          `db:"source_id"`        // Device identifier (from JWT did)
 	SourceChangeID int64           `db:"source_change_id"` // Client change ID
 	ServerVersion  int64           `db:"server_version"`   // Server version for chronological ordering
