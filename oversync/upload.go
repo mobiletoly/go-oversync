@@ -330,7 +330,17 @@ func (s *SyncService) parentsMissingBatch(
 			if !dbHasValue {
 				continue // Converted value is null or empty - skip validation
 			}
-			if parsed, err := uuid.Parse(dbRefValStr); err == nil {
+
+			// If the parent column is UUID, treat non-UUID payload values as bad payload early (avoid
+			// server-side cast errors and keep precheck queries index-friendly).
+			if s.discoveredSchema != nil && s.discoveredSchema.IsUUIDColumn(fk.RefSchema, fk.RefTable, fk.RefCol) {
+				parsed, err := uuid.Parse(dbRefValStr)
+				if err != nil {
+					missingByIdx[idx] = []string{ReasonBadPayload}
+					break
+				}
+				dbRefValStr = parsed.String()
+			} else if parsed, err := uuid.Parse(dbRefValStr); err == nil {
 				dbRefValStr = parsed.String()
 			}
 
@@ -408,14 +418,42 @@ func (s *SyncService) parentsMissingBatch(
 
 			args := pgx.NamedArgs{"vals": chunk}
 
+			// Keep this query index-friendly:
+			// - Prefer typed comparisons (uuid/text) without casting the column.
+			// - Fall back to text casting only when we don't know the column type.
+			refType := ""
+			if s.discoveredSchema != nil {
+				refType = s.discoveredSchema.ColumnType(g.refSchema, g.refTable, g.refCol)
+			}
+			isUUID := refType == "uuid"
+			isText := refType == "text" || refType == "varchar" || refType == "bpchar" || refType == "citext"
+
 			where := fmt.Sprintf(`%s::text = ANY(@vals::text[])`, colIdent)
+			if isUUID {
+				where = fmt.Sprintf(`%s = ANY(@vals::uuid[])`, colIdent)
+			} else if isText {
+				where = fmt.Sprintf(`%s = ANY(@vals::text[])`, colIdent)
+			}
+
 			if tenantCol != "" {
 				tenantIdent := pgx.Identifier{tenantCol}.Sanitize()
-				where += fmt.Sprintf(` AND %s::text = @tenant::text`, tenantIdent)
+				tenantType := ""
+				if s.discoveredSchema != nil {
+					tenantType = s.discoveredSchema.ColumnType(g.refSchema, g.refTable, tenantCol)
+				}
+				switch tenantType {
+				case "uuid":
+					where += fmt.Sprintf(` AND %s = @tenant::uuid`, tenantIdent)
+				case "text", "varchar", "bpchar", "citext":
+					where += fmt.Sprintf(` AND %s = @tenant`, tenantIdent)
+				default:
+					where += fmt.Sprintf(` AND %s::text = @tenant::text`, tenantIdent)
+				}
 				args["tenant"] = userID
 			}
 
-			query := fmt.Sprintf(`SELECT DISTINCT %s::text FROM %s.%s WHERE %s`, colIdent, schemaIdent, tableIdent, where)
+			// Use a simple SELECT and de-duplicate in memory (map) to avoid extra DB work.
+			query := fmt.Sprintf(`SELECT %s::text FROM %s.%s WHERE %s`, colIdent, schemaIdent, tableIdent, where)
 
 			rows, err := tx.Query(ctx, query, args)
 			if err != nil {

@@ -43,15 +43,32 @@ type ForeignKeyConstraint struct {
 
 // DiscoveredSchema contains the discovered table relationships
 type DiscoveredSchema struct {
-	TableOrder   []string            // Ordered list of schema.table (parents first)
-	OrderIdx     map[string]int      // schema.table -> order index for O(1) lookups
-	FKMap        map[string][]FK     // schema.table -> FK constraints
+	TableOrder   []string        // Ordered list of schema.table (parents first)
+	OrderIdx     map[string]int  // schema.table -> order index for O(1) lookups
+	FKMap        map[string][]FK // schema.table -> FK constraints
+	ColumnTypes  map[string]map[string]string
 	Dependencies map[string][]string // schema.table -> list of parent schema.table
 }
 
 // Key creates a normalized schema.table key (public helper)
 func Key(schema, table string) string {
 	return strings.ToLower(schema + "." + table)
+}
+
+func (d *DiscoveredSchema) ColumnType(schema, table, column string) string {
+	if d == nil || d.ColumnTypes == nil {
+		return ""
+	}
+	tableKey := Key(schema, table)
+	cols := d.ColumnTypes[tableKey]
+	if cols == nil {
+		return ""
+	}
+	return cols[strings.ToLower(column)]
+}
+
+func (d *DiscoveredSchema) IsUUIDColumn(schema, table, column string) bool {
+	return d.ColumnType(schema, table, column) == "uuid"
 }
 
 // key creates a normalized schema.table key (internal helper)
@@ -80,6 +97,12 @@ func (sd *SchemaDiscovery) DiscoverSchema(ctx context.Context, registeredTables 
 	fkConstraints, err := sd.getForeignKeyConstraints(ctx, registeredTables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get foreign key constraints: %w", err)
+	}
+
+	// Step 1.5: Fetch column types for registered + referenced tables (used by FK precheck for typed queries).
+	columnTypes, err := sd.getColumnTypes(ctx, registeredTables, fkConstraints)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get column types: %w", err)
 	}
 
 	// Step 2: Build dependency graph
@@ -119,6 +142,7 @@ func (sd *SchemaDiscovery) DiscoverSchema(ctx context.Context, registeredTables 
 		TableOrder:   tableOrder,
 		OrderIdx:     orderIdx,
 		FKMap:        fkMap,
+		ColumnTypes:  columnTypes,
 		Dependencies: dependencies,
 	}, nil
 }
@@ -135,6 +159,12 @@ func (sd *SchemaDiscovery) DiscoverSchemaWithDependencyOverrides(
 	fkConstraints, err := sd.getForeignKeyConstraints(ctx, registeredTables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get foreign key constraints: %w", err)
+	}
+
+	// Step 1.5: Fetch column types for registered + referenced tables (used by FK precheck for typed queries).
+	columnTypes, err := sd.getColumnTypes(ctx, registeredTables, fkConstraints)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get column types: %w", err)
 	}
 
 	// Step 2: Build dependency graph
@@ -175,8 +205,85 @@ func (sd *SchemaDiscovery) DiscoverSchemaWithDependencyOverrides(
 		TableOrder:   tableOrder,
 		OrderIdx:     orderIdx,
 		FKMap:        fkMap,
+		ColumnTypes:  columnTypes,
 		Dependencies: dependencies,
 	}, nil
+}
+
+func (sd *SchemaDiscovery) getColumnTypes(
+	ctx context.Context,
+	registeredTables map[string]bool,
+	fkConstraints []ForeignKeyConstraint,
+) (map[string]map[string]string, error) {
+	// Gather tables: all registered + all FK referenced tables (even if unregistered).
+	toCheck := make(map[string]struct{}, len(registeredTables)+len(fkConstraints))
+	for k := range registeredTables {
+		toCheck[k] = struct{}{}
+	}
+	for _, fk := range fkConstraints {
+		toCheck[key(fk.TableSchema, fk.TableName)] = struct{}{}
+		toCheck[key(fk.RefSchema, fk.RefTable)] = struct{}{}
+	}
+	if len(toCheck) == 0 {
+		return nil, nil
+	}
+
+	schemas := make([]string, 0, len(toCheck))
+	tables := make([]string, 0, len(toCheck))
+	for st := range toCheck {
+		parts := strings.SplitN(st, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		schemas = append(schemas, parts[0])
+		tables = append(tables, parts[1])
+	}
+	if len(schemas) == 0 {
+		return nil, nil
+	}
+
+	const q = `
+WITH t AS (
+  SELECT * FROM unnest(@schemas::text[], @tables::text[]) AS x(schema_name, table_name)
+)
+SELECT
+  c.table_schema,
+  c.table_name,
+  lower(c.column_name) AS column_name,
+  lower(c.udt_name)    AS udt_name
+FROM information_schema.columns c
+JOIN t
+  ON c.table_schema = t.schema_name
+ AND c.table_name = t.table_name`
+
+	rows, err := sd.pool.Query(ctx, q, pgx.NamedArgs{
+		"schemas": schemas,
+		"tables":  tables,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	colTypes := make(map[string]map[string]string)
+	for rows.Next() {
+		var schemaName, tableName, colName, udtName string
+		if scanErr := rows.Scan(&schemaName, &tableName, &colName, &udtName); scanErr != nil {
+			return nil, scanErr
+		}
+		tableKey := key(schemaName, tableName)
+		m := colTypes[tableKey]
+		if m == nil {
+			m = make(map[string]string)
+			colTypes[tableKey] = m
+		}
+		m[colName] = udtName
+	}
+	if rows.Err() != nil {
+		return nil, rows.Err()
+	}
+
+	return colTypes, nil
 }
 
 func applyDependencyOverrides(
