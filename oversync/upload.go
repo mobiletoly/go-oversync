@@ -27,6 +27,11 @@ type inBatchIndex struct {
 	ref map[refKey]pkset
 }
 
+type materializeItem struct {
+	change           ChangeUpload
+	attemptedVersion int64
+}
+
 // splitAndOrder splits changes into upserts and deletes, ordering them appropriately
 func (s *SyncService) splitAndOrder(changes []ChangeUpload) (upserts, deletes []ChangeUpload) {
 	for _, ch := range changes {
@@ -528,6 +533,146 @@ func (s *SyncService) parentsMissingBatch(
 	return missingByIdx
 }
 
+func (s *SyncService) materializeBatchBestEffort(ctx context.Context, tx pgx.Tx, userID string, items []materializeItem, deleted bool) bool {
+	if len(items) == 0 {
+		return false
+	}
+
+	// Group by table handler key (schema.table).
+	type groupKey struct {
+		handlerKey string
+		schema     string
+		table      string
+	}
+	groups := make(map[groupKey][]materializeItem)
+	order := make([]groupKey, 0)
+	for _, it := range items {
+		key := groupKey{
+			handlerKey: it.change.Schema + "." + it.change.Table,
+			schema:     it.change.Schema,
+			table:      it.change.Table,
+		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], it)
+	}
+
+	hadError := false
+	for groupIdx, gk := range order {
+		group := groups[gk]
+		if len(group) == 0 {
+			continue
+		}
+
+		s.mu.RLock()
+		handler, exists := s.tableHandlers[gk.handlerKey]
+		s.mu.RUnlock()
+		if !exists || handler == nil {
+			continue
+		}
+
+		spName := fmt.Sprintf("sp_mat_batch_%d", groupIdx)
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SAVEPOINT %s", pgx.Identifier{spName}.Sanitize())); err != nil {
+			// Best-effort: fall back to per-row, which will attempt its own savepoints.
+			for _, it := range group {
+				if err2 := s.applyBusinessProjectionBestEffort(ctx, tx, userID, it.change, deleted, it.attemptedVersion); err2 != nil {
+					hadError = true
+					s.logger.Warn("Business projection failed; sync still applied",
+						"error", err2, "schema", it.change.Schema, "table", it.change.Table, "pk", it.change.PK,
+						"server_version", it.attemptedVersion, "source_change_id", it.change.SourceChangeID)
+				}
+			}
+			continue
+		}
+
+		// Try batched hook if available, otherwise run per-row without per-row savepoints.
+		var batchErr error
+		if deleted {
+			if bh, ok := handler.(BatchMaterializationHandler); ok {
+				pks := make([]uuid.UUID, 0, len(group))
+				for _, it := range group {
+					pkUUID, err := uuid.Parse(it.change.PK)
+					if err != nil {
+						batchErr = fmt.Errorf("invalid UUID format: %w", err)
+						break
+					}
+					pks = append(pks, pkUUID)
+				}
+				if batchErr == nil {
+					batchErr = bh.ApplyDeleteBatch(ctx, tx, gk.schema, gk.table, pks)
+				}
+			} else {
+				for _, it := range group {
+					pkUUID, err := uuid.Parse(it.change.PK)
+					if err != nil {
+						batchErr = fmt.Errorf("invalid UUID format: %w", err)
+						break
+					}
+					if err := handler.ApplyDelete(ctx, tx, gk.schema, gk.table, pkUUID); err != nil {
+						batchErr = err
+						break
+					}
+				}
+			}
+		} else {
+			if bh, ok := handler.(BatchMaterializationHandler); ok {
+				ups := make([]MaterializeUpsert, 0, len(group))
+				for _, it := range group {
+					pkUUID, err := uuid.Parse(it.change.PK)
+					if err != nil {
+						batchErr = fmt.Errorf("invalid UUID format: %w", err)
+						break
+					}
+					ups = append(ups, MaterializeUpsert{
+						PK:               pkUUID,
+						Payload:          it.change.Payload,
+						AttemptedVersion: it.attemptedVersion,
+					})
+				}
+				if batchErr == nil {
+					batchErr = bh.ApplyUpsertBatch(ctx, tx, gk.schema, gk.table, ups)
+				}
+			} else {
+				for _, it := range group {
+					pkUUID, err := uuid.Parse(it.change.PK)
+					if err != nil {
+						batchErr = fmt.Errorf("invalid UUID format: %w", err)
+						break
+					}
+					if err := handler.ApplyUpsert(ctx, tx, gk.schema, gk.table, pkUUID, it.change.Payload); err != nil {
+						batchErr = err
+						break
+					}
+				}
+			}
+		}
+
+		if batchErr == nil {
+			_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+			continue
+		}
+
+		// Roll back batch attempt and fall back to per-row materialization for accurate failure tracking.
+		_, _ = tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+		_, _ = tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", pgx.Identifier{spName}.Sanitize()))
+
+		s.logger.Debug("Batch materialization failed; falling back to per-row",
+			"schema", gk.schema, "table", gk.table, "deleted", deleted, "count", len(group), "error", batchErr)
+
+		for _, it := range group {
+			if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, it.change, deleted, it.attemptedVersion); err != nil {
+				hadError = true
+				s.logger.Warn("Business projection failed; sync still applied",
+					"error", err, "schema", it.change.Schema, "table", it.change.Table, "pk", it.change.PK,
+					"server_version", it.attemptedVersion, "source_change_id", it.change.SourceChangeID)
+			}
+		}
+	}
+
+	return hadError
+}
+
 // processUpserts processes INSERT/UPDATE operations with FK precheck and SAVEPOINTs
 func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sourceID string, upserts, deletes []ChangeUpload, useBatchedApply bool) ([]ChangeUploadStatus, error) {
 	s.logger.Info("Processing upserts batch", "count", len(upserts), "user_id", userID, "source_id", sourceID)
@@ -635,12 +780,7 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 		applyIdx = append(applyIdx, i)
 	}
 
-	type matItem struct {
-		change           ChangeUpload
-		deleted          bool
-		attemptedVersion int64
-	}
-	var mats []matItem
+	var mats []materializeItem
 
 	if useBatchedApply && len(applyIdx) > 1 {
 		applyStart := s.stageStart()
@@ -664,7 +804,7 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 				st = statusAppliedIdempotent(ch.SourceChangeID)
 			case 1:
 				st = statusApplied(ch.SourceChangeID, o.newServerVer64)
-				mats = append(mats, matItem{change: ch, deleted: false, attemptedVersion: o.newServerVer64})
+				mats = append(mats, materializeItem{change: ch, attemptedVersion: o.newServerVer64})
 			case 2:
 				serverRow, fetchErr := s.fetchServerRowJSON(ctx, tx, userID, ch.Schema, ch.Table, ch.PK)
 				if fetchErr != nil {
@@ -704,15 +844,7 @@ func (s *SyncService) processUpserts(ctx context.Context, tx pgx.Tx, userID, sou
 	}
 
 	matStart := s.stageStart()
-	hadMatError := false
-	for _, m := range mats {
-		if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, m.change, m.deleted, m.attemptedVersion); err != nil {
-			hadMatError = true
-			s.logger.Warn("Business projection failed; sync still applied",
-				"error", err, "schema", m.change.Schema, "table", m.change.Table, "pk", m.change.PK,
-				"server_version", m.attemptedVersion, "source_change_id", m.change.SourceChangeID)
-		}
-	}
+	hadMatError := s.materializeBatchBestEffort(ctx, tx, userID, mats, false)
 	if len(mats) > 0 {
 		s.observeStage(ctx, MetricsOpUpload, MetricsStageUpsertsMaterialize, matStart, len(mats), 0, hadMatError)
 	}
@@ -771,12 +903,7 @@ func (s *SyncService) processDeletes(
 	}
 	s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesValidate, validateStart, len(deletes), 0, false)
 
-	type matItem struct {
-		change           ChangeUpload
-		deleted          bool
-		attemptedVersion int64
-	}
-	var mats []matItem
+	var mats []materializeItem
 
 	if useBatchedApply && len(applyIdx) > 1 {
 		applyStart := s.stageStart()
@@ -799,7 +926,7 @@ func (s *SyncService) processDeletes(
 				st = statusAppliedIdempotent(ch.SourceChangeID)
 			case 1:
 				st = statusApplied(ch.SourceChangeID, o.newServerVer64)
-				mats = append(mats, matItem{change: ch, deleted: true, attemptedVersion: o.newServerVer64})
+				mats = append(mats, materializeItem{change: ch, attemptedVersion: o.newServerVer64})
 			case 2:
 				serverRow, fetchErr := s.fetchServerRowJSON(ctx, tx, userID, ch.Schema, ch.Table, ch.PK)
 				if fetchErr != nil {
@@ -835,15 +962,7 @@ func (s *SyncService) processDeletes(
 	}
 
 	matStart := s.stageStart()
-	hadMatError := false
-	for _, m := range mats {
-		if err := s.applyBusinessProjectionBestEffort(ctx, tx, userID, m.change, m.deleted, m.attemptedVersion); err != nil {
-			hadMatError = true
-			s.logger.Warn("Business projection failed; sync still applied",
-				"error", err, "schema", m.change.Schema, "table", m.change.Table, "pk", m.change.PK,
-				"server_version", m.attemptedVersion, "source_change_id", m.change.SourceChangeID)
-		}
-	}
+	hadMatError := s.materializeBatchBestEffort(ctx, tx, userID, mats, true)
 	if len(mats) > 0 {
 		s.observeStage(ctx, MetricsOpUpload, MetricsStageDeletesMaterialize, matStart, len(mats), 0, hadMatError)
 	}

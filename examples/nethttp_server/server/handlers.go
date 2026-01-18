@@ -189,6 +189,65 @@ func (h *UsersTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schema, 
 	return nil
 }
 
+func (h *UsersTableHandler) ApplyUpsertBatch(ctx context.Context, tx pgx.Tx, schema, table string, upserts []oversync.MaterializeUpsert) error {
+	if len(upserts) == 0 {
+		return nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(upserts))
+	names := make([]string, 0, len(upserts))
+	emails := make([]string, 0, len(upserts))
+	createdAts := make([]time.Time, 0, len(upserts))
+	updatedAts := make([]time.Time, 0, len(upserts))
+
+	for _, u := range upserts {
+		var userData UserData
+		if err := json.Unmarshal(u.Payload, &userData); err != nil {
+			return fmt.Errorf("failed to parse user data: %w", err)
+		}
+
+		updatedAt := time.Now()
+		if userData.UpdatedAt > 0 {
+			updatedAt = time.Unix(userData.UpdatedAt, 0)
+		}
+		createdAt := updatedAt
+		if userData.CreatedAt > 0 {
+			createdAt = time.Unix(userData.CreatedAt, 0)
+		}
+
+		ids = append(ids, u.PK)
+		names = append(names, userData.Name)
+		emails = append(emails, userData.Email)
+		createdAts = append(createdAts, createdAt)
+		updatedAts = append(updatedAts, updatedAt)
+	}
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO business.users (id, name, email, created_at, updated_at)
+		SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[], $5::timestamptz[])
+		ON CONFLICT (id) DO UPDATE SET
+			name = EXCLUDED.name,
+			email = EXCLUDED.email,
+			updated_at = EXCLUDED.updated_at`,
+		ids, names, emails, createdAts, updatedAts)
+	if err != nil {
+		return fmt.Errorf("failed to materialize users to business table: %w", err)
+	}
+
+	return nil
+}
+
+func (h *UsersTableHandler) ApplyDeleteBatch(ctx context.Context, tx pgx.Tx, schema, table string, pks []uuid.UUID) error {
+	if len(pks) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM business.users WHERE id = ANY($1::uuid[])`, pks)
+	if err != nil {
+		return fmt.Errorf("failed to delete users from business table: %w", err)
+	}
+	return nil
+}
+
 // PostsTableHandler implements oversync.MaterializationHandler for the posts table
 // This handler materializes changes from sidecar tables to the business posts table
 type PostsTableHandler struct {
@@ -257,6 +316,73 @@ func (h *PostsTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schema, 
 	return nil
 }
 
+func (h *PostsTableHandler) ApplyUpsertBatch(ctx context.Context, tx pgx.Tx, schema, table string, upserts []oversync.MaterializeUpsert) error {
+	if len(upserts) == 0 {
+		return nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(upserts))
+	titles := make([]string, 0, len(upserts))
+	contents := make([]string, 0, len(upserts))
+	authorIDs := make([]uuid.UUID, 0, len(upserts))
+	createdAts := make([]time.Time, 0, len(upserts))
+	updatedAts := make([]time.Time, 0, len(upserts))
+
+	for _, u := range upserts {
+		var postData PostData
+		if err := json.Unmarshal(u.Payload, &postData); err != nil {
+			return fmt.Errorf("failed to parse post data: %w", err)
+		}
+
+		updatedAt := time.Now()
+		if postData.UpdatedAt > 0 {
+			updatedAt = time.Unix(postData.UpdatedAt, 0)
+		}
+		createdAt := updatedAt
+		if postData.CreatedAt > 0 {
+			createdAt = time.Unix(postData.CreatedAt, 0)
+		}
+
+		authorUUID, err := uuid.Parse(postData.AuthorID)
+		if err != nil {
+			return fmt.Errorf("failed to parse author_id: %w", err)
+		}
+
+		ids = append(ids, u.PK)
+		titles = append(titles, postData.Title)
+		contents = append(contents, postData.Content)
+		authorIDs = append(authorIDs, authorUUID)
+		createdAts = append(createdAts, createdAt)
+		updatedAts = append(updatedAts, updatedAt)
+	}
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO business.posts (id, title, content, author_id, created_at, updated_at)
+		SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::uuid[], $5::timestamptz[], $6::timestamptz[])
+		ON CONFLICT (id) DO UPDATE SET
+			title = EXCLUDED.title,
+			content = EXCLUDED.content,
+			author_id = EXCLUDED.author_id,
+			updated_at = EXCLUDED.updated_at`,
+		ids, titles, contents, authorIDs, createdAts, updatedAts)
+	if err != nil {
+		return fmt.Errorf("failed to materialize posts to business table: %w", err)
+	}
+
+	return nil
+}
+
+func (h *PostsTableHandler) ApplyDeleteBatch(ctx context.Context, tx pgx.Tx, schema, table string, pks []uuid.UUID) error {
+	if len(pks) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM business.posts WHERE id = ANY($1::uuid[])`, pks)
+	if err != nil {
+		return fmt.Errorf("failed to delete posts from business table: %w", err)
+	}
+	return nil
+}
+
 type FilesTableHandler struct {
 	logger *slog.Logger
 }
@@ -293,6 +419,50 @@ func (h *FilesTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, schema, 
 	_, err := tx.Exec(ctx, `DELETE FROM business.files WHERE id = @id`, pgx.NamedArgs{"id": pk})
 	if err != nil {
 		return fmt.Errorf("failed to delete file from business table: %w", err)
+	}
+	return nil
+}
+
+func (h *FilesTableHandler) ApplyUpsertBatch(ctx context.Context, tx pgx.Tx, schema, table string, upserts []oversync.MaterializeUpsert) error {
+	if len(upserts) == 0 {
+		return nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(upserts))
+	names := make([]string, 0, len(upserts))
+	datas := make([][]byte, 0, len(upserts))
+
+	for _, u := range upserts {
+		var fileData FileData
+		if err := json.Unmarshal(u.Payload, &fileData); err != nil {
+			return fmt.Errorf("failed to parse file data: %w", err)
+		}
+		ids = append(ids, u.PK)
+		names = append(names, fileData.Name)
+		datas = append(datas, fileData.Data)
+	}
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO business.files (id, name, data)
+		SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::bytea[])
+		ON CONFLICT (id) DO UPDATE SET
+			name = EXCLUDED.name,
+			data = EXCLUDED.data`,
+		ids, names, datas)
+	if err != nil {
+		return fmt.Errorf("failed to materialize files to business table: %w", err)
+	}
+
+	return nil
+}
+
+func (h *FilesTableHandler) ApplyDeleteBatch(ctx context.Context, tx pgx.Tx, schema, table string, pks []uuid.UUID) error {
+	if len(pks) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM business.files WHERE id = ANY($1::uuid[])`, pks)
+	if err != nil {
+		return fmt.Errorf("failed to delete files from business table: %w", err)
 	}
 	return nil
 }
@@ -337,6 +507,54 @@ func (h *FileReviewsTableHandler) ApplyDelete(ctx context.Context, tx pgx.Tx, sc
 	_, err := tx.Exec(ctx, `DELETE FROM business.file_reviews WHERE id = @id`, pgx.NamedArgs{"id": pk})
 	if err != nil {
 		return fmt.Errorf("failed to delete file review from business table: %w", err)
+	}
+	return nil
+}
+
+func (h *FileReviewsTableHandler) ApplyUpsertBatch(ctx context.Context, tx pgx.Tx, schema, table string, upserts []oversync.MaterializeUpsert) error {
+	if len(upserts) == 0 {
+		return nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(upserts))
+	reviews := make([]string, 0, len(upserts))
+	fileIDs := make([]uuid.UUID, 0, len(upserts))
+
+	for _, u := range upserts {
+		var fileReviewData FileReviewData
+		if err := json.Unmarshal(u.Payload, &fileReviewData); err != nil {
+			return fmt.Errorf("failed to parse file review data: %w", err)
+		}
+		fileID, err := oversync.ConvertBase64EncodedUUID(fileReviewData.FileID)
+		if err != nil {
+			return fmt.Errorf("failed to parse file ID: %w", err)
+		}
+		ids = append(ids, u.PK)
+		reviews = append(reviews, fileReviewData.Review)
+		fileIDs = append(fileIDs, fileID)
+	}
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO business.file_reviews (id, review, file_id)
+		SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::uuid[])
+		ON CONFLICT (id) DO UPDATE SET
+			review = EXCLUDED.review,
+			file_id = EXCLUDED.file_id`,
+		ids, reviews, fileIDs)
+	if err != nil {
+		return fmt.Errorf("failed to materialize file reviews to business table: %w", err)
+	}
+
+	return nil
+}
+
+func (h *FileReviewsTableHandler) ApplyDeleteBatch(ctx context.Context, tx pgx.Tx, schema, table string, pks []uuid.UUID) error {
+	if len(pks) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM business.file_reviews WHERE id = ANY($1::uuid[])`, pks)
+	if err != nil {
+		return fmt.Errorf("failed to delete file reviews from business table: %w", err)
 	}
 	return nil
 }
