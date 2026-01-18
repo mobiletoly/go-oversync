@@ -52,17 +52,17 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		defer tx.Rollback(ctx)
 
 		_, err = tx.Exec(ctx, `
-			CREATE OR REPLACE FUNCTION pg_temp.fail_gate_upsert(
+			CREATE OR REPLACE FUNCTION pg_temp.fail_apply_upsert(
 				user_id text, schema_name text, table_name text, op text,
-				pk uuid, payload jsonb, source_id text, source_change_id bigint, server_version bigint
+				pk uuid, payload jsonb, source_id text, source_change_id bigint, base_version bigint
 			) RETURNS void AS $$
 			BEGIN
 				RAISE EXCEPTION 'forced' USING ERRCODE = '40001';
 			END
-			$$ LANGUAGE plpgsql`)
+		$$ LANGUAGE plpgsql`)
 		require.NoError(t, err)
 
-		_, err = tx.Prepare(ctx, stmtGateInsertUpsert, `SELECT pg_temp.fail_gate_upsert($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)`)
+		_, err = tx.Prepare(ctx, stmtApplyUpsert, `SELECT pg_temp.fail_apply_upsert($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)`)
 		require.NoError(t, err)
 
 		change := ChangeUpload{
@@ -96,17 +96,17 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		defer tx.Rollback(ctx)
 
 		_, err = tx.Exec(ctx, `
-			CREATE OR REPLACE FUNCTION pg_temp.fail_gate_upsert(
+			CREATE OR REPLACE FUNCTION pg_temp.fail_apply_upsert(
 				user_id text, schema_name text, table_name text, op text,
-				pk uuid, payload jsonb, source_id text, source_change_id bigint, server_version bigint
+				pk uuid, payload jsonb, source_id text, source_change_id bigint, base_version bigint
 			) RETURNS void AS $$
 			BEGIN
 				RAISE EXCEPTION 'forced' USING ERRCODE = '40001';
 			END
-			$$ LANGUAGE plpgsql`)
+		$$ LANGUAGE plpgsql`)
 		require.NoError(t, err)
 
-		_, err = tx.Prepare(ctx, stmtGateInsertUpsert, `SELECT pg_temp.fail_gate_upsert($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)`)
+		_, err = tx.Prepare(ctx, stmtApplyUpsert, `SELECT pg_temp.fail_apply_upsert($1,$2,$3,$4,$5::uuid,$6::jsonb,$7,$8,$9)`)
 		require.NoError(t, err)
 
 		pk := uuid.New().String()
@@ -148,17 +148,17 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		defer tx.Rollback(ctx)
 
 		_, err = tx.Exec(ctx, `
-			CREATE OR REPLACE FUNCTION pg_temp.fail_gate_delete(
+			CREATE OR REPLACE FUNCTION pg_temp.fail_apply_delete(
 				user_id text, schema_name text, table_name text, op text,
 				pk uuid, source_id text, source_change_id bigint, server_version bigint
 			) RETURNS void AS $$
 			BEGIN
 				RAISE EXCEPTION 'forced' USING ERRCODE = '40P01';
 			END
-			$$ LANGUAGE plpgsql`)
+		$$ LANGUAGE plpgsql`)
 		require.NoError(t, err)
 
-		_, err = tx.Prepare(ctx, stmtGateInsertDelete, `SELECT pg_temp.fail_gate_delete($1,$2,$3,$4,$5::uuid,$6,$7,$8)`)
+		_, err = tx.Prepare(ctx, stmtApplyDelete, `SELECT pg_temp.fail_apply_delete($1,$2,$3,$4,$5::uuid,$6,$7,$8)`)
 		require.NoError(t, err)
 
 		change := ChangeUpload{
@@ -191,17 +191,17 @@ func TestIdempotencyGate_ErrorStatesVerifyTriplet(t *testing.T) {
 		defer tx.Rollback(ctx)
 
 		_, err = tx.Exec(ctx, `
-			CREATE OR REPLACE FUNCTION pg_temp.fail_gate_delete(
+			CREATE OR REPLACE FUNCTION pg_temp.fail_apply_delete(
 				user_id text, schema_name text, table_name text, op text,
 				pk uuid, source_id text, source_change_id bigint, server_version bigint
 			) RETURNS void AS $$
 			BEGIN
 				RAISE EXCEPTION 'forced' USING ERRCODE = '40P01';
 			END
-			$$ LANGUAGE plpgsql`)
+		$$ LANGUAGE plpgsql`)
 		require.NoError(t, err)
 
-		_, err = tx.Prepare(ctx, stmtGateInsertDelete, `SELECT pg_temp.fail_gate_delete($1,$2,$3,$4,$5::uuid,$6,$7,$8)`)
+		_, err = tx.Prepare(ctx, stmtApplyDelete, `SELECT pg_temp.fail_apply_delete($1,$2,$3,$4,$5::uuid,$6,$7,$8)`)
 		require.NoError(t, err)
 
 		pk := uuid.New().String()

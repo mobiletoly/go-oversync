@@ -5,7 +5,6 @@ package oversync
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -70,52 +69,34 @@ func (s *SyncService) ProcessDownloadWindowed(
 	}
 
 	const q = `
-WITH page_raw AS (
-  SELECT
-    l.server_id,
-    l.schema_name AS schema,
-    l.table_name  AS "table",
-    l.op,
-    l.pk_uuid::text AS pk,
-    l.payload,
-    l.server_version,
-    COALESCE(m.deleted, false)    AS deleted,
-    l.source_id,
-    l.source_change_id,
-    l.ts
-  FROM sync.server_change_log AS l
-  LEFT JOIN sync.sync_row_meta AS m
-    ON m.user_id     = l.user_id
-   AND m.schema_name = l.schema_name
-   AND m.table_name  = l.table_name
-   AND m.pk_uuid     = l.pk_uuid
-  WHERE l.user_id   = $1
-    AND l.server_id > $2
-    AND l.server_id <= $7
-    AND ($3::text IS NULL OR l.schema_name = $3)
-    AND (CASE WHEN $4::bool THEN TRUE ELSE l.source_id <> $5 END)
-  ORDER BY l.server_id
-  LIMIT ($6 + 1)
-),
-page_limited AS (
-  SELECT * FROM page_raw ORDER BY server_id LIMIT $6
-),
-agg AS (
-  SELECT
-    COALESCE(json_agg(to_jsonb(page_limited) ORDER BY page_limited.server_id), '[]'::json) AS changes,
-    COALESCE(MAX(page_limited.server_id), $2) AS next_after,
-    (SELECT COUNT(*) > $6 FROM page_raw) AS has_more
-  FROM page_limited
-)
-SELECT changes, next_after, has_more FROM agg;`
+SELECT
+  l.server_id,
+  l.schema_name AS schema,
+  l.table_name  AS "table",
+  l.op,
+  l.pk_uuid::text AS pk,
+  l.payload,
+  l.server_version,
+  COALESCE(m.deleted, false)    AS deleted,
+  l.source_id,
+  l.source_change_id,
+  l.ts
+FROM sync.server_change_log AS l
+LEFT JOIN sync.sync_row_meta AS m
+  ON m.user_id     = l.user_id
+ AND m.schema_name = l.schema_name
+ AND m.table_name  = l.table_name
+ AND m.pk_uuid     = l.pk_uuid
+WHERE l.user_id   = $1
+  AND l.server_id > $2
+  AND l.server_id <= $7
+  AND ($3::text IS NULL OR l.schema_name = $3)
+  AND (CASE WHEN $4::bool THEN TRUE ELSE l.source_id <> $5 END)
+ORDER BY l.server_id
+LIMIT ($6 + 1);`
 
-	var (
-		changesJSON []byte
-		nextAfter   int64
-		hasMore     bool
-	)
 	// Use positional args; pgx will handle NULL for $3 when schemaArg == nil.
-	if err := s.pool.QueryRow(ctx, q,
+	rows, err := s.pool.Query(ctx, q,
 		userID,      // $1
 		after,       // $2
 		schemaArg,   // $3
@@ -123,13 +104,45 @@ SELECT changes, next_after, has_more FROM agg;`
 		sourceID,    // $5
 		limit,       // $6
 		until,       // $7 (upper bound)
-	).Scan(&changesJSON, &nextAfter, &hasMore); err != nil {
+	)
+	if err != nil {
 		return nil, fmt.Errorf("failed to fetch download page: %w", err)
 	}
+	defer rows.Close()
 
-	var changes []ChangeDownloadResponse
-	if err := json.Unmarshal(changesJSON, &changes); err != nil {
-		return nil, fmt.Errorf("failed to decode page JSON: %w", err)
+	changes := make([]ChangeDownloadResponse, 0, limit)
+	hasMore := false
+	for rows.Next() {
+		var c ChangeDownloadResponse
+		if scanErr := rows.Scan(
+			&c.ServerID,
+			&c.Schema,
+			&c.TableName,
+			&c.Op,
+			&c.PK,
+			&c.Payload,
+			&c.ServerVersion,
+			&c.Deleted,
+			&c.SourceID,
+			&c.SourceChangeID,
+			&c.Timestamp,
+		); scanErr != nil {
+			return nil, fmt.Errorf("failed to scan download row: %w", scanErr)
+		}
+		changes = append(changes, c)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("failed to fetch download page rows: %w", rows.Err())
+	}
+
+	if len(changes) > limit {
+		hasMore = true
+		changes = changes[:limit]
+	}
+
+	nextAfter := after
+	if len(changes) > 0 {
+		nextAfter = changes[len(changes)-1].ServerID
 	}
 
 	//s.logger.Debug("Processed download page",
