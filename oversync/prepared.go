@@ -13,6 +13,8 @@ import (
 const (
 	stmtApplyUpsert = "s_apply_upsert"
 	stmtApplyDelete = "s_apply_delete"
+
+	stmtApplyUpsertBatch = "s_apply_upsert_batch"
 )
 
 // prepareUploadStatements prepares frequently used statements in the current transaction connection.
@@ -100,6 +102,119 @@ SELECT
     ELSE 3
   END AS code,
   COALESCE((SELECT new_server_version FROM applied LIMIT 1), 0) AS new_server_version
+`); err != nil {
+		return err
+	}
+
+	// s_apply_upsert_batch: set-based apply for INSERT/UPDATE using array inputs to reduce
+	// per-row round trips. Returns one result row per input row in ordinality order.
+	if _, err := tx.Prepare(ctx, stmtApplyUpsertBatch, `
+WITH inp AS (
+  SELECT
+    u.schema_name,
+    u.table_name,
+    u.op,
+    u.pk_uuid::uuid AS pk_uuid,
+    u.payload::json AS payload,
+    u.source_change_id,
+    u.base_version,
+    u.ord
+  FROM unnest(
+    $3::text[],
+    $4::text[],
+    $5::text[],
+    $6::text[],
+    $7::text[],
+    $8::bigint[],
+    $9::bigint[]
+  ) WITH ORDINALITY AS u(schema_name, table_name, op, pk_uuid, payload, source_change_id, base_version, ord)
+),
+gate AS MATERIALIZED (
+  INSERT INTO sync.server_change_log
+      (user_id, schema_name, table_name, op, pk_uuid, payload, source_id, source_change_id, server_version)
+  SELECT $1, i.schema_name, i.table_name, i.op, i.pk_uuid, i.payload, $2, i.source_change_id, (i.base_version + 1)
+  FROM inp i
+  ON CONFLICT (user_id, source_id, source_change_id) DO NOTHING
+  RETURNING source_change_id
+),
+gate_rows AS (
+  SELECT i.ord, i.source_change_id
+  FROM inp i
+  JOIN gate g ON g.source_change_id = i.source_change_id
+),
+meta_upd AS (
+  UPDATE sync.sync_row_meta m
+  SET server_version = m.server_version + 1,
+      deleted = FALSE,
+      updated_at = now()
+  FROM inp i
+  JOIN gate g ON g.source_change_id = i.source_change_id
+  WHERE m.user_id = $1
+    AND m.schema_name = i.schema_name
+    AND m.table_name = i.table_name
+    AND m.pk_uuid = i.pk_uuid
+    AND m.server_version = i.base_version
+  RETURNING i.ord, m.server_version AS new_server_version
+),
+meta_ins AS (
+  INSERT INTO sync.sync_row_meta (user_id, schema_name, table_name, pk_uuid, server_version, deleted, updated_at)
+  SELECT $1, i.schema_name, i.table_name, i.pk_uuid, (i.base_version + 1), FALSE, now()
+  FROM inp i
+  JOIN gate g ON g.source_change_id = i.source_change_id
+  WHERE i.base_version = 0
+  ON CONFLICT (user_id, schema_name, table_name, pk_uuid) DO NOTHING
+  RETURNING schema_name, table_name, pk_uuid, server_version
+),
+meta_ins_mapped AS (
+  SELECT i.ord, mi.server_version AS new_server_version
+  FROM inp i
+  JOIN gate g ON g.source_change_id = i.source_change_id
+  JOIN meta_ins mi
+    ON mi.schema_name = i.schema_name
+   AND mi.table_name = i.table_name
+   AND mi.pk_uuid = i.pk_uuid
+  WHERE i.base_version = 0
+),
+applied AS (
+  SELECT ord, new_server_version FROM meta_upd
+  UNION ALL
+  SELECT ord, new_server_version FROM meta_ins_mapped
+),
+state_upsert AS (
+  INSERT INTO sync.sync_state (user_id, schema_name, table_name, pk_uuid, payload)
+  SELECT $1, i.schema_name, i.table_name, i.pk_uuid, i.payload
+  FROM inp i
+  JOIN applied a ON a.ord = i.ord
+  ON CONFLICT (user_id, schema_name, table_name, pk_uuid) DO UPDATE
+  SET payload = EXCLUDED.payload
+  RETURNING 1
+),
+gate_cleanup AS (
+  DELETE FROM sync.server_change_log l
+  USING gate_rows gr
+  LEFT JOIN applied a ON a.ord = gr.ord
+  WHERE a.ord IS NULL
+    AND l.user_id = $1
+    AND l.source_id = $2
+    AND l.source_change_id = gr.source_change_id
+  RETURNING 1
+)
+SELECT
+  CASE
+    WHEN gr.ord IS NULL THEN 0
+    WHEN a.ord IS NOT NULL THEN 1
+    WHEN inp.base_version = 0 THEN 2
+    WHEN EXISTS (
+      SELECT 1 FROM sync.sync_row_meta m
+      WHERE m.user_id = $1 AND m.schema_name = inp.schema_name AND m.table_name = inp.table_name AND m.pk_uuid = inp.pk_uuid
+    ) THEN 2
+    ELSE 3
+  END AS code,
+  COALESCE(a.new_server_version, 0) AS new_server_version
+FROM inp
+LEFT JOIN gate_rows gr ON gr.ord = inp.ord
+LEFT JOIN applied a ON a.ord = inp.ord
+ORDER BY inp.ord
 `); err != nil {
 		return err
 	}

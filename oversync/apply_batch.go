@@ -37,33 +37,58 @@ func (s *SyncService) applyUpsertsSidecarBatched(
 		}
 		chunkIdx := applyIdx[start:end]
 
-		b := &pgx.Batch{}
+		schemaNames := make([]string, 0, len(chunkIdx))
+		tableNames := make([]string, 0, len(chunkIdx))
+		ops := make([]string, 0, len(chunkIdx))
+		pkUUIDs := make([]string, 0, len(chunkIdx))
+		payloads := make([]string, 0, len(chunkIdx))
+		sourceChangeIDs := make([]int64, 0, len(chunkIdx))
+		baseVersions := make([]int64, 0, len(chunkIdx))
+
 		for _, idx := range chunkIdx {
 			ch := upserts[idx]
-			b.Queue(
-				stmtApplyUpsert,
-				userID,
-				ch.Schema,
-				ch.Table,
-				ch.Op,
-				ch.PK,
-				ch.Payload,
-				sourceID,
-				ch.SourceChangeID,
-				ch.ServerVersion,
-			).QueryRow(func(row pgx.Row) error {
-				var o sidecarApplyOutcome
-				if err := row.Scan(&o.code, &o.newServerVer64); err != nil {
-					return err
-				}
-				outcomes = append(outcomes, o)
-				return nil
-			})
+			schemaNames = append(schemaNames, ch.Schema)
+			tableNames = append(tableNames, ch.Table)
+			ops = append(ops, ch.Op)
+			pkUUIDs = append(pkUUIDs, ch.PK)
+			payloads = append(payloads, string(ch.Payload))
+			sourceChangeIDs = append(sourceChangeIDs, ch.SourceChangeID)
+			baseVersions = append(baseVersions, ch.ServerVersion)
 		}
 
-		br := tx.SendBatch(ctx, b)
-		if err := br.Close(); err != nil {
+		rows, err := tx.Query(ctx,
+			stmtApplyUpsertBatch,
+			userID,
+			sourceID,
+			schemaNames,
+			tableNames,
+			ops,
+			pkUUIDs,
+			payloads,
+			sourceChangeIDs,
+			baseVersions,
+		)
+		if err != nil {
 			return nil, fmt.Errorf("%w: %w", errUploadBatchedApplyFailed, err)
+		}
+
+		got := 0
+		for rows.Next() {
+			var o sidecarApplyOutcome
+			if scanErr := rows.Scan(&o.code, &o.newServerVer64); scanErr != nil {
+				rows.Close()
+				return nil, fmt.Errorf("%w: %w", errUploadBatchedApplyFailed, scanErr)
+			}
+			outcomes = append(outcomes, o)
+			got++
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			rows.Close()
+			return nil, fmt.Errorf("%w: %w", errUploadBatchedApplyFailed, rowsErr)
+		}
+		rows.Close()
+		if got != len(chunkIdx) {
+			return nil, fmt.Errorf("%w: unexpected row count in batch apply: got=%d want=%d", errUploadBatchedApplyFailed, got, len(chunkIdx))
 		}
 	}
 
