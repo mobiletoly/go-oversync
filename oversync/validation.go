@@ -88,13 +88,9 @@ func (s *SyncService) validateChangeAndMaybeParsePayload(change *ChangeUpload, p
 			}
 		}
 
-		// Disallow reserved keys
-		if _, ok := payloadObj["server_version"]; ok {
-			return nil, fmt.Errorf("payload may not contain server_version")
-		}
-		if _, ok := payloadObj["deleted"]; ok {
-			return nil, fmt.Errorf("payload may not contain deleted")
-		}
+		// Note: payload is a user-defined JSON object. Server-managed fields like server_version/deleted
+		// are carried outside payload in the sync protocol, so we don't reserve or forbid column names
+		// inside payload (common schemas use fields like "deleted" for business logic).
 
 		// Optional: enforce payload.id == pk if present
 		//if v, ok := obj["id"]; ok {
