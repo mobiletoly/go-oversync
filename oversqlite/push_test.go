@@ -1,0 +1,1626 @@
+package oversqlite
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/mobiletoly/go-oversync/oversync"
+	"github.com/stretchr/testify/require"
+)
+
+func newBundleClient(t *testing.T, schema string, tables []SyncTable, ddl ...string) (*Client, *sql.DB) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, stmt := range ddl {
+		_, err := db.Exec(stmt)
+		require.NoError(t, err)
+	}
+
+	client, err := NewClient(db, "http://example.invalid", "bundle-user", "bundle-device", func(context.Context) (string, error) {
+		return "token", nil
+	}, DefaultConfig(schema, tables))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	require.NoError(t, client.Bootstrap(context.Background(), false))
+	return client, db
+}
+
+func decodeDirtyPayload(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(raw), &payload))
+	return payload
+}
+
+func rowKeyJSON(id string) string {
+	raw, _ := json.Marshal(map[string]any{"id": id})
+	return string(raw)
+}
+
+func mustJSONPayload(t *testing.T, payload map[string]any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	return raw
+}
+
+func stageCommittedPushBundleRows(t *testing.T, db *sql.DB, bundleSeq int64, rows []oversync.BundleRow) {
+	t.Helper()
+	for idx, row := range rows {
+		idValue, ok := row.Key["id"].(string)
+		require.True(t, ok)
+
+		var payload any
+		if row.Op != oversync.OpDelete {
+			payload = string(row.Payload)
+		}
+		_, err := db.Exec(`
+			INSERT INTO _sync_push_stage (
+				bundle_seq, row_ordinal, schema_name, table_name, key_json, op, row_version, payload
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, bundleSeq, idx, row.Schema, row.Table, rowKeyJSON(idValue), row.Op, row.RowVersion, payload)
+		require.NoError(t, err)
+	}
+}
+
+func readApplyMode(t *testing.T, db *sql.DB, userID string) int {
+	t.Helper()
+	var applyMode int
+	require.NoError(t, db.QueryRow(`SELECT apply_mode FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&applyMode))
+	return applyMode
+}
+
+func loadDirtyRowForKey(t *testing.T, db *sql.DB, keyJSON string) (string, int64, sql.NullString, bool) {
+	t.Helper()
+
+	var (
+		op             string
+		baseRowVersion int64
+		payload        sql.NullString
+	)
+	err := db.QueryRow(`
+		SELECT op, base_row_version, payload
+		FROM _sync_dirty_rows
+		WHERE table_name = 'users' AND key_json = ?
+	`, keyJSON).Scan(&op, &baseRowVersion, &payload)
+	if err == sql.ErrNoRows {
+		return "", 0, sql.NullString{}, false
+	}
+	require.NoError(t, err)
+	return op, baseRowVersion, payload, true
+}
+
+func loadUserForKey(t *testing.T, db *sql.DB, id string) (string, string, bool) {
+	t.Helper()
+
+	var name, email string
+	err := db.QueryRow(`SELECT name, email FROM users WHERE id = ?`, id).Scan(&name, &email)
+	if err == sql.ErrNoRows {
+		return "", "", false
+	}
+	require.NoError(t, err)
+	return name, email, true
+}
+
+func loadUserRowStateForKey(t *testing.T, db *sql.DB, keyJSON string) (int64, bool, bool) {
+	t.Helper()
+
+	var (
+		rowVersion int64
+		deletedInt int
+	)
+	err := db.QueryRow(`
+		SELECT row_version, deleted
+		FROM _sync_row_state
+		WHERE schema_name = 'main' AND table_name = 'users' AND key_json = ?
+	`, keyJSON).Scan(&rowVersion, &deletedInt)
+	if err == sql.ErrNoRows {
+		return 0, false, false
+	}
+	require.NoError(t, err)
+	return rowVersion, deletedInt == 1, true
+}
+
+func seedSyncedUserRow(t *testing.T, client *Client, db *sql.DB, id, name string, rowVersion int64) {
+	t.Helper()
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, id, name, strings.ToLower(name)+"@example.com")
+	require.NoError(t, err)
+
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	require.NoError(t, client.updateStructuredRowStateInTx(context.Background(), tx, "main", "users", rowKeyJSON(id), rowVersion, false))
+	require.NoError(t, tx.Commit())
+
+	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
+	require.NoError(t, err)
+}
+
+func newFixedVersionCommitHook(t *testing.T, server *mockPushSessionServer, rowVersion int64) func(string, *mockPushSession) *http.Response {
+	t.Helper()
+
+	return func(pushID string, session *mockPushSession) *http.Response {
+		rows := make([]oversync.BundleRow, 0, len(session.Rows))
+		for _, row := range session.Rows {
+			rows = append(rows, oversync.BundleRow{
+				Schema:     row.Schema,
+				Table:      row.Table,
+				Key:        row.Key,
+				Op:         row.Op,
+				RowVersion: rowVersion,
+				Payload:    row.Payload,
+			})
+		}
+		committed := &mockCommittedBundle{
+			BundleSeq:      server.nextBundleSeq,
+			SourceID:       session.SourceID,
+			SourceBundleID: session.SourceBundleID,
+			Rows:           rows,
+			BundleHash:     mustBundleHash(t, rows),
+		}
+		server.nextBundleSeq++
+		server.committedBySource[session.SourceBundleID] = committed
+		server.committedBySeq[committed.BundleSeq] = committed
+		return jsonResponse(oversync.PushSessionCommitResponse{
+			BundleSeq:      committed.BundleSeq,
+			SourceID:       committed.SourceID,
+			SourceBundleID: committed.SourceBundleID,
+			RowCount:       int64(len(committed.Rows)),
+			BundleHash:     committed.BundleHash,
+		})
+	}
+}
+
+type mockPushSession struct {
+	PushID          string
+	SourceID        string
+	SourceBundleID  int64
+	PlannedRowCount int64
+	Rows            []oversync.PushRequestRow
+}
+
+type mockCommittedBundle struct {
+	BundleSeq      int64
+	SourceID       string
+	SourceBundleID int64
+	Rows           []oversync.BundleRow
+	BundleHash     string
+}
+
+type mockPushSessionServer struct {
+	t                 *testing.T
+	nextPushID        int
+	nextBundleSeq     int64
+	sessions          map[string]*mockPushSession
+	committedBySource map[int64]*mockCommittedBundle
+	committedBySeq    map[int64]*mockCommittedBundle
+	chunkRequests     []oversync.PushSessionChunkRequest
+	commitHook        func(pushID string, session *mockPushSession) *http.Response
+}
+
+func newMockPushSessionServer(t *testing.T) *mockPushSessionServer {
+	t.Helper()
+	return &mockPushSessionServer{
+		t:                 t,
+		nextBundleSeq:     1,
+		sessions:          make(map[string]*mockPushSession),
+		committedBySource: make(map[int64]*mockCommittedBundle),
+		committedBySeq:    make(map[int64]*mockCommittedBundle),
+	}
+}
+
+func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, error) {
+	s.t.Helper()
+
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions":
+		var req oversync.PushSessionCreateRequest
+		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
+		if committed := s.committedBySource[req.SourceBundleID]; committed != nil {
+			return jsonResponse(oversync.PushSessionCreateResponse{
+				Status:         "already_committed",
+				BundleSeq:      committed.BundleSeq,
+				SourceID:       committed.SourceID,
+				SourceBundleID: committed.SourceBundleID,
+				RowCount:       int64(len(committed.Rows)),
+				BundleHash:     committed.BundleHash,
+			}), nil
+		}
+		s.nextPushID++
+		pushID := "push-" + strconv.Itoa(s.nextPushID)
+		s.sessions[pushID] = &mockPushSession{
+			PushID:          pushID,
+			SourceID:        req.SourceID,
+			SourceBundleID:  req.SourceBundleID,
+			PlannedRowCount: req.PlannedRowCount,
+		}
+		return jsonResponse(oversync.PushSessionCreateResponse{
+			PushID:                 pushID,
+			Status:                 "staging",
+			PlannedRowCount:        req.PlannedRowCount,
+			NextExpectedRowOrdinal: 0,
+		}), nil
+
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/") && strings.HasSuffix(r.URL.Path, "/chunks"):
+		pushID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/sync/push-sessions/"), "/chunks")
+		session := s.sessions[pushID]
+		require.NotNil(s.t, session)
+
+		var req oversync.PushSessionChunkRequest
+		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
+		s.chunkRequests = append(s.chunkRequests, req)
+		session.Rows = append(session.Rows, req.Rows...)
+		return jsonResponse(oversync.PushSessionChunkResponse{
+			PushID:                 pushID,
+			NextExpectedRowOrdinal: req.StartRowOrdinal + int64(len(req.Rows)),
+		}), nil
+
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/") && strings.HasSuffix(r.URL.Path, "/commit"):
+		pushID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/sync/push-sessions/"), "/commit")
+		session := s.sessions[pushID]
+		require.NotNil(s.t, session)
+		if s.commitHook != nil {
+			return s.commitHook(pushID, session), nil
+		}
+		return s.defaultCommitResponse(session), nil
+
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sync/committed-bundles/") && strings.HasSuffix(r.URL.Path, "/rows"):
+		trimmed := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/sync/committed-bundles/"), "/rows")
+		bundleSeq, err := strconv.ParseInt(trimmed, 10, 64)
+		require.NoError(s.t, err)
+		committed := s.committedBySeq[bundleSeq]
+		require.NotNil(s.t, committed)
+
+		maxRows := 1000
+		if raw := r.URL.Query().Get("max_rows"); raw != "" {
+			maxRows, err = strconv.Atoi(raw)
+			require.NoError(s.t, err)
+		}
+
+		start := 0
+		logicalAfter := int64(-1)
+		if raw := r.URL.Query().Get("after_row_ordinal"); raw != "" {
+			logicalAfter, err = strconv.ParseInt(raw, 10, 64)
+			require.NoError(s.t, err)
+			start = int(logicalAfter + 1)
+		}
+		end := start + maxRows
+		if end > len(committed.Rows) {
+			end = len(committed.Rows)
+		}
+		chunkRows := append([]oversync.BundleRow(nil), committed.Rows[start:end]...)
+		nextRowOrdinal := logicalAfter
+		if len(chunkRows) > 0 {
+			nextRowOrdinal = logicalAfter + int64(len(chunkRows))
+		}
+		return jsonResponse(oversync.CommittedBundleRowsResponse{
+			BundleSeq:      committed.BundleSeq,
+			SourceID:       committed.SourceID,
+			SourceBundleID: committed.SourceBundleID,
+			RowCount:       int64(len(committed.Rows)),
+			BundleHash:     committed.BundleHash,
+			Rows:           chunkRows,
+			NextRowOrdinal: nextRowOrdinal,
+			HasMore:        end < len(committed.Rows),
+		}), nil
+
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/"):
+		return jsonResponse(map[string]any{"status": "deleted"}), nil
+	}
+
+	return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+}
+
+func (s *mockPushSessionServer) defaultCommitResponse(session *mockPushSession) *http.Response {
+	rows := make([]oversync.BundleRow, 0, len(session.Rows))
+	for idx, row := range session.Rows {
+		rows = append(rows, oversync.BundleRow{
+			Schema:     row.Schema,
+			Table:      row.Table,
+			Key:        row.Key,
+			Op:         row.Op,
+			RowVersion: int64(idx + 1),
+			Payload:    row.Payload,
+		})
+	}
+	committed := &mockCommittedBundle{
+		BundleSeq:      s.nextBundleSeq,
+		SourceID:       session.SourceID,
+		SourceBundleID: session.SourceBundleID,
+		Rows:           rows,
+		BundleHash:     mustBundleHash(s.t, rows),
+	}
+	s.nextBundleSeq++
+	s.committedBySource[session.SourceBundleID] = committed
+	s.committedBySeq[committed.BundleSeq] = committed
+	return jsonResponse(oversync.PushSessionCommitResponse{
+		BundleSeq:      committed.BundleSeq,
+		SourceID:       committed.SourceID,
+		SourceBundleID: committed.SourceBundleID,
+		RowCount:       int64(len(committed.Rows)),
+		BundleHash:     committed.BundleHash,
+	})
+}
+
+func mustBundleHash(t *testing.T, rows []oversync.BundleRow) string {
+	t.Helper()
+
+	logicalRows := make([]map[string]any, 0, len(rows))
+	for idx, row := range rows {
+		payloadValue := any(nil)
+		if row.Op != oversync.OpDelete && len(row.Payload) > 0 {
+			require.NoError(t, json.Unmarshal(row.Payload, &payloadValue))
+		}
+		logicalRows = append(logicalRows, map[string]any{
+			"row_ordinal": idx,
+			"schema":      row.Schema,
+			"table":       row.Table,
+			"key":         row.Key,
+			"op":          row.Op,
+			"row_version": row.RowVersion,
+			"payload":     payloadValue,
+		})
+	}
+	raw, err := json.Marshal(logicalRows)
+	require.NoError(t, err)
+	canonical, err := canonicalizeJSONBytes(raw)
+	require.NoError(t, err)
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
+}
+
+func TestPushPending_RepeatedLocalEditsCollapseIntoOneDirtyRowAndAdvanceBundleState(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "Ada Updated", "ada.updated@example.com", userID)
+	require.NoError(t, err)
+
+	var dirtyCount int
+	var dirtyOp string
+	var payload string
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*), COALESCE(MAX(op), ''), COALESCE(MAX(payload), '')
+		FROM _sync_dirty_rows
+		WHERE table_name = 'users'
+	`).Scan(&dirtyCount, &dirtyOp, &payload))
+	require.Equal(t, 1, dirtyCount)
+	require.Equal(t, oversync.OpInsert, dirtyOp)
+	require.Equal(t, "Ada Updated", decodeDirtyPayload(t, payload)["name"])
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+
+	require.NoError(t, client.PushPending(ctx))
+	require.Len(t, server.chunkRequests, 1)
+	require.Len(t, server.chunkRequests[0].Rows, 1)
+	require.Equal(t, oversync.OpInsert, server.chunkRequests[0].Rows[0].Op)
+	require.Equal(t, "Ada Updated", mustPushPayloadName(t, server.chunkRequests[0].Rows[0].Payload))
+
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 0, dirtyCount)
+
+	var rowVersion int64
+	var deleted int
+	require.NoError(t, db.QueryRow(`
+		SELECT row_version, deleted
+		FROM _sync_row_state
+		WHERE schema_name = 'main' AND table_name = 'users' AND key_json = ?
+	`, rowKeyJSON(userID)).Scan(&rowVersion, &deleted))
+	require.Equal(t, int64(1), rowVersion)
+	require.Equal(t, 0, deleted)
+
+	var nextSourceBundleID int64
+	var lastBundleSeq int64
+	require.NoError(t, db.QueryRow(`
+		SELECT next_source_bundle_id, last_bundle_seq_seen
+		FROM _sync_client_state
+		WHERE user_id = ?
+	`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeq))
+	require.Equal(t, int64(2), nextSourceBundleID)
+	require.Equal(t, int64(1), lastBundleSeq)
+}
+
+func TestPushPending_EmptyDirtyQueueIsNoOpBeforeOutboundStateIsCreated(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	requests := 0
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		return nil, fmt.Errorf("unexpected network request: %s %s", r.Method, r.URL.Path)
+	})}
+
+	require.NoError(t, client.PushPending(ctx))
+	require.Equal(t, 0, requests)
+
+	var dirtyCount, outboundCount, stageCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stageCount))
+	require.Equal(t, 0, dirtyCount)
+	require.Equal(t, 0, outboundCount)
+	require.Equal(t, 0, stageCount)
+
+	var nextSourceBundleID, lastBundleSeq int64
+	require.NoError(t, db.QueryRow(`
+		SELECT next_source_bundle_id, last_bundle_seq_seen
+		FROM _sync_client_state
+		WHERE user_id = ?
+	`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeq))
+	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, int64(0), lastBundleSeq)
+}
+
+func TestPushPending_DirtySetLargerThanOneChunkSucceeds(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	client.config.UploadLimit = 2
+
+	for idx := 0; idx < 5; idx++ {
+		_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`,
+			uuid.NewString(),
+			fmt.Sprintf("User %d", idx),
+			fmt.Sprintf("user%d@example.com", idx),
+		)
+		require.NoError(t, err)
+	}
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+
+	require.NoError(t, client.PushPending(ctx))
+	require.Equal(t, int64(1), client.PushTransferDiagnostics().SessionsCreated)
+	require.Equal(t, int64(3), client.PushTransferDiagnostics().ChunksUploaded)
+	require.Len(t, server.chunkRequests, 3)
+	require.Len(t, server.chunkRequests[0].Rows, 2)
+	require.Len(t, server.chunkRequests[1].Rows, 2)
+	require.Len(t, server.chunkRequests[2].Rows, 1)
+
+	var dirtyCount, outboundCount, stageCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stageCount))
+	require.Equal(t, 0, dirtyCount)
+	require.Equal(t, 0, outboundCount)
+	require.Equal(t, 0, stageCount)
+
+	var nextSourceBundleID, lastBundleSeq int64
+	require.NoError(t, db.QueryRow(`
+		SELECT next_source_bundle_id, last_bundle_seq_seen
+		FROM _sync_client_state
+		WHERE user_id = ?
+	`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeq))
+	require.Equal(t, int64(2), nextSourceBundleID)
+	require.Equal(t, int64(1), lastBundleSeq)
+}
+
+func TestPushPending_OrdersUpsertsParentFirstAndDeletesChildFirst(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "id"},
+		{TableName: "posts", SyncKeyColumnName: "id"},
+	}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`, `
+		CREATE TABLE posts (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			author_id TEXT NOT NULL,
+			FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+		)
+	`)
+
+	userID := uuid.NewString()
+	postID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO posts (id, title, author_id) VALUES (?, ?, ?)`, postID, "Hello", userID)
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+
+	require.NoError(t, client.PushPending(ctx))
+	require.Len(t, server.chunkRequests, 1)
+	require.Len(t, server.chunkRequests[0].Rows, 2)
+	require.Equal(t, "users", server.chunkRequests[0].Rows[0].Table)
+	require.Equal(t, "posts", server.chunkRequests[0].Rows[1].Table)
+
+	_, err = db.Exec(`DELETE FROM users WHERE id = ?`, userID)
+	require.NoError(t, err)
+	require.NoError(t, client.PushPending(ctx))
+	require.Len(t, server.chunkRequests, 2)
+	require.Len(t, server.chunkRequests[1].Rows, 2)
+	require.Equal(t, oversync.OpDelete, server.chunkRequests[1].Rows[0].Op)
+	require.Equal(t, "posts", server.chunkRequests[1].Rows[0].Table)
+	require.Equal(t, "users", server.chunkRequests[1].Rows[1].Table)
+}
+
+func TestPushPending_ConflictLeavesDirtyRowsIntact(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+		return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{
+			Error:   "push_conflict",
+			Message: "bundle conflict",
+		})
+	}
+	client.HTTP = &http.Client{Transport: server}
+
+	err = client.PushPending(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "409")
+
+	var dirtyCount, outboundCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = 'users'`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound WHERE table_name = 'users'`).Scan(&outboundCount))
+	require.Equal(t, 0, dirtyCount)
+	require.Equal(t, 1, outboundCount)
+
+	var nextSourceBundleID int64
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&nextSourceBundleID))
+	require.Equal(t, int64(1), nextSourceBundleID)
+}
+
+func TestPushPending_RejectsInvalidCommitResponse(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+		return jsonResponse(map[string]any{
+			"bundle_seq":       1,
+			"source_id":        session.SourceID,
+			"source_bundle_id": session.SourceBundleID,
+			"row_count":        len(session.Rows),
+		})
+	}
+	client.HTTP = &http.Client{Transport: server}
+
+	err = client.PushPending(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "bundle_hash")
+
+	var dirtyCount, outboundCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = 'users'`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound WHERE table_name = 'users'`).Scan(&outboundCount))
+	require.Equal(t, 0, dirtyCount)
+	require.Equal(t, 1, outboundCount)
+
+	var nextSourceBundleID int64
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&nextSourceBundleID))
+	require.Equal(t, int64(1), nextSourceBundleID)
+}
+
+func TestPushPending_FailsClosedOnCommittedReplayMetadataMismatch(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name        string
+		mutate      func(*oversync.PushSessionCommitResponse)
+		errContains string
+	}{
+		{
+			name: "row count mismatch",
+			mutate: func(resp *oversync.PushSessionCommitResponse) {
+				resp.RowCount++
+			},
+			errContains: "row_count",
+		},
+		{
+			name: "bundle hash mismatch",
+			mutate: func(resp *oversync.PushSessionCommitResponse) {
+				resp.BundleHash = strings.Repeat("0", 64)
+			},
+			errContains: "bundle_hash",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+				CREATE TABLE users (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					email TEXT NOT NULL
+				)
+			`)
+
+			userID := uuid.NewString()
+			_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+			require.NoError(t, err)
+
+			server := newMockPushSessionServer(t)
+			server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+				rows := make([]oversync.BundleRow, 0, len(session.Rows))
+				for idx, row := range session.Rows {
+					rows = append(rows, oversync.BundleRow{
+						Schema:     row.Schema,
+						Table:      row.Table,
+						Key:        row.Key,
+						Op:         row.Op,
+						RowVersion: int64(idx + 1),
+						Payload:    row.Payload,
+					})
+				}
+				committed := &mockCommittedBundle{
+					BundleSeq:      server.nextBundleSeq,
+					SourceID:       session.SourceID,
+					SourceBundleID: session.SourceBundleID,
+					Rows:           rows,
+					BundleHash:     mustBundleHash(t, rows),
+				}
+				server.nextBundleSeq++
+				server.committedBySource[session.SourceBundleID] = committed
+				server.committedBySeq[committed.BundleSeq] = committed
+
+				resp := &oversync.PushSessionCommitResponse{
+					BundleSeq:      committed.BundleSeq,
+					SourceID:       committed.SourceID,
+					SourceBundleID: committed.SourceBundleID,
+					RowCount:       int64(len(committed.Rows)),
+					BundleHash:     committed.BundleHash,
+				}
+				tc.mutate(resp)
+				return jsonResponse(resp)
+			}
+			client.HTTP = &http.Client{Transport: server}
+
+			err = client.PushPending(ctx)
+			require.Error(t, err)
+			require.Contains(t, strings.ToLower(err.Error()), tc.errContains)
+
+			var dirtyCount, outboundCount, stagedCount int
+			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
+			require.Equal(t, 0, dirtyCount)
+			require.Equal(t, 1, outboundCount)
+			require.Equal(t, 0, stagedCount)
+
+			var nextSourceBundleID, lastBundleSeqSeen int64
+			require.NoError(t, db.QueryRow(`
+				SELECT next_source_bundle_id, last_bundle_seq_seen
+				FROM _sync_client_state
+				WHERE user_id = ?
+			`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeqSeen))
+			require.Equal(t, int64(1), nextSourceBundleID)
+			require.Equal(t, int64(0), lastBundleSeqSeen)
+		})
+	}
+}
+
+func TestPushPending_ReplaysAcceptedBundleAfterCrashBeforeDurableApply(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+
+	snapshot, err := client.ensurePushOutboundSnapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Rows, 1)
+
+	committed, err := client.commitPushOutboundSnapshot(ctx, snapshot)
+	require.NoError(t, err)
+	require.NoError(t, client.fetchCommittedPushBundle(ctx, committed))
+	require.NoError(t, client.Close())
+
+	restarted, err := NewClient(db, "http://example.invalid", "bundle-user", client.SourceID, func(context.Context) (string, error) {
+		return "token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+	require.NoError(t, err)
+	restarted.HTTP = &http.Client{Transport: server}
+	require.NoError(t, restarted.Bootstrap(ctx, false))
+	require.NoError(t, restarted.PushPending(ctx))
+	require.Equal(t, int64(0), restarted.PushTransferDiagnostics().SessionsCreated)
+	require.Equal(t, int64(0), restarted.PushTransferDiagnostics().ChunksUploaded)
+	require.Equal(t, int64(1), restarted.PushTransferDiagnostics().CommittedBundleChunksRead)
+	require.Len(t, server.chunkRequests, 1)
+
+	var dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 0, dirtyCount)
+
+	var rowVersion int64
+	require.NoError(t, db.QueryRow(`
+		SELECT row_version
+		FROM _sync_row_state
+		WHERE schema_name = 'main' AND table_name = 'users' AND key_json = ?
+	`, rowKeyJSON(userID)).Scan(&rowVersion))
+	require.Equal(t, int64(1), rowVersion)
+
+	var nextSourceBundleID int64
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, restarted.UserID).Scan(&nextSourceBundleID))
+	require.Equal(t, int64(2), nextSourceBundleID)
+}
+
+func TestPushPending_ReuploadsFrozenOutboundSnapshotAfterCrashBeforeCommit(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	client.config.UploadLimit = 2
+
+	for idx := 0; idx < 3; idx++ {
+		_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`,
+			uuid.NewString(),
+			fmt.Sprintf("User %d", idx),
+			fmt.Sprintf("user%d@example.com", idx),
+		)
+		require.NoError(t, err)
+	}
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+	client.SetBeforePushCommitHook(func(context.Context) error {
+		return fmt.Errorf("simulated crash before push commit")
+	})
+
+	err := client.PushPending(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "simulated crash before push commit")
+	require.Len(t, server.chunkRequests, 2)
+	require.Equal(t, int64(1), client.PushTransferDiagnostics().SessionsCreated)
+	require.Equal(t, int64(2), client.PushTransferDiagnostics().ChunksUploaded)
+	require.Equal(t, int64(0), client.PushTransferDiagnostics().CommittedBundleChunksRead)
+
+	var outboundCount, stagedCount, dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 3, outboundCount)
+	require.Equal(t, 0, stagedCount)
+	require.Equal(t, 0, dirtyCount)
+	require.NoError(t, client.Close())
+
+	restarted, err := NewClient(db, "http://example.invalid", "bundle-user", client.SourceID, func(context.Context) (string, error) {
+		return "token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+	require.NoError(t, err)
+	restarted.config.UploadLimit = 2
+	restarted.HTTP = &http.Client{Transport: server}
+	require.NoError(t, restarted.Bootstrap(ctx, false))
+	require.NoError(t, restarted.PushPending(ctx))
+	require.Len(t, server.chunkRequests, 4)
+	require.Equal(t, int64(1), restarted.PushTransferDiagnostics().SessionsCreated)
+	require.Equal(t, int64(2), restarted.PushTransferDiagnostics().ChunksUploaded)
+
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 0, outboundCount)
+	require.Equal(t, 0, stagedCount)
+	require.Equal(t, 0, dirtyCount)
+
+	var nextSourceBundleID int64
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, restarted.UserID).Scan(&nextSourceBundleID))
+	require.Equal(t, int64(2), nextSourceBundleID)
+}
+
+func TestPushPending_MovesFrozenRowsIntoOutboundAtomically(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	for idx := 0; idx < 2; idx++ {
+		_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`,
+			uuid.NewString(),
+			fmt.Sprintf("User %d", idx),
+			fmt.Sprintf("user%d@example.com", idx),
+		)
+		require.NoError(t, err)
+	}
+
+	client.SetBeforePushFreezeHook(func(context.Context) error {
+		return fmt.Errorf("simulated freeze rollback")
+	})
+	_, err := client.ensurePushOutboundSnapshot(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "simulated freeze rollback")
+
+	var dirtyCount, outboundCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.Equal(t, 2, dirtyCount)
+	require.Equal(t, 0, outboundCount)
+
+	snapshot, err := client.ensurePushOutboundSnapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Rows, 2)
+
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.Equal(t, 0, dirtyCount)
+	require.Equal(t, 2, outboundCount)
+}
+
+func TestPushPending_NewLocalWritesDuringUploadSurviveInDirtyRows(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	originalID := uuid.NewString()
+	newID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, originalID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	client.SetBeforePushCommitHook(func(context.Context) error {
+		_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, newID, "Grace", "grace@example.com")
+		require.NoError(t, err)
+		return fmt.Errorf("simulated crash before commit")
+	})
+	client.HTTP = &http.Client{Transport: newMockPushSessionServer(t)}
+
+	err = client.PushPending(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "simulated crash before commit")
+
+	var dirtyCount, outboundCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.Equal(t, 1, dirtyCount)
+	require.Equal(t, 1, outboundCount)
+
+	var keyJSON string
+	var op string
+	require.NoError(t, db.QueryRow(`SELECT key_json, op FROM _sync_dirty_rows`).Scan(&keyJSON, &op))
+	require.Equal(t, rowKeyJSON(newID), keyJSON)
+	require.Equal(t, oversync.OpInsert, op)
+}
+
+func TestPushPending_NewLocalWritesDuringReplaySurviveInDirtyRows(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	originalID := uuid.NewString()
+	newID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, originalID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	client.SetBeforePushReplayHook(func(context.Context) error {
+		_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, newID, "Grace", "grace@example.com")
+		require.NoError(t, err)
+		return nil
+	})
+	client.HTTP = &http.Client{Transport: newMockPushSessionServer(t)}
+
+	require.NoError(t, client.PushPending(ctx))
+
+	var dirtyCount, outboundCount, stagedCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
+	require.Equal(t, 1, dirtyCount)
+	require.Equal(t, 0, outboundCount)
+	require.Equal(t, 0, stagedCount)
+
+	var keyJSON string
+	require.NoError(t, db.QueryRow(`SELECT key_json FROM _sync_dirty_rows`).Scan(&keyJSON))
+	require.Equal(t, rowKeyJSON(newID), keyJSON)
+}
+
+func TestPushPending_AuthoritativeReplayDoesNotGenerateDirtyRowsAndCapturesLaterWrites(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	snapshot, err := client.ensurePushOutboundSnapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Rows, 1)
+
+	committedRows := []oversync.BundleRow{{
+		Schema:     "main",
+		Table:      "users",
+		Key:        mustBundleKey(userID),
+		Op:         oversync.OpInsert,
+		RowVersion: 1,
+		Payload:    mustJSONPayload(t, map[string]any{"id": userID, "name": "Ada Server", "email": "ada.server@example.com"}),
+	}}
+	committed := &committedPushBundle{
+		BundleSeq:      1,
+		SourceID:       client.SourceID,
+		SourceBundleID: snapshot.SourceBundleID,
+		RowCount:       int64(len(committedRows)),
+		BundleHash:     mustBundleHash(t, committedRows),
+	}
+	stageCommittedPushBundleRows(t, db, committed.BundleSeq, committedRows)
+
+	require.NoError(t, client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed))
+	require.Equal(t, 0, readApplyMode(t, db, client.UserID))
+
+	var dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 0, dirtyCount)
+
+	_, err = db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "Ada Local", "ada.local@example.com", userID)
+	require.NoError(t, err)
+
+	var dirtyOp string
+	require.NoError(t, db.QueryRow(`
+		SELECT op
+		FROM _sync_dirty_rows
+		WHERE schema_name = 'main' AND table_name = 'users' AND key_json = ?
+	`, rowKeyJSON(userID)).Scan(&dirtyOp))
+	require.Equal(t, oversync.OpUpdate, dirtyOp)
+}
+
+func TestPushPending_AuthoritativeReplayRollbackDoesNotLeakApplyMode(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	snapshot, err := client.ensurePushOutboundSnapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Rows, 1)
+
+	committedRows := []oversync.BundleRow{{
+		Schema:     "main",
+		Table:      "users",
+		Key:        mustBundleKey(userID),
+		Op:         oversync.OpInsert,
+		RowVersion: 1,
+		Payload:    []byte(`{"id":"` + userID + `","name":"Broken"}`),
+	}}
+	committed := &committedPushBundle{
+		BundleSeq:      1,
+		SourceID:       client.SourceID,
+		SourceBundleID: snapshot.SourceBundleID,
+		RowCount:       int64(len(committedRows)),
+		BundleHash:     mustBundleHash(t, committedRows),
+	}
+	stageCommittedPushBundleRows(t, db, committed.BundleSeq, committedRows)
+
+	err = client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "payload for users")
+	require.Equal(t, 0, readApplyMode(t, db, client.UserID))
+
+	var dirtyCount, outboundCount, stagedCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
+	require.Equal(t, 0, dirtyCount)
+	require.Equal(t, 1, outboundCount)
+	require.Equal(t, 1, stagedCount)
+}
+
+func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("self referential child before parent", func(t *testing.T) {
+		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "categories", SyncKeyColumnName: "id"}}, `
+			CREATE TABLE categories (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				parent_id TEXT,
+				FOREIGN KEY (parent_id) REFERENCES categories(id) DEFERRABLE INITIALLY IMMEDIATE
+			)
+		`)
+
+		_, err := db.Exec(`INSERT INTO categories (id, name, parent_id) VALUES ('parent', 'Parent', NULL)`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO categories (id, name, parent_id) VALUES ('child', 'Child', 'parent')`)
+		require.NoError(t, err)
+
+		snapshot, err := client.ensurePushOutboundSnapshot(ctx)
+		require.NoError(t, err)
+		require.Len(t, snapshot.Rows, 2)
+
+		committedRows := []oversync.BundleRow{
+			{
+				Schema:     "main",
+				Table:      "categories",
+				Key:        mustBundleKey("child"),
+				Op:         oversync.OpInsert,
+				RowVersion: 1,
+				Payload:    mustJSONPayload(t, map[string]any{"id": "child", "name": "Child", "parent_id": "parent"}),
+			},
+			{
+				Schema:     "main",
+				Table:      "categories",
+				Key:        mustBundleKey("parent"),
+				Op:         oversync.OpInsert,
+				RowVersion: 2,
+				Payload:    mustJSONPayload(t, map[string]any{"id": "parent", "name": "Parent", "parent_id": nil}),
+			},
+		}
+		committed := &committedPushBundle{
+			BundleSeq:      1,
+			SourceID:       client.SourceID,
+			SourceBundleID: snapshot.SourceBundleID,
+			RowCount:       int64(len(committedRows)),
+			BundleHash:     mustBundleHash(t, committedRows),
+		}
+		stageCommittedPushBundleRows(t, db, committed.BundleSeq, committedRows)
+
+		require.NoError(t, client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed))
+
+		var parentID string
+		require.NoError(t, db.QueryRow(`SELECT parent_id FROM categories WHERE id = 'child'`).Scan(&parentID))
+		require.Equal(t, "parent", parentID)
+	})
+
+	t.Run("cyclic foreign keys", func(t *testing.T) {
+		client, db := newBundleClient(t, "main", []SyncTable{
+			{TableName: "teams", SyncKeyColumnName: "id"},
+			{TableName: "team_members", SyncKeyColumnName: "id"},
+		}, `
+			CREATE TABLE teams (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				captain_member_id TEXT,
+				FOREIGN KEY (captain_member_id) REFERENCES team_members(id) DEFERRABLE INITIALLY IMMEDIATE
+			)
+		`, `
+			CREATE TABLE team_members (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				team_id TEXT NOT NULL,
+				FOREIGN KEY (team_id) REFERENCES teams(id) DEFERRABLE INITIALLY IMMEDIATE
+			)
+		`)
+
+		tx, err := db.Begin()
+		require.NoError(t, err)
+		_, err = tx.Exec(`PRAGMA defer_foreign_keys = ON`)
+		require.NoError(t, err)
+		_, err = tx.Exec(`INSERT INTO teams (id, name, captain_member_id) VALUES ('team-1', 'Core', 'member-1')`)
+		require.NoError(t, err)
+		_, err = tx.Exec(`INSERT INTO team_members (id, name, team_id) VALUES ('member-1', 'Ada', 'team-1')`)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+
+		snapshot, err := client.ensurePushOutboundSnapshot(ctx)
+		require.NoError(t, err)
+		require.Len(t, snapshot.Rows, 2)
+
+		committedRows := []oversync.BundleRow{
+			{
+				Schema:     "main",
+				Table:      "teams",
+				Key:        mustBundleKey("team-1"),
+				Op:         oversync.OpInsert,
+				RowVersion: 1,
+				Payload:    mustJSONPayload(t, map[string]any{"id": "team-1", "name": "Core", "captain_member_id": "member-1"}),
+			},
+			{
+				Schema:     "main",
+				Table:      "team_members",
+				Key:        mustBundleKey("member-1"),
+				Op:         oversync.OpInsert,
+				RowVersion: 2,
+				Payload:    mustJSONPayload(t, map[string]any{"id": "member-1", "name": "Ada", "team_id": "team-1"}),
+			},
+		}
+		committed := &committedPushBundle{
+			BundleSeq:      1,
+			SourceID:       client.SourceID,
+			SourceBundleID: snapshot.SourceBundleID,
+			RowCount:       int64(len(committedRows)),
+			BundleHash:     mustBundleHash(t, committedRows),
+		}
+		stageCommittedPushBundleRows(t, db, committed.BundleSeq, committedRows)
+
+		require.NoError(t, client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed))
+
+		var captainID, teamID string
+		require.NoError(t, db.QueryRow(`SELECT captain_member_id FROM teams WHERE id = 'team-1'`).Scan(&captainID))
+		require.NoError(t, db.QueryRow(`SELECT team_id FROM team_members WHERE id = 'member-1'`).Scan(&teamID))
+		require.Equal(t, "member-1", captainID)
+		require.Equal(t, "team-1", teamID)
+	})
+}
+
+func TestClient_RejectsOverlappingSyncOperations(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	client.SetBeforePushCommitHook(func(context.Context) error {
+		close(entered)
+		<-release
+		return nil
+	})
+
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- client.PushPending(ctx)
+	}()
+
+	<-entered
+
+	cases := []struct {
+		name string
+		op   func() error
+	}{
+		{
+			name: "push rejects overlap",
+			op: func() error {
+				return client.PushPending(ctx)
+			},
+		},
+		{
+			name: "pull rejects overlap",
+			op: func() error {
+				return client.PullToStable(ctx)
+			},
+		},
+		{
+			name: "hydrate rejects overlap",
+			op: func() error {
+				return client.Hydrate(ctx)
+			},
+		},
+		{
+			name: "recover rejects overlap",
+			op: func() error {
+				return client.Recover(ctx)
+			},
+		},
+		{
+			name: "sync rejects overlap",
+			op: func() error {
+				return client.Sync(ctx)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.op()
+			var inProgressErr *SyncOperationInProgressError
+			require.ErrorAs(t, err, &inProgressErr)
+		})
+	}
+
+	close(release)
+	require.NoError(t, <-firstErr)
+}
+
+func TestPushPending_RebasesSameKeyLocalIntentDuringAuthoritativeReplay(t *testing.T) {
+	ctx := context.Background()
+	const committedRowVersion int64 = 11
+
+	cases := []struct {
+		name              string
+		seed              func(*testing.T, *Client, *sql.DB, string)
+		firstMutation     func(*testing.T, *sql.DB, string)
+		secondMutation    func(*testing.T, *sql.DB, string)
+		expectedVisible   bool
+		expectedName      string
+		expectedDeleted   bool
+		expectedDirtyOp   string
+		expectedDirty     bool
+		expectedDirtyName string
+		expectedUploadOp  string
+	}{
+		{
+			name: "update to later update",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "First", "first@example.com", id)
+				require.NoError(t, err)
+			},
+			secondMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "Second", "second@example.com", id)
+				require.NoError(t, err)
+			},
+			expectedVisible:   true,
+			expectedName:      "Second",
+			expectedDeleted:   false,
+			expectedDirty:     true,
+			expectedDirtyOp:   oversync.OpUpdate,
+			expectedDirtyName: "Second",
+			expectedUploadOp:  oversync.OpUpdate,
+		},
+		{
+			name: "update to later delete",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "First", "first@example.com", id)
+				require.NoError(t, err)
+			},
+			secondMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)
+				require.NoError(t, err)
+			},
+			expectedVisible:  false,
+			expectedDeleted:  false,
+			expectedDirty:    true,
+			expectedDirtyOp:  oversync.OpDelete,
+			expectedUploadOp: oversync.OpUpdate,
+		},
+		{
+			name: "delete to later recreate",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)
+				require.NoError(t, err)
+			},
+			secondMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, id, "Recreated", "recreated@example.com")
+				require.NoError(t, err)
+			},
+			expectedVisible:   true,
+			expectedName:      "Recreated",
+			expectedDeleted:   true,
+			expectedDirty:     true,
+			expectedDirtyOp:   oversync.OpInsert,
+			expectedDirtyName: "Recreated",
+			expectedUploadOp:  oversync.OpDelete,
+		},
+		{
+			name: "insert to later update before replay",
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, id, "First", "first@example.com")
+				require.NoError(t, err)
+			},
+			secondMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "Second", "second@example.com", id)
+				require.NoError(t, err)
+			},
+			expectedVisible:   true,
+			expectedName:      "Second",
+			expectedDeleted:   false,
+			expectedDirty:     true,
+			expectedDirtyOp:   oversync.OpUpdate,
+			expectedDirtyName: "Second",
+			expectedUploadOp:  oversync.OpInsert,
+		},
+		{
+			name: "insert to later delete before replay",
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, id, "First", "first@example.com")
+				require.NoError(t, err)
+			},
+			secondMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)
+				require.NoError(t, err)
+			},
+			expectedVisible:  false,
+			expectedDeleted:  false,
+			expectedDirty:    true,
+			expectedDirtyOp:  oversync.OpDelete,
+			expectedUploadOp: oversync.OpInsert,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+				CREATE TABLE users (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					email TEXT NOT NULL
+				)
+			`)
+
+			rowID := uuid.NewString()
+			if tc.seed != nil {
+				tc.seed(t, client, db, rowID)
+			}
+			tc.firstMutation(t, db, rowID)
+
+			server := newMockPushSessionServer(t)
+			server.commitHook = newFixedVersionCommitHook(t, server, committedRowVersion)
+			client.HTTP = &http.Client{Transport: server}
+
+			snapshot, err := client.ensurePushOutboundSnapshot(ctx)
+			require.NoError(t, err)
+			require.Len(t, snapshot.Rows, 1)
+			require.Equal(t, tc.expectedUploadOp, snapshot.Rows[0].Op)
+
+			tc.secondMutation(t, db, rowID)
+
+			committed, err := client.commitPushOutboundSnapshot(ctx, snapshot)
+			require.NoError(t, err)
+			require.NoError(t, client.fetchCommittedPushBundle(ctx, committed))
+			require.NoError(t, client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed))
+
+			name, _, exists := loadUserForKey(t, db, rowID)
+			require.Equal(t, tc.expectedVisible, exists)
+			if tc.expectedVisible {
+				require.Equal(t, tc.expectedName, name)
+			}
+
+			rowVersion, deleted, metaExists := loadUserRowStateForKey(t, db, rowKeyJSON(rowID))
+			require.True(t, metaExists)
+			require.Equal(t, committedRowVersion, rowVersion)
+			require.Equal(t, tc.expectedDeleted, deleted)
+
+			op, baseRowVersion, payload, dirtyExists := loadDirtyRowForKey(t, db, rowKeyJSON(rowID))
+			require.Equal(t, tc.expectedDirty, dirtyExists)
+			if tc.expectedDirty {
+				require.Equal(t, tc.expectedDirtyOp, op)
+				require.Equal(t, committedRowVersion, baseRowVersion)
+				if tc.expectedDirtyOp == oversync.OpDelete {
+					require.False(t, payload.Valid)
+				} else {
+					require.True(t, payload.Valid)
+					payloadObj := decodeDirtyPayload(t, payload.String)
+					require.Equal(t, tc.expectedDirtyName, payloadObj["name"])
+				}
+			}
+		})
+	}
+}
+
+func TestIsExpectedSyncContention(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, IsExpectedSyncContention(nil))
+	require.True(t, IsExpectedSyncContention(&SyncOperationInProgressError{}))
+	require.True(t, IsExpectedSyncContention(fmt.Errorf("wrapped: %w", &SyncOperationInProgressError{})))
+	require.False(t, IsExpectedSyncContention(&PendingPushReplayError{OutboundCount: 3}))
+	require.False(t, IsExpectedSyncContention(context.Canceled))
+}
+
+func TestDirtyRowCapture_CapturesLocalCascadeDeletes(t *testing.T) {
+	client, db := newBundleClient(t, "main", []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "id"},
+		{TableName: "posts", SyncKeyColumnName: "id"},
+	}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`, `
+		CREATE TABLE posts (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			author_id TEXT NOT NULL,
+			FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+		)
+	`)
+
+	userID := uuid.NewString()
+	postID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO posts (id, title, author_id) VALUES (?, ?, ?)`, postID, "Hello", userID)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
+	require.NoError(t, err)
+
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	require.NoError(t, client.updateStructuredRowStateInTx(context.Background(), tx, "main", "users", rowKeyJSON(userID), 1, false))
+	require.NoError(t, client.updateStructuredRowStateInTx(context.Background(), tx, "main", "posts", rowKeyJSON(postID), 2, false))
+	require.NoError(t, tx.Commit())
+
+	_, err = db.Exec(`DELETE FROM users WHERE id = ?`, userID)
+	require.NoError(t, err)
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE op = 'DELETE'`).Scan(&count))
+	require.Equal(t, 2, count)
+}
+
+func TestDirtyRowCapture_CapturesLocalTriggerGeneratedWrites(t *testing.T) {
+	_, db := newBundleClient(t, "main", []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "id"},
+		{TableName: "audit_logs", SyncKeyColumnName: "id"},
+	}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`, `
+		CREATE TABLE audit_logs (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			action TEXT NOT NULL
+		)
+	`, `
+		CREATE TRIGGER users_audit_after_insert
+		AFTER INSERT ON users
+		BEGIN
+			INSERT INTO audit_logs (id, user_id, action)
+			VALUES (NEW.id || '-audit', NEW.id, 'inserted');
+		END
+	`)
+
+	userID := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	var dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 2, dirtyCount)
+}
+
+func TestDirtyRowCapture_KeyChangingUpdateCreatesDeleteAndUpsert(t *testing.T) {
+	_, db := newBundleClient(t, "main", []SyncTable{{TableName: "widgets", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE widgets (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO widgets (id, name) VALUES ('old-id', 'Widget')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE widgets SET id = 'new-id' WHERE id = 'old-id'`)
+	require.NoError(t, err)
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = 'widgets'`).Scan(&count))
+	require.Equal(t, 2, count)
+
+	type dirtyKey struct {
+		KeyJSON string
+		Op      string
+	}
+	rows, err := db.Query(`SELECT key_json, op FROM _sync_dirty_rows WHERE table_name = 'widgets' ORDER BY key_json`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var got []dirtyKey
+	for rows.Next() {
+		var keyJSON string
+		var op string
+		require.NoError(t, rows.Scan(&keyJSON, &op))
+		got = append(got, dirtyKey{KeyJSON: keyJSON, Op: op})
+	}
+	require.NoError(t, rows.Err())
+	require.ElementsMatch(t, []dirtyKey{
+		{KeyJSON: rowKeyJSON("old-id"), Op: oversync.OpDelete},
+		{KeyJSON: rowKeyJSON("new-id"), Op: oversync.OpInsert},
+	}, got)
+}
+
+func mustPushPayloadName(t *testing.T, payload []byte) string {
+	t.Helper()
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(payload, &decoded))
+	name, _ := decoded["name"].(string)
+	return name
+}
+
+func mustProcessPayload(t *testing.T, client *Client, tableName, raw string) []byte {
+	t.Helper()
+	payload, err := client.processPayloadForUpload(tableName, raw)
+	require.NoError(t, err)
+	return payload
+}
+
+func mustBeginTx(t *testing.T, db *sql.DB) *sql.Tx {
+	t.Helper()
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	return tx
+}

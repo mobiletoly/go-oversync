@@ -42,5 +42,6 @@ examples/samplesync_server/samplesync_server
 example/mobile_flow/mobile_flow
 
 .drymint
+specs/
 
 AGENTS.md

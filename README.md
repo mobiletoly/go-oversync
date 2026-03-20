@@ -44,7 +44,8 @@ client for Android/iOS apps. Both sync with the same PostgreSQL adapter. More cl
 are coming.
 
 **Simple integration:** Register your tables with go-oversync, add a few HTTP handlers to your
-routes, and the library handles change tracking, conflict resolution, and sync protocol details.
+routes, and the library handles chunked push-session upload, bundle capture, conflict detection,
+and sync protocol details.
 
 **Flexible authentication:** Works with any auth system — JWT, sessions, API keys, or custom
 authentication. You extract user/device IDs and pass them to go-oversync.
@@ -73,7 +74,7 @@ go get github.com/mobiletoly/go-oversync
 go run ./examples/nethttp_server
 
 # In another terminal, run the mobile simulator
-go run ./examples/mobile_flow
+cd examples/mobile_flow && go run .
 ```
 
 The mobile simulator runs 11 comprehensive scenarios including multi-device sync, conflict
@@ -87,23 +88,36 @@ cfg := &oversync.ServiceConfig{
     MaxSupportedSchemaVersion: 1,
     AppName: "my-app",
     RegisteredTables: []oversync.RegisteredTable{
-        {Schema: "business", Table: "users"},
-        {Schema: "business", Table: "posts"},
+        {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
+        {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
     },
 }
 
-svc, _ := oversync.NewSyncService(pool, cfg, logger)
+svc, _ := oversync.NewRuntimeService(pool, cfg, logger)
+if err := svc.Bootstrap(ctx); err != nil {
+    log.Fatal(err)
+}
+// Bootstrap also prepares the runtime topology snapshot.
+// Runtime schema changes are restart-only for now.
 
 // 2. Create handlers (works with any auth system)
-h := oversync.NewSyncHandlers(svc, yourAuthSystem, logger)
+h := oversync.NewHTTPSyncHandlers(svc, logger)
 
 // 3. Add to your existing HTTP server
-mux.Handle("POST /sync/upload", yourAuthMiddleware(http.HandlerFunc(h.HandleUpload)))
-mux.Handle("GET /sync/download", yourAuthMiddleware(http.HandlerFunc(h.HandleDownload)))
+mux.Handle("POST /sync/push-sessions", yourAuthMiddleware(http.HandlerFunc(h.HandleCreatePushSession)))
+mux.Handle("POST /sync/push-sessions/{push_id}/chunks", yourAuthMiddleware(http.HandlerFunc(h.HandlePushSessionChunk)))
+mux.Handle("POST /sync/push-sessions/{push_id}/commit", yourAuthMiddleware(http.HandlerFunc(h.HandleCommitPushSession)))
+mux.Handle("DELETE /sync/push-sessions/{push_id}", yourAuthMiddleware(http.HandlerFunc(h.HandleDeletePushSession)))
+mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", yourAuthMiddleware(http.HandlerFunc(h.HandleGetCommittedBundleRows)))
+mux.Handle("GET /sync/pull", yourAuthMiddleware(http.HandlerFunc(h.HandlePull)))
+mux.Handle("POST /sync/snapshot-sessions", yourAuthMiddleware(http.HandlerFunc(h.HandleCreateSnapshotSession)))
+mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", yourAuthMiddleware(http.HandlerFunc(h.HandleGetSnapshotChunk)))
+mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", yourAuthMiddleware(http.HandlerFunc(h.HandleDeleteSnapshotSession)))
+mux.Handle("GET /sync/capabilities", yourAuthMiddleware(http.HandlerFunc(h.HandleCapabilities)))
 ```
 
-**Your auth, your rules:** Use JWT, sessions, API keys, or any authentication system. Just extract
-`userID` and `deviceID` and pass them to the handlers.
+**Your auth, your rules:** Use JWT, sessions, API keys, or any authentication system. Your middleware should
+authenticate the request and inject an `oversync.Actor{UserID, SourceID}` into request context before calling the handlers.
 
 
 ### 4. Client Setup
@@ -116,7 +130,7 @@ compatibility across platforms.
 - **Location:** `oversqlite/` package in this repo
 - **Use case:** Go applications, desktop apps, server-to-server sync
 - **Database:** SQLite with automatic trigger-based change tracking
-- **Features:** Batch uploads, conflict resolution, offline-first design
+- **Features:** bundle push/pull, chunked snapshot rebuild, conflict resolution, offline-first design
 
 #### Option B: Kotlin Multiplatform Client (Android/iOS)
 

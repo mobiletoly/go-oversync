@@ -56,7 +56,7 @@ func (v *DatabaseVerifier) CountRecords(ctx context.Context, tableName string) (
 	return count, nil
 }
 
-// CountRows is an alias for CountRecords for compatibility
+// CountRows is a convenience wrapper over CountRecords.
 func (v *DatabaseVerifier) CountRows(tableName string) (int, error) {
 	return v.CountRecords(context.Background(), tableName)
 }
@@ -84,24 +84,24 @@ func (v *DatabaseVerifier) CountOrphanedReviews() (int, error) {
 func (v *DatabaseVerifier) CountUserRecords(ctx context.Context, tableName string, userID string) (int, error) {
 	var count int
 
-	// Query the sync.server_change_log to count records for this user
-	// This ensures we only count records that belong to this user
+	// Query the authoritative bundle-era row state so we only count live rows that belong to this user.
 	query := `
-		SELECT COUNT(DISTINCT pk_uuid)
-		FROM sync.server_change_log
+		SELECT COUNT(*)
+		FROM sync.row_state
 		WHERE user_id = $1
-		AND schema_name = 'business'
-		AND table_name = $2
-		AND op != 'DELETE'`
+		AND schema_name = $2
+		AND table_name = $3
+		AND deleted = FALSE`
 
 	// Extract table name from full table name (e.g., "business.users" -> "users")
 	parts := strings.Split(tableName, ".")
 	if len(parts) != 2 {
 		return 0, fmt.Errorf("invalid table name format: %s (expected schema.table)", tableName)
 	}
+	schemaName := parts[0]
 	tableNameOnly := parts[1]
 
-	err := v.pool.QueryRow(ctx, query, userID, tableNameOnly).Scan(&count)
+	err := v.pool.QueryRow(ctx, query, userID, schemaName, tableNameOnly).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count user records in %s for user %s: %w", tableName, userID, err)
 	}
@@ -122,16 +122,16 @@ func (v *DatabaseVerifier) CountActualBusinessRecords(ctx context.Context, table
 	schemaName := parts[0]
 	tableNameOnly := parts[1]
 
-	// Count records by joining business table with sync metadata to filter by user
-	// This works because sync metadata tracks which user owns which records
+	// Count records by joining business rows with authoritative bundle-era row ownership.
 	query := fmt.Sprintf(`
 		SELECT COUNT(DISTINCT bt.id)
 		FROM %s.%s bt
-		INNER JOIN sync.server_change_log scl ON scl.pk_uuid = bt.id
-		WHERE scl.user_id = $1
-		AND scl.schema_name = $2
-		AND scl.table_name = $3
-		AND scl.op != 'DELETE'`, schemaName, tableNameOnly)
+		INNER JOIN sync.row_state rs
+			ON rs.key_json::jsonb ->> 'id' = bt.id::text
+		WHERE rs.user_id = $1
+		AND rs.schema_name = $2
+		AND rs.table_name = $3
+		AND rs.deleted = FALSE`, schemaName, tableNameOnly)
 
 	err := v.pool.QueryRow(ctx, query, userID, schemaName, tableNameOnly).Scan(&count)
 	if err != nil {
@@ -156,18 +156,19 @@ func (v *DatabaseVerifier) VerifyBusinessRecordsExist(ctx context.Context, table
 	schemaName := parts[0]
 	tableNameOnly := parts[1]
 
-	// Check each record exists by joining with sync metadata
+	// Check each record exists by joining with authoritative bundle-era row ownership.
 	for _, recordID := range recordIDs {
 		var exists bool
 		query := fmt.Sprintf(`
 			SELECT EXISTS(
 				SELECT 1 FROM %s.%s bt
-				INNER JOIN sync.server_change_log scl ON scl.pk_uuid = bt.id
-				WHERE scl.user_id = $1
+				INNER JOIN sync.row_state rs
+					ON rs.key_json::jsonb ->> 'id' = bt.id::text
+				WHERE rs.user_id = $1
 				AND bt.id = $2
-				AND scl.schema_name = $3
-				AND scl.table_name = $4
-				AND scl.op != 'DELETE'
+				AND rs.schema_name = $3
+				AND rs.table_name = $4
+				AND rs.deleted = FALSE
 			)`, schemaName, tableNameOnly)
 
 		err := v.pool.QueryRow(ctx, query, userID, recordID, schemaName, tableNameOnly).Scan(&exists)
@@ -184,10 +185,10 @@ func (v *DatabaseVerifier) VerifyBusinessRecordsExist(ctx context.Context, table
 	return nil
 }
 
-// CountSyncChanges counts sync changes for a specific user
+// CountSyncChanges counts committed row effects for a specific user.
 func (v *DatabaseVerifier) CountSyncChanges(ctx context.Context, userID string) (int, error) {
 	var count int
-	query := "SELECT COUNT(*) FROM sync.server_change_log WHERE user_id = $1"
+	query := "SELECT COUNT(*) FROM sync.bundle_rows WHERE user_id = $1"
 
 	err := v.pool.QueryRow(ctx, query, userID).Scan(&count)
 	if err != nil {
@@ -204,25 +205,26 @@ func (v *DatabaseVerifier) GetSyncMetadata(ctx context.Context, userID string) (
 		UserID: userID,
 	}
 
-	// Count total changes
+	// Count committed row effects.
 	changeCount, err := v.CountSyncChanges(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 	metadata.TotalChanges = changeCount
 
-	// Get highest server sequence
+	// Get highest authoritative per-user bundle sequence.
 	var maxSeq int64
-	query := "SELECT COALESCE(MAX(server_id), 0) FROM sync.server_change_log WHERE user_id = $1"
+	query := `
+		SELECT COALESCE((SELECT next_bundle_seq - 1 FROM sync.user_state WHERE user_id = $1), 0)`
 	err = v.pool.QueryRow(ctx, query, userID).Scan(&maxSeq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get max sequence for user %s: %w", userID, err)
+		return nil, fmt.Errorf("failed to get max bundle sequence for user %s: %w", userID, err)
 	}
 	metadata.HighestSequence = maxSeq
 
-	// Count by operation type
+	// Count by operation type in bundle rows.
 	opCounts := make(map[string]int)
-	query = "SELECT op, COUNT(*) FROM sync.server_change_log WHERE user_id = $1 GROUP BY op"
+	query = "SELECT op, COUNT(*) FROM sync.bundle_rows WHERE user_id = $1 GROUP BY op"
 	rows, err := v.pool.Query(ctx, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get operation counts for user %s: %w", userID, err)
@@ -372,14 +374,6 @@ func (v *DatabaseVerifier) GeneratePostgreSQLReport(ctx context.Context, userID 
 			return nil, fmt.Errorf("failed to count sync records in %s: %w", tableName, err)
 		}
 		results.SyncMetadataCounts[tableName] = syncCount
-
-		// Get sample records
-		samples, err := v.getSampleRecords(ctx, tableName, userID, 3)
-		if err != nil {
-			v.logger.Warn("Failed to get sample records", "table", tableName, "error", err)
-		} else {
-			results.RecordSamples[tableName] = samples
-		}
 	}
 
 	// Get sync metadata
@@ -393,71 +387,6 @@ func (v *DatabaseVerifier) GeneratePostgreSQLReport(ctx context.Context, userID 
 	results.OperationCounts = syncMetadata.OperationCounts
 
 	return results, nil
-}
-
-// getSampleRecords gets sample records from a business table for a specific user
-func (v *DatabaseVerifier) getSampleRecords(ctx context.Context, tableName string, userID string, limit int) ([]RecordSample, error) {
-	parts := strings.Split(tableName, ".")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid table name format: %s", tableName)
-	}
-	schemaName := parts[0]
-	tableNameOnly := parts[1]
-
-	// Get sample records by joining with sync metadata to filter by user
-	var query string
-	if tableNameOnly == "users" {
-		query = fmt.Sprintf(`
-			SELECT bt.id, bt.name, bt.created_at::text, bt.updated_at::text
-			FROM %s.%s bt
-			INNER JOIN sync.server_change_log scl ON scl.pk_uuid = bt.id
-			WHERE scl.user_id = $1
-			AND scl.schema_name = $2
-			AND scl.table_name = $3
-			AND scl.op != 'DELETE'
-			ORDER BY bt.created_at DESC
-			LIMIT $4`, schemaName, tableNameOnly)
-	} else if tableNameOnly == "posts" {
-		query = fmt.Sprintf(`
-			SELECT bt.id, bt.title, bt.created_at::text, bt.updated_at::text
-			FROM %s.%s bt
-			INNER JOIN sync.server_change_log scl ON scl.pk_uuid = bt.id
-			WHERE scl.user_id = $1
-			AND scl.schema_name = $2
-			AND scl.table_name = $3
-			AND scl.op != 'DELETE'
-			ORDER BY bt.created_at DESC
-			LIMIT $4`, schemaName, tableNameOnly)
-	} else {
-		return nil, fmt.Errorf("unsupported table for sample records: %s", tableNameOnly)
-	}
-
-	rows, err := v.pool.Query(ctx, query, userID, schemaName, tableNameOnly, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query sample records: %w", err)
-	}
-	defer rows.Close()
-
-	var samples []RecordSample
-	for rows.Next() {
-		var sample RecordSample
-		var name, createdAt, updatedAt string
-
-		err := rows.Scan(&sample.ID, &name, &createdAt, &updatedAt)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan sample record: %w", err)
-		}
-
-		sample.Data = map[string]interface{}{
-			"name": name,
-		}
-		sample.CreatedAt = createdAt
-		sample.UpdatedAt = updatedAt
-
-		samples = append(samples, sample)
-	}
-
-	return samples, nil
 }
 
 // ComprehensiveVerificationResult holds the results of comprehensive verification

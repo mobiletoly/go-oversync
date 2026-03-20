@@ -12,10 +12,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,36 +28,210 @@ import (
 
 // Client manages SQLite database and two-way sync operations
 type Client struct {
-	DB       *sql.DB
-	BaseURL  string
-	Token    func(context.Context) (string, error) // returns JWT
-	SourceID string
-	UserID   string
-	Resolver Resolver
-	HTTP     *http.Client
-	config   *Config
-	logger   *slog.Logger
-	writeMu  sync.Mutex // Serialize write operations to prevent SQLite locking issues
+	DB         *sql.DB
+	BaseURL    string
+	Token      func(context.Context) (string, error) // returns JWT
+	SourceID   string
+	UserID     string
+	Resolver   Resolver
+	HTTP       *http.Client
+	config     *Config
+	logger     *slog.Logger
+	writeMu    sync.Mutex // Serialize write operations to prevent SQLite locking issues
+	pkByTable  map[string]string
+	keyByTable map[string][]string
+	tableOrder map[string]int
+	tableInfo  *TableInfoProvider
+	closed     uint32
 
 	// Pause switches (atomic): allow callers to suspend sync activity deterministically
-	uploadPaused   int32
-	downloadPaused int32
+	uploadPaused         int32
+	downloadPaused       int32
+	snapshotStats        snapshotTransferStats
+	pushStats            pushTransferStats
+	beforePushFreezeHook func(context.Context) error
+	beforePushCommitHook func(context.Context) error
+	beforePushReplayHook func(context.Context) error
+	dbOwnershipKey       string
+}
+
+// DatabaseAlreadyOwnedError indicates that another oversqlite client already owns the same SQLite DB.
+type DatabaseAlreadyOwnedError struct {
+	Database string
+}
+
+func (e *DatabaseAlreadyOwnedError) Error() string {
+	if e == nil || strings.TrimSpace(e.Database) == "" {
+		return "another oversqlite client is already active for this SQLite database"
+	}
+	return fmt.Sprintf("another oversqlite client is already active for SQLite database %s", e.Database)
+}
+
+// ClientClosedError indicates that Close() has already been called on the client.
+type ClientClosedError struct{}
+
+func (e *ClientClosedError) Error() string {
+	return "oversqlite client has been closed"
+}
+
+type clientDBIdentity struct {
+	Key   string
+	Label string
+}
+
+type clientDBOwner struct {
+	label string
+	db    *sql.DB
+}
+
+var activeClientDBOwnership = struct {
+	mu     sync.Mutex
+	owners map[string]clientDBOwner
+}{
+	owners: make(map[string]clientDBOwner),
+}
+
+type snapshotTransferStats struct {
+	sessionsCreated int64
+	chunksFetched   int64
+}
+
+type SnapshotTransferStats struct {
+	SessionsCreated int64
+	ChunksFetched   int64
+}
+
+type pushTransferStats struct {
+	sessionsCreated           int64
+	chunksUploaded            int64
+	committedBundleChunksRead int64
+}
+
+type PushTransferStats struct {
+	SessionsCreated           int64
+	ChunksUploaded            int64
+	CommittedBundleChunksRead int64
+}
+
+func (c *Client) tryBeginSyncOperation() error {
+	if c == nil {
+		return nil
+	}
+	if atomic.LoadUint32(&c.closed) == 1 {
+		return &ClientClosedError{}
+	}
+	if !c.writeMu.TryLock() {
+		return &SyncOperationInProgressError{}
+	}
+	if atomic.LoadUint32(&c.closed) == 1 {
+		c.writeMu.Unlock()
+		return &ClientClosedError{}
+	}
+	return nil
+}
+
+func detectClientDBIdentity(db *sql.DB) (clientDBIdentity, error) {
+	if db == nil {
+		return clientDBIdentity{}, fmt.Errorf("db cannot be nil")
+	}
+
+	rows, err := db.Query(`PRAGMA database_list`)
+	if err != nil {
+		return clientDBIdentity{}, fmt.Errorf("failed to inspect SQLite database identity: %w", err)
+	}
+	defer rows.Close()
+
+	var mainFile string
+	for rows.Next() {
+		var (
+			seq  int
+			name string
+			file string
+		)
+		if err := rows.Scan(&seq, &name, &file); err != nil {
+			return clientDBIdentity{}, fmt.Errorf("failed to scan SQLite database identity: %w", err)
+		}
+		if name == "main" {
+			mainFile = strings.TrimSpace(file)
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return clientDBIdentity{}, fmt.Errorf("failed to iterate SQLite database identity: %w", err)
+	}
+
+	if mainFile == "" {
+		label := fmt.Sprintf("in-memory:%p", db)
+		return clientDBIdentity{
+			Key:   label,
+			Label: label,
+		}, nil
+	}
+
+	if !strings.HasPrefix(mainFile, "file:") {
+		resolvedPath := mainFile
+		if !filepath.IsAbs(resolvedPath) {
+			if absPath, err := filepath.Abs(resolvedPath); err == nil {
+				resolvedPath = absPath
+			}
+		}
+		if evalPath, err := filepath.EvalSymlinks(resolvedPath); err == nil {
+			resolvedPath = evalPath
+		}
+		mainFile = resolvedPath
+	}
+
+	return clientDBIdentity{
+		Key:   "sqlite:" + mainFile,
+		Label: mainFile,
+	}, nil
+}
+
+func claimClientDBOwnership(db *sql.DB) (clientDBIdentity, error) {
+	identity, err := detectClientDBIdentity(db)
+	if err != nil {
+		return clientDBIdentity{}, err
+	}
+
+	activeClientDBOwnership.mu.Lock()
+	defer activeClientDBOwnership.mu.Unlock()
+
+	if _, exists := activeClientDBOwnership.owners[identity.Key]; exists {
+		return clientDBIdentity{}, &DatabaseAlreadyOwnedError{Database: identity.Label}
+	}
+	activeClientDBOwnership.owners[identity.Key] = clientDBOwner{
+		label: identity.Label,
+		db:    db,
+	}
+	return identity, nil
+}
+
+func releaseClientDBOwnership(key string) {
+	if strings.TrimSpace(key) == "" {
+		return
+	}
+
+	activeClientDBOwnership.mu.Lock()
+	defer activeClientDBOwnership.mu.Unlock()
+	delete(activeClientDBOwnership.owners, key)
 }
 
 // SyncTable represents a table configuration for synchronization
 type SyncTable struct {
-	TableName         string // Table name (e.g., "users", "posts")
-	SyncKeyColumnName string // Primary key column name (empty string defaults to "id")
+	TableName         string   // Table name (e.g., "users", "posts")
+	SyncKeyColumnName string   // Single-column convenience field for the current supported envelope
+	SyncKeyColumns    []string // Ordered sync key columns for the bundle-based runtime
 }
 
 // Config holds configuration for the SQLite sync client
 type Config struct {
-	Schema        string        // e.g., "app"
-	Tables        []SyncTable   // Table configurations with optional custom primary key columns
-	UploadLimit   int           // e.g., 200 per batch
-	DownloadLimit int           // e.g., 1000
-	BackoffMin    time.Duration // 1s
-	BackoffMax    time.Duration // 60s
+	Schema            string        // e.g., "app"
+	Tables            []SyncTable   // Table configurations with explicit primary key columns
+	UploadLimit       int           // e.g., 200 rows per push chunk
+	DownloadLimit     int           // e.g., 1000
+	SnapshotChunkRows int           // e.g., 1000
+	BackoffMin        time.Duration // 1s
+	BackoffMax        time.Duration // 60s
 }
 
 // Resolver interface for conflict resolution
@@ -68,33 +243,98 @@ type Resolver interface {
 
 // DefaultConfig returns a default configuration for the specified tables.
 // Schema must be provided explicitly by the caller to avoid business-specific defaults.
-// If SyncKeyColumnName is empty string, it defaults to "id".
+// Each table must also declare SyncKeyColumnName explicitly.
 func DefaultConfig(schema string, tables []SyncTable) *Config {
 	return &Config{
-		Schema:        schema,
-		Tables:        tables,
-		UploadLimit:   200,
-		DownloadLimit: 1000,
-		BackoffMin:    1 * time.Second,
-		BackoffMax:    60 * time.Second,
+		Schema:            schema,
+		Tables:            tables,
+		UploadLimit:       1000,
+		DownloadLimit:     1000,
+		SnapshotChunkRows: 1000,
+		BackoffMin:        1 * time.Second,
+		BackoffMax:        60 * time.Second,
 	}
 }
 
-// PauseUploads suspends upload operations (UploadOnce and background loops respect this flag)
+// PauseUploads suspends push operations and background sync loops.
 func (c *Client) PauseUploads() { atomic.StoreInt32(&c.uploadPaused, 1) }
 
 // ResumeUploads resumes upload operations
 func (c *Client) ResumeUploads() { atomic.StoreInt32(&c.uploadPaused, 0) }
 
-// PauseDownloads suspends download operations (DownloadOnce/Hydrate and background loops respect this flag)
+// PauseDownloads suspends pull, hydrate, recover, and background download-loop work.
 func (c *Client) PauseDownloads() { atomic.StoreInt32(&c.downloadPaused, 1) }
 
 // ResumeDownloads resumes download operations
 func (c *Client) ResumeDownloads() { atomic.StoreInt32(&c.downloadPaused, 0) }
 
+// SnapshotTransferDiagnostics returns counters for chunked hydrate/recover transport activity.
+func (c *Client) SnapshotTransferDiagnostics() SnapshotTransferStats {
+	if c == nil {
+		return SnapshotTransferStats{}
+	}
+	return SnapshotTransferStats{
+		SessionsCreated: atomic.LoadInt64(&c.snapshotStats.sessionsCreated),
+		ChunksFetched:   atomic.LoadInt64(&c.snapshotStats.chunksFetched),
+	}
+}
+
+// ResetSnapshotTransferDiagnostics clears the local chunked snapshot counters.
+func (c *Client) ResetSnapshotTransferDiagnostics() {
+	if c == nil {
+		return
+	}
+	atomic.StoreInt64(&c.snapshotStats.sessionsCreated, 0)
+	atomic.StoreInt64(&c.snapshotStats.chunksFetched, 0)
+}
+
+func (c *Client) PushTransferDiagnostics() PushTransferStats {
+	if c == nil {
+		return PushTransferStats{}
+	}
+	return PushTransferStats{
+		SessionsCreated:           atomic.LoadInt64(&c.pushStats.sessionsCreated),
+		ChunksUploaded:            atomic.LoadInt64(&c.pushStats.chunksUploaded),
+		CommittedBundleChunksRead: atomic.LoadInt64(&c.pushStats.committedBundleChunksRead),
+	}
+}
+
+func (c *Client) ResetPushTransferDiagnostics() {
+	if c == nil {
+		return
+	}
+	atomic.StoreInt64(&c.pushStats.sessionsCreated, 0)
+	atomic.StoreInt64(&c.pushStats.chunksUploaded, 0)
+	atomic.StoreInt64(&c.pushStats.committedBundleChunksRead, 0)
+}
+
+func (c *Client) SetBeforePushReplayHook(hook func(context.Context) error) {
+	if c == nil {
+		return
+	}
+	c.beforePushReplayHook = hook
+}
+
+func (c *Client) SetBeforePushFreezeHook(hook func(context.Context) error) {
+	if c == nil {
+		return
+	}
+	c.beforePushFreezeHook = hook
+}
+
+func (c *Client) SetBeforePushCommitHook(hook func(context.Context) error) {
+	if c == nil {
+		return
+	}
+	c.beforePushCommitHook = hook
+}
+
 // NewClient creates a new SQLite sync client with the specified configuration
 // Automatically creates triggers for all tables specified in the config
-func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx context.Context) (string, error), config *Config) (*Client, error) {
+func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx context.Context) (string, error), config *Config) (client *Client, err error) {
+	if db == nil {
+		return nil, fmt.Errorf("db cannot be nil")
+	}
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
@@ -102,63 +342,459 @@ func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx contex
 		return nil, fmt.Errorf("config.Schema must be provided (no default schema)")
 	}
 
+	identity, err := claimClientDBOwnership(db)
+	if err != nil {
+		return nil, err
+	}
+	releaseOwnershipOnError := true
+	defer func() {
+		if releaseOwnershipOnError {
+			releaseClientDBOwnership(identity.Key)
+		}
+	}()
+
 	// Initialize database first (create sync tables and reset apply_mode)
 	if err := initializeDatabase(db); err != nil {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
+	if err := validateClientSchemaScope(db, config.Schema); err != nil {
+		return nil, err
+	}
 
-	// Clear global table info cache to prevent cached data from previous databases
-	// from being used with this new database connection
-	ClearGlobalTableInfoCache()
+	pkByTable, keyByTable, tableOrder, err := validateSyncTables(db, config.Tables)
+	if err != nil {
+		return nil, err
+	}
 
-	client := &Client{
-		DB:       db,
-		BaseURL:  baseURL,
-		Token:    tok,
-		SourceID: sourceID,
-		UserID:   userID,
-		Resolver: &DefaultResolver{},
-		HTTP:     &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
-		config:   config,
-		logger:   slog.Default(),
+	client = &Client{
+		DB:             db,
+		BaseURL:        baseURL,
+		Token:          tok,
+		SourceID:       sourceID,
+		UserID:         userID,
+		Resolver:       &DefaultResolver{},
+		HTTP:           &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
+		config:         config,
+		logger:         slog.Default(),
+		pkByTable:      pkByTable,
+		keyByTable:     keyByTable,
+		tableOrder:     tableOrder,
+		tableInfo:      NewTableInfoProvider(),
+		dbOwnershipKey: identity.Key,
 	}
 
 	// Create triggers for all registered tables (after sync tables are created)
 	for _, syncTable := range config.Tables {
-		if err := createTriggersForTable(db, syncTable); err != nil {
+		if err := createTriggersForTable(db, config.Schema, syncTable); err != nil {
 			return nil, fmt.Errorf("failed to create triggers for table %s: %w", syncTable.TableName, err)
 		}
 	}
 
+	releaseOwnershipOnError = false
 	return client, nil
+}
+
+// Close releases the process-local ownership claim for this client.
+// It does not close the underlying *sql.DB.
+func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	if atomic.LoadUint32(&c.closed) == 1 {
+		return nil
+	}
+	atomic.StoreUint32(&c.closed, 1)
+	releaseClientDBOwnership(c.dbOwnershipKey)
+	c.dbOwnershipKey = ""
+	return nil
+}
+
+func (c *Client) tableInfoProvider() *TableInfoProvider {
+	if c.tableInfo == nil {
+		c.tableInfo = NewTableInfoProvider()
+	}
+	return c.tableInfo
+}
+
+func (c *Client) getTableInfo(tableName string) (*TableInfo, error) {
+	return c.tableInfoProvider().Get(c.DB, strings.ToLower(tableName))
+}
+
+func (c *Client) getTableInfoTx(tx *sql.Tx, tableName string) (*TableInfo, error) {
+	return c.tableInfoProvider().Get(tx, strings.ToLower(tableName))
+}
+
+func validateSyncTables(db *sql.DB, tables []SyncTable) (map[string]string, map[string][]string, map[string]int, error) {
+	pkByTable := make(map[string]string, len(tables))
+	keyByTable := make(map[string][]string, len(tables))
+	managedTables := make(map[string]struct{}, len(tables))
+	for _, syncTable := range tables {
+		tableName := strings.ToLower(strings.TrimSpace(syncTable.TableName))
+		if tableName == "" {
+			return nil, nil, nil, fmt.Errorf("sync table name must be provided")
+		}
+		if strings.Contains(tableName, ".") {
+			return nil, nil, nil, fmt.Errorf("table %s must not include a schema qualifier; oversqlite supports exactly one config.Schema per local database", syncTable.TableName)
+		}
+		if _, exists := pkByTable[tableName]; exists {
+			return nil, nil, nil, fmt.Errorf("duplicate sync table registration for %s", tableName)
+		}
+		managedTables[tableName] = struct{}{}
+
+		keyColumns, err := normalizedSyncKeyColumns(syncTable)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if len(keyColumns) != 1 {
+			return nil, nil, nil, fmt.Errorf("table %s must declare exactly one sync key column in the current client runtime", syncTable.TableName)
+		}
+
+		tableInfo, err := GetTableInfo(db, tableName)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to inspect table %s: %w", syncTable.TableName, err)
+		}
+
+		resolvedPK, err := configuredPrimaryKeyColumn(tableInfo, syncTable)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		pkByTable[tableName] = resolvedPK
+		keyByTable[tableName] = append([]string(nil), keyColumns...)
+	}
+	if err := validateManagedForeignKeyClosure(db, managedTables); err != nil {
+		return nil, nil, nil, err
+	}
+	tableOrder, err := computeManagedTableOrder(db, tables)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return pkByTable, keyByTable, tableOrder, nil
+}
+
+func validateClientSchemaScope(db *sql.DB, schemaName string) error {
+	schemaName = strings.TrimSpace(schemaName)
+	if schemaName == "" {
+		return fmt.Errorf("config.Schema must be provided (no default schema)")
+	}
+
+	rows, err := db.Query(`
+			SELECT DISTINCT schema_name
+			FROM (
+				SELECT schema_name FROM _sync_client_state
+				UNION ALL
+				SELECT schema_name FROM _sync_row_state
+				UNION ALL
+				SELECT schema_name FROM _sync_dirty_rows
+				UNION ALL
+				SELECT schema_name FROM _sync_snapshot_stage
+				UNION ALL
+				SELECT schema_name FROM _sync_push_outbound
+				UNION ALL
+				SELECT schema_name FROM _sync_push_stage
+			)
+			WHERE TRIM(schema_name) <> ''
+			ORDER BY schema_name
+		`)
+	if err != nil {
+		return fmt.Errorf("failed to validate client schema scope: %w", err)
+	}
+	defer rows.Close()
+
+	var seen []string
+	for rows.Next() {
+		var persisted string
+		if err := rows.Scan(&persisted); err != nil {
+			return fmt.Errorf("failed to scan client schema scope: %w", err)
+		}
+		seen = append(seen, persisted)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate client schema scope: %w", err)
+	}
+
+	if len(seen) == 0 {
+		return nil
+	}
+	if len(seen) == 1 && seen[0] == schemaName {
+		return nil
+	}
+	return fmt.Errorf("oversqlite supports exactly one configured schema per local database; existing sync state uses schema(s) %s while config.Schema=%s", strings.Join(seen, ", "), schemaName)
+}
+
+func normalizedSyncKeyColumns(syncTable SyncTable) ([]string, error) {
+	if len(syncTable.SyncKeyColumns) == 0 {
+		pkColumn := strings.TrimSpace(syncTable.SyncKeyColumnName)
+		if pkColumn == "" {
+			return nil, fmt.Errorf("table %s must declare SyncKeyColumnName or SyncKeyColumns explicitly", syncTable.TableName)
+		}
+		return []string{pkColumn}, nil
+	}
+
+	columns := make([]string, 0, len(syncTable.SyncKeyColumns))
+	seen := make(map[string]struct{}, len(syncTable.SyncKeyColumns))
+	for _, col := range syncTable.SyncKeyColumns {
+		normalized := strings.TrimSpace(col)
+		if normalized == "" {
+			continue
+		}
+		key := strings.ToLower(normalized)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		columns = append(columns, normalized)
+	}
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("table %s must declare at least one non-empty sync key column", syncTable.TableName)
+	}
+	return columns, nil
+}
+
+func validateManagedForeignKeyClosure(db *sql.DB, managedTables map[string]struct{}) error {
+	for tableName := range managedTables {
+		rows, err := db.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", quoteIdent(tableName)))
+		if err != nil {
+			return fmt.Errorf("failed to inspect foreign keys for table %s: %w", tableName, err)
+		}
+
+		var unsupportedCompositeRefs []string
+		var missingRefs []string
+		for rows.Next() {
+			var (
+				id       int
+				seq      int
+				refTable string
+				fromCol  string
+				toCol    string
+				onUpdate string
+				onDelete string
+				match    string
+			)
+			if err := rows.Scan(&id, &seq, &refTable, &fromCol, &toCol, &onUpdate, &onDelete, &match); err != nil {
+				rows.Close()
+				return fmt.Errorf("failed to scan foreign key metadata for table %s: %w", tableName, err)
+			}
+
+			refKey := strings.ToLower(strings.TrimSpace(refTable))
+			if refKey == "" {
+				continue
+			}
+			if seq > 0 {
+				unsupportedCompositeRefs = append(unsupportedCompositeRefs, fmt.Sprintf("%s -> %s", tableName, refKey))
+				continue
+			}
+			if _, ok := managedTables[refKey]; ok {
+				continue
+			}
+
+			missingRefs = append(missingRefs, fmt.Sprintf("%s.%s -> %s.%s", tableName, fromCol, refKey, toCol))
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to iterate foreign key metadata for table %s: %w", tableName, err)
+		}
+		rows.Close()
+
+		if len(unsupportedCompositeRefs) > 0 {
+			sort.Strings(unsupportedCompositeRefs)
+			return fmt.Errorf("managed tables contain unsupported composite foreign keys: %s", strings.Join(unsupportedCompositeRefs, "; "))
+		}
+		if len(missingRefs) > 0 {
+			sort.Strings(missingRefs)
+			return fmt.Errorf("managed tables are not FK-closed: %s", strings.Join(missingRefs, "; "))
+		}
+	}
+
+	return nil
+}
+
+func computeManagedTableOrder(db *sql.DB, tables []SyncTable) (map[string]int, error) {
+	orderByTable := make(map[string]int, len(tables))
+	originalOrder := make(map[string]int, len(tables))
+	managed := make(map[string]struct{}, len(tables))
+	dependents := make(map[string]map[string]struct{}, len(tables))
+	inDegree := make(map[string]int, len(tables))
+
+	for i, table := range tables {
+		name := strings.ToLower(strings.TrimSpace(table.TableName))
+		originalOrder[name] = i
+		managed[name] = struct{}{}
+		if _, ok := dependents[name]; !ok {
+			dependents[name] = make(map[string]struct{})
+		}
+	}
+
+	for _, table := range tables {
+		tableName := strings.ToLower(strings.TrimSpace(table.TableName))
+		rows, err := db.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", quoteIdent(tableName)))
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect foreign keys for table %s: %w", tableName, err)
+		}
+
+		for rows.Next() {
+			var (
+				id       int
+				seq      int
+				refTable string
+				fromCol  string
+				toCol    string
+				onUpdate string
+				onDelete string
+				match    string
+			)
+			if err := rows.Scan(&id, &seq, &refTable, &fromCol, &toCol, &onUpdate, &onDelete, &match); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("failed to scan foreign key metadata for table %s: %w", tableName, err)
+			}
+			refName := strings.ToLower(strings.TrimSpace(refTable))
+			if refName == "" || refName == tableName {
+				continue
+			}
+			if _, ok := managed[refName]; !ok {
+				continue
+			}
+			if _, ok := dependents[refName][tableName]; ok {
+				continue
+			}
+			dependents[refName][tableName] = struct{}{}
+			inDegree[tableName]++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("failed to iterate foreign key metadata for table %s: %w", tableName, err)
+		}
+		rows.Close()
+	}
+
+	queue := make([]string, 0, len(tables))
+	for _, table := range tables {
+		name := strings.ToLower(strings.TrimSpace(table.TableName))
+		if inDegree[name] == 0 {
+			queue = append(queue, name)
+		}
+	}
+	sort.Slice(queue, func(i, j int) bool {
+		return originalOrder[queue[i]] < originalOrder[queue[j]]
+	})
+
+	ordered := make([]string, 0, len(tables))
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		ordered = append(ordered, current)
+
+		children := make([]string, 0, len(dependents[current]))
+		for child := range dependents[current] {
+			children = append(children, child)
+		}
+		sort.Slice(children, func(i, j int) bool {
+			return originalOrder[children[i]] < originalOrder[children[j]]
+		})
+
+		for _, child := range children {
+			inDegree[child]--
+			if inDegree[child] == 0 {
+				queue = append(queue, child)
+			}
+		}
+		sort.Slice(queue, func(i, j int) bool {
+			return originalOrder[queue[i]] < originalOrder[queue[j]]
+		})
+	}
+
+	if len(ordered) < len(tables) {
+		remaining := make([]string, 0, len(tables)-len(ordered))
+		seen := make(map[string]struct{}, len(ordered))
+		for _, tableName := range ordered {
+			seen[tableName] = struct{}{}
+		}
+		for _, table := range tables {
+			name := strings.ToLower(strings.TrimSpace(table.TableName))
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			remaining = append(remaining, name)
+		}
+		sort.Slice(remaining, func(i, j int) bool {
+			return originalOrder[remaining[i]] < originalOrder[remaining[j]]
+		})
+		ordered = append(ordered, remaining...)
+	}
+
+	for i, tableName := range ordered {
+		orderByTable[tableName] = i
+	}
+	return orderByTable, nil
+}
+
+func (c *Client) primaryKeyColumnForTable(tableName string) (string, error) {
+	pkColumn, ok := c.pkByTable[strings.ToLower(tableName)]
+	if !ok {
+		return "", fmt.Errorf("table %s is not configured for sync", tableName)
+	}
+	return pkColumn, nil
+}
+
+func (c *Client) syncKeyColumnsForTable(tableName string) ([]string, error) {
+	keyColumns, ok := c.keyByTable[strings.ToLower(tableName)]
+	if !ok || len(keyColumns) == 0 {
+		return nil, fmt.Errorf("table %s is not configured for sync", tableName)
+	}
+	return append([]string(nil), keyColumns...), nil
 }
 
 // EnsureSourceID generates and persists a source ID if not already present
 func EnsureSourceID(db *sql.DB, userID string) (string, error) {
-	var sourceID string
-	err := db.QueryRow(`SELECT source_id FROM _sync_client_info WHERE user_id = ?`, userID).Scan(&sourceID)
-	if errors.Is(err, sql.ErrNoRows) {
-		// Generate new source ID
-		sourceID = uuid.New().String()
-		_, err = db.Exec(`
-			INSERT INTO _sync_client_info (user_id, source_id, next_change_id, last_server_seq_seen, apply_mode)
-			VALUES (?, ?, 1, 0, 0)
-		`, userID, sourceID)
-		if err != nil {
-			return "", fmt.Errorf("failed to insert client info: %w", err)
-		}
-	} else if err != nil {
-		return "", fmt.Errorf("failed to query client info: %w", err)
+	return ensureClientSourceID(db, userID, "", "")
+}
+
+func ensureClientSourceID(db *sql.DB, userID, preferredSourceID, schemaName string) (string, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return "", fmt.Errorf("userID must be provided")
 	}
-	return sourceID, nil
+
+	sourceID := strings.TrimSpace(preferredSourceID)
+	if sourceID == "" {
+		sourceID = uuid.NewString()
+	}
+
+	schemaName = strings.TrimSpace(schemaName)
+	if _, err := db.Exec(`
+		INSERT INTO _sync_client_state (user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode, rebuild_required)
+		VALUES (?, ?, ?, 1, 0, 0, 0)
+		ON CONFLICT(user_id) DO NOTHING
+	`, userID, sourceID, schemaName); err != nil {
+		return "", fmt.Errorf("failed to ensure client state: %w", err)
+	}
+	if schemaName != "" {
+		if _, err := db.Exec(`
+			UPDATE _sync_client_state
+			SET schema_name = ?
+			WHERE user_id = ? AND TRIM(schema_name) = ''
+		`, schemaName, userID); err != nil {
+			return "", fmt.Errorf("failed to persist client schema identity: %w", err)
+		}
+	}
+
+	var persistedSourceID string
+	var persistedSchema string
+	if err := db.QueryRow(`SELECT source_id, schema_name FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&persistedSourceID, &persistedSchema); err != nil {
+		return "", fmt.Errorf("failed to load client source id: %w", err)
+	}
+	if schemaName != "" && strings.TrimSpace(persistedSchema) != schemaName {
+		return "", fmt.Errorf("client state for user %s is bound to schema %s, not %s", userID, persistedSchema, schemaName)
+	}
+	return persistedSourceID, nil
 }
 
 // initializeDatabase creates sync metadata tables according to the spec (private function)
 func initializeDatabase(db *sql.DB) error {
-	// Clear global table info cache to prevent cached data from previous databases
-	// from being used with this new database connection
-	ClearGlobalTableInfoCache()
-
 	// Enable WAL mode and foreign keys
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
 		return fmt.Errorf("failed to enable WAL mode: %w", err)
@@ -169,36 +805,72 @@ func initializeDatabase(db *sql.DB) error {
 
 	// Create sync metadata tables according to spec
 	tables := []string{
-		// Client/device info (one row)
-		`CREATE TABLE IF NOT EXISTS _sync_client_info (
-			user_id                TEXT NOT NULL,          -- from JWT.sub
-			source_id              TEXT NOT NULL,          -- locally generated UUIDv4 (persisted)
-			next_change_id         INTEGER NOT NULL DEFAULT 1,
-			last_server_seq_seen   INTEGER NOT NULL DEFAULT 0,
-			apply_mode             INTEGER NOT NULL DEFAULT 0,  -- 0=normal (queue to _sync_pending), 1=server-apply (suppress)
-			current_window_until   INTEGER NOT NULL DEFAULT 0,  -- durable watermark for windowed downloads
-			PRIMARY KEY (user_id)                               -- single signed-in user per DB file
+		`CREATE TABLE IF NOT EXISTS _sync_client_state (
+			user_id               TEXT NOT NULL,
+			source_id             TEXT NOT NULL,
+			schema_name           TEXT NOT NULL DEFAULT '',
+			next_source_bundle_id INTEGER NOT NULL DEFAULT 1,
+			last_bundle_seq_seen  INTEGER NOT NULL DEFAULT 0,
+			apply_mode            INTEGER NOT NULL DEFAULT 0,
+			rebuild_required      INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (user_id)
 		)`,
 
-		`CREATE TABLE IF NOT EXISTS _sync_row_meta (
-			table_name     TEXT NOT NULL,
-			pk_uuid        TEXT NOT NULL,
-			server_version INTEGER NOT NULL DEFAULT 0,
-			deleted        INTEGER NOT NULL DEFAULT 0,
-			updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-			PRIMARY KEY (table_name, pk_uuid)
+		`CREATE TABLE IF NOT EXISTS _sync_row_state (
+			schema_name TEXT NOT NULL,
+			table_name  TEXT NOT NULL,
+			key_json    TEXT NOT NULL,
+			row_version INTEGER NOT NULL DEFAULT 0,
+			deleted     INTEGER NOT NULL DEFAULT 0,
+			updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			PRIMARY KEY (schema_name, table_name, key_json)
 		)`,
 
-		// Pending queue (coalesced, one row per PK)
-		`CREATE TABLE IF NOT EXISTS _sync_pending (
-			table_name     TEXT NOT NULL,
-			pk_uuid        TEXT NOT NULL,
-			op             TEXT NOT NULL CHECK (op IN ('INSERT','UPDATE','DELETE')),
-			base_version   INTEGER NOT NULL,
-			payload        TEXT, -- JSON payload captured at time of change (NULL for DELETE)
-			change_id      INTEGER, -- Original change ID for idempotency (assigned on first queue)
-			queued_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-			PRIMARY KEY (table_name, pk_uuid)
+		`CREATE TABLE IF NOT EXISTS _sync_dirty_rows (
+			schema_name      TEXT NOT NULL,
+			table_name       TEXT NOT NULL,
+			key_json         TEXT NOT NULL,
+			op               TEXT NOT NULL CHECK (op IN ('INSERT','UPDATE','DELETE')),
+			base_row_version INTEGER NOT NULL DEFAULT 0,
+			payload          TEXT,
+			dirty_ordinal    INTEGER NOT NULL DEFAULT 0,
+			updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			PRIMARY KEY (schema_name, table_name, key_json)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS _sync_snapshot_stage (
+			snapshot_id  TEXT NOT NULL,
+			row_ordinal  INTEGER NOT NULL,
+			schema_name  TEXT NOT NULL,
+			table_name   TEXT NOT NULL,
+			key_json     TEXT NOT NULL,
+			row_version  INTEGER NOT NULL,
+			payload      TEXT NOT NULL,
+			PRIMARY KEY (snapshot_id, row_ordinal)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS _sync_push_outbound (
+			source_bundle_id INTEGER NOT NULL,
+			row_ordinal      INTEGER NOT NULL,
+			schema_name      TEXT NOT NULL,
+			table_name       TEXT NOT NULL,
+			key_json         TEXT NOT NULL,
+			op               TEXT NOT NULL CHECK (op IN ('INSERT','UPDATE','DELETE')),
+			base_row_version INTEGER NOT NULL DEFAULT 0,
+			payload          TEXT,
+			PRIMARY KEY (source_bundle_id, row_ordinal)
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS _sync_push_stage (
+			bundle_seq   INTEGER NOT NULL,
+			row_ordinal  INTEGER NOT NULL,
+			schema_name  TEXT NOT NULL,
+			table_name   TEXT NOT NULL,
+			key_json     TEXT NOT NULL,
+			op           TEXT NOT NULL CHECK (op IN ('INSERT','UPDATE','DELETE')),
+			row_version  INTEGER NOT NULL,
+			payload      TEXT,
+			PRIMARY KEY (bundle_seq, row_ordinal)
 		)`,
 	}
 
@@ -208,16 +880,15 @@ func initializeDatabase(db *sql.DB) error {
 		}
 	}
 
-	// Reset apply_mode to 0 in case the app crashed while apply_mode was set to 1
-	// This ensures sync triggers are not permanently suppressed after a crash
-	_, err := db.Exec(`UPDATE _sync_client_info SET apply_mode = 0 WHERE apply_mode = 1`)
-	if err != nil {
-		// This is not a fatal error since the table might not exist yet or be empty
-		// We'll just log it and continue
-		fmt.Printf("Warning: failed to reset apply_mode during initialization: %v\n", err)
+	if _, err := db.Exec(`ALTER TABLE _sync_client_state ADD COLUMN rebuild_required INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("failed to add rebuild_required column: %w", err)
 	}
 
-	// (Migration to add change_id column is no longer needed.)
+	// Reset apply_mode to 0 in case the app crashed while apply_mode was set to 1
+	// This ensures sync triggers are not permanently suppressed after a crash
+	if _, err := db.Exec(`UPDATE _sync_client_state SET apply_mode = 0 WHERE apply_mode = 1`); err != nil {
+		fmt.Printf("Warning: failed to reset bundle apply_mode during initialization: %v\n", err)
+	}
 
 	return nil
 }
@@ -239,258 +910,74 @@ func (c *Client) Stop(ctx context.Context) error {
 	return nil
 }
 
-// UploadOnce performs a single upload operation.
-//
-// It also performs a bounded post-upload download drain (include_self=false) to pick up any peer
-// changes that arrived since the last download cursor, without ever fast-forwarding the cursor based
-// on `highest_server_seq`. This avoids permanently skipping peer changes under high parallelism where
-// server_id gaps can be large.
-func (c *Client) UploadOnce(ctx context.Context) error {
-	// Allow callers to pause uploads deterministically (prevents mid-creation drains)
-	if atomic.LoadInt32(&c.uploadPaused) == 1 {
+// PullToStable pulls complete committed bundles until the client reaches the server's frozen stable ceiling.
+func (c *Client) PullToStable(ctx context.Context) error {
+	if atomic.LoadInt32(&c.downloadPaused) == 1 {
 		return nil
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	// Phase 1: upload local changes.
-	if err := c.uploadBatch(ctx); err != nil {
+	if err := c.tryBeginSyncOperation(); err != nil {
 		return err
 	}
+	defer c.writeMu.Unlock()
+	return c.pullToStableLocked(ctx)
+}
 
-	// Phase 2: post-upload download drain (peer changes only).
+// Sync pushes local changes and then pulls to a stable committed-bundle ceiling.
+func (c *Client) Sync(ctx context.Context) error {
+	if atomic.LoadInt32(&c.uploadPaused) == 1 && atomic.LoadInt32(&c.downloadPaused) == 1 {
+		return nil
+	}
+	if err := c.tryBeginSyncOperation(); err != nil {
+		return err
+	}
+	defer c.writeMu.Unlock()
+	if atomic.LoadInt32(&c.uploadPaused) == 0 {
+		if err := c.pushPendingLocked(ctx); err != nil {
+			return err
+		}
+	}
 	if atomic.LoadInt32(&c.downloadPaused) == 0 {
-		maxPasses := 50
-		for passes := 0; passes < maxPasses; passes++ {
-			applied, _, err := c.downloadBatch(ctx, c.config.DownloadLimit, false)
-			if err != nil {
-				return fmt.Errorf("post-upload download drain failed: %w", err)
-			}
-			if applied == 0 {
-				break
-			}
+		if err := c.pullToStableLocked(ctx); err != nil {
+			return err
 		}
 	}
-
 	return nil
-}
-
-// DownloadOnce performs a single download operation
-func (c *Client) DownloadOnce(ctx context.Context, limit int) (applied int, nextAfter int64, err error) {
-	// Allow callers to pause downloads deterministically
-	if atomic.LoadInt32(&c.downloadPaused) == 1 {
-		return 0, 0, nil
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.downloadBatch(ctx, limit, false)
-}
-
-// DownloadOnceUntil performs a single download operation with a frozen upper bound (until)
-func (c *Client) DownloadOnceUntil(ctx context.Context, limit int, until int64) (applied int, nextAfter int64, err error) {
-	if atomic.LoadInt32(&c.downloadPaused) == 1 {
-		return 0, 0, nil
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	// Get current cursor
-	var lastServerSeq int64
-	if err := c.DB.QueryRowContext(ctx, `SELECT last_server_seq_seen FROM _sync_client_info WHERE user_id = ?`, c.UserID).Scan(&lastServerSeq); err != nil {
-		return 0, 0, fmt.Errorf("failed to get last server seq: %w", err)
-	}
-	// Request a windowed page
-	downloadResponse, err := c.sendDownloadRequestWithUntil(ctx, lastServerSeq, limit, false, until)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to download changes: %w", err)
-	}
-	// If empty, persist next_after if advanced
-	if len(downloadResponse.Changes) == 0 {
-		if downloadResponse.NextAfter > lastServerSeq {
-			tx, err := c.DB.BeginTx(ctx, nil)
-			if err != nil {
-				return 0, 0, fmt.Errorf("failed to begin tx to persist cursor: %w", err)
-			}
-			defer tx.Rollback()
-			if _, err := tx.ExecContext(ctx, `UPDATE _sync_client_info SET last_server_seq_seen = ? WHERE user_id = ?`, downloadResponse.NextAfter, c.UserID); err != nil {
-				return 0, 0, fmt.Errorf("failed to update last_server_seq_seen: %w", err)
-			}
-			if err := tx.Commit(); err != nil {
-				return 0, 0, fmt.Errorf("failed to commit cursor persist tx: %w", err)
-			}
-		}
-		return 0, downloadResponse.NextAfter, nil
-	}
-	// Apply page atomically (reuse existing logic via downloadBatchInTx-like sequence)
-	tx, err := c.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-			_, _ = c.DB.ExecContext(ctx, `UPDATE _sync_client_info SET apply_mode = 0 WHERE user_id = ?`, c.UserID)
-		}
-	}()
-	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
-		return 0, 0, fmt.Errorf("failed to enable deferred FK checks: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE _sync_client_info SET apply_mode = 1 WHERE user_id = ?`, c.UserID); err != nil {
-		return 0, 0, fmt.Errorf("failed to set apply_mode: %w", err)
-	}
-	applied = 0
-	for i := range downloadResponse.Changes {
-		ch := &downloadResponse.Changes[i]
-		if ch.SourceID == c.SourceID {
-			continue
-		}
-		if err := c.applyServerChangeInTx(ctx, tx, ch); err != nil {
-			return applied, 0, fmt.Errorf("failed to apply server change: %w", err)
-		}
-		applied++
-	}
-	if downloadResponse.NextAfter > lastServerSeq {
-		if _, err := tx.ExecContext(ctx, `UPDATE _sync_client_info SET last_server_seq_seen = ? WHERE user_id = ?`, downloadResponse.NextAfter, c.UserID); err != nil {
-			return applied, 0, fmt.Errorf("failed to update last_server_seq_seen: %w", err)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE _sync_client_info SET apply_mode = 0 WHERE user_id = ?`, c.UserID); err != nil {
-		return applied, 0, fmt.Errorf("failed to reset apply_mode: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return applied, 0, fmt.Errorf("failed to commit transaction: %w", err)
-	}
-	committed = true
-	return applied, downloadResponse.NextAfter, nil
-}
-
-// DownloadWithSelf performs a single download operation including own changes (for recovery)
-func (c *Client) DownloadWithSelf(ctx context.Context, limit int) (applied int, nextAfter int64, err error) {
-	if atomic.LoadInt32(&c.downloadPaused) == 1 {
-		return 0, 0, nil
-	}
-	return c.downloadBatch(ctx, limit, true)
 }
 
 // Bootstrap performs initial setup for a new or restored client
 // This includes creating client info and optionally performing hydration
 func (c *Client) Bootstrap(ctx context.Context, performHydration bool) error {
-	// Clear global table info cache to ensure fresh table information for this database
-	ClearGlobalTableInfoCache()
+	if err := c.tryBeginSyncOperation(); err != nil {
+		return err
+	}
+	defer c.writeMu.Unlock()
 
-	// Check if client info already exists
-	var exists bool
-	err := c.DB.QueryRowContext(ctx, `
-		SELECT EXISTS(SELECT 1 FROM _sync_client_info WHERE user_id = ? AND source_id = ?)
-	`, c.UserID, c.SourceID).Scan(&exists)
+	sourceID, err := c.ensureBootstrapStateLocked(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to check client info existence: %w", err)
+		return fmt.Errorf("failed to ensure client bootstrap state: %w", err)
 	}
-
-	if !exists {
-		// Create new client info
-		_, err = c.DB.ExecContext(ctx, `
-			INSERT INTO _sync_client_info (user_id, source_id, next_change_id, last_server_seq_seen, apply_mode)
-			VALUES (?, ?, 1, 0, 0)
-		`, c.UserID, c.SourceID)
-		if err != nil {
-			return fmt.Errorf("failed to create client info: %w", err)
-		}
-	}
+	c.SourceID = sourceID
 
 	if performHydration {
 		if atomic.LoadInt32(&c.downloadPaused) == 1 {
 			return nil
 		}
-		return c.Hydrate(ctx)
+		return c.hydrateLocked(ctx)
 	}
 
 	return nil
 }
 
-// Hydrate downloads all user data from the server, optionally including own changes
-// This is used for client recovery scenarios
+// Hydrate rebuilds the managed tables from the current server snapshot.
 func (c *Client) Hydrate(ctx context.Context) error {
 	if atomic.LoadInt32(&c.downloadPaused) == 1 {
 		return nil
 	}
-	c.writeMu.Lock()
+	if err := c.tryBeginSyncOperation(); err != nil {
+		return err
+	}
 	defer c.writeMu.Unlock()
-	return c.HydrateWithOptions(ctx, HydrationOptions{
-		IncludeSelf: false,
-		Limit:       1000,
-	})
-}
-
-// HydrateWithSelf downloads all user data including own changes (for recovery)
-func (c *Client) HydrateWithSelf(ctx context.Context) error {
-	if atomic.LoadInt32(&c.downloadPaused) == 1 {
-		return nil
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.HydrateWithOptions(ctx, HydrationOptions{
-		IncludeSelf: true,
-		Limit:       1000,
-	})
-}
-
-// HydrationOptions configures hydration behavior
-type HydrationOptions struct {
-	IncludeSelf bool // Include changes from the same source (for recovery)
-	Limit       int  // Batch size for downloads
-}
-
-// HydrateWithOptions downloads all user data with specified options
-func (c *Client) HydrateWithOptions(ctx context.Context, options HydrationOptions) error {
-	if atomic.LoadInt32(&c.downloadPaused) == 1 {
-		return nil
-	}
-	// Start transaction for atomic hydration
-	tx, err := c.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin hydration transaction: %w", err)
-	}
-	defer tx.Rollback() // Safe to call even after commit
-
-	// Defer foreign key constraint checks until end of transaction
-	// This maintains data integrity while allowing out-of-order application
-	_, err = tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`)
-	if err != nil {
-		return fmt.Errorf("failed to defer foreign keys: %w", err)
-	}
-
-	// Reset last server seq to 0 to download everything
-	_, err = tx.ExecContext(ctx, `
-		UPDATE _sync_client_info SET last_server_seq_seen = 0 WHERE user_id = ? AND source_id = ?
-	`, c.UserID, c.SourceID)
-	if err != nil {
-		return fmt.Errorf("failed to reset server seq: %w", err)
-	}
-
-	totalApplied := 0
-	for {
-		var applied int
-
-		applied, _, err = c.downloadBatchInTx(ctx, tx, options.Limit, options.IncludeSelf)
-		if err != nil {
-			return fmt.Errorf("hydration failed: %w", err)
-		}
-
-		totalApplied += applied
-
-		// If we got fewer changes than the limit, we're done
-		if applied < options.Limit {
-			break
-		}
-	}
-
-	// Commit the transaction - foreign key constraints will be checked at this point
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit hydration transaction: %w", err)
-	}
-
-	return nil
+	return c.hydrateLocked(ctx)
 }
 
 // SerializeRow loads a row by (table, pk) and serializes it to JSON payload for upload
@@ -499,13 +986,16 @@ func (c *Client) SerializeRow(ctx context.Context, table, pk string) (json.RawMe
 	tableLc := strings.ToLower(table)
 
 	// Get table information to determine primary key column and BLOB columns
-	tableInfo, err := GetTableInfo(c.DB, tableLc)
+	tableInfo, err := c.getTableInfo(tableLc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get table info for %s: %w", table, err)
 	}
 
 	// Determine primary key column
-	pkColumn := c.getPrimaryKeyColumn(table)
+	pkColumn, err := c.primaryKeyColumnForTable(table)
+	if err != nil {
+		return nil, err
+	}
 
 	// Convert PK value for query (handles BLOB primary keys)
 	pkValue, err := c.convertPKForQuery(table, pk)
@@ -514,7 +1004,7 @@ func (c *Client) SerializeRow(ctx context.Context, table, pk string) (json.RawMe
 	}
 
 	// Build query with correct primary key column
-	query := fmt.Sprintf("SELECT * FROM \"%s\" WHERE \"%s\" = ?", tableLc, pkColumn)
+	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", quoteIdent(tableLc), quoteIdent(pkColumn))
 
 	rows, err := c.DB.Query(query, pkValue)
 	if err != nil {
@@ -584,98 +1074,81 @@ func (c *Client) SerializeRow(ctx context.Context, table, pk string) (json.RawMe
 	return json.RawMessage(jsonData), nil
 }
 
-// LocalDeletion represents a record that was deleted locally
-type LocalDeletion struct {
-	Table string
-	ID    string
-}
+func (c *Client) serializeRowInTx(ctx context.Context, tx *sql.Tx, table, pk string) (json.RawMessage, error) {
+	tableLc := strings.ToLower(table)
 
-// captureLocalDeletions captures the current state of locally deleted records
-// This is used to preserve deletions during sync window downloads
-func (c *Client) captureLocalDeletions(ctx context.Context) ([]LocalDeletion, error) {
-	var deletions []LocalDeletion
-
-	// Query all pending DELETE operations from _sync_pending
-	rows, err := c.DB.QueryContext(ctx, `
-		SELECT table_name, pk_uuid
-		FROM _sync_pending
-		WHERE op = 'DELETE'
-	`)
+	tableInfo, err := c.getTableInfoTx(tx, tableLc)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query pending deletions: %w", err)
+		return nil, fmt.Errorf("failed to get table info for %s: %w", table, err)
+	}
+
+	pkColumn, err := c.primaryKeyColumnForTable(table)
+	if err != nil {
+		return nil, err
+	}
+
+	pkValue, err := c.convertPKForQueryInTx(tx, table, pk)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert primary key for query: %w", err)
+	}
+
+	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", quoteIdent(tableLc), quoteIdent(pkColumn))
+	rows, err := tx.QueryContext(ctx, query, pkValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query row: %w", err)
 	}
 	defer rows.Close()
 
-	for rows.Next() {
-		var deletion LocalDeletion
-		err := rows.Scan(&deletion.Table, &deletion.ID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan deletion: %w", err)
-		}
-		deletions = append(deletions, deletion)
+	if !rows.Next() {
+		return nil, fmt.Errorf("row not found: table=%s pk=%s", table, pk)
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating deletions: %w", err)
-	}
-
-	return deletions, nil
-}
-
-// restoreLocalDeletions re-applies local deletions that may have been overwritten
-// by sync window downloads, ensuring deleted records stay deleted
-func (c *Client) restoreLocalDeletions(ctx context.Context, deletions []LocalDeletion) error {
-	if len(deletions) == 0 {
-		return nil // No deletions to restore
-	}
-
-	// Begin transaction to ensure atomicity
-	tx, err := c.DB.BeginTx(ctx, nil)
+	columns, err := rows.Columns()
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to get columns: %w", err)
 	}
-	defer tx.Rollback()
 
-	for _, deletion := range deletions {
-		pkColumn := c.getPrimaryKeyColumn(deletion.Table)
-		// Use tx-aware table info lookups to avoid deadlocks when MaxOpenConns=1.
-		pkValue, err := c.convertPKForQueryInTx(tx, deletion.Table, deletion.ID)
-		if err != nil {
-			return fmt.Errorf("failed to convert primary key for query: %w", err)
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	if err := rows.Scan(valuePtrs...); err != nil {
+		return nil, fmt.Errorf("failed to scan row: %w", err)
+	}
+
+	row := make(map[string]interface{})
+	for i, col := range columns {
+		val := values[i]
+		if val == nil {
+			row[strings.ToLower(col)] = nil
+			continue
 		}
 
-		// Check if the record was restored by sync window download
-		var exists bool
-		err = tx.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM \"%s\" WHERE \"%s\" = ?)", deletion.Table, pkColumn),
-			pkValue).Scan(&exists)
-		if err != nil {
-			return fmt.Errorf("failed to check if record exists: %w", err)
-		}
-
-		if exists {
-			// Check if there's a pending INSERT for this record (re-add case)
-			var hasPendingInsert bool
-			err := tx.QueryRowContext(ctx, `
-				SELECT EXISTS(SELECT 1 FROM _sync_pending
-				WHERE table_name = ? AND pk_uuid = ? AND op = 'INSERT')
-			`, deletion.Table, deletion.ID).Scan(&hasPendingInsert)
-			if err != nil {
-				return fmt.Errorf("failed to check pending INSERT: %w", err)
-			}
-
-			if !hasPendingInsert {
-				// Record was restored by sync window and not re-added locally - delete it again
-				_, err = tx.ExecContext(ctx,
-					fmt.Sprintf("DELETE FROM \"%s\" WHERE \"%s\" = ?", deletion.Table, pkColumn),
-					pkValue)
-				if err != nil {
-					return fmt.Errorf("failed to restore deletion for %s.%s: %w", deletion.Table, deletion.ID, err)
+		if b, ok := val.([]byte); ok {
+			isBlob := false
+			for _, colInfo := range tableInfo.Columns {
+				if strings.EqualFold(colInfo.Name, col) && colInfo.IsBlob() {
+					isBlob = true
+					break
 				}
 			}
-			// If hasPendingInsert is true, skip deletion - the record was re-added locally
+
+			if isBlob {
+				row[strings.ToLower(col)] = strings.ToLower(fmt.Sprintf("%x", b))
+			} else {
+				row[strings.ToLower(col)] = string(b)
+			}
+		} else {
+			row[strings.ToLower(col)] = val
 		}
 	}
 
-	return tx.Commit()
+	jsonData, err := json.Marshal(row)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal row to JSON: %w", err)
+	}
+
+	return json.RawMessage(jsonData), nil
 }

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/mobiletoly/go-oversync/internal/auth"
 )
 
 // JWTAuth handles JWT authentication
@@ -76,48 +75,6 @@ func (j *JWTAuth) ValidateToken(tokenString string) (*JWTClaims, error) {
 	return nil, fmt.Errorf("invalid token")
 }
 
-// GetSourceID extracts the source ID from the HTTP request (implements ClientAuthenticator)
-func (j *JWTAuth) GetSourceID(r *http.Request) (string, error) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return "", fmt.Errorf("authorization header required")
-	}
-
-	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-	if tokenString == authHeader {
-		return "", fmt.Errorf("bearer token required")
-	}
-
-	claims, err := j.ValidateToken(tokenString)
-	if err != nil {
-		return "", fmt.Errorf("invalid token: %w", err)
-	}
-
-	// Source ID comes from device ID (did) claim per auth spec
-	return claims.DeviceID, nil
-}
-
-// GetUserID extracts the user ID from JWT sub claim
-func (j *JWTAuth) GetUserID(r *http.Request) (string, error) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return "", fmt.Errorf("authorization header required")
-	}
-
-	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-	if tokenString == authHeader {
-		return "", fmt.Errorf("bearer token required")
-	}
-
-	claims, err := j.ValidateToken(tokenString)
-	if err != nil {
-		return "", fmt.Errorf("invalid token: %w", err)
-	}
-
-	// User ID comes from standard 'sub' claim
-	return claims.Subject, nil
-}
-
 // Middleware returns an HTTP middleware for JWT authentication
 func (j *JWTAuth) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -145,11 +102,10 @@ func (j *JWTAuth) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Add auth context with user and device info
-		ctx := r.Context()
-		ctx = auth.SetAuthContext(ctx, claims.Subject, claims.DeviceID, "", nil) // No channel in this model
-		ctx = auth.SetSourceID(ctx, claims.DeviceID)                             // Legacy compatibility
-		r = r.WithContext(ctx)
+		r = r.WithContext(ContextWithActor(r.Context(), Actor{
+			UserID:   claims.Subject,
+			SourceID: claims.DeviceID,
+		}))
 
 		next.ServeHTTP(w, r)
 	})

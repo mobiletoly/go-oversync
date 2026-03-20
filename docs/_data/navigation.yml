@@ -10,3 +10,5 @@ main:
         url: "/documentation/core-concepts/"
       - title: "Advanced Concepts"
         url: "/documentation/advanced-concepts/"
+      - title: "Performance"
+        url: "/documentation/performance/"

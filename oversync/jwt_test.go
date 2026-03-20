@@ -1,6 +1,8 @@
 package oversync
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -234,5 +236,35 @@ func TestJWTAuth_TokenRoundTrip(t *testing.T) {
 				t.Error("Token should not be expired immediately after generation")
 			}
 		})
+	}
+}
+
+func TestJWTAuth_MiddlewareInjectsActor(t *testing.T) {
+	jwtAuth := NewJWTAuth("test-secret")
+	token, err := jwtAuth.GenerateToken("user-123", "device-456", time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to generate token: %v", err)
+	}
+
+	var got Actor
+	handler := jwtAuth.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		actor, ok := ActorFromContext(r.Context())
+		if !ok {
+			t.Fatal("expected actor in request context")
+		}
+		got = actor
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/sync/push-sessions", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected status %d, got %d", http.StatusNoContent, rec.Code)
+	}
+	if got.UserID != "user-123" || got.SourceID != "device-456" {
+		t.Fatalf("unexpected actor injected into context: %#v", got)
 	}
 }

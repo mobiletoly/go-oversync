@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/mobiletoly/go-oversync/oversqlite"
 )
 
 // SyncManager manages the upload and download sync loops
@@ -177,8 +179,11 @@ func (u *Uploader) runOnce(ctx context.Context) {
 		return
 	}
 
-	if err := client.UploadOnce(ctx); err != nil {
+	if err := client.PushPending(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {
+			return
+		}
+		if isIgnorableBackgroundSyncError(err) {
 			return
 		}
 		u.logger.Error("Upload failed", "error", err)
@@ -250,9 +255,12 @@ func (d *Downloader) runOnce(ctx context.Context) {
 		return
 	}
 
-	_, _, err := client.DownloadOnce(ctx, 1000)
+	err := client.PullToStable(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
+			return
+		}
+		if isIgnorableBackgroundSyncError(err) {
 			return
 		}
 		d.logger.Error("Download failed", "error", err)
@@ -278,6 +286,14 @@ func isAuthError(err error) bool {
 	errStr := err.Error()
 	return contains(errStr, "401") || contains(errStr, "403") ||
 		contains(errStr, "unauthorized") || contains(errStr, "forbidden")
+}
+
+func isIgnorableBackgroundSyncError(err error) bool {
+	if oversqlite.IsExpectedSyncContention(err) {
+		return true
+	}
+	var pendingReplayErr *oversqlite.PendingPushReplayError
+	return errors.As(err, &pendingReplayErr)
 }
 
 // contains checks if a string contains a substring

@@ -51,13 +51,13 @@ func TestBlobPrimaryKeySupport(t *testing.T) {
 		t.Fatalf("Failed to create triggers: %v", err)
 	}
 
-	// Set up client info for triggers to work
+	// Set up client state for triggers to work
 	_, err = db.Exec(`
-		INSERT INTO _sync_client_info (user_id, source_id, next_change_id, last_server_seq_seen, apply_mode)
+		INSERT INTO _sync_client_state (user_id, source_id, next_source_bundle_id, last_bundle_seq_seen, apply_mode)
 		VALUES ('test-user', 'test-source', 1, 0, 0)
 	`)
 	if err != nil {
-		t.Fatalf("Failed to insert client info: %v", err)
+		t.Fatalf("Failed to insert client state: %v", err)
 	}
 
 	// Generate test data
@@ -79,29 +79,17 @@ func TestBlobPrimaryKeySupport(t *testing.T) {
 		t.Fatalf("Failed to insert blob file: %v", err)
 	}
 
-	// Verify that sync metadata was created with hex-encoded BLOB primary key
-	var metaCount int
 	fileIDHex := strings.ToLower(hex.EncodeToString(fileIDBytes))
-	err = db.QueryRow(`
-		SELECT COUNT(*) FROM _sync_row_meta
-		WHERE table_name='blob_files' AND pk_uuid=?
-	`, fileIDHex).Scan(&metaCount)
-	if err != nil {
-		t.Fatalf("Failed to query row meta: %v", err)
-	}
-	if metaCount != 1 {
-		t.Errorf("Expected 1 row meta entry, got %d", metaCount)
-	}
 
-	// Verify that pending change was created with proper payload
+	// Verify that dirty row was created with proper payload
 	var pendingCount int
 	var op string
 	var payload sql.NullString
 	err = db.QueryRow(`
 		SELECT COUNT(*), COALESCE(MAX(op), ''), COALESCE(MAX(payload), '')
-		FROM _sync_pending
-		WHERE table_name='blob_files' AND pk_uuid=?
-	`, fileIDHex).Scan(&pendingCount, &op, &payload)
+		FROM _sync_dirty_rows
+		WHERE table_name='blob_files' AND key_json=?
+	`, fmt.Sprintf(`{"id":"%s"}`, fileIDHex)).Scan(&pendingCount, &op, &payload)
 	if err != nil {
 		t.Fatalf("Failed to query pending changes: %v", err)
 	}

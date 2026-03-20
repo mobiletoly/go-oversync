@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+ruby_bin="${RUBY_BIN:-/opt/homebrew/opt/ruby@3.2/bin/ruby}"
+if [[ ! -x "$ruby_bin" ]]; then
+  ruby_bin="$(command -v ruby)"
+fi
+
+bundle_bin="$(dirname "$ruby_bin")/bundle"
+if [[ ! -x "$bundle_bin" ]]; then
+  bundle_bin="$(command -v bundle)"
+fi
+
+export PATH="$(dirname "$ruby_bin"):$PATH"
+export BUNDLE_PATH="${BUNDLE_PATH:-vendor/bundle}"
+
+"$bundle_bin" install
+RUBYOPT="${RUBYOPT:+$RUBYOPT }-r./_plugins/ruby_compat.rb" "$bundle_bin" exec jekyll build

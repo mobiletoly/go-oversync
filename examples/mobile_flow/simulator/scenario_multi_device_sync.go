@@ -44,7 +44,7 @@ func (s *MultiDeviceSyncScenario) Name() string {
 }
 
 func (s *MultiDeviceSyncScenario) Description() string {
-	return "Single-user ulti-device sync: Test delete operations and sync window conflicts"
+	return "Single-user multi-device sync: verify delete convergence and stable bundle checkpoints"
 }
 
 // Setup creates two mobile apps representing different devices for the same user
@@ -109,13 +109,8 @@ func (s *MultiDeviceSyncScenario) createDeviceApp(scenarioConfig *config.Scenari
 
 	// Create oversqlite config
 	oversqliteConfig := &oversqlite.Config{
-		Schema: "business",
-		Tables: []oversqlite.SyncTable{
-			{TableName: "users"},
-			{TableName: "posts"},
-			{TableName: "files"},
-			{TableName: "file_reviews"},
-		},
+		Schema:        "business",
+		Tables:        managedSyncTables(),
 		UploadLimit:   100, // Standard batch size
 		DownloadLimit: 100, // Standard batch size
 	}
@@ -147,7 +142,7 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 	logger := s.simulator.GetLogger()
 
 	logger.Info("🎯 Starting Multi-Device Sync Scenario (SAME user)")
-	logger.Info("📊 Strategy: Two devices under same user; test delete + sync window interactions")
+	logger.Info("📊 Strategy: Two devices under same user; test delete propagation and stable bundle convergence")
 
 	// Step 1: Sign in with user A on device 1
 	logger.Info("👤 Step 1: Device 1 - Sign in with User A")
@@ -165,14 +160,14 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 
 	// Step 3: Sync device 1
 	logger.Info("🔄 Step 3: Sync Device 1 (User A)")
-	err = s.app.PerformHydration(ctx)
+	err = s.app.Hydrate(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync device 1: %w", err)
 	}
 
 	// Step 4: Sync device 2
 	logger.Info("🔄 Step 4: Sync Device 2 (User A)")
-	err = s.device2App.PerformHydration(ctx)
+	err = s.device2App.Hydrate(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync device 2: %w", err)
 	}
@@ -195,38 +190,22 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 
 	// Step 7: Sync device 1 (upload person A)
 	logger.Info("🔄 Step 7: Sync Device 1 (upload person A)")
-	err = s.app.PerformSyncUpload(ctx)
+	err = s.app.PushPending(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync device 1: %w", err)
 	}
-	// Post-upload download loop to mirror mobile app full sync
-	limit := 500
-	for {
-		applied, _, err := s.app.PerformSyncDownload(ctx, limit)
-		if err != nil {
-			return fmt.Errorf("post-upload download (device 1) failed: %w", err)
-		}
-		if applied < limit {
-			break
-		}
+	if _, _, err := s.app.PullToStable(ctx); err != nil {
+		return fmt.Errorf("post-upload pull (device 1) failed: %w", err)
 	}
 
 	// Step 8: Sync device 2 (upload person B)
 	logger.Info("🔄 Step 8: Sync Device 2 (upload person B)")
-	err = s.device2App.PerformSyncUpload(ctx)
+	err = s.device2App.PushPending(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync device 2: %w", err)
 	}
-	// Post-upload download loop to mirror mobile app full sync
-	limit = 500
-	for {
-		applied, _, err := s.device2App.PerformSyncDownload(ctx, limit)
-		if err != nil {
-			return fmt.Errorf("post-upload download (device 2) failed: %w", err)
-		}
-		if applied < limit {
-			break
-		}
+	if _, _, err := s.device2App.PullToStable(ctx); err != nil {
+		return fmt.Errorf("post-upload pull (device 2) failed: %w", err)
 	}
 
 	// Step 9: Delete person A record (this is the critical test)
@@ -248,20 +227,12 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 
 	// Step 10: Sync user A (upload delete operation)
 	logger.Info("🔄 Step 10: Sync User A (upload delete operation)")
-	err = s.app.PerformSyncUpload(ctx)
+	err = s.app.PushPending(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync user A after delete: %w", err)
 	}
-	// Post-upload download loop after delete (critical to mirror mobile app full sync)
-	limit = 500
-	for {
-		applied, _, err := s.app.PerformSyncDownload(ctx, limit)
-		if err != nil {
-			return fmt.Errorf("post-delete download (device 1) failed: %w", err)
-		}
-		if applied < limit {
-			break
-		}
+	if _, _, err := s.app.PullToStable(ctx); err != nil {
+		return fmt.Errorf("post-delete pull (device 1) failed: %w", err)
 	}
 
 	// Verify the record is still deleted after sync
@@ -271,7 +242,7 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 	}
 	if hasPersonAAfterSync {
 		logger.Error("🚨 BUG REPRODUCED: Person A was restored after sync!")
-		logger.Error("This indicates the sync window strategy is incorrectly restoring deleted records")
+		logger.Error("This indicates bundle-era delete convergence is incorrectly restoring deleted records")
 		return fmt.Errorf("SYNC BUG: Deleted record was restored after sync")
 	}
 
@@ -279,15 +250,8 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 
 	// Final convergence: ensure Device 2 pulls the deletion as in full sync flows
 	logger.Info("🔄 Final convergence sync: Device 2 downloads deletions")
-	limit = 500
-	for {
-		applied, _, err := s.device2App.PerformSyncDownload(ctx, limit)
-		if err != nil {
-			return fmt.Errorf("final convergence download (device 2) failed: %w", err)
-		}
-		if applied < limit {
-			break
-		}
+	if _, _, err := s.device2App.PullToStable(ctx); err != nil {
+		return fmt.Errorf("final convergence pull (device 2) failed: %w", err)
 	}
 
 	// Verify both devices have the same expected records at the end

@@ -13,9 +13,12 @@ import (
 
 // TriggerData holds the data needed for trigger template rendering
 type TriggerData struct {
+	SchemaName string
 	TableName  string
 	PKColumn   string
 	NewRowJSON string
+	OldKeyJSON string
+	NewKeyJSON string
 	PKExprNew  string
 	PKExprOld  string
 }
@@ -23,109 +26,125 @@ type TriggerData struct {
 // Template for INSERT trigger
 const insertTriggerTemplate = `CREATE TRIGGER IF NOT EXISTS trg_{{.TableName}}_ai
 AFTER INSERT ON {{.TableName}}
-WHEN COALESCE((SELECT apply_mode FROM _sync_client_info LIMIT 1), 0) = 0
+WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
 BEGIN
-	INSERT OR IGNORE INTO _sync_row_meta(table_name, pk_uuid, server_version, deleted)
-	VALUES ('{{.TableName}}', {{.PKExprNew}}, 0, 0);
-
-	-- Reset deleted flag when record is reinserted
-	UPDATE _sync_row_meta SET deleted=0, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-	WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}} AND deleted=1;
-
-	-- Check if this is a new pending change (doesn't exist yet)
-	INSERT INTO _sync_pending(table_name, pk_uuid, op, base_version, payload, change_id)
-	SELECT '{{.TableName}}', {{.PKExprNew}}, 'INSERT', 0, {{.NewRowJSON}}, (SELECT next_change_id FROM _sync_client_info LIMIT 1)
-	WHERE NOT EXISTS (SELECT 1 FROM _sync_pending WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}});
-
-	-- Update existing pending change if it exists
-	UPDATE _sync_pending SET
-		op='INSERT',
-		base_version=(SELECT server_version FROM _sync_row_meta WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}}),
-		payload={{.NewRowJSON}},
-		queued_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-	WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}};
-
-	-- Increment change ID counter only for new changes (when INSERT actually happened)
-	UPDATE _sync_client_info SET next_change_id = next_change_id + 1
-	WHERE changes() > 0 AND last_insert_rowid() > 0;
+	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
+	VALUES (
+		'{{.SchemaName}}',
+		'{{.TableName}}',
+		{{.NewKeyJSON}},
+		CASE
+			WHEN EXISTS (
+				SELECT 1
+				FROM _sync_row_state
+				WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}} AND deleted=0
+			) THEN 'UPDATE'
+			ELSE 'INSERT'
+		END,
+		COALESCE(
+			(SELECT base_row_version FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+			(SELECT row_version FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+			0
+		),
+		{{.NewRowJSON}},
+		COALESCE(
+			(SELECT dirty_ordinal FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+			(SELECT COALESCE(MAX(dirty_ordinal), 0) + 1 FROM _sync_dirty_rows)
+		),
+		strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	)
+	ON CONFLICT(schema_name, table_name, key_json) DO UPDATE SET
+		op=excluded.op,
+		payload=excluded.payload,
+		updated_at=excluded.updated_at;
 END`
 
 // Template for UPDATE trigger
 const updateTriggerTemplate = `CREATE TRIGGER IF NOT EXISTS trg_{{.TableName}}_au
 AFTER UPDATE ON {{.TableName}}
-WHEN COALESCE((SELECT apply_mode FROM _sync_client_info LIMIT 1), 0) = 0
+WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
 BEGIN
-	-- Ensure meta exists; mark not deleted
-	INSERT OR IGNORE INTO _sync_row_meta(table_name, pk_uuid, server_version, deleted)
-	VALUES ('{{.TableName}}', {{.PKExprNew}}, 0, 0);
+	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
+	SELECT
+		'{{.SchemaName}}',
+		'{{.TableName}}',
+		{{.OldKeyJSON}},
+		'DELETE',
+		COALESCE(
+			(SELECT base_row_version FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+			(SELECT row_version FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+			0
+		),
+		NULL,
+		COALESCE(
+			(SELECT dirty_ordinal FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+			(SELECT COALESCE(MAX(dirty_ordinal), 0) + 1 FROM _sync_dirty_rows)
+		),
+		strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	WHERE {{.OldKeyJSON}} != {{.NewKeyJSON}}
+	ON CONFLICT(schema_name, table_name, key_json) DO UPDATE SET
+		op='DELETE',
+		payload=NULL,
+		updated_at=excluded.updated_at;
 
-	UPDATE _sync_row_meta SET deleted=0, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-	WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}};
-
-	-- Queue UPDATE, but if an INSERT is already pending, keep it as INSERT and only refresh payload
-	-- Check if this is a new pending change (doesn't exist yet)
-	INSERT INTO _sync_pending(table_name, pk_uuid, op, base_version, payload, change_id)
-	SELECT '{{.TableName}}', {{.PKExprNew}}, 'UPDATE',
-		(SELECT server_version FROM _sync_row_meta WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}}),
+	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
+	VALUES (
+		'{{.SchemaName}}',
+		'{{.TableName}}',
+		{{.NewKeyJSON}},
+		CASE
+			WHEN EXISTS (
+				SELECT 1
+				FROM _sync_row_state
+				WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}} AND deleted=0
+			) THEN 'UPDATE'
+			ELSE 'INSERT'
+		END,
+		COALESCE(
+			(SELECT base_row_version FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+			(SELECT row_version FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+			0
+		),
 		{{.NewRowJSON}},
-		(SELECT next_change_id FROM _sync_client_info LIMIT 1)
-	WHERE NOT EXISTS (SELECT 1 FROM _sync_pending WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}});
-
-	-- Update existing pending change if it exists
-	UPDATE _sync_pending SET
-		op = CASE WHEN op = 'INSERT' THEN 'INSERT' ELSE 'UPDATE' END,
-		base_version = CASE WHEN op = 'INSERT' THEN base_version ELSE (SELECT server_version FROM _sync_row_meta WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}}) END,
-		payload = {{.NewRowJSON}},
-		queued_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-	WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprNew}};
-
-	-- Increment change ID counter only for new changes (when INSERT actually happened)
-	UPDATE _sync_client_info SET next_change_id = next_change_id + 1
-	WHERE changes() > 0 AND last_insert_rowid() > 0;
+		COALESCE(
+			(SELECT dirty_ordinal FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+			(SELECT COALESCE(MAX(dirty_ordinal), 0) + 1 FROM _sync_dirty_rows)
+		),
+		strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	)
+	ON CONFLICT(schema_name, table_name, key_json) DO UPDATE SET
+		op=excluded.op,
+		payload=excluded.payload,
+		updated_at=excluded.updated_at;
 END`
 
 // Template for DELETE trigger
 const deleteTriggerTemplate = `CREATE TRIGGER IF NOT EXISTS trg_{{.TableName}}_ad
 AFTER DELETE ON {{.TableName}}
-WHEN COALESCE((SELECT apply_mode FROM _sync_client_info LIMIT 1), 0) = 0
+WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
 BEGIN
-	-- Ensure meta row exists (for already-synced rows this will no-op)
-	INSERT OR IGNORE INTO _sync_row_meta(table_name, pk_uuid, server_version, deleted)
-	VALUES ('{{.TableName}}', {{.PKExprOld}}, 0, 1);
-
-	-- 1) Attempt to queue a DELETE **only if** there is no pending INSERT for this row.
-	INSERT INTO _sync_pending(table_name, pk_uuid, op, base_version, payload, change_id)
-	SELECT '{{.TableName}}', {{.PKExprOld}}, 'DELETE',
-	       (SELECT server_version FROM _sync_row_meta WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprOld}}),
-	       NULL,
-	       (SELECT next_change_id FROM _sync_client_info LIMIT 1)
-	WHERE NOT EXISTS (
-	  SELECT 1 FROM _sync_pending WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprOld}}
-	);
-
-	-- Update existing pending change to DELETE if it's not an INSERT
-	UPDATE _sync_pending SET
-		op = 'DELETE',
-		base_version = (SELECT server_version FROM _sync_row_meta WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprOld}}),
-		payload = NULL,
-		queued_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-	WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprOld}} AND op != 'INSERT';
-
-	-- Increment change ID counter only for new DELETE changes (when INSERT actually happened)
-	UPDATE _sync_client_info SET next_change_id = next_change_id + 1
-	WHERE changes() > 0 AND last_insert_rowid() > 0;
-
-	-- 2) If there WAS a pending INSERT (unsynced new row), cancel it now (net no-op).
-	DELETE FROM _sync_pending WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprOld}} AND op='INSERT';
-
-	-- 3) Update meta for regular deletes
-	UPDATE _sync_row_meta SET deleted=1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-	WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprOld}};
-
-	-- 4) Cleanup meta for canceled unsynced INSERTs (server_version=0 and no pending left)
-	DELETE FROM _sync_row_meta
-	WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprOld}} AND server_version=0
-	  AND NOT EXISTS (SELECT 1 FROM _sync_pending WHERE table_name='{{.TableName}}' AND pk_uuid={{.PKExprOld}});
+	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
+	VALUES (
+		'{{.SchemaName}}',
+		'{{.TableName}}',
+		{{.OldKeyJSON}},
+		'DELETE',
+		COALESCE(
+			(SELECT base_row_version FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+			(SELECT row_version FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+			0
+		),
+		NULL,
+		COALESCE(
+			(SELECT dirty_ordinal FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+			(SELECT COALESCE(MAX(dirty_ordinal), 0) + 1 FROM _sync_dirty_rows)
+		),
+		strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	)
+	ON CONFLICT(schema_name, table_name, key_json) DO UPDATE SET
+		op='DELETE',
+		payload=NULL,
+		updated_at=excluded.updated_at;
 END`
 
 // buildJsonObjectExprHexAware creates a SQLite json_object() call that uses hex encoding for BLOB columns
@@ -146,9 +165,45 @@ func buildJsonObjectExprHexAware(tableInfo *TableInfo, prefix string) string {
 	return fmt.Sprintf("json_object(%s)", strings.Join(pairs, ", "))
 }
 
+func buildKeyJSONObjectExprHexAware(tableInfo *TableInfo, keyColumn, prefix string) string {
+	for _, col := range tableInfo.Columns {
+		if !strings.EqualFold(col.Name, keyColumn) {
+			continue
+		}
+		name := strings.ToLower(col.Name)
+		if col.IsBlob() {
+			return fmt.Sprintf("json_object('%s', lower(hex(%s.%s)))", name, prefix, col.Name)
+		}
+		return fmt.Sprintf("json_object('%s', %s.%s)", name, prefix, col.Name)
+	}
+	return fmt.Sprintf("json_object('%s', %s.%s)", strings.ToLower(keyColumn), prefix, keyColumn)
+}
+
 // createTriggersForTable creates INSERT, UPDATE, DELETE triggers for a table
 // according to the technical specification using the KMP-inspired approach
-func createTriggersForTable(db *sql.DB, syncTable SyncTable) error {
+func createTriggersForTable(db *sql.DB, args ...any) error {
+	schemaName := "main"
+	var syncTable SyncTable
+	switch len(args) {
+	case 1:
+		var ok bool
+		syncTable, ok = args[0].(SyncTable)
+		if !ok {
+			return fmt.Errorf("createTriggersForTable requires SyncTable argument")
+		}
+	case 2:
+		var ok bool
+		schemaName, ok = args[0].(string)
+		if !ok {
+			return fmt.Errorf("createTriggersForTable schema must be a string")
+		}
+		syncTable, ok = args[1].(SyncTable)
+		if !ok {
+			return fmt.Errorf("createTriggersForTable requires SyncTable argument")
+		}
+	default:
+		return fmt.Errorf("createTriggersForTable requires SyncTable argument")
+	}
 	tableName := syncTable.TableName
 	tableLc := strings.ToLower(tableName)
 
@@ -158,8 +213,10 @@ func createTriggersForTable(db *sql.DB, syncTable SyncTable) error {
 		return fmt.Errorf("failed to get table info for %s: %w", tableName, err)
 	}
 
-	// Determine the primary key column name
-	pkColumn := determinePrimaryKeyColumn(tableInfo, syncTable)
+	pkColumn, err := configuredPrimaryKeyColumn(tableInfo, syncTable)
+	if err != nil {
+		return err
+	}
 
 	// Check if primary key is BLOB
 	pkIsBlob := isPrimaryKeyBlob(tableInfo, pkColumn)
@@ -176,12 +233,17 @@ func createTriggersForTable(db *sql.DB, syncTable SyncTable) error {
 
 	// Build BLOB-aware payload expression
 	payloadExpr := buildJsonObjectExprHexAware(tableInfo, "NEW")
+	oldKeyExpr := buildKeyJSONObjectExprHexAware(tableInfo, pkColumn, "OLD")
+	newKeyExpr := buildKeyJSONObjectExprHexAware(tableInfo, pkColumn, "NEW")
 
 	// Prepare template data
 	data := TriggerData{
+		SchemaName: schemaName,
 		TableName:  tableLc,
 		PKColumn:   pkColumn,
 		NewRowJSON: payloadExpr,
+		OldKeyJSON: oldKeyExpr,
+		NewKeyJSON: newKeyExpr,
 		PKExprNew:  pkExprNew,
 		PKExprOld:  pkExprOld,
 	}
@@ -197,6 +259,15 @@ func createTriggersForTable(db *sql.DB, syncTable SyncTable) error {
 	}
 
 	for _, tmpl := range templates {
+		triggerName := fmt.Sprintf("trg_%s_%s", tableLc, map[string]string{
+			"insert": "ai",
+			"update": "au",
+			"delete": "ad",
+		}[tmpl.name])
+		if _, err := db.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s", quoteIdent(triggerName))); err != nil {
+			return fmt.Errorf("failed to drop %s trigger for table %s: %w", tmpl.name, tableName, err)
+		}
+
 		// Parse template
 		t, err := template.New(tmpl.name).Parse(tmpl.template)
 		if err != nil {
@@ -218,18 +289,24 @@ func createTriggersForTable(db *sql.DB, syncTable SyncTable) error {
 	return nil
 }
 
-// determinePrimaryKeyColumn determines the primary key column for a table
-func determinePrimaryKeyColumn(tableInfo *TableInfo, syncTable SyncTable) string {
-	// If syncKeyColumnName is explicitly specified, use it
-	if syncTable.SyncKeyColumnName != "" {
-		return syncTable.SyncKeyColumnName
+func configuredPrimaryKeyColumn(tableInfo *TableInfo, syncTable SyncTable) (string, error) {
+	keyColumns, err := normalizedSyncKeyColumns(syncTable)
+	if err != nil {
+		return "", err
 	}
-	// or auto-detect primary key from table schema
-	if tableInfo.PrimaryKey != nil {
-		return tableInfo.PrimaryKey.Name
+	if len(keyColumns) != 1 {
+		return "", fmt.Errorf("table %s must declare exactly one sync key column in the current client runtime", syncTable.TableName)
 	}
-	// or fall back to "id" if no primary key is detected
-	return "id"
+	pkColumn := keyColumns[0]
+	for _, col := range tableInfo.Columns {
+		if strings.EqualFold(col.Name, pkColumn) {
+			if !col.IsPrimaryKey {
+				return "", fmt.Errorf("configured primary key column %s for table %s is not declared as PRIMARY KEY", col.Name, syncTable.TableName)
+			}
+			return col.Name, nil
+		}
+	}
+	return "", fmt.Errorf("table %s does not contain configured primary key column %s", syncTable.TableName, pkColumn)
 }
 
 // isPrimaryKeyBlob checks if the primary key column is a BLOB type

@@ -115,19 +115,11 @@ func (r *ReportGenerator) generateSQLiteReport(dbPath string, expectedCounts map
 			return nil, fmt.Errorf("failed to count records in %s: %w", tableNameOnly, err)
 		}
 		results.TableCounts[tableNameOnly] = count
-
-		// Get sample records
-		samples, err := r.getSQLiteSampleRecords(db, tableNameOnly, 3)
-		if err != nil {
-			// Log warning but don't fail
-			continue
-		}
-		results.RecordSamples[tableNameOnly] = samples
 	}
 
 	// Count sync metadata
 	var syncMetaCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM _sync_row_meta").Scan(&syncMetaCount)
+	err = db.QueryRow("SELECT COUNT(*) FROM _sync_row_state").Scan(&syncMetaCount)
 	if err != nil {
 		// Sync metadata table might not exist in some scenarios
 		syncMetaCount = 0
@@ -136,7 +128,7 @@ func (r *ReportGenerator) generateSQLiteReport(dbPath string, expectedCounts map
 
 	// Count pending changes
 	var pendingCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM _sync_pending_changes").Scan(&pendingCount)
+	err = db.QueryRow("SELECT COUNT(*) FROM _sync_dirty_rows").Scan(&pendingCount)
 	if err != nil {
 		// Pending changes table might not exist
 		pendingCount = 0
@@ -144,36 +136,6 @@ func (r *ReportGenerator) generateSQLiteReport(dbPath string, expectedCounts map
 	results.PendingChanges = pendingCount
 
 	return results, nil
-}
-
-// getSQLiteSampleRecords gets sample records from SQLite table
-func (r *ReportGenerator) getSQLiteSampleRecords(db *sql.DB, tableName string, limit int) ([]RecordSample, error) {
-	query := fmt.Sprintf("SELECT id, name FROM %s ORDER BY rowid DESC LIMIT ?", tableName)
-
-	rows, err := db.Query(query, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query sample records: %w", err)
-	}
-	defer rows.Close()
-
-	var samples []RecordSample
-	for rows.Next() {
-		var sample RecordSample
-		var name string
-
-		err := rows.Scan(&sample.ID, &name)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan sample record: %w", err)
-		}
-
-		sample.Data = map[string]interface{}{
-			"name": name,
-		}
-
-		samples = append(samples, sample)
-	}
-
-	return samples, nil
 }
 
 // GenerateCompleteReport generates a complete test report for all users

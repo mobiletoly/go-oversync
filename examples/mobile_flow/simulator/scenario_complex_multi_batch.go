@@ -2,6 +2,8 @@ package simulator
 
 import (
 	"context"
+	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -20,43 +22,96 @@ type ComplexMultiBatchScenario struct {
 	laptopApp       *MobileApp // For download testing with different source ID
 	phoneSourceID   string     // Generated once and reused
 	laptopSourceID  string     // Generated once and reused
-	uploadWatermark int64      // Server seq after laptop uploads (for watermark-based download termination)
+	stableBundleSeq int64      // Durable server bundle checkpoint after laptop uploads
 }
 
 // ComplexTestData holds the test data structure for verification
 type ComplexTestData struct {
 	// Original data created by phone
-	UserIDs []string
-	PostIDs []string
+	UserIDs   []string
+	PostIDs   []string
+	FileIDs   []string
+	ReviewIDs []string
 
 	// New data created by laptop for multi-stage testing
-	NewUserIDs []string
-	NewPostIDs []string
+	NewUserIDs   []string
+	NewPostIDs   []string
+	NewFileIDs   []string
+	NewReviewIDs []string
+
+	ExpectedUsers   map[string]expectedUserState
+	ExpectedPosts   map[string]expectedPostState
+	ExpectedFiles   map[string]expectedFileState
+	ExpectedReviews map[string]expectedReviewState
 }
 
 // AppConfig holds common configuration for creating mobile apps
 type AppConfig struct {
-	SourceID   string
-	DeviceName string
-	UserID     string
-	BatchSize  int
+	SourceID          string
+	DeviceName        string
+	UserID            string
+	PullLimit         int
+	PushLimit         int
+	SnapshotChunkRows int
+}
+
+type deferredFKCreationSpec struct {
+	label          string
+	userCount      int
+	postsPerUser   int
+	postLogEvery   int
+	postNumberBase int
+	buildUser      func(userOrdinal int) (name, email string)
+	buildPost      func(globalPostNum, userOrdinal int) (title, content string)
+}
+
+type expectedUserState struct {
+	Name   string
+	Email  string
+	Exists bool
+}
+
+type expectedPostState struct {
+	AuthorID string
+	Title    string
+	Content  string
+	Exists   bool
+}
+
+type expectedFileState struct {
+	Name    string
+	DataHex string
+	Exists  bool
+}
+
+type expectedReviewState struct {
+	FileID string
+	Review string
+	Exists bool
 }
 
 // Constants for the scenario
 const (
-	totalUsers      = 5
-	postsPerUser    = 20
-	newUsersStage2  = 20 // Additional users created by laptop
-	newPostsPerUser = 20 // Posts per new user
-	batchSize       = 50
-	maxRounds       = 15 // Increased for multi-stage testing
+	totalUsers        = 5
+	postsPerUser      = 20
+	newUsersStage2    = 20 // Additional users created by laptop
+	newPostsPerUser   = 20 // Posts per new user
+	pullLimit         = 50
+	pushLimit         = 40
+	snapshotChunkRows = 25
+	maxRounds         = 15 // Increased for multi-stage testing
 )
 
 // NewComplexMultiBatchScenario creates a new complex multi-batch scenario
 func NewComplexMultiBatchScenario(simulator *Simulator) Scenario {
 	return &ComplexMultiBatchScenario{
 		BaseScenario: NewBaseScenario(simulator, "complex-multi-batch"),
-		testData:     &ComplexTestData{},
+		testData: &ComplexTestData{
+			ExpectedUsers:   make(map[string]expectedUserState),
+			ExpectedPosts:   make(map[string]expectedPostState),
+			ExpectedFiles:   make(map[string]expectedFileState),
+			ExpectedReviews: make(map[string]expectedReviewState),
+		},
 	}
 }
 
@@ -65,14 +120,14 @@ func (s *ComplexMultiBatchScenario) Name() string {
 }
 
 func (s *ComplexMultiBatchScenario) Description() string {
-	return "FK constraint testing: Create posts before users to test server-side FK constraint retry logic"
+	return "FK-heavy multi-batch stress test with mixed inserts, updates, deletes, and two-device convergence"
 }
 
-// Setup creates a mobile app with small batch sizes for FK constraint testing
+// Setup creates a mobile app with a small pull limit for convergence testing.
 func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 	logger := s.simulator.GetLogger()
 	if verboseLog {
-		logger.Info("🔧 Setting up mobile app with small batch sizes for FK constraint testing")
+		logger.Info("🔧 Setting up mobile app with incremental pull limits for high-volume sync testing")
 	}
 
 	// Generate source IDs once and store for reuse throughout scenario
@@ -82,10 +137,10 @@ func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 		logger.Info("📱 Generated source IDs", "phone_source_id", s.phoneSourceID, "laptop_source_id", s.laptopSourceID)
 	}
 
-	// Create mobile app with small batch sizes to force multi-batch operations
+	// Create a mobile app tuned for a large local dirty set plus incremental pulls.
 	app, err := s.createAppWithSmallBatches(s.config)
 	if err != nil {
-		return fmt.Errorf("failed to create mobile app with small batches: %w", err)
+		return fmt.Errorf("failed to create mobile app for complex sync scenario: %w", err)
 	}
 
 	s.app = app
@@ -97,18 +152,20 @@ func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 	}
 
 	if verboseLog {
-		logger.Info("✅ Mobile app setup complete with small batch sizes")
+		logger.Info("✅ Mobile app setup complete")
 	}
 	return nil
 }
 
-// createAppWithSmallBatches creates a mobile app with small upload limits to force multi-batch operations
+// createAppWithSmallBatches creates a mobile app with intentionally small push/pull chunk sizes.
 func (s *ComplexMultiBatchScenario) createAppWithSmallBatches(scenarioConfig *config.ScenarioConfig) (*MobileApp, error) {
 	appConfig := &AppConfig{
-		SourceID:   s.phoneSourceID,
-		DeviceName: "FK Test Device",
-		UserID:     scenarioConfig.UserID,
-		BatchSize:  batchSize,
+		SourceID:          s.phoneSourceID,
+		DeviceName:        "FK Test Device",
+		UserID:            scenarioConfig.UserID,
+		PullLimit:         pullLimit,
+		PushLimit:         pushLimit,
+		SnapshotChunkRows: snapshotChunkRows,
 	}
 	return s.createMobileApp(appConfig, s.phoneSourceID)
 }
@@ -120,17 +177,14 @@ func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePre
 	// Create unique database file path using user ID and timestamp to prevent collisions in parallel execution
 	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", sourcePrefix, config.UserID, time.Now().UnixNano()))
 
-	// Create oversqlite config with small batch sizes
+	// Force both push-session chunking and incremental pull replay so the scenario exercises
+	// multi-chunk upload/download paths under a large FK-connected working set.
 	oversqliteConfig := &oversqlite.Config{
-		Schema: "business",
-		Tables: []oversqlite.SyncTable{
-			{TableName: "users"},
-			{TableName: "posts"},
-			{TableName: "files"},
-			{TableName: "file_reviews"},
-		},
-		UploadLimit:   config.BatchSize,
-		DownloadLimit: config.BatchSize,
+		Schema:            "business",
+		Tables:            managedSyncTables(),
+		UploadLimit:       config.PushLimit,
+		DownloadLimit:     config.PullLimit,
+		SnapshotChunkRows: config.SnapshotChunkRows,
 	}
 
 	// Create mobile app config
@@ -183,86 +237,44 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 		logger.Info("👤📝 Creating FK-challenging data in SQLite")
 	}
 
-	// Configuration for this test
-	totalPosts := totalUsers * postsPerUser
-
 	if verboseLog {
-		logger.Info("📊 Test configuration", "users", totalUsers, "posts_per_user", postsPerUser, "total_posts", totalPosts)
+		logger.Info("📊 Test configuration", "users", totalUsers, "posts_per_user", postsPerUser, "total_posts", totalUsers*postsPerUser)
 	}
 
-	s.testData.UserIDs = make([]string, totalUsers)
-	s.testData.PostIDs = make([]string, totalPosts)
-
-	// Prevent background sync from draining pending changes during creation
-	s.app.StopSync()
-	s.app.PauseSync()
-	if verboseLog {
-		logger.Info("⏸️ Paused phone client sync during offline creation")
-	}
-
-	// Ensure apply_mode=0 so local triggers capture pending changes deterministically
-	if err := s.app.ResetApplyMode(ctx); err != nil {
-		logger.Warn("Failed to reset apply_mode to 0 before creation (phone)", "error", err)
-	}
-
-	// Create posts BEFORE users in a single transaction with deferred FK checks
-	db := s.app.GetDatabase()
-	// Best-effort clear any stray transaction
-	_, _ = db.Exec("ROLLBACK")
-	if verboseLog {
-		logger.Info("⏱️ About to begin phone creation transaction")
-	}
-	tx, err := db.BeginTx(ctx, nil)
+	s.testData.UserIDs, s.testData.PostIDs, err = s.createDeferredFKData(ctx, logger, s.app, deferredFKCreationSpec{
+		label:          "phone",
+		userCount:      totalUsers,
+		postsPerUser:   postsPerUser,
+		postNumberBase: 0,
+		buildUser: func(userOrdinal int) (string, string) {
+			return fmt.Sprintf("User %d", userOrdinal), fmt.Sprintf("user%d@example.com", userOrdinal)
+		},
+		buildPost: func(globalPostNum, userOrdinal int) (string, string) {
+			return fmt.Sprintf("FK Test Post %d by User %d", globalPostNum, userOrdinal),
+				fmt.Sprintf("Content for post %d by user %d", globalPostNum, userOrdinal)
+		},
+	})
 	if err != nil {
-		return fmt.Errorf("failed to begin tx for FK-challenging creation: %w", err)
+		return fmt.Errorf("failed to create phone FK-challenging data: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
-	if verboseLog {
-		logger.Info("✅ Phone creation transaction begun")
+	s.recordDeferredFKCreatedData(s.testData.UserIDs, s.testData.PostIDs, deferredFKCreationSpec{
+		userCount:      totalUsers,
+		postsPerUser:   postsPerUser,
+		postNumberBase: 0,
+		buildUser: func(userOrdinal int) (string, string) {
+			return fmt.Sprintf("User %d", userOrdinal), fmt.Sprintf("user%d@example.com", userOrdinal)
+		},
+		buildPost: func(globalPostNum, userOrdinal int) (string, string) {
+			return fmt.Sprintf("FK Test Post %d by User %d", globalPostNum, userOrdinal),
+				fmt.Sprintf("Content for post %d by user %d", globalPostNum, userOrdinal)
+		},
+	})
+	s.testData.FileIDs, s.testData.ReviewIDs, err = s.createBlobBatch(s.app, "phone-seed", totalUsers)
+	if err != nil {
+		return fmt.Errorf("failed to create phone blob batch: %w", err)
 	}
-	if _, err := tx.Exec("PRAGMA defer_foreign_keys = ON"); err != nil {
-		return fmt.Errorf("failed to enable deferred FKs in tx: %w", err)
-	}
-
-	if verboseLog {
-		logger.Info("🔄 Creating data in FK-challenging order (tx): posts BEFORE users, FK checks deferred to COMMIT")
-	}
-
-	for userGroup := 0; userGroup < totalUsers; userGroup++ {
-		// Pre-generate user UUID
-		futureUserID := uuid.New().String()
-
-		// Create 20 posts that reference this user (who doesn't exist yet)
-		for postInGroup := 0; postInGroup < postsPerUser; postInGroup++ {
-			postIndex := userGroup*postsPerUser + postInGroup
-			postID := uuid.New().String()
-			if err := s.app.CreatePostTx(tx, postID,
-				futureUserID,
-				fmt.Sprintf("FK Test Post %d by User %d", postIndex+1, userGroup+1),
-				fmt.Sprintf("Content for post %d by user %d", postIndex+1, userGroup+1)); err != nil {
-				return fmt.Errorf("failed to create post %d: %w", postIndex+1, err)
-			}
-			s.testData.PostIDs[postIndex] = postID
-		}
-
-		// Now create the user with the pre-generated UUID
-		if err := s.app.CreateUserTx(tx, futureUserID,
-			fmt.Sprintf("User %d", userGroup+1),
-			fmt.Sprintf("user%d@example.com", userGroup+1)); err != nil {
-			return fmt.Errorf("failed to create user %d: %w", userGroup+1, err)
-		}
-		s.testData.UserIDs[userGroup] = futureUserID
-
-		if verboseLog {
-			logger.Info("✅ FK-challenging group complete", "group", userGroup+1, "posts_created", postsPerUser, "user_created", 1)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit FK-challenging creation tx: %w", err)
-	}
-	if verboseLog {
-		logger.Info("✅ FK-challenging data creation committed (FKs verified at COMMIT)")
+	if err := s.rebalancePendingForDeferredFKGroups(ctx, logger, s.app, "phone-seed", s.testData.UserIDs, s.testData.PostIDs, postsPerUser); err != nil {
+		return fmt.Errorf("failed to rebalance phone pending queue: %w", err)
 	}
 
 	actualUsers := len(s.testData.UserIDs)
@@ -293,7 +305,7 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 
 	// Resume uploads and trigger upload - this should cause FK constraint violations and retries
 	if verboseLog {
-		logger.Info("🚀 Starting upload with small batch sizes (will trigger FK constraint violations)")
+		logger.Info("🚀 Starting bundle push for the full local dirty set")
 	}
 
 	if client := s.app.GetClient(); client != nil {
@@ -304,10 +316,10 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 		}
 	}
 
-	// Upload all pending changes in multiple small batches
+	// Push all pending changes for this stage.
 	err = s.performMultiBatchUpload(ctx, logger)
 	if err != nil {
-		return fmt.Errorf("failed to perform multi-batch upload: %w", err)
+		return fmt.Errorf("failed to push pending changes: %w", err)
 	}
 
 	// Check pending changes after upload
@@ -318,9 +330,6 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	if verboseLog {
 		logger.Info("📊 Pending changes after upload", "count", pendingCountAfter)
 	}
-
-	// Wait a moment for any async operations to complete
-	time.Sleep(1 * time.Second)
 
 	// Step 5: Test download sync with "phone" source ID (should get 0 records)
 	if client := s.app.GetClient(); client != nil {
@@ -402,7 +411,7 @@ func (s *ComplexMultiBatchScenario) testDownloadWithPhoneSourceID(ctx context.Co
 	}
 
 	// Perform download sync - should get 0 records since we uploaded from this phone
-	applied, nextAfter, err := s.app.PerformSyncDownload(ctx, batchSize)
+	applied, nextAfter, err := s.app.PullToStable(ctx)
 	if err != nil {
 		logger.Warn("❌ Download with phone source ID failed", "error", err.Error())
 		return fmt.Errorf("download sync with phone source ID failed: %w", err)
@@ -454,10 +463,12 @@ func (s *ComplexMultiBatchScenario) createLaptopApp(ctx context.Context, logger 
 	}
 
 	appConfig := &AppConfig{
-		SourceID:   s.laptopSourceID,
-		DeviceName: "Laptop Test Device",
-		UserID:     s.app.config.UserID,
-		BatchSize:  batchSize,
+		SourceID:          s.laptopSourceID,
+		DeviceName:        "Laptop Test Device",
+		UserID:            s.app.config.UserID,
+		PullLimit:         pullLimit,
+		PushLimit:         pushLimit,
+		SnapshotChunkRows: snapshotChunkRows,
 	}
 
 	laptopApp, err := s.createMobileApp(appConfig, s.laptopSourceID)
@@ -479,10 +490,11 @@ func (s *ComplexMultiBatchScenario) createLaptopApp(ctx context.Context, logger 
 	return nil
 }
 
-// performMultiBatchDownload performs multiple download requests until all data is received
+// performMultiBatchDownload performs initial hydrate on a fresh device and proves chunked
+// snapshot transfer was actually used.
 func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Context, logger *slog.Logger) error {
 	if verboseLog {
-		logger.Info("📥 Starting multi-batch download with small batch sizes")
+		logger.Info("📥 Starting fresh-device hydrate with forced chunked snapshot transfer")
 	}
 
 	// Get initial counts
@@ -495,75 +507,34 @@ func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Contex
 		logger.Info("📊 Initial laptop database state", "users", initialUserCount, "posts", initialPostCount)
 	}
 
-	// Download all data in multiple small batches
-	downloadRound := 1
-	totalUsersDownloaded := 0
-	totalPostsDownloaded := 0
-
-	for {
-		if verboseLog {
-			logger.Info("📤 Download round", "round", downloadRound)
-		}
-
-		// Get counts before this download round
-		usersBefore, postsBefore, err := s.getDataCounts(s.laptopApp)
-		if err != nil {
-			return fmt.Errorf("failed to get data counts before download round %d: %w", downloadRound, err)
-		}
-
-		// Perform one download batch
-		applied, nextAfter, err := s.laptopApp.PerformSyncDownload(ctx, batchSize)
-		if err != nil {
-			logger.Warn("❌ Download round failed", "round", downloadRound, "error", err.Error())
-			return fmt.Errorf("failed to download in round %d: %w", downloadRound, err)
-		}
-
-		if verboseLog {
-			logger.Info("📊 Download batch results", "applied", applied, "next_after", nextAfter)
-		}
-
-		// Get counts after this download round
-		usersAfter, postsAfter, err := s.getDataCounts(s.laptopApp)
-		if err != nil {
-			return fmt.Errorf("failed to get data counts after download round %d: %w", downloadRound, err)
-		}
-
-		// Calculate what was downloaded in this round
-		usersDownloaded := usersAfter - usersBefore
-		postsDownloaded := postsAfter - postsBefore
-		totalUsersDownloaded += usersDownloaded
-		totalPostsDownloaded += postsDownloaded
-
-		if verboseLog {
-			logger.Info("📈 Download round completed",
-				"round", downloadRound,
-				"users_downloaded", usersDownloaded,
-				"posts_downloaded", postsDownloaded,
-				"total_users", usersAfter,
-				"total_posts", postsAfter)
-		}
-
-		// Check if we got any new data in this round
-		if usersDownloaded == 0 && postsDownloaded == 0 {
-			if verboseLog {
-				logger.Info("✅ All data downloaded successfully")
-				logger.Info("📊 Download summary",
-					"total_rounds", downloadRound,
-					"total_users_downloaded", totalUsersDownloaded,
-					"total_posts_downloaded", totalPostsDownloaded,
-					"batch_size", batchSize)
-			}
-			break
-		}
-
-		// Safety check to prevent infinite loops
-		if downloadRound > maxRounds {
-			return fmt.Errorf("download failed: too many rounds (%d), still downloading data", downloadRound)
-		}
-
-		downloadRound++
+	s.laptopApp.ResetSnapshotTransferDiagnostics()
+	if err := s.laptopApp.Hydrate(ctx); err != nil {
+		logger.Warn("❌ Hydrate failed", "error", err.Error())
+		return fmt.Errorf("failed to hydrate laptop from chunked snapshot: %w", err)
+	}
+	snapshotStats := s.laptopApp.SnapshotTransferDiagnostics()
+	if snapshotStats.ChunksFetched <= 1 {
+		return fmt.Errorf("expected laptop hydrate to fetch more than one snapshot chunk, got %d", snapshotStats.ChunksFetched)
 	}
 
+	usersAfter, postsAfter, err := s.getDataCounts(s.laptopApp)
+	if err != nil {
+		return fmt.Errorf("failed to get laptop data counts after hydrate: %w", err)
+	}
+
+	usersDownloaded := usersAfter - initialUserCount
+	postsDownloaded := postsAfter - initialPostCount
+
+	if verboseLog {
+		logger.Info("✅ Chunked hydrate completed",
+			"snapshot_sessions", snapshotStats.SessionsCreated,
+			"snapshot_chunks", snapshotStats.ChunksFetched,
+			"users_downloaded", usersDownloaded,
+			"posts_downloaded", postsDownloaded,
+			"total_users", usersAfter,
+			"total_posts", postsAfter,
+			"snapshot_chunk_rows", snapshotChunkRows)
+	}
 	return nil
 }
 
@@ -573,152 +544,23 @@ func (s *ComplexMultiBatchScenario) verifyDownloadedData(ctx context.Context, lo
 		logger.Info("🔍 Verifying downloaded data matches uploaded data")
 	}
 
-	// Get final counts
-	userCount, postCount, err := s.getDataCounts(s.laptopApp)
-	if err != nil {
-		return fmt.Errorf("failed to get final laptop data counts: %w", err)
-	}
-
-	// Verify counts match expected
-	expectedUsers := len(s.testData.UserIDs)
-	expectedPosts := len(s.testData.PostIDs)
-
-	if verboseLog {
-		logger.Info("📊 Data count verification",
-			"expected_users", expectedUsers, "actual_users", userCount,
-			"expected_posts", expectedPosts, "actual_posts", postCount)
-	}
-
-	if userCount != expectedUsers {
-		return fmt.Errorf("user count mismatch: expected %d, got %d", expectedUsers, userCount)
-	}
-
-	if postCount != expectedPosts {
-		return fmt.Errorf("post count mismatch: expected %d, got %d", expectedPosts, postCount)
-	}
-
-	// Verify all user IDs are present
-	err = s.verifyUserIDs(logger)
-	if err != nil {
-		return fmt.Errorf("user ID verification failed: %w", err)
-	}
-
-	// Verify all post IDs are present and have correct FK relationships
-	err = s.verifyPostIDs(logger)
-	if err != nil {
-		return fmt.Errorf("post ID verification failed: %w", err)
-	}
-
-	// Verify FK relationships are valid
-	err = s.verifyFKRelationships(logger)
-	if err != nil {
-		return fmt.Errorf("FK relationship verification failed: %w", err)
+	if err := s.verifyExpectedBusinessState(s.laptopApp, logger, "laptop"); err != nil {
+		return fmt.Errorf("laptop state verification failed: %w", err)
 	}
 
 	if verboseLog {
 		logger.Info("✅ Downloaded data verification completed successfully")
-		logger.Info("📊 All user IDs, post IDs, and FK relationships verified")
+		logger.Info("📊 Laptop state matches original uploaded dataset")
 	}
 	return nil
 }
 
-// verifyUserIDs verifies that all expected user IDs are present in the laptop database
-func (s *ComplexMultiBatchScenario) verifyUserIDs(logger *slog.Logger) error {
-	db := s.laptopApp.GetDatabase()
-
-	if verboseLog {
-		logger.Info("🔍 Verifying user IDs", "expected_count", len(s.testData.UserIDs))
-	}
-
-	for i, expectedUserID := range s.testData.UserIDs {
-		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM users WHERE id = ?", expectedUserID).Scan(&count)
-		if err != nil {
-			return fmt.Errorf("failed to check user ID %s: %w", expectedUserID, err)
-		}
-
-		if count != 1 {
-			return fmt.Errorf("user ID %s not found in laptop database", expectedUserID)
-		}
-
-		if verboseLog {
-			logger.Info("✅ User ID verified", "index", i+1, "user_id", expectedUserID)
-		}
-	}
-
-	if verboseLog {
-		logger.Info("✅ All user IDs verified successfully")
-	}
-	return nil
-}
-
-// verifyPostIDs verifies that all expected post IDs are present in the laptop database
-func (s *ComplexMultiBatchScenario) verifyPostIDs(logger *slog.Logger) error {
-	db := s.laptopApp.GetDatabase()
-
-	if verboseLog {
-		logger.Info("🔍 Verifying post IDs", "expected_count", len(s.testData.PostIDs))
-	}
-
-	for i, expectedPostID := range s.testData.PostIDs {
-		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM posts WHERE id = ?", expectedPostID).Scan(&count)
-		if err != nil {
-			return fmt.Errorf("failed to check post ID %s: %w", expectedPostID, err)
-		}
-
-		if count != 1 {
-			return fmt.Errorf("post ID %s not found in laptop database", expectedPostID)
-		}
-
-		if (i+1)%20 == 0 { // Log every 20 posts to avoid spam
-			if verboseLog {
-				logger.Info("✅ Post IDs verified", "verified_count", i+1, "total", len(s.testData.PostIDs))
-			}
-		}
-	}
-
-	if verboseLog {
-		logger.Info("✅ All post IDs verified successfully")
-	}
-	return nil
-}
-
-// verifyFKRelationships verifies that all FK relationships are valid in the laptop database
-func (s *ComplexMultiBatchScenario) verifyFKRelationships(logger *slog.Logger) error {
-	db := s.laptopApp.GetDatabase()
-
-	if verboseLog {
-		logger.Info("🔍 Verifying FK relationships")
-	}
-
-	// Count posts with valid FK relationships
-	var validFKCount int
-	err := db.QueryRow(`
-		SELECT COUNT(*) FROM posts p
-		INNER JOIN users u ON p.author_id = u.id
-	`).Scan(&validFKCount)
-	if err != nil {
-		return fmt.Errorf("failed to count posts with valid FK relationships: %w", err)
-	}
-
-	expectedPosts := len(s.testData.PostIDs)
-	if validFKCount != expectedPosts {
-		return fmt.Errorf("FK relationship mismatch: expected %d posts with valid FKs, got %d", expectedPosts, validFKCount)
-	}
-
-	if verboseLog {
-		logger.Info("✅ All FK relationships verified successfully", "valid_relationships", validFKCount)
-	}
-	return nil
-}
-
-// performMultiBatchUpload performs multiple upload requests until all data is uploaded (DRY helper)
+// performMultiBatchUpload performs explicit upload rounds until all staged data is uploaded.
 func (s *ComplexMultiBatchScenario) performMultiBatchUpload(ctx context.Context, logger *slog.Logger) error {
 	return s.performMultiBatchUploadForApp(ctx, logger, s.app, "phone")
 }
 
-// performMultiBatchUploadForApp performs multiple upload requests for any app until all data is uploaded (DRY helper)
+// performMultiBatchUploadForApp performs explicit upload rounds for any app until dirty state clears.
 func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Context, logger *slog.Logger, app *MobileApp, deviceName string) error {
 	// For deterministic behavior, pause downloads during explicit upload rounds
 	if client := app.GetClient(); client != nil {
@@ -732,21 +574,25 @@ func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Co
 		if err != nil {
 			return fmt.Errorf("failed to get pending changes count before upload round %d: %w", uploadRound, err)
 		}
+		outboundCount, _, _, err := s.getPushRecoveryStateCounts(ctx, app)
+		if err != nil {
+			return fmt.Errorf("failed to inspect push recovery state before upload round %d: %w", uploadRound, err)
+		}
 
-		if pendingBefore == 0 {
+		if pendingBefore == 0 && outboundCount == 0 {
 			if verboseLog {
 				logger.Info("✅ All changes uploaded successfully", "device", deviceName)
-				logger.Info("📊 Upload summary", "device", deviceName, "total_rounds", uploadRound-1, "batch_size", batchSize, "strategy", "FK constraint retry logic")
+				logger.Info("📊 Upload summary", "device", deviceName, "total_rounds", uploadRound-1, "pull_limit", pullLimit, "push_limit", pushLimit)
 			}
 			break
 		}
 
 		if verboseLog {
-			logger.Info("📤 Upload round", "device", deviceName, "round", uploadRound, "pending_changes", pendingBefore)
+			logger.Info("📤 Upload round", "device", deviceName, "round", uploadRound, "pending_changes", pendingBefore, "outbound_rows", outboundCount)
 		}
 
-		// Upload one batch and inspect the response
-		err = app.PerformSyncUpload(ctx)
+		// Push the current dirty set and inspect the response.
+		err = app.PushPending(ctx)
 		if err != nil {
 			logger.Warn("❌ Upload round failed", "device", deviceName, "round", uploadRound, "error", err.Error())
 			return fmt.Errorf("failed to upload changes in round %d: %w", uploadRound, err)
@@ -811,12 +657,12 @@ func (s *ComplexMultiBatchScenario) getDataCounts(app *MobileApp) (int, int, err
 	return userCount, postCount, nil
 }
 
-// stage1CreateAdditionalDataOnLaptop creates 20 new users and 400 new posts on laptop
+// stage1CreateAdditionalDataOnLaptop creates new data and mixed CRUD churn on laptop
 func (s *ComplexMultiBatchScenario) stage1CreateAdditionalDataOnLaptop(ctx context.Context, logger *slog.Logger) error {
 	if verboseLog {
 		logger.Info("🏁 STAGE 1: Creating Additional Data on Laptop")
-		logger.Info("📊 Target: 20 new users + 400 new posts (20 posts per user) = 420 total records")
-		logger.Info("🎯 Strategy: Create posts BEFORE users to test FK constraint handling")
+		logger.Info("📊 Target: 20 new users + 400 new posts, then deterministic updates and deletes")
+		logger.Info("🎯 Strategy: Keep FK-hostile inserts, then add hot-row churn and cleanup deletes")
 	}
 
 	// Verify laptop app is ready
@@ -833,117 +679,419 @@ func (s *ComplexMultiBatchScenario) stage1CreateAdditionalDataOnLaptop(ctx conte
 		logger.Info("📊 Current laptop state", "users", currentUsers, "posts", currentPosts)
 	}
 
-	// Initialize storage for new data
-	totalNewPosts := newUsersStage2 * newPostsPerUser
-	s.testData.NewUserIDs = make([]string, newUsersStage2)
-	s.testData.NewPostIDs = make([]string, totalNewPosts)
-
 	if verboseLog {
-		logger.Info("📊 Stage 1 configuration", "new_users", newUsersStage2, "posts_per_user", newPostsPerUser, "total_new_posts", totalNewPosts)
+		logger.Info("📊 Stage 1 configuration", "new_users", newUsersStage2, "posts_per_user", newPostsPerUser, "total_new_posts", newUsersStage2*newPostsPerUser)
 	}
 
-	// Prevent background sync from draining pending changes during laptop creation
-	s.laptopApp.StopSync()  // ensure no in-flight txs or loops
-	s.laptopApp.PauseSync() // belt-and-suspenders: pause at client layer too
-	if verboseLog {
-		logger.Info("⏸️ Paused laptop client sync during offline creation")
-	}
-
-	// Ensure apply_mode=0 so local triggers capture pending changes deterministically
-	if err := s.laptopApp.ResetApplyMode(ctx); err != nil {
-		logger.Warn("Failed to reset apply_mode to 0 before creation", "error", err)
-	}
-
-	// Create data in one transaction with deferred FK checks
-	db := s.laptopApp.GetDatabase()
-	// Best-effort clear any stray transaction
-	_, _ = db.Exec("ROLLBACK")
-	if verboseLog {
-		logger.Info("⏱️ About to begin laptop creation transaction")
-	}
-	tx, err := db.BeginTx(ctx, nil)
+	s.testData.NewUserIDs, s.testData.NewPostIDs, err = s.createDeferredFKData(ctx, logger, s.laptopApp, deferredFKCreationSpec{
+		label:          "laptop",
+		userCount:      newUsersStage2,
+		postsPerUser:   newPostsPerUser,
+		postLogEvery:   100,
+		postNumberBase: 100,
+		buildUser: func(userOrdinal int) (string, string) {
+			return fmt.Sprintf("New User %d", userOrdinal), fmt.Sprintf("newuser%d@example.com", userOrdinal)
+		},
+		buildPost: func(globalPostNum, userOrdinal int) (string, string) {
+			return fmt.Sprintf("New FK Test Post %d by New User %d", globalPostNum, userOrdinal),
+				fmt.Sprintf("Content for new post %d", globalPostNum)
+		},
+	})
 	if err != nil {
-		return fmt.Errorf("failed to begin tx for laptop creation: %w", err)
+		return fmt.Errorf("failed to create laptop FK-challenging data: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
-	if verboseLog {
-		logger.Info("✅ Laptop creation transaction begun")
-	}
-	if _, err := tx.Exec("PRAGMA defer_foreign_keys = ON"); err != nil {
-		return fmt.Errorf("failed to enable deferred FKs in tx (laptop): %w", err)
-	}
-
-	// Create data in FK-challenging order using deferred FKs within the tx
-	if verboseLog {
-		logger.Info("🔄 Creating new data in FK-challenging order (tx): posts BEFORE users")
-	}
-
-	postIndex := 0
-	for userGroup := 0; userGroup < newUsersStage2; userGroup++ {
-		// Generate new user ID
-		newUserID := uuid.New().String()
-		s.testData.NewUserIDs[userGroup] = newUserID
-
-		// Create posts BEFORE the user (FK-challenging order)
-		for postNum := 1; postNum <= newPostsPerUser; postNum++ {
-			newPostID := uuid.New().String()
-			s.testData.NewPostIDs[postIndex] = newPostID
-
-			globalPostNum := postIndex + 1 + 100 // Continue numbering after original 100 posts
-			title := fmt.Sprintf("New FK Test Post %d by New User %d", globalPostNum, userGroup+1)
-
-			if err := s.laptopApp.CreatePostTx(tx, newPostID, newUserID, title, fmt.Sprintf("Content for new post %d", globalPostNum)); err != nil {
-				return fmt.Errorf("failed to create new post %d: %w", globalPostNum, err)
-			}
-
-			//logger.Info("📝 New post created", "id", newPostID, "title", title, "author_id", newUserID)
-			postIndex++
-
-			// Log progress every 100 posts
-			if postIndex%100 == 0 && verboseLog {
-				logger.Info("📈 New posts creation progress", "created", postIndex, "total", totalNewPosts)
-			}
-		}
-
-		// Create the user AFTER its posts (FK-challenging order)
-		userName := fmt.Sprintf("New User %d", userGroup+1)
-		if err := s.laptopApp.CreateUserTx(tx, newUserID, userName, fmt.Sprintf("newuser%d@example.com", userGroup+1)); err != nil {
-			return fmt.Errorf("failed to create new user %d: %w", userGroup+1, err)
-		}
-
-		if verboseLog {
-			logger.Info("👤 New user created", "id", newUserID, "name", userName)
-			logger.Info("✅ FK-challenging group complete", "group", userGroup+1, "posts_created", newPostsPerUser, "user_created", 1)
-		}
+	s.recordDeferredFKCreatedData(s.testData.NewUserIDs, s.testData.NewPostIDs, deferredFKCreationSpec{
+		userCount:      newUsersStage2,
+		postsPerUser:   newPostsPerUser,
+		postNumberBase: 100,
+		buildUser: func(userOrdinal int) (string, string) {
+			return fmt.Sprintf("New User %d", userOrdinal), fmt.Sprintf("newuser%d@example.com", userOrdinal)
+		},
+		buildPost: func(globalPostNum, userOrdinal int) (string, string) {
+			return fmt.Sprintf("New FK Test Post %d by New User %d", globalPostNum, userOrdinal),
+				fmt.Sprintf("Content for new post %d", globalPostNum)
+		},
+	})
+	s.testData.NewFileIDs, s.testData.NewReviewIDs, err = s.createBlobBatch(s.laptopApp, "laptop-seed", newUsersStage2)
+	if err != nil {
+		return fmt.Errorf("failed to create laptop blob batch: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit laptop creation tx: %w", err)
+	if err := s.applyMixedCRUDOnLaptop(ctx, logger); err != nil {
+		return fmt.Errorf("failed to apply mixed CRUD workload on laptop: %w", err)
 	}
-	if verboseLog {
-		logger.Info("✅ Laptop FK-challenging data creation committed (FKs verified at COMMIT)")
+	if err := s.rebalancePendingForDeferredFKGroups(ctx, logger, s.laptopApp, "laptop-mixed", s.testData.NewUserIDs, s.testData.NewPostIDs, newPostsPerUser); err != nil {
+		return fmt.Errorf("failed to rebalance laptop pending queue: %w", err)
 	}
 
-	// Verify data creation
 	actualNewUsers := len(s.testData.NewUserIDs)
 	actualNewPosts := len(s.testData.NewPostIDs)
 	totalNewRecords := actualNewUsers + actualNewPosts
 
 	if verboseLog {
 		logger.Info("✅ Stage 1 completed successfully")
-		logger.Info("📊 New data created", "users", actualNewUsers, "posts", actualNewPosts, "total_records", totalNewRecords)
-		logger.Info("🎯 FK challenge strategy", "approach", "posts created BEFORE their users", "pragma", "foreign_keys OFF/ON")
+		logger.Info("📊 Offline workload created", "new_users", actualNewUsers, "new_posts", actualNewPosts, "created_records", totalNewRecords, "expected_final_users", s.expectedUserCount(), "expected_final_posts", s.expectedPostCount())
+		logger.Info("🎯 Stress profile", "mix", "fk-hostile inserts + deterministic updates + deletes", "pragma", "foreign_keys OFF/ON")
 	}
 
 	return nil
+}
+
+func (s *ComplexMultiBatchScenario) createDeferredFKData(ctx context.Context, logger *slog.Logger, app *MobileApp, spec deferredFKCreationSpec) ([]string, []string, error) {
+	totalPosts := spec.userCount * spec.postsPerUser
+	userIDs := make([]string, spec.userCount)
+	postIDs := make([]string, totalPosts)
+
+	app.StopSync()
+	app.PauseSync()
+	if verboseLog {
+		logger.Info("⏸️ Paused client sync during offline creation", "device", spec.label)
+	}
+
+	if err := app.ResetApplyMode(ctx); err != nil {
+		logger.Warn("Failed to reset apply_mode to 0 before creation", "device", spec.label, "error", err)
+	}
+
+	db := app.GetDatabase()
+	_, _ = db.Exec("ROLLBACK")
+	if verboseLog {
+		logger.Info("⏱️ About to begin creation transaction", "device", spec.label)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to begin %s creation tx: %w", spec.label, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if verboseLog {
+		logger.Info("✅ Creation transaction begun", "device", spec.label)
+		logger.Info("🔄 Creating data in FK-challenging order (tx): posts BEFORE users", "device", spec.label)
+	}
+
+	if _, err := tx.Exec("PRAGMA defer_foreign_keys = ON"); err != nil {
+		return nil, nil, fmt.Errorf("failed to enable deferred FKs in tx (%s): %w", spec.label, err)
+	}
+
+	postIndex := 0
+	for userGroup := 0; userGroup < spec.userCount; userGroup++ {
+		userOrdinal := userGroup + 1
+		userID := uuid.New().String()
+
+		for postInGroup := 0; postInGroup < spec.postsPerUser; postInGroup++ {
+			postID := uuid.New().String()
+			globalPostNum := spec.postNumberBase + postIndex + 1
+			title, content := spec.buildPost(globalPostNum, userOrdinal)
+
+			if err := app.CreatePostTx(tx, postID, userID, title, content); err != nil {
+				return nil, nil, fmt.Errorf("failed to create post %d on %s: %w", globalPostNum, spec.label, err)
+			}
+
+			postIDs[postIndex] = postID
+			postIndex++
+
+			if spec.postLogEvery > 0 && postIndex%spec.postLogEvery == 0 && verboseLog {
+				logger.Info("📈 Posts creation progress", "device", spec.label, "created", postIndex, "total", totalPosts)
+			}
+		}
+
+		name, email := spec.buildUser(userOrdinal)
+		if err := app.CreateUserTx(tx, userID, name, email); err != nil {
+			return nil, nil, fmt.Errorf("failed to create user %d on %s: %w", userOrdinal, spec.label, err)
+		}
+		userIDs[userGroup] = userID
+
+		if verboseLog {
+			logger.Info("✅ FK-challenging group complete", "device", spec.label, "group", userOrdinal, "posts_created", spec.postsPerUser, "user_created", 1)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("failed to commit %s creation tx: %w", spec.label, err)
+	}
+	if verboseLog {
+		logger.Info("✅ FK-challenging data creation committed (FKs verified at COMMIT)", "device", spec.label)
+	}
+
+	return userIDs, postIDs, nil
+}
+
+func (s *ComplexMultiBatchScenario) recordDeferredFKCreatedData(userIDs, postIDs []string, spec deferredFKCreationSpec) {
+	for userGroup, userID := range userIDs {
+		userOrdinal := userGroup + 1
+		name, email := spec.buildUser(userOrdinal)
+		s.testData.ExpectedUsers[userID] = expectedUserState{
+			Name:   name,
+			Email:  email,
+			Exists: true,
+		}
+
+		for postInGroup := 0; postInGroup < spec.postsPerUser; postInGroup++ {
+			postIndex := userGroup*spec.postsPerUser + postInGroup
+			globalPostNum := spec.postNumberBase + postIndex + 1
+			title, content := spec.buildPost(globalPostNum, userOrdinal)
+			s.testData.ExpectedPosts[postIDs[postIndex]] = expectedPostState{
+				AuthorID: userID,
+				Title:    title,
+				Content:  content,
+				Exists:   true,
+			}
+		}
+	}
+}
+
+func (s *ComplexMultiBatchScenario) applyMixedCRUDOnLaptop(ctx context.Context, logger *slog.Logger) error {
+	const (
+		originalUserUpdates     = 2
+		newUserUpdates          = 3
+		originalPostUpdates     = 8
+		newPostUpdates          = 20
+		deletedOriginalPosts    = 5
+		deletedAdditionalPosts  = 8
+		deletedTailNewUserCount = 2
+	)
+
+	if verboseLog {
+		logger.Info("🧪 Applying deterministic mixed CRUD on laptop")
+	}
+
+	for i := 0; i < originalUserUpdates; i++ {
+		userID := s.testData.UserIDs[i]
+		if err := s.applyUserUpdate(s.laptopApp, userID,
+			fmt.Sprintf("User %d Laptop Rev 1", i+1),
+			fmt.Sprintf("user%d+laptop-rev1@example.com", i+1)); err != nil {
+			return err
+		}
+	}
+	if err := s.applyUserUpdate(s.laptopApp, s.testData.UserIDs[0], "User 1 Laptop Rev 2", "user1+laptop-rev2@example.com"); err != nil {
+		return err
+	}
+
+	for i := 0; i < newUserUpdates; i++ {
+		userID := s.testData.NewUserIDs[i]
+		if err := s.applyUserUpdate(s.laptopApp, userID,
+			fmt.Sprintf("New User %d Laptop Rev 1", i+1),
+			fmt.Sprintf("newuser%d+laptop-rev1@example.com", i+1)); err != nil {
+			return err
+		}
+	}
+	if err := s.applyUserUpdate(s.laptopApp, s.testData.NewUserIDs[1], "New User 2 Laptop Rev 2", "newuser2+laptop-rev2@example.com"); err != nil {
+		return err
+	}
+
+	for i := 0; i < originalPostUpdates; i++ {
+		postID := s.testData.PostIDs[i]
+		if err := s.applyPostUpdate(s.laptopApp, postID,
+			fmt.Sprintf("Original Post %d Laptop Rev 1", i+1),
+			fmt.Sprintf("Original post %d updated on laptop during offline stress", i+1)); err != nil {
+			return err
+		}
+	}
+	if err := s.applyPostUpdate(s.laptopApp, s.testData.PostIDs[0], "Original Post 1 Laptop Rev 2", "Original post 1 received a second offline edit on laptop"); err != nil {
+		return err
+	}
+
+	for i := 0; i < newPostUpdates; i++ {
+		postID := s.testData.NewPostIDs[i]
+		if err := s.applyPostUpdate(s.laptopApp, postID,
+			fmt.Sprintf("New Post %d Laptop Rev 1", i+1),
+			fmt.Sprintf("New post %d updated on laptop during offline stress", i+1)); err != nil {
+			return err
+		}
+	}
+	if err := s.applyPostUpdate(s.laptopApp, s.testData.NewPostIDs[1], "New Post 2 Laptop Rev 2", "New post 2 received a second offline edit on laptop"); err != nil {
+		return err
+	}
+
+	for i := 0; i < deletedOriginalPosts; i++ {
+		if err := s.applyPostDelete(s.laptopApp, s.testData.PostIDs[i]); err != nil {
+			return err
+		}
+	}
+
+	for i := 0; i < deletedAdditionalPosts; i++ {
+		if err := s.applyPostDelete(s.laptopApp, s.testData.NewPostIDs[100+i]); err != nil {
+			return err
+		}
+	}
+
+	for offset := 0; offset < deletedTailNewUserCount; offset++ {
+		userGroup := len(s.testData.NewUserIDs) - 1 - offset
+		for _, postID := range s.newUserPostIDs(userGroup) {
+			if err := s.applyPostDelete(s.laptopApp, postID); err != nil {
+				return err
+			}
+		}
+		if err := s.applyUserDelete(ctx, s.laptopApp, s.testData.NewUserIDs[userGroup]); err != nil {
+			return err
+		}
+	}
+
+	if verboseLog {
+		logger.Info("✅ Mixed CRUD workload applied",
+			"original_user_updates", originalUserUpdates+1,
+			"new_user_updates", newUserUpdates+1,
+			"original_post_updates", originalPostUpdates+1,
+			"new_post_updates", newPostUpdates+1,
+			"deleted_original_posts", deletedOriginalPosts,
+			"deleted_additional_new_posts", deletedAdditionalPosts,
+			"deleted_new_users", deletedTailNewUserCount,
+			"expected_final_users", s.expectedUserCount(),
+			"expected_final_posts", s.expectedPostCount(),
+			"expected_final_files", s.expectedFileCount(),
+			"expected_final_reviews", s.expectedReviewCount())
+	}
+
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) applyUserUpdate(app *MobileApp, userID, name, email string) error {
+	if err := app.UpdateUser(userID, name, email); err != nil {
+		return fmt.Errorf("failed to update user %s: %w", userID, err)
+	}
+	s.testData.ExpectedUsers[userID] = expectedUserState{Name: name, Email: email, Exists: true}
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) applyPostUpdate(app *MobileApp, postID, title, content string) error {
+	if err := app.UpdatePost(postID, title, content); err != nil {
+		return fmt.Errorf("failed to update post %s: %w", postID, err)
+	}
+	state := s.testData.ExpectedPosts[postID]
+	state.Title = title
+	state.Content = content
+	state.Exists = true
+	s.testData.ExpectedPosts[postID] = state
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) applyPostDelete(app *MobileApp, postID string) error {
+	if err := app.DeletePost(postID); err != nil {
+		return fmt.Errorf("failed to delete post %s: %w", postID, err)
+	}
+	state := s.testData.ExpectedPosts[postID]
+	state.Exists = false
+	s.testData.ExpectedPosts[postID] = state
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) applyUserDelete(ctx context.Context, app *MobileApp, userID string) error {
+	if err := app.DeleteUserWithContext(ctx, userID); err != nil {
+		return fmt.Errorf("failed to delete user %s: %w", userID, err)
+	}
+	state := s.testData.ExpectedUsers[userID]
+	state.Exists = false
+	s.testData.ExpectedUsers[userID] = state
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) newUserPostIDs(userGroup int) []string {
+	start := userGroup * newPostsPerUser
+	end := start + newPostsPerUser
+	return s.testData.NewPostIDs[start:end]
+}
+
+func (s *ComplexMultiBatchScenario) rebalancePendingForDeferredFKGroups(ctx context.Context, logger *slog.Logger, app *MobileApp, label string, userIDs, postIDs []string, postsPerGroup int) error {
+	if len(userIDs) == 0 || len(postIDs) == 0 || postsPerGroup <= 0 {
+		return nil
+	}
+
+	db := app.GetDatabase()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin pending rebalance tx for %s: %w", label, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	reordered := 0
+	prefixPosts := postsPerGroup / 2
+	if prefixPosts < 1 {
+		prefixPosts = 1
+	}
+
+	base := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	step := time.Millisecond
+	seq := 0
+
+	for groupIdx, userID := range userIDs {
+		start := groupIdx * postsPerGroup
+		end := start + postsPerGroup
+		if end > len(postIDs) {
+			end = len(postIDs)
+		}
+		groupPosts := postIDs[start:end]
+
+		for _, postID := range groupPosts[:min(prefixPosts, len(groupPosts))] {
+			changed, err := setDirtyRowOrder(ctx, tx, "posts", postID, seq, base.Add(time.Duration(seq)*step))
+			if err != nil {
+				return fmt.Errorf("failed to rebalance post %s for %s: %w", postID, label, err)
+			}
+			if changed {
+				reordered++
+				seq++
+			}
+		}
+
+		changed, err := setDirtyRowOrder(ctx, tx, "users", userID, seq, base.Add(time.Duration(seq)*step))
+		if err != nil {
+			return fmt.Errorf("failed to rebalance user %s for %s: %w", userID, label, err)
+		}
+		if changed {
+			reordered++
+			seq++
+		}
+
+		for _, postID := range groupPosts[min(prefixPosts, len(groupPosts)):] {
+			changed, err := setDirtyRowOrder(ctx, tx, "posts", postID, seq, base.Add(time.Duration(seq)*step))
+			if err != nil {
+				return fmt.Errorf("failed to rebalance trailing post %s for %s: %w", postID, label, err)
+			}
+			if changed {
+				reordered++
+				seq++
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit pending rebalance for %s: %w", label, err)
+	}
+
+	if verboseLog {
+		logger.Info("🧭 Rebalanced dirty-row order for FK progress", "label", label, "groups", len(userIDs), "reordered_entries", reordered, "prefix_posts_before_user", prefixPosts)
+	}
+	return nil
+}
+
+func setDirtyRowOrder(ctx context.Context, tx *sql.Tx, tableName, pkUUID string, dirtyOrdinal int, updatedAt time.Time) (bool, error) {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE _sync_dirty_rows
+		SET dirty_ordinal = ?, updated_at = ?
+		WHERE table_name = ? AND key_json = json_object('id', ?)
+	`, dirtyOrdinal, updatedAt.UTC().Format("2006-01-02T15:04:05.000Z"), tableName, pkUUID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // stage2UploadNewDataFromLaptop uploads the 420 new records from laptop to server
 func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Context, logger *slog.Logger) error {
 	if verboseLog {
 		logger.Info("🏁 STAGE 2: Upload New Data from Laptop")
-		logger.Info("📊 Target: Upload 420 new records (20 users + 400 posts) using 50-record batches")
-		logger.Info("🎯 Expected: Multiple upload rounds due to FK constraints and batch size limits")
+		logger.Info("📊 Target: Push the laptop mixed-CRUD session as a bundle-backed dirty set")
+		logger.Info("🎯 Expected: Upload rounds continue only if retries are needed, not to drain artificial batch limits")
 	}
 
 	// Ensure apply_mode=0 before reading pending (safety against interrupted flows)
@@ -957,28 +1105,16 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 		return fmt.Errorf("failed to get pending changes count before upload: %w", err)
 	}
 
-	expectedNewRecords := newUsersStage2 + (newUsersStage2 * newPostsPerUser)
 	if verboseLog {
-		logger.Info("📊 Pending changes before upload", "count", pendingBefore, "expected", expectedNewRecords)
+		logger.Info("📊 Pending changes before upload", "count", pendingBefore, "expected_final_users", s.expectedUserCount(), "expected_final_posts", s.expectedPostCount())
 	}
 
-	// Allow some flexibility in pending count due to sync system behavior
-	if pendingBefore < expectedNewRecords {
-		return fmt.Errorf("insufficient pending changes: expected at least %d, got %d", expectedNewRecords, pendingBefore)
-	}
-
-	if pendingBefore > expectedNewRecords {
-		logger.Info("⚠️ More pending changes than expected", "extra", pendingBefore-expectedNewRecords, "possible_cause", "sync system state")
-	}
-
-	// INVESTIGATION: Check what's actually in the pending changes
-	err = s.investigatePendingChanges(ctx, logger)
-	if err != nil {
-		logger.Warn("⚠️ Failed to investigate pending changes", "error", err.Error())
+	if pendingBefore == 0 {
+		return fmt.Errorf("expected pending changes on laptop before upload, got 0")
 	}
 
 	if verboseLog {
-		logger.Info("🚀 Starting upload with small batch sizes (will trigger FK constraint violations)")
+		logger.Info("🚀 Starting laptop chunked push-session upload")
 	}
 
 	// Resume uploads now that creation is complete and pending has been verified
@@ -990,10 +1126,9 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 		}
 	}
 
-	// Perform multi-batch upload using existing helper
-	err = s.performMultiBatchUploadForApp(ctx, logger, s.laptopApp, "laptop")
-	if err != nil {
-		return fmt.Errorf("failed to perform multi-batch upload from laptop: %w", err)
+	s.laptopApp.ResetPushTransferDiagnostics()
+	if err := s.verifyChunkedPushRestartRecovery(ctx, logger); err != nil {
+		return fmt.Errorf("failed chunked push restart recovery verification: %w", err)
 	}
 
 	// Verify all changes uploaded
@@ -1006,76 +1141,228 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 		return fmt.Errorf("upload incomplete: %d changes still pending", pendingAfter)
 	}
 
-	// Capture upload watermark for watermark-based download termination
-	s.uploadWatermark, err = s.laptopApp.GetCurrentWindowUntil(ctx)
+	// Capture the durable bundle checkpoint after laptop uploads.
+	s.stableBundleSeq, err = s.laptopApp.GetLastServerSeqSeen(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get upload watermark: %w", err)
+		return fmt.Errorf("failed to get stable bundle seq after upload: %w", err)
 	}
 
 	if verboseLog {
 		logger.Info("✅ Stage 2 completed successfully")
-		logger.Info("📊 Upload summary", "total_uploaded", expectedNewRecords, "remaining_pending", pendingAfter, "watermark", s.uploadWatermark)
+		logger.Info("📊 Upload summary",
+			"remaining_pending", pendingAfter,
+			"stable_bundle_seq", s.stableBundleSeq,
+			"push_sessions", s.laptopApp.PushTransferDiagnostics().SessionsCreated,
+			"push_chunks", s.laptopApp.PushTransferDiagnostics().ChunksUploaded,
+			"committed_bundle_chunks", s.laptopApp.PushTransferDiagnostics().CommittedBundleChunksRead,
+			"expected_final_users", s.expectedUserCount(),
+			"expected_final_posts", s.expectedPostCount())
 	}
 
 	return nil
 }
 
-// stage3DownloadVerificationLaptop verifies laptop gets 0 records (already fully synced)
+func (s *ComplexMultiBatchScenario) verifyChunkedPushRestartRecovery(ctx context.Context, logger *slog.Logger) error {
+	const preCommitCrashMessage = "simulated crash after chunk upload before push commit"
+	const replayCrashMessage = "simulated crash after committed bundle fetch before local replay"
+
+	client := s.laptopApp.GetClient()
+	if client == nil {
+		return fmt.Errorf("laptop client not initialized")
+	}
+	client.SetBeforePushCommitHook(func(context.Context) error {
+		return fmt.Errorf(preCommitCrashMessage)
+	})
+
+	err := client.PushPending(ctx)
+	if err == nil || !strings.Contains(err.Error(), preCommitCrashMessage) {
+		return fmt.Errorf("expected simulated pre-commit crash, got %v", err)
+	}
+
+	pushStatsBeforeCommitRestart := s.laptopApp.PushTransferDiagnostics()
+	if pushStatsBeforeCommitRestart.ChunksUploaded <= 1 {
+		return fmt.Errorf("expected laptop push to upload more than one chunk before pre-commit restart, got %d", pushStatsBeforeCommitRestart.ChunksUploaded)
+	}
+	if pushStatsBeforeCommitRestart.CommittedBundleChunksRead != 0 {
+		return fmt.Errorf("expected no committed bundle fetch before pre-commit restart, got %d chunks", pushStatsBeforeCommitRestart.CommittedBundleChunksRead)
+	}
+
+	outboundCount, stagedCount, dirtyCount, err := s.getPushRecoveryStateCounts(ctx, s.laptopApp)
+	if err != nil {
+		return err
+	}
+	if outboundCount == 0 {
+		return fmt.Errorf("expected outbound push snapshot rows to remain after simulated pre-commit crash")
+	}
+	if stagedCount != 0 {
+		return fmt.Errorf("expected no staged committed bundle rows after simulated pre-commit crash, got %d", stagedCount)
+	}
+	if dirtyCount != 0 {
+		return fmt.Errorf("expected only outbound snapshot rows after simulated pre-commit crash, got dirty_rows=%d", dirtyCount)
+	}
+
+	if verboseLog {
+		logger.Info("♻️ Restarting laptop after simulated pre-commit crash",
+			"outbound_rows", outboundCount,
+			"staged_rows", stagedCount,
+			"dirty_rows", dirtyCount,
+			"push_chunks", pushStatsBeforeCommitRestart.ChunksUploaded,
+			"committed_bundle_chunks", pushStatsBeforeCommitRestart.CommittedBundleChunksRead)
+	}
+
+	restartedLaptop, err := s.restartApp(ctx, s.laptopApp, "laptop")
+	if err != nil {
+		return err
+	}
+	s.laptopApp = restartedLaptop
+
+	client = s.laptopApp.GetClient()
+	if client == nil {
+		return fmt.Errorf("restarted laptop client not initialized")
+	}
+	client.ResumeUploads()
+	s.laptopApp.ResetPushTransferDiagnostics()
+	client.SetBeforePushReplayHook(func(context.Context) error {
+		return fmt.Errorf(replayCrashMessage)
+	})
+	err = client.PushPending(ctx)
+	if err == nil || !strings.Contains(err.Error(), replayCrashMessage) {
+		return fmt.Errorf("expected simulated pre-replay crash after pre-commit restart, got %v", err)
+	}
+
+	pushStatsBeforeReplayRestart := s.laptopApp.PushTransferDiagnostics()
+	if pushStatsBeforeReplayRestart.SessionsCreated != 1 {
+		return fmt.Errorf("expected one fresh push session after pre-commit restart, got %d", pushStatsBeforeReplayRestart.SessionsCreated)
+	}
+	if pushStatsBeforeReplayRestart.ChunksUploaded <= 1 {
+		return fmt.Errorf("expected restarted laptop push to re-upload more than one chunk from zero, got %d", pushStatsBeforeReplayRestart.ChunksUploaded)
+	}
+	if pushStatsBeforeReplayRestart.CommittedBundleChunksRead <= 1 {
+		return fmt.Errorf("expected restarted laptop replay fetch to read more than one committed bundle chunk before replay restart, got %d", pushStatsBeforeReplayRestart.CommittedBundleChunksRead)
+	}
+
+	outboundCount, stagedCount, dirtyCount, err = s.getPushRecoveryStateCounts(ctx, s.laptopApp)
+	if err != nil {
+		return err
+	}
+	if outboundCount == 0 {
+		return fmt.Errorf("expected outbound push snapshot rows to remain after simulated pre-replay crash")
+	}
+	if stagedCount == 0 {
+		return fmt.Errorf("expected staged committed bundle rows to remain after simulated pre-replay crash")
+	}
+	if dirtyCount != 0 {
+		return fmt.Errorf("expected no live dirty rows after simulated pre-replay crash without newer local writes, got %d", dirtyCount)
+	}
+
+	if verboseLog {
+		logger.Info("♻️ Restarting laptop after simulated pre-replay crash",
+			"outbound_rows", outboundCount,
+			"staged_rows", stagedCount,
+			"dirty_rows", dirtyCount,
+			"push_sessions", pushStatsBeforeReplayRestart.SessionsCreated,
+			"push_chunks", pushStatsBeforeReplayRestart.ChunksUploaded,
+			"committed_bundle_chunks", pushStatsBeforeReplayRestart.CommittedBundleChunksRead)
+	}
+
+	restartedLaptop, err = s.restartApp(ctx, s.laptopApp, "laptop")
+	if err != nil {
+		return err
+	}
+	s.laptopApp = restartedLaptop
+	if client = s.laptopApp.GetClient(); client != nil {
+		client.ResumeUploads()
+	}
+	s.laptopApp.ResetPushTransferDiagnostics()
+	if err := s.performMultiBatchUploadForApp(ctx, logger, s.laptopApp, "laptop-restart-replay"); err != nil {
+		return fmt.Errorf("failed to replay committed laptop push after restart: %w", err)
+	}
+
+	outboundCount, stagedCount, dirtyCount, err = s.getPushRecoveryStateCounts(ctx, s.laptopApp)
+	if err != nil {
+		return err
+	}
+	if outboundCount != 0 || stagedCount != 0 || dirtyCount != 0 {
+		return fmt.Errorf("expected restart replay to clear outbound=%d staged=%d dirty=%d", outboundCount, stagedCount, dirtyCount)
+	}
+
+	postCommitRestart, err := s.restartApp(ctx, s.laptopApp, "laptop")
+	if err != nil {
+		return err
+	}
+	s.laptopApp = postCommitRestart
+	lastSeen, err := s.laptopApp.GetLastServerSeqSeen(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load laptop checkpoint after post-commit restart: %w", err)
+	}
+	if lastSeen <= 0 {
+		return fmt.Errorf("expected durable bundle checkpoint after post-commit restart, got %d", lastSeen)
+	}
+	if _, _, err := s.laptopApp.PullToStable(ctx); err != nil {
+		return fmt.Errorf("post-commit restart pull failed: %w", err)
+	}
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) getPushRecoveryStateCounts(ctx context.Context, app *MobileApp) (outboundCount int, stagedCount int, dirtyCount int, err error) {
+	db := app.GetDatabase()
+	if db == nil {
+		return 0, 0, 0, fmt.Errorf("database not initialized")
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to count _sync_push_outbound rows: %w", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to count _sync_push_stage rows: %w", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to count _sync_dirty_rows rows: %w", err)
+	}
+	return outboundCount, stagedCount, dirtyCount, nil
+}
+
+func (s *ComplexMultiBatchScenario) restartApp(ctx context.Context, app *MobileApp, label string) (*MobileApp, error) {
+	if app == nil {
+		return nil, fmt.Errorf("%s app is not initialized", label)
+	}
+	originalPreserveDB := app.config.PreserveDB
+	app.config.PreserveDB = true
+	cfg := *app.config
+	cfg.PreserveDB = originalPreserveDB
+	if err := app.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close %s app for restart: %w", label, err)
+	}
+	restarted, err := NewMobileApp(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to recreate %s app after restart: %w", label, err)
+	}
+	if err := restarted.OnLaunch(ctx); err != nil {
+		return nil, fmt.Errorf("failed to relaunch %s app after restart: %w", label, err)
+	}
+	restarted.StopSync()
+	restarted.PauseSync()
+	return restarted, nil
+}
+
+// stage3DownloadVerificationLaptop verifies the laptop checkpoint already matches the stable
+// bundle published by its own Stage 2 upload, without issuing another network pull.
 func (s *ComplexMultiBatchScenario) stage3DownloadVerificationLaptop(ctx context.Context, logger *slog.Logger) error {
 	if verboseLog {
-		logger.Info("🏁 STAGE 3: Download Verification - Laptop (Should Get 0 Records)")
-		logger.Info("📊 Expected result: 0 records downloaded (laptop is already fully synced)")
+		logger.Info("🏁 STAGE 3: Checkpoint Verification - Laptop")
+		logger.Info("📊 Expected result: laptop durable checkpoint already equals the Stage 2 stable bundle")
 	}
 
-	if client := s.laptopApp.GetClient(); client != nil {
-		client.ResumeDownloads()
-		if verboseLog {
-			logger.Info("▶️ Resumed laptop client downloads for Stage 3")
-		}
-	}
-
-	// Get data counts before download
-	usersBefore, postsBefore, err := s.getDataCounts(s.laptopApp)
+	lastSeen, err := s.laptopApp.GetLastServerSeqSeen(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get laptop data counts before download: %w", err)
+		return fmt.Errorf("failed to get laptop stable checkpoint: %w", err)
 	}
-
-	if verboseLog {
-		logger.Info("📊 Laptop data before download", "users", usersBefore, "posts", postsBefore)
-	}
-
-	// Perform download sync - should get 0 records since laptop uploaded the data
-	applied, nextAfter, err := s.laptopApp.PerformSyncDownload(ctx, batchSize)
-	if err != nil {
-		logger.Warn("❌ Download verification on laptop failed", "error", err.Error())
-		return fmt.Errorf("download sync on laptop failed: %w", err)
-	}
-
-	if verboseLog {
-		logger.Info("📊 Download results", "device", "laptop", "applied", applied, "next_after", nextAfter)
-	}
-
-	// Get data counts after download
-	usersAfter, postsAfter, err := s.getDataCounts(s.laptopApp)
-	if err != nil {
-		return fmt.Errorf("failed to get laptop data counts after download: %w", err)
-	}
-
-	// Verify no new data was downloaded
-	usersDownloaded := usersAfter - usersBefore
-	postsDownloaded := postsAfter - postsBefore
-
-	if applied != 0 {
-		return fmt.Errorf("unexpected download result: expected 0 applied, got %d", applied)
-	}
-
-	if usersDownloaded != 0 || postsDownloaded != 0 {
-		return fmt.Errorf("unexpected data downloaded: %d users, %d posts (expected 0, 0)", usersDownloaded, postsDownloaded)
+	if lastSeen != s.stableBundleSeq {
+		return fmt.Errorf("unexpected laptop checkpoint: expected stable bundle seq %d, got %d", s.stableBundleSeq, lastSeen)
 	}
 
 	if verboseLog {
 		logger.Info("✅ Stage 3 completed successfully")
-		logger.Info("📊 Verification result", "device", "laptop", "users_downloaded", usersDownloaded, "posts_downloaded", postsDownloaded, "expected", "0, 0")
+		logger.Info("📊 Verification result", "device", "laptop", "stable_bundle_seq", s.stableBundleSeq, "last_seen_bundle_seq", lastSeen)
 	}
 
 	return nil
@@ -1098,9 +1385,9 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 	// Target totals come from the scenario configuration:
 	//   - Initially we created `totalUsers` users with `postsPerUser` posts each on the phone
 	//   - Stage 1 created `newUsersStage2` users with `newPostsPerUser` posts each on the laptop
-	// Final expected totals after Stage 4 = (totalUsers + newUsersStage2, totalUsers*postsPerUser + newUsersStage2*newPostsPerUser)
-	targetTotalUsers := totalUsers + newUsersStage2
-	targetTotalPosts := (totalUsers * postsPerUser) + (newUsersStage2 * newPostsPerUser)
+	// Final expected totals after Stage 4 come from the tracked final state after laptop mixed CRUD.
+	targetTotalUsers := s.expectedUserCount()
+	targetTotalPosts := s.expectedPostCount()
 
 	// Get data counts before download
 	usersBefore, postsBefore, err := s.getDataCounts(s.app)
@@ -1139,32 +1426,54 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 		}
 		return nil
 	}
+	if s.simulator.verifier == nil {
+		return fmt.Errorf("complex-multi-batch requires database verification access to force prune fallback")
+	}
 
-	// Use a frozen server-side ceiling to avoid interleaving with concurrent writes
-	if verboseLog {
-		logger.Info("📥 Starting windowed multi-batch download to upload watermark", "until", s.uploadWatermark)
+	if _, err := s.simulator.verifier.pool.Exec(ctx, `
+		UPDATE sync.user_state
+		SET retained_bundle_floor = $2
+		WHERE user_id = $1
+	`, s.config.UserID, s.stableBundleSeq); err != nil {
+		return fmt.Errorf("failed to advance retained bundle floor for prune fallback: %w", err)
 	}
-	totalApplied, lastAfter, err := s.app.SyncDownloadToWatermark(ctx, batchSize, s.uploadWatermark)
+
+	s.app.ResetSnapshotTransferDiagnostics()
+	if verboseLog {
+		logger.Info("📥 Starting bundle pull to the stable upload checkpoint with forced prune fallback", "stable_bundle_seq", s.stableBundleSeq, "snapshot_chunk_rows", snapshotChunkRows)
+	}
+	totalApplied, lastAfter, err := s.app.PullToStable(ctx)
 	if err != nil {
-		return fmt.Errorf("download to watermark failed: %w", err)
+		return fmt.Errorf("bundle pull to stable checkpoint failed: %w", err)
+	}
+	snapshotStats := s.app.SnapshotTransferDiagnostics()
+	if snapshotStats.ChunksFetched <= 1 {
+		return fmt.Errorf("expected phone prune fallback to fetch more than one snapshot chunk, got %d", snapshotStats.ChunksFetched)
 	}
 	if verboseLog {
-		logger.Info("📊 Windowed download complete", "applied", totalApplied, "last_after", lastAfter, "until", s.uploadWatermark)
+		logger.Info("📊 Bundle pull complete", "applied", totalApplied, "last_after", lastAfter, "stable_bundle_seq", s.stableBundleSeq, "snapshot_sessions", snapshotStats.SessionsCreated, "snapshot_chunks", snapshotStats.ChunksFetched)
 	}
 
 	// Verify we reached the target totals (stronger check than deltas)
 	usersAfter, postsAfter, err := s.getDataCounts(s.app)
 	if err != nil {
-		return fmt.Errorf("failed to get phone data counts after windowed download: %w", err)
+		return fmt.Errorf("failed to get phone data counts after bundle pull: %w", err)
 	}
 	if usersAfter != targetTotalUsers || postsAfter != targetTotalPosts {
-		return fmt.Errorf("final count mismatch after windowed download: expected users=%d posts=%d, got users=%d posts=%d",
+		return fmt.Errorf("final count mismatch after bundle pull: expected users=%d posts=%d, got users=%d posts=%d",
 			targetTotalUsers, targetTotalPosts, usersAfter, postsAfter)
+	}
+	lastSeen, err := s.app.GetLastServerSeqSeen(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get phone stable checkpoint after prune fallback: %w", err)
+	}
+	if lastSeen != s.stableBundleSeq {
+		return fmt.Errorf("unexpected phone checkpoint after prune fallback: expected stable bundle seq %d, got %d", s.stableBundleSeq, lastSeen)
 	}
 
 	if verboseLog {
 		logger.Info("✅ Stage 4 completed successfully")
-		logger.Info("📊 Download verification", "device", "phone", "users_total", usersAfter, "posts_total", postsAfter, "targets", fmt.Sprintf("users=%d posts=%d", targetTotalUsers, targetTotalPosts))
+		logger.Info("📊 Download verification", "device", "phone", "users_total", usersAfter, "posts_total", postsAfter, "targets", fmt.Sprintf("users=%d posts=%d", targetTotalUsers, targetTotalPosts), "last_seen_bundle_seq", lastSeen)
 	}
 
 	return nil
@@ -1184,8 +1493,8 @@ func (s *ComplexMultiBatchScenario) stage5DataVerification(ctx context.Context, 
 	}
 
 	// Expected totals: original data + new data
-	expectedTotalUsers := totalUsers + newUsersStage2
-	expectedTotalPosts := (totalUsers * postsPerUser) + (newUsersStage2 * newPostsPerUser)
+	expectedTotalUsers := s.expectedUserCount()
+	expectedTotalPosts := s.expectedPostCount()
 
 	if verboseLog {
 		logger.Info("📊 Final data count verification",
@@ -1202,28 +1511,11 @@ func (s *ComplexMultiBatchScenario) stage5DataVerification(ctx context.Context, 
 		return fmt.Errorf("total post count mismatch: expected %d, got %d", expectedTotalPosts, finalPosts)
 	}
 
-	// Verify phone received only the NEW user IDs created by laptop
-	err = s.verifyNewUserIDsOnPhone(logger)
-	if err != nil {
-		return fmt.Errorf("new user ID verification failed: %w", err)
+	if err := s.verifyExpectedBusinessState(s.laptopApp, logger, "laptop"); err != nil {
+		return fmt.Errorf("laptop final state verification failed: %w", err)
 	}
-
-	// Verify phone received only the NEW post IDs created by laptop
-	err = s.verifyNewPostIDsOnPhone(logger)
-	if err != nil {
-		return fmt.Errorf("new post ID verification failed: %w", err)
-	}
-
-	// Verify FK relationships for new posts
-	err = s.verifyNewFKRelationshipsOnPhone(logger)
-	if err != nil {
-		return fmt.Errorf("new FK relationship verification failed: %w", err)
-	}
-
-	// Verify original data integrity (original 105 records should remain unchanged)
-	err = s.verifyOriginalDataIntegrity(logger)
-	if err != nil {
-		return fmt.Errorf("original data integrity verification failed: %w", err)
+	if err := s.verifyExpectedBusinessState(s.app, logger, "phone"); err != nil {
+		return fmt.Errorf("phone final state verification failed: %w", err)
 	}
 
 	if verboseLog {
@@ -1235,315 +1527,382 @@ func (s *ComplexMultiBatchScenario) stage5DataVerification(ctx context.Context, 
 	return nil
 }
 
-// verifyNewUserIDsOnPhone verifies phone received only the NEW user IDs created by laptop
-func (s *ComplexMultiBatchScenario) verifyNewUserIDsOnPhone(logger *slog.Logger) error {
-	db := s.app.GetDatabase()
-
-	if verboseLog {
-		logger.Info("🔍 Verifying new user IDs on phone", "expected_count", len(s.testData.NewUserIDs))
-	}
-
-	for _, expectedNewUserID := range s.testData.NewUserIDs {
-		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM users WHERE id = ?", expectedNewUserID).Scan(&count)
-		if err != nil {
-			return fmt.Errorf("failed to check new user ID %s: %w", expectedNewUserID, err)
+func (s *ComplexMultiBatchScenario) expectedUserCount() int {
+	count := 0
+	for _, state := range s.testData.ExpectedUsers {
+		if state.Exists {
+			count++
 		}
-
-		if count != 1 {
-			return fmt.Errorf("new user ID %s not found on phone", expectedNewUserID)
-		}
-
-		//logger.Info("✅ New user ID verified on phone", "index", i+1, "user_id", expectedNewUserID)
 	}
-
-	if verboseLog {
-		logger.Info("✅ All new user IDs verified successfully on phone")
-	}
-	return nil
+	return count
 }
 
-// verifyNewPostIDsOnPhone verifies phone received only the NEW post IDs created by laptop
-func (s *ComplexMultiBatchScenario) verifyNewPostIDsOnPhone(logger *slog.Logger) error {
-	db := s.app.GetDatabase()
-
-	if verboseLog {
-		logger.Info("🔍 Verifying new post IDs on phone", "expected_count", len(s.testData.NewPostIDs))
-	}
-
-	for _, expectedNewPostID := range s.testData.NewPostIDs {
-		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM posts WHERE id = ?", expectedNewPostID).Scan(&count)
-		if err != nil {
-			return fmt.Errorf("failed to check new post ID %s: %w", expectedNewPostID, err)
+func (s *ComplexMultiBatchScenario) expectedPostCount() int {
+	count := 0
+	for _, state := range s.testData.ExpectedPosts {
+		if state.Exists {
+			count++
 		}
-
-		if count != 1 {
-			return fmt.Errorf("new post ID %s not found on phone", expectedNewPostID)
-		}
-
-		//if (i+1)%50 == 0 { // Log every 50 posts to avoid spam
-		//	logger.Info("✅ New post IDs verified on phone", "verified_count", i+1, "total", len(s.testData.NewPostIDs))
-		//}
 	}
-
-	if verboseLog {
-		logger.Info("✅ All new post IDs verified successfully on phone")
-	}
-	return nil
+	return count
 }
 
-// verifyNewFKRelationshipsOnPhone verifies all new posts reference correct new user IDs
-func (s *ComplexMultiBatchScenario) verifyNewFKRelationshipsOnPhone(logger *slog.Logger) error {
-	db := s.app.GetDatabase()
-
-	if verboseLog {
-		logger.Info("🔍 Verifying new FK relationships on phone")
+func (s *ComplexMultiBatchScenario) expectedFileCount() int {
+	count := 0
+	for _, state := range s.testData.ExpectedFiles {
+		if state.Exists {
+			count++
+		}
 	}
+	return count
+}
 
-	// Count new posts with valid FK relationships to new users
-	var validNewFKCount int
-	err := db.QueryRow(`
-		SELECT COUNT(*) FROM posts p
-		INNER JOIN users u ON p.author_id = u.id
-		WHERE p.id IN (`+s.buildPlaceholders(len(s.testData.NewPostIDs))+`)
-		AND u.id IN (`+s.buildPlaceholders(len(s.testData.NewUserIDs))+`)
-	`, append(s.stringSliceToInterface(s.testData.NewPostIDs), s.stringSliceToInterface(s.testData.NewUserIDs)...)...).Scan(&validNewFKCount)
+func (s *ComplexMultiBatchScenario) expectedReviewCount() int {
+	count := 0
+	for _, state := range s.testData.ExpectedReviews {
+		if state.Exists {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *ComplexMultiBatchScenario) verifyExpectedBusinessState(app *MobileApp, logger *slog.Logger, device string) error {
+	actualUsers, err := s.loadActualUsers(app.GetDatabase())
 	if err != nil {
-		return fmt.Errorf("failed to count new posts with valid FK relationships: %w", err)
+		return fmt.Errorf("failed to load users on %s: %w", device, err)
 	}
-
-	expectedNewPosts := len(s.testData.NewPostIDs)
-	if validNewFKCount != expectedNewPosts {
-		return fmt.Errorf("new FK relationship mismatch: expected %d new posts with valid FKs, got %d", expectedNewPosts, validNewFKCount)
+	actualPosts, err := s.loadActualPosts(app.GetDatabase())
+	if err != nil {
+		return fmt.Errorf("failed to load posts on %s: %w", device, err)
+	}
+	actualFiles, err := s.loadActualFiles(app.GetDatabase())
+	if err != nil {
+		return fmt.Errorf("failed to load files on %s: %w", device, err)
+	}
+	actualReviews, err := s.loadActualReviews(app.GetDatabase())
+	if err != nil {
+		return fmt.Errorf("failed to load file reviews on %s: %w", device, err)
 	}
 
 	if verboseLog {
-		logger.Info("✅ All new FK relationships verified successfully on phone", "valid_new_relationships", validNewFKCount)
+		logger.Info("🔍 Verifying expected business state",
+			"device", device,
+			"expected_users", s.expectedUserCount(),
+			"actual_users", len(actualUsers),
+			"expected_posts", s.expectedPostCount(),
+			"actual_posts", len(actualPosts),
+			"expected_files", s.expectedFileCount(),
+			"actual_files", len(actualFiles),
+			"expected_reviews", s.expectedReviewCount(),
+			"actual_reviews", len(actualReviews))
+	}
+
+	if err := s.compareExpectedUsers(device, actualUsers); err != nil {
+		return err
+	}
+	if err := s.compareExpectedPosts(device, actualPosts); err != nil {
+		return err
+	}
+	if err := s.compareExpectedFiles(device, actualFiles); err != nil {
+		return err
+	}
+	if err := s.compareExpectedReviews(device, actualReviews); err != nil {
+		return err
+	}
+	if err := s.verifyActualFKIntegrity(device, actualUsers, actualPosts, actualFiles, actualReviews); err != nil {
+		return err
+	}
+
+	if verboseLog {
+		logger.Info("✅ Expected business state verified", "device", device, "users", len(actualUsers), "posts", len(actualPosts), "files", len(actualFiles), "reviews", len(actualReviews))
 	}
 	return nil
 }
 
-// verifyOriginalDataIntegrity verifies original 105 records remain unchanged
-func (s *ComplexMultiBatchScenario) verifyOriginalDataIntegrity(logger *slog.Logger) error {
-	db := s.app.GetDatabase()
-
-	if verboseLog {
-		logger.Info("🔍 Verifying original data integrity on phone")
-	}
-
-	// Verify all original user IDs are still present
-	for i, originalUserID := range s.testData.UserIDs {
-		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM users WHERE id = ?", originalUserID).Scan(&count)
-		if err != nil {
-			return fmt.Errorf("failed to check original user ID %s: %w", originalUserID, err)
-		}
-
-		if count != 1 {
-			return fmt.Errorf("original user ID %s missing from phone", originalUserID)
-		}
-
-		if i == 0 || i == len(s.testData.UserIDs)-1 { // Log first and last
-			if verboseLog {
-				logger.Info("✅ Original user ID verified", "index", i+1, "user_id", originalUserID)
-			}
-		}
-	}
-
-	// Verify all original post IDs are still present
-	for i, originalPostID := range s.testData.PostIDs {
-		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM posts WHERE id = ?", originalPostID).Scan(&count)
-		if err != nil {
-			return fmt.Errorf("failed to check original post ID %s: %w", originalPostID, err)
-		}
-
-		if count != 1 {
-			return fmt.Errorf("original post ID %s missing from phone", originalPostID)
-		}
-
-		if (i+1)%50 == 0 { // Log every 50 posts
-			if verboseLog {
-				logger.Info("✅ Original post IDs verified", "verified_count", i+1, "total", len(s.testData.PostIDs))
-			}
-		}
-	}
-
-	// Verify original FK relationships are still valid
-	var validOriginalFKCount int
-	err := db.QueryRow(`
-		SELECT COUNT(*) FROM posts p
-		INNER JOIN users u ON p.author_id = u.id
-		WHERE p.id IN (`+s.buildPlaceholders(len(s.testData.PostIDs))+`)
-		AND u.id IN (`+s.buildPlaceholders(len(s.testData.UserIDs))+`)
-	`, append(s.stringSliceToInterface(s.testData.PostIDs), s.stringSliceToInterface(s.testData.UserIDs)...)...).Scan(&validOriginalFKCount)
+func (s *ComplexMultiBatchScenario) loadActualUsers(db *sql.DB) (map[string]expectedUserState, error) {
+	rows, err := db.Query(`SELECT id, name, email FROM users`)
 	if err != nil {
-		return fmt.Errorf("failed to count original posts with valid FK relationships: %w", err)
-	}
-
-	expectedOriginalPosts := len(s.testData.PostIDs)
-	if validOriginalFKCount != expectedOriginalPosts {
-		return fmt.Errorf("original FK relationship mismatch: expected %d original posts with valid FKs, got %d", expectedOriginalPosts, validOriginalFKCount)
-	}
-
-	if verboseLog {
-		logger.Info("✅ Original data integrity verified successfully on phone")
-		logger.Info("📊 Original data counts", "users", len(s.testData.UserIDs), "posts", len(s.testData.PostIDs), "valid_fk_relationships", validOriginalFKCount)
-	}
-	return nil
-}
-
-// Helper methods for SQL query building
-func (s *ComplexMultiBatchScenario) buildPlaceholders(count int) string {
-	if count == 0 {
-		return ""
-	}
-	placeholders := make([]string, count)
-	for i := range placeholders {
-		placeholders[i] = "?"
-	}
-	return strings.Join(placeholders, ",")
-}
-
-func (s *ComplexMultiBatchScenario) stringSliceToInterface(slice []string) []interface{} {
-	result := make([]interface{}, len(slice))
-	for i, v := range slice {
-		result[i] = v
-	}
-	return result
-}
-
-// investigatePendingChanges investigates what's in the pending changes to understand the issue
-func (s *ComplexMultiBatchScenario) investigatePendingChanges(ctx context.Context, logger *slog.Logger) error {
-	if verboseLog {
-		logger.Info("🔍 INVESTIGATION: Analyzing pending changes on laptop")
-	}
-
-	db := s.laptopApp.GetDatabase()
-
-	// Query the oversqlite pending queue to see what changes are pending
-	rows, err := db.Query(`
-		SELECT table_name, op, pk_uuid, base_version, change_id, queued_at
-		FROM _sync_pending
-		ORDER BY queued_at DESC
-		LIMIT 50
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to query pending changes: %w", err)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var pendingChanges []struct {
-		Table       string
-		Operation   string
-		PK          string
-		BaseVersion int64
-		ChangeID    *int64
-		QueuedAt    string
-	}
-
+	users := make(map[string]expectedUserState)
 	for rows.Next() {
-		var change struct {
-			Table       string
-			Operation   string
-			PK          string
-			BaseVersion int64
-			ChangeID    *int64
-			QueuedAt    string
+		var id, name, email string
+		if err := rows.Scan(&id, &name, &email); err != nil {
+			return nil, err
 		}
-		err := rows.Scan(&change.Table, &change.Operation, &change.PK, &change.BaseVersion, &change.ChangeID, &change.QueuedAt)
-		if err != nil {
-			return fmt.Errorf("failed to scan pending change: %w", err)
+		users[id] = expectedUserState{Name: name, Email: email, Exists: true}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
+func (s *ComplexMultiBatchScenario) loadActualPosts(db *sql.DB) (map[string]expectedPostState, error) {
+	rows, err := db.Query(`SELECT id, author_id, title, content FROM posts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	posts := make(map[string]expectedPostState)
+	for rows.Next() {
+		var id, authorID, title, content string
+		if err := rows.Scan(&id, &authorID, &title, &content); err != nil {
+			return nil, err
 		}
-		pendingChanges = append(pendingChanges, change)
+		posts[id] = expectedPostState{AuthorID: authorID, Title: title, Content: content, Exists: true}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return posts, nil
+}
+
+func (s *ComplexMultiBatchScenario) loadActualFiles(db *sql.DB) (map[string]expectedFileState, error) {
+	rows, err := db.Query(`SELECT lower(hex(id)), name, lower(hex(data)) FROM files`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	files := make(map[string]expectedFileState)
+	for rows.Next() {
+		var idHex, name, dataHex string
+		if err := rows.Scan(&idHex, &name, &dataHex); err != nil {
+			return nil, err
+		}
+		files[idHex] = expectedFileState{Name: name, DataHex: dataHex, Exists: true}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+func (s *ComplexMultiBatchScenario) loadActualReviews(db *sql.DB) (map[string]expectedReviewState, error) {
+	rows, err := db.Query(`SELECT lower(hex(id)), lower(hex(file_id)), review FROM file_reviews`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	reviews := make(map[string]expectedReviewState)
+	for rows.Next() {
+		var idHex, fileIDHex, review string
+		if err := rows.Scan(&idHex, &fileIDHex, &review); err != nil {
+			return nil, err
+		}
+		reviews[idHex] = expectedReviewState{FileID: fileIDHex, Review: review, Exists: true}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return reviews, nil
+}
+
+func (s *ComplexMultiBatchScenario) compareExpectedUsers(device string, actual map[string]expectedUserState) error {
+	if len(actual) != s.expectedUserCount() {
+		return fmt.Errorf("user count mismatch on %s: expected %d, got %d", device, s.expectedUserCount(), len(actual))
 	}
 
-	if verboseLog {
-		logger.Info("📊 Pending changes analysis", "total_found", len(pendingChanges))
-	}
-
-	// Count by table and operation
-	userInserts := 0
-	postInserts := 0
-	otherChanges := 0
-
-	for i, change := range pendingChanges {
-		if change.Table == "users" && change.Operation == "INSERT" {
-			userInserts++
-		} else if change.Table == "posts" && change.Operation == "INSERT" {
-			postInserts++
-		} else {
-			otherChanges++
-		}
-
-		// Log first 10 changes for detailed analysis
-		if i < 10 {
-			if verboseLog {
-				logger.Info("🔍 Pending change detail",
-					"index", i+1,
-					"table", change.Table,
-					"operation", change.Operation,
-					"pk", change.PK,
-					"base_version", change.BaseVersion,
-					"change_id", change.ChangeID,
-					"queued_at", change.QueuedAt)
+	for id, expected := range s.testData.ExpectedUsers {
+		actualState, exists := actual[id]
+		if !expected.Exists {
+			if exists {
+				return fmt.Errorf("unexpected deleted user %s present on %s", id, device)
 			}
+			continue
+		}
+		if !exists {
+			return fmt.Errorf("expected user %s missing on %s", id, device)
+		}
+		if actualState.Name != expected.Name || actualState.Email != expected.Email {
+			return fmt.Errorf("user state mismatch on %s for %s: expected (%q, %q), got (%q, %q)",
+				device, id, expected.Name, expected.Email, actualState.Name, actualState.Email)
 		}
 	}
 
-	if verboseLog {
-		logger.Info("📊 Pending changes breakdown",
-			"user_inserts", userInserts,
-			"post_inserts", postInserts,
-			"other_changes", otherChanges)
-	}
-
-	// Check if any of the pending changes match our original data
-	originalDataInPending := 0
-	for _, change := range pendingChanges {
-		// Check if this PK matches any of our original user IDs
-		for _, originalUserID := range s.testData.UserIDs {
-			if change.PK == originalUserID {
-				originalDataInPending++
-				logger.Warn("⚠️ FOUND ORIGINAL DATA IN PENDING",
-					"table", change.Table,
-					"pk", change.PK,
-					"operation", change.Operation)
-				break
-			}
-		}
-
-		// Check if this PK matches any of our original post IDs
-		for _, originalPostID := range s.testData.PostIDs {
-			if change.PK == originalPostID {
-				originalDataInPending++
-				logger.Warn("⚠️ FOUND ORIGINAL DATA IN PENDING",
-					"table", change.Table,
-					"pk", change.PK,
-					"operation", change.Operation)
-				break
-			}
+	for id := range actual {
+		expected, known := s.testData.ExpectedUsers[id]
+		if !known || !expected.Exists {
+			return fmt.Errorf("unexpected live user %s on %s", id, device)
 		}
 	}
-
-	if originalDataInPending > 0 {
-		logger.Info("🚨 ISSUE DETECTED: Downloaded data is being treated as pending changes",
-			"original_data_in_pending", originalDataInPending)
-		logger.Info("💡 This suggests oversqlite is incorrectly marking downloaded records as local changes")
-	} else {
-		if verboseLog {
-			logger.Info("✅ No original data found in pending changes - this is expected")
-		}
-	}
-
 	return nil
+}
+
+func (s *ComplexMultiBatchScenario) compareExpectedPosts(device string, actual map[string]expectedPostState) error {
+	if len(actual) != s.expectedPostCount() {
+		return fmt.Errorf("post count mismatch on %s: expected %d, got %d", device, s.expectedPostCount(), len(actual))
+	}
+
+	for id, expected := range s.testData.ExpectedPosts {
+		actualState, exists := actual[id]
+		if !expected.Exists {
+			if exists {
+				return fmt.Errorf("unexpected deleted post %s present on %s", id, device)
+			}
+			continue
+		}
+		if !exists {
+			return fmt.Errorf("expected post %s missing on %s", id, device)
+		}
+		if actualState.AuthorID != expected.AuthorID || actualState.Title != expected.Title || actualState.Content != expected.Content {
+			return fmt.Errorf("post state mismatch on %s for %s: expected author=%q title=%q content=%q, got author=%q title=%q content=%q",
+				device, id, expected.AuthorID, expected.Title, expected.Content, actualState.AuthorID, actualState.Title, actualState.Content)
+		}
+	}
+
+	for id := range actual {
+		expected, known := s.testData.ExpectedPosts[id]
+		if !known || !expected.Exists {
+			return fmt.Errorf("unexpected live post %s on %s", id, device)
+		}
+	}
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) compareExpectedFiles(device string, actual map[string]expectedFileState) error {
+	if len(actual) != s.expectedFileCount() {
+		return fmt.Errorf("file count mismatch on %s: expected %d, got %d", device, s.expectedFileCount(), len(actual))
+	}
+
+	for id, expected := range s.testData.ExpectedFiles {
+		actualState, exists := actual[id]
+		if !expected.Exists {
+			if exists {
+				return fmt.Errorf("unexpected deleted file %s present on %s", id, device)
+			}
+			continue
+		}
+		if !exists {
+			return fmt.Errorf("expected file %s missing on %s", id, device)
+		}
+		if actualState.Name != expected.Name || actualState.DataHex != expected.DataHex {
+			return fmt.Errorf("file state mismatch on %s for %s: expected (%q, %q), got (%q, %q)",
+				device, id, expected.Name, expected.DataHex, actualState.Name, actualState.DataHex)
+		}
+	}
+
+	for id := range actual {
+		expected, known := s.testData.ExpectedFiles[id]
+		if !known || !expected.Exists {
+			return fmt.Errorf("unexpected live file %s on %s", id, device)
+		}
+	}
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) compareExpectedReviews(device string, actual map[string]expectedReviewState) error {
+	if len(actual) != s.expectedReviewCount() {
+		return fmt.Errorf("file review count mismatch on %s: expected %d, got %d", device, s.expectedReviewCount(), len(actual))
+	}
+
+	for id, expected := range s.testData.ExpectedReviews {
+		actualState, exists := actual[id]
+		if !expected.Exists {
+			if exists {
+				return fmt.Errorf("unexpected deleted file review %s present on %s", id, device)
+			}
+			continue
+		}
+		if !exists {
+			return fmt.Errorf("expected file review %s missing on %s", id, device)
+		}
+		if actualState.FileID != expected.FileID || actualState.Review != expected.Review {
+			return fmt.Errorf("file review state mismatch on %s for %s: expected file=%q review=%q, got file=%q review=%q",
+				device, id, expected.FileID, expected.Review, actualState.FileID, actualState.Review)
+		}
+	}
+
+	for id := range actual {
+		expected, known := s.testData.ExpectedReviews[id]
+		if !known || !expected.Exists {
+			return fmt.Errorf("unexpected live file review %s on %s", id, device)
+		}
+	}
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) verifyActualFKIntegrity(
+	device string,
+	actualUsers map[string]expectedUserState,
+	actualPosts map[string]expectedPostState,
+	actualFiles map[string]expectedFileState,
+	actualReviews map[string]expectedReviewState,
+) error {
+	for postID, post := range actualPosts {
+		if _, ok := actualUsers[post.AuthorID]; !ok {
+			return fmt.Errorf("post %s on %s references missing user %s", postID, device, post.AuthorID)
+		}
+	}
+	for reviewID, review := range actualReviews {
+		if _, ok := actualFiles[review.FileID]; !ok {
+			return fmt.Errorf("file review %s on %s references missing file %s", reviewID, device, review.FileID)
+		}
+	}
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) createBlobBatch(app *MobileApp, label string, groups int) ([]string, []string, error) {
+	fileIDs := make([]string, 0, groups*2)
+	reviewIDs := make([]string, 0, groups*2)
+
+	for group := 0; group < groups; group++ {
+		for variant, suffix := range []string{"A", "B"} {
+			fileUUID := uuid.New()
+			fileBytes, err := fileUUID.MarshalBinary()
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to marshal file UUID for %s group %d: %w", label, group, err)
+			}
+			fileHex := hex.EncodeToString(fileBytes)
+			dataUUID := uuid.New()
+			dataHex := strings.ReplaceAll(dataUUID.String(), "-", "")
+			fileName := fmt.Sprintf("Blob File %s %s-%d", suffix, label, group)
+			if _, err := app.db.Exec(`INSERT INTO files (id, name, data) VALUES (?, ?, x'`+dataHex+`')`, fileBytes, fileName); err != nil {
+				return nil, nil, fmt.Errorf("failed to insert file %s %s-%d: %w", suffix, label, group, err)
+			}
+			s.testData.ExpectedFiles[fileHex] = expectedFileState{Name: fileName, DataHex: dataHex, Exists: true}
+			fileIDs = append(fileIDs, fileHex)
+
+			reviewUUID := uuid.New()
+			reviewBytes, err := reviewUUID.MarshalBinary()
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to marshal review UUID for %s group %d: %w", label, group, err)
+			}
+			reviewHex := hex.EncodeToString(reviewBytes)
+			reviewText := fmt.Sprintf("Blob Review %s %s-%d", suffix, label, group)
+			if _, err := app.db.Exec(`INSERT INTO file_reviews (id, file_id, review) VALUES (?, ?, ?)`, reviewBytes, fileBytes, reviewText); err != nil {
+				return nil, nil, fmt.Errorf("failed to insert file review %s %s-%d: %w", suffix, label, group, err)
+			}
+			s.testData.ExpectedReviews[reviewHex] = expectedReviewState{FileID: fileHex, Review: reviewText, Exists: true}
+			reviewIDs = append(reviewIDs, reviewHex)
+
+			_ = variant
+		}
+	}
+
+	return fileIDs, reviewIDs, nil
 }
 
 // Cleanup cleans up resources
 func (s *ComplexMultiBatchScenario) Cleanup(ctx context.Context) error {
-	if s.laptopApp != nil {
-		// Clean up laptop app resources if needed
+	var err1, err2 error
+
+	if s.app != nil {
+		err1 = s.app.Close()
 	}
-	return nil
+
+	if s.laptopApp != nil {
+		err2 = s.laptopApp.Close()
+	}
+
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }

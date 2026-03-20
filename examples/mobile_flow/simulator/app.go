@@ -121,8 +121,8 @@ func (app *MobileApp) createBusinessTables() error {
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL,
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
 		)`
 	if _, err := app.db.Exec(createUsersSQL); err != nil {
 		return fmt.Errorf("failed to create users table: %w", err)
@@ -135,13 +135,46 @@ func (app *MobileApp) createBusinessTables() error {
 			title TEXT NOT NULL,
 			content TEXT NOT NULL,
 			author_id TEXT,
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
 			FOREIGN KEY (author_id) REFERENCES users(id)
 		)`
 
 	if _, err := app.db.Exec(createPostsSQL); err != nil {
 		return fmt.Errorf("failed to create posts table: %w", err)
+	}
+
+	createCategoriesSQL := `
+		CREATE TABLE IF NOT EXISTS categories (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			parent_id TEXT,
+			FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+		)`
+	if _, err := app.db.Exec(createCategoriesSQL); err != nil {
+		return fmt.Errorf("failed to create categories table: %w", err)
+	}
+
+	createTeamsSQL := `
+		CREATE TABLE IF NOT EXISTS teams (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			captain_member_id TEXT,
+			FOREIGN KEY (captain_member_id) REFERENCES team_members(id) DEFERRABLE INITIALLY DEFERRED
+		)`
+	if _, err := app.db.Exec(createTeamsSQL); err != nil {
+		return fmt.Errorf("failed to create teams table: %w", err)
+	}
+
+	createTeamMembersSQL := `
+		CREATE TABLE IF NOT EXISTS team_members (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			team_id TEXT NOT NULL,
+			FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+		)`
+	if _, err := app.db.Exec(createTeamMembersSQL); err != nil {
+		return fmt.Errorf("failed to create team_members table: %w", err)
 	}
 
 	// Create local files table (SQLite) with BLOB primary key
@@ -215,7 +248,7 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 
 		// Ensure the local oversqlite client is bootstrapped before starting background sync loops.
 		// Under high parallelism, background loops can tick before SignIn/Bootstrap runs and hit
-		// sql.ErrNoRows on _sync_client_info.
+		// sql.ErrNoRows on _sync_client_state.
 		if err := app.client.Bootstrap(ctx, false); err != nil {
 			app.logger.Error("Failed to bootstrap client after session restore", "error", err)
 			app.ui.SetBanner("Setup failed")
@@ -323,7 +356,7 @@ func (app *MobileApp) CreateUserWithIDReturningID(userID, name, email string) (s
 
 // createUserWithID is the internal implementation for creating users
 func (app *MobileApp) createUserWithID(ctx context.Context, userID, name, email string) (string, error) {
-	now := time.Now().Unix()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err := app.db.ExecContext(ctx, `
 		INSERT INTO users (id, name, email, created_at, updated_at)
@@ -342,7 +375,7 @@ func (app *MobileApp) createUserWithID(ctx context.Context, userID, name, email 
 
 // CreateUserTx inserts a user row within an existing transaction
 func (app *MobileApp) CreateUserTx(tx *sql.Tx, userID, name, email string) error {
-	now := time.Now().Unix()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := tx.Exec(`
         INSERT INTO users (id, name, email, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)`,
@@ -367,7 +400,7 @@ func (app *MobileApp) CreatePostWithID(ctx context.Context, postID, authorID, ti
 
 // createPostWithID is the internal implementation for creating posts
 func (app *MobileApp) createPostWithID(ctx context.Context, postID, authorID, title, content string) (string, error) {
-	now := time.Now().Unix()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err := app.db.ExecContext(ctx, `
 		INSERT INTO posts (id, title, content, author_id, created_at, updated_at)
@@ -386,7 +419,7 @@ func (app *MobileApp) createPostWithID(ctx context.Context, postID, authorID, ti
 
 // CreatePostTx inserts a post row within an existing transaction
 func (app *MobileApp) CreatePostTx(tx *sql.Tx, postID, authorID, title, content string) error {
-	now := time.Now().Unix()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := tx.Exec(`
         INSERT INTO posts (id, title, content, author_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)`,
@@ -399,7 +432,7 @@ func (app *MobileApp) CreatePostTx(tx *sql.Tx, postID, authorID, title, content 
 
 // UpdateUser updates an existing user record
 func (app *MobileApp) UpdateUser(userID, name, email string) error {
-	now := time.Now().Unix()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err := app.db.Exec(`
 		UPDATE users SET name = ?, email = ?, updated_at = ?
@@ -418,7 +451,7 @@ func (app *MobileApp) UpdateUser(userID, name, email string) error {
 
 // UpdatePost updates an existing post record
 func (app *MobileApp) UpdatePost(postID, title, content string) error {
-	now := time.Now().Unix()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err := app.db.Exec(`
 		UPDATE posts SET title = ?, content = ?, updated_at = ?
@@ -429,7 +462,7 @@ func (app *MobileApp) UpdatePost(postID, title, content string) error {
 	}
 
 	app.ui.SetPendingBadge(app.getPendingCount())
-	app.logger.Info("✏️ Post updated", "id", postID, "title", title)
+	//app.logger.Info("✏️ Post updated", "id", postID, "title", title)
 
 	return nil
 }
@@ -442,7 +475,7 @@ func (app *MobileApp) DeletePost(postID string) error {
 	}
 
 	app.ui.SetPendingBadge(app.getPendingCount())
-	app.logger.Info("🗑️ Post deleted", "id", postID)
+	//app.logger.Info("🗑️ Post deleted", "id", postID)
 
 	return nil
 }
@@ -476,28 +509,28 @@ func (app *MobileApp) DeleteUserWithContext(ctx context.Context, userID string) 
 	return nil
 }
 
-// getPendingCount returns the number of pending sync operations
+// getPendingCount returns the number of locally dirty rows waiting for bundle push.
 func (app *MobileApp) getPendingCount() int {
 	if app.db == nil {
 		return 0
 	}
 
 	var count int
-	err := app.db.QueryRow(`SELECT COUNT(*) FROM _sync_pending`).Scan(&count)
+	err := app.db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&count)
 	if err != nil {
 		return 0
 	}
 	return count
 }
 
-// GetPendingChangesCount returns the number of pending sync operations (public method)
+// GetPendingChangesCount returns the number of locally dirty rows (public method).
 func (app *MobileApp) GetPendingChangesCount(ctx context.Context) (int, error) {
 	if app.db == nil {
 		return 0, fmt.Errorf("database not initialized")
 	}
 
 	var count int
-	err := app.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_pending`).Scan(&count)
+	err := app.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&count)
 	if err != nil {
 		return 0, nil
 	}
@@ -509,11 +542,7 @@ func (app *MobileApp) Close() error {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 
-	if !app.isRunning {
-		return nil
-	}
-
-	if verboseLog {
+	if verboseLog && app.isRunning {
 		app.logger.Info("🔄 App shutting down")
 	}
 
@@ -523,10 +552,17 @@ func (app *MobileApp) Close() error {
 
 	if app.client != nil {
 		app.client.Stop(context.Background())
+		if err := app.client.Close(); err != nil {
+			return fmt.Errorf("failed to close oversqlite client: %w", err)
+		}
+		app.client = nil
 	}
 
 	if app.db != nil {
-		app.db.Close()
+		if err := app.db.Close(); err != nil {
+			return fmt.Errorf("failed to close database: %w", err)
+		}
+		app.db = nil
 	}
 
 	// Clean up database file (unless preservation is requested)
@@ -566,14 +602,14 @@ func (app *MobileApp) GetUI() *UISimulator {
 	return app.ui
 }
 
-// ResetApplyMode forces _sync_client_info.apply_mode back to 0 for this user.
+// ResetApplyMode forces _sync_client_state.apply_mode back to 0 for this user.
 // This ensures local change-tracking triggers are active even if a previous
 // download transaction left apply_mode=1 due to an interrupted flow.
 func (app *MobileApp) ResetApplyMode(ctx context.Context) error {
 	if app.db == nil {
 		return fmt.Errorf("database not initialized")
 	}
-	_, err := app.db.ExecContext(ctx, `UPDATE _sync_client_info SET apply_mode = 0 WHERE user_id = ?`, app.config.UserID)
+	_, err := app.db.ExecContext(ctx, `UPDATE _sync_client_state SET apply_mode = 0 WHERE user_id = ?`, app.config.UserID)
 	return err
 }
 
@@ -615,8 +651,8 @@ func (app *MobileApp) IsRunning() bool {
 	return app.isRunning
 }
 
-// PerformHydration downloads all user data from the server
-func (app *MobileApp) PerformHydration(ctx context.Context) error {
+// Hydrate rebuilds local state from the authoritative server snapshot using chunked snapshot sessions.
+func (app *MobileApp) Hydrate(ctx context.Context) error {
 	if app.client == nil {
 		return fmt.Errorf("no oversqlite client available")
 	}
@@ -635,28 +671,54 @@ func (app *MobileApp) PerformHydration(ctx context.Context) error {
 	return nil
 }
 
-// PerformRecoveryHydration downloads all user data including own changes (for recovery)
-func (app *MobileApp) PerformRecoveryHydration(ctx context.Context) error {
+// Recover rebuilds local state from the authoritative server snapshot using chunked snapshot sessions and rotates source identity.
+func (app *MobileApp) Recover(ctx context.Context) error {
 	if app.client == nil {
 		return fmt.Errorf("no oversqlite client available")
 	}
 
-	app.logger.Info("🔄 Starting recovery hydration (include_self=true)")
+	app.logger.Info("🔄 Starting recovery rebuild")
 	app.ui.SetBanner("Recovering data...")
 
-	if err := app.client.HydrateWithSelf(ctx); err != nil {
+	if err := app.client.Recover(ctx); err != nil {
 		app.ui.SetBanner("Recovery failed")
-		return fmt.Errorf("recovery hydration failed: %w", err)
+		return fmt.Errorf("recovery rebuild failed: %w", err)
 	}
 
 	app.ui.SetBanner("Data recovered")
-	app.logger.Info("✅ Recovery hydration completed successfully")
+	app.logger.Info("✅ Recovery rebuild completed successfully")
 
 	return nil
 }
 
-// PerformSyncUpload performs a synchronous upload operation and refreshes UI
-func (app *MobileApp) PerformSyncUpload(ctx context.Context) error {
+func (app *MobileApp) ResetSnapshotTransferDiagnostics() {
+	if app.client != nil {
+		app.client.ResetSnapshotTransferDiagnostics()
+	}
+}
+
+func (app *MobileApp) SnapshotTransferDiagnostics() oversqlite.SnapshotTransferStats {
+	if app.client == nil {
+		return oversqlite.SnapshotTransferStats{}
+	}
+	return app.client.SnapshotTransferDiagnostics()
+}
+
+func (app *MobileApp) ResetPushTransferDiagnostics() {
+	if app.client != nil {
+		app.client.ResetPushTransferDiagnostics()
+	}
+}
+
+func (app *MobileApp) PushTransferDiagnostics() oversqlite.PushTransferStats {
+	if app.client == nil {
+		return oversqlite.PushTransferStats{}
+	}
+	return app.client.PushTransferDiagnostics()
+}
+
+// PushPending uploads the full current dirty set and refreshes the local UI state.
+func (app *MobileApp) PushPending(ctx context.Context) error {
 	if app.client == nil {
 		return fmt.Errorf("client not initialized")
 	}
@@ -667,7 +729,7 @@ func (app *MobileApp) PerformSyncUpload(ctx context.Context) error {
 
 	var err error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		err = app.client.UploadOnce(ctx)
+		err = app.client.PushPending(ctx)
 		if err == nil {
 			break
 		}
@@ -689,83 +751,9 @@ func (app *MobileApp) PerformSyncUpload(ctx context.Context) error {
 	return nil
 }
 
-// PerformSyncDownloadUntil performs a synchronous download with a **server-side ceiling** (until watermark).
-// This ensures the server does not return rows beyond the specified `until` server_id,
-// which prevents paging from skipping older rows when new changes are being appended concurrently.
-//
-// Why this exists:
-// In parallel test scenarios a phone may capture an upload watermark W at Stage 2.
-// If the client downloads without passing `until=W`, the server may interleave rows > W,
-// the client's last_server_seq_seen will jump forward, and earlier rows <= W may be skipped.
-// This helper attempts to call an extended download method on the oversqlite client that
-// accepts an `until` parameter. If it's not available, it falls back to the legacy DownloadOnce.
-//
-// The method tries several optional interfaces to avoid breaking builds with older clients:
-//  1. DownloadOnceWindowed(ctx, limit, until, includeSelf, schema)
-//  2. DownloadOnceUntil(ctx, limit, until)
-//  3. DownloadOnceWithQuery(ctx, limit, map[string]string)  // adds query params such as until/include_self
-//
-// If none of the above are implemented by the client, it logs a warning and falls back to DownloadOnce.
-func (app *MobileApp) PerformSyncDownloadUntil(ctx context.Context, limit int, until int64) (applied int, nextAfter int64, err error) {
-	if app.client == nil {
-		return 0, 0, fmt.Errorf("client not initialized")
-	}
-
-	// Optional interfaces the oversqlite client may implement
-	type dlWindowed interface {
-		DownloadOnceWindowed(ctx context.Context, limit int, until int64, includeSelf bool, schema string) (int, int64, error)
-	}
-	type dlUntil interface {
-		DownloadOnceUntil(ctx context.Context, limit int, until int64) (int, int64, error)
-	}
-	type dlWithQuery interface {
-		DownloadOnceWithQuery(ctx context.Context, limit int, query map[string]string) (int, int64, error)
-	}
-
-	const maxRetries = 5
-	const retryDelay = 500 * time.Millisecond
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		switch c := any(app.client).(type) {
-		case dlWindowed:
-			applied, nextAfter, err = c.DownloadOnceWindowed(ctx, limit, until, false /* includeSelf */, "" /* schema: default */)
-		case dlUntil:
-			applied, nextAfter, err = c.DownloadOnceUntil(ctx, limit, until)
-		case dlWithQuery:
-			q := map[string]string{
-				"until":        fmt.Sprintf("%d", until),
-				"include_self": "false",
-			}
-			applied, nextAfter, err = c.DownloadOnceWithQuery(ctx, limit, q)
-		default:
-			app.logger.Warn("Download ceiling not supported by client; falling back to legacy download",
-				"until", until, "limit", limit)
-			applied, nextAfter, err = app.client.DownloadOnce(ctx, limit)
-		}
-
-		if err == nil {
-			break
-		}
-		if attempt < maxRetries {
-			backoff := time.Duration(attempt) * retryDelay
-			app.logger.Warn("DownloadUntil attempt failed, retrying",
-				"attempt", attempt, "backoff_ms", backoff.Milliseconds(), "error", err.Error(), "until", until)
-			time.Sleep(backoff)
-			continue
-		}
-		return 0, 0, fmt.Errorf("download (until=%d) failed after %d attempts: %w", until, maxRetries, err)
-	}
-
-	// Refresh UI state after download (if any changes were applied)
-	if applied > 0 {
-		app.ui.SetPendingBadge(app.getPendingCount())
-	}
-
-	return applied, nextAfter, nil
-}
-
-// PerformSyncDownload performs a synchronous download operation and refreshes UI
-func (app *MobileApp) PerformSyncDownload(ctx context.Context, limit int) (applied int, nextAfter int64, err error) {
+// PullToStable performs one bundle-era pull session and returns the number of
+// newly applied bundles along with the latest durable bundle checkpoint.
+func (app *MobileApp) PullToStable(ctx context.Context) (applied int, nextAfter int64, err error) {
 	if app.client == nil {
 		return 0, 0, fmt.Errorf("client not initialized")
 	}
@@ -775,8 +763,21 @@ func (app *MobileApp) PerformSyncDownload(ctx context.Context, limit int) (appli
 	const retryDelay = 500 * time.Millisecond
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		applied, nextAfter, err = app.client.DownloadOnce(ctx, limit)
+		before, err := app.GetLastServerSeqSeen(ctx)
+		if err != nil {
+			return 0, 0, err
+		}
+		err = app.client.PullToStable(ctx)
 		if err == nil {
+			nextAfter, err = app.GetLastServerSeqSeen(ctx)
+			if err != nil {
+				return 0, 0, err
+			}
+			if nextAfter > before {
+				applied = int(nextAfter - before)
+			} else {
+				applied = 0
+			}
 			break
 		}
 		if attempt < maxRetries {
@@ -802,48 +803,16 @@ func (app *MobileApp) GetDatabasePath() string {
 	return app.config.DatabaseFile
 }
 
-// GetLastServerSeqSeen returns the last server sequence number seen by this client
+// GetLastServerSeqSeen returns the last committed bundle sequence seen by this client.
 func (app *MobileApp) GetLastServerSeqSeen(ctx context.Context) (int64, error) {
 	var lastSeq int64
 	err := app.db.QueryRowContext(ctx, `
-		SELECT last_server_seq_seen FROM _sync_client_info WHERE user_id = ?
+		SELECT last_bundle_seq_seen FROM _sync_client_state WHERE user_id = ?
 	`, app.config.UserID).Scan(&lastSeq)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get last server seq seen: %w", err)
+		return 0, fmt.Errorf("failed to get last bundle seq seen: %w", err)
 	}
 	return lastSeq, nil
-}
-
-// GetCurrentWindowUntil returns the latest known server watermark from the client_info row.
-// This is updated from upload/download responses and is intended for windowed paging (`until`).
-func (app *MobileApp) GetCurrentWindowUntil(ctx context.Context) (int64, error) {
-	var until int64
-	err := app.db.QueryRowContext(ctx, `
-		SELECT current_window_until FROM _sync_client_info WHERE user_id = ?
-	`, app.config.UserID).Scan(&until)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get current window until: %w", err)
-	}
-	return until, nil
-}
-
-// SyncDownloadToWatermark downloads pages until the server-side ceiling `until` is reached.
-// It repeatedly calls PerformSyncDownloadUntil until nextAfter >= until or a page returns 0.
-func (app *MobileApp) SyncDownloadToWatermark(ctx context.Context, limit int, until int64) (totalApplied int, lastAfter int64, err error) {
-	var applied int
-	var nextAfter int64
-	for {
-		applied, nextAfter, err = app.PerformSyncDownloadUntil(ctx, limit, until)
-		if err != nil {
-			return totalApplied, lastAfter, err
-		}
-		totalApplied += applied
-		lastAfter = nextAfter
-		if applied == 0 || nextAfter >= until {
-			break
-		}
-	}
-	return totalApplied, lastAfter, nil
 }
 
 // GetUserCount returns the number of users in the database
@@ -874,13 +843,13 @@ func (app *MobileApp) HasUser(ctx context.Context, userID string) (bool, error) 
 	return count > 0, nil
 }
 
-// ResetSyncState resets the sync state to download all changes from the beginning
+// ResetSyncState resets the durable bundle checkpoint to force a fresh pull from bundle 0.
 func (app *MobileApp) ResetSyncState(ctx context.Context) error {
 	if app.db == nil {
 		return fmt.Errorf("database not initialized")
 	}
 
-	_, err := app.db.ExecContext(ctx, "UPDATE _sync_client_info SET last_server_seq_seen = 0 WHERE user_id = ?", app.config.UserID)
+	_, err := app.db.ExecContext(ctx, "UPDATE _sync_client_state SET last_bundle_seq_seen = 0 WHERE user_id = ?", app.config.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to reset sync state: %w", err)
 	}

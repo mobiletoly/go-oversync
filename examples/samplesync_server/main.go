@@ -35,9 +35,17 @@ func main() {
 
 	logger.Info("Samplesync server listening", "addr", addr)
 	logger.Info("Endpoints:")
-	logger.Info("  POST /sync/upload         - Upload changes with conflict resolution")
-	logger.Info("  GET  /sync/download       - Download changes from server")
-	logger.Info("  GET  /sync/schema-version - Get current schema version")
+	logger.Info("  POST /sync/push-sessions  - Create chunked push session")
+	logger.Info("  POST /sync/push-sessions/{push_id}/chunks - Upload push chunk")
+	logger.Info("  POST /sync/push-sessions/{push_id}/commit - Commit staged push")
+	logger.Info("  GET  /sync/committed-bundles/{bundle_seq}/rows - Fetch committed bundle rows")
+	logger.Info("  GET  /sync/pull           - Pull committed bundles from server")
+	logger.Info("  POST /sync/snapshot-sessions               - Create frozen chunked snapshot session")
+	logger.Info("  GET  /sync/snapshot-sessions/{snapshot_id} - Fetch one snapshot chunk")
+	logger.Info("  DEL  /sync/snapshot-sessions/{snapshot_id} - Delete snapshot session")
+	logger.Info("  GET  /sync/capabilities   - Get protocol capabilities and limits")
+	logger.Info("  GET  /status              - Service lifecycle and bundle visibility status")
+	logger.Info("  GET  /health              - Readiness health check")
 	logger.Info("  POST /dummy-signin        - Dummy signin to obtain JWT (user/device)")
 
 	// Create HTTP server with custom timeout settings

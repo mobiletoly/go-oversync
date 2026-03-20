@@ -22,11 +22,11 @@ import (
 func main() {
 	// Parse command line flags
 	var (
-		scenarioFlag   = flag.String("scenario", "", "Scenario to run (fresh-install, normal-usage, reinstall, device-replacement, offline-online, conflicts, user-switch, fk-batch-retry, complex-multi-batch, multi-device-sync, multi-device-complex, all)")
+		scenarioFlag   = flag.String("scenario", "", "Scenario to run (fresh-install, normal-usage, reinstall, device-replacement, offline-online, conflicts, user-switch, bundle-fk-atomicity, complex-multi-batch, multi-device-sync, multi-device-complex, all)")
 		verifyFlag     = flag.Bool("verify", true, "Enable database verification")
 		outputFlag     = flag.String("output", "", "Output report file (JSON)")
 		verboseFlag    = flag.Bool("verbose", false, "Enable verbose logging")
-		serverFlag     = flag.String("server", "http://localhost:8080", "Server URL")
+		serverFlag     = flag.String("server", "http://127.0.0.1:8080", "Server URL")
 		dbFlag         = flag.String("db", "postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable", "Database URL for verification")
 		jwtSecretFlag  = flag.String("jwt-secret", "", "JWT secret for local token generation (defaults to env JWT_SECRET, else server default)")
 		parallelFlag   = flag.Int("parallel", 1, "Number of parallel users to simulate (1-100)")
@@ -121,13 +121,14 @@ func runInteractiveMode(ctx context.Context, sim *simulator.Simulator) {
 	fmt.Println("6. Multi-Device Conflicts - Concurrent edits, conflict resolution")
 	fmt.Println("7. User Switch          - Multiple users, database isolation")
 	fmt.Println("8. Multi-Device Sync    - Two devices sync scenario with ordering fix")
-	fmt.Println("9. Multi-Device Complex - Long mixed ops across two devices, converge")
-	fmt.Println("10. Run All Scenarios   - Complete test suite")
-	fmt.Println("11. Exit")
+	fmt.Println("9. Bundle FK Atomicity  - Bundle checkpoints plus self-ref/cycle/cascade FK graphs")
+	fmt.Println("10. Multi-Device Complex - Long mixed ops across two devices, converge")
+	fmt.Println("11. Run All Scenarios   - Complete test suite")
+	fmt.Println("12. Exit")
 	fmt.Println()
 
 	for {
-		fmt.Print("Select scenario (1-11): ")
+		fmt.Print("Select scenario (1-12): ")
 		var choice string
 		fmt.Scanln(&choice)
 
@@ -149,14 +150,16 @@ func runInteractiveMode(ctx context.Context, sim *simulator.Simulator) {
 		case "8":
 			runScenario(ctx, sim, "multi-device-sync")
 		case "9":
-			runScenario(ctx, sim, "multi-device-complex")
+			runScenario(ctx, sim, "bundle-fk-atomicity")
 		case "10":
-			runScenario(ctx, sim, "all")
+			runScenario(ctx, sim, "multi-device-complex")
 		case "11":
+			runScenario(ctx, sim, "all")
+		case "12":
 			fmt.Println("👋 Goodbye!")
 			return
 		default:
-			fmt.Println("❌ Invalid choice. Please select 1-11.")
+			fmt.Println("❌ Invalid choice. Please select 1-12.")
 		}
 		fmt.Println()
 	}
@@ -167,7 +170,7 @@ func runScenario(ctx context.Context, sim *simulator.Simulator, scenarioName str
 		scenarios := []string{
 			"fresh-install", "normal-usage", "reinstall",
 			"device-replacement", "offline-online", "conflicts", "user-switch",
-			"fk-batch-retry", "complex-multi-batch", "multi-device-sync", "multi-device-complex",
+			"bundle-fk-atomicity", "complex-multi-batch", "multi-device-sync", "multi-device-complex",
 		}
 
 		fmt.Printf("🎯 Running all %d scenarios...\n\n", len(scenarios))
@@ -423,38 +426,41 @@ func cleanupServerDatabase(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// Clean up business tables
-	businessTables := []string{
-		"business.file_reviews", // Delete reviews first due to foreign key constraint
-		"business.files",
-		"business.posts",
-		"business.users",
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin cleanup transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		TRUNCATE TABLE
+			business.file_reviews,
+			business.files,
+			business.posts,
+			business.users,
+			business.categories,
+			business.team_members,
+			business.teams
+		RESTART IDENTITY CASCADE
+	`); err != nil {
+		return fmt.Errorf("failed to truncate business tables: %w", err)
 	}
 
-	for _, table := range businessTables {
-		_, err := db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s", table))
-		if err != nil {
-			cfg.Logger.Warn("Failed to clean business table", "table", table, "error", err)
-		} else {
-			cfg.Logger.Debug("Cleaned business table", "table", table)
-		}
+	if _, err := tx.ExecContext(ctx, `
+		TRUNCATE TABLE
+			sync.bundle_capture_stage,
+			sync.applied_pushes,
+			sync.bundle_rows,
+			sync.bundle_log,
+			sync.row_state,
+			sync.user_state
+		RESTART IDENTITY CASCADE
+	`); err != nil {
+		return fmt.Errorf("failed to truncate sync tables: %w", err)
 	}
 
-	// Clean up sync tables (in sync schema)
-	syncTables := []string{
-		"sync.sync_row_meta",
-		"sync.sync_state",
-		"sync.server_change_log",
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit cleanup transaction: %w", err)
 	}
-
-	for _, table := range syncTables {
-		_, err := db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s", table))
-		if err != nil {
-			cfg.Logger.Warn("Failed to clean sync table", "table", table, "error", err)
-		} else {
-			cfg.Logger.Debug("Cleaned sync table", "table", table)
-		}
-	}
-
 	return nil
 }

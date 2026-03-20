@@ -59,3 +59,53 @@ func TestProcessPayloadForUpload_BlobUUIDPK_UsesUUIDStringForPK(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, data, gotData)
 }
+
+func TestProcessPayloadForUpload_BlobUUIDReferenceColumns_UseUUIDStrings(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	_, err = db.Exec(`
+		CREATE TABLE files (
+			id BLOB PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`
+		CREATE TABLE file_reviews (
+			id BLOB PRIMARY KEY NOT NULL,
+			file_id BLOB NOT NULL REFERENCES files(id),
+			review TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	cfg := DefaultConfig("business", []SyncTable{
+		{TableName: "files", SyncKeyColumnName: "id"},
+		{TableName: "file_reviews", SyncKeyColumnName: "id"},
+	})
+	tokenFunc := func(ctx context.Context) (string, error) { return "mock-token", nil }
+	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, cfg)
+	require.NoError(t, err)
+
+	reviewID := uuid.New()
+	fileID := uuid.New()
+	rawPayload := map[string]any{
+		"id":      hex.EncodeToString(reviewID[:]),
+		"file_id": hex.EncodeToString(fileID[:]),
+		"review":  "looks good",
+	}
+	rawBytes, err := json.Marshal(rawPayload)
+	require.NoError(t, err)
+
+	out, err := client.processPayloadForUpload("file_reviews", string(rawBytes))
+	require.NoError(t, err)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(out, &decoded))
+	require.Equal(t, reviewID.String(), decoded["id"])
+	require.Equal(t, fileID.String(), decoded["file_id"])
+	require.Equal(t, "looks good", decoded["review"])
+}

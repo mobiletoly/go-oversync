@@ -6,6 +6,7 @@ package oversqlite
 import (
 	"database/sql"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 )
@@ -28,32 +29,48 @@ func (c *ColumnInfo) IsBlob() bool {
 	return strings.Contains(strings.ToLower(c.DeclaredType), "blob")
 }
 
+func (t *TableInfo) IsBlobReferenceColumn(columnName string) bool {
+	if t == nil {
+		return false
+	}
+	return t.ForeignKeyColumnsLower[strings.ToLower(columnName)]
+}
+
 // TableInfo holds cached information about a table's structure
 type TableInfo struct {
-	Table            string
-	Columns          []ColumnInfo
-	ColumnNamesLower []string
-	TypesByNameLower map[string]string
-	PrimaryKey       *ColumnInfo
-	PrimaryKeyIsBlob bool
+	Table                  string
+	Columns                []ColumnInfo
+	ColumnNamesLower       []string
+	TypesByNameLower       map[string]string
+	PrimaryKey             *ColumnInfo
+	PrimaryKeyIsBlob       bool
+	ForeignKeyColumnsLower map[string]bool
 }
 
 // TableInfoProvider manages cached table information
 type TableInfoProvider struct {
-	cache map[string]*TableInfo
+	cache map[tableInfoCacheKey]*TableInfo
 	mutex sync.RWMutex
+}
+
+type tableInfoCacheKey struct {
+	scope uintptr
+	table string
 }
 
 // NewTableInfoProvider creates a new TableInfoProvider
 func NewTableInfoProvider() *TableInfoProvider {
 	return &TableInfoProvider{
-		cache: make(map[string]*TableInfo),
+		cache: make(map[tableInfoCacheKey]*TableInfo),
 	}
 }
 
 // Get retrieves table information, using cache when available
 func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*TableInfo, error) {
-	key := strings.ToLower(tableName)
+	key := tableInfoCacheKey{
+		scope: reflect.ValueOf(queryer).Pointer(),
+		table: strings.ToLower(tableName),
+	}
 
 	// Check cache first
 	p.mutex.RLock()
@@ -73,7 +90,7 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 	}
 
 	// Query table info using PRAGMA table_info
-	rows, err := queryer.Query(fmt.Sprintf("PRAGMA table_info(%s)", key))
+	rows, err := queryer.Query(fmt.Sprintf("PRAGMA table_info(%s)", key.table))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get table info for %s: %w", tableName, err)
 	}
@@ -128,13 +145,41 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 		primaryKeyIsBlob = primaryKey.IsBlob()
 	}
 
+	foreignKeyColumnsLower := make(map[string]bool)
+	fkRows, err := queryer.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", key.table))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get foreign keys for %s: %w", tableName, err)
+	}
+	defer fkRows.Close()
+
+	for fkRows.Next() {
+		var (
+			id       int
+			seq      int
+			refTable string
+			fromCol  string
+			toCol    string
+			onUpdate string
+			onDelete string
+			match    string
+		)
+		if err := fkRows.Scan(&id, &seq, &refTable, &fromCol, &toCol, &onUpdate, &onDelete, &match); err != nil {
+			return nil, fmt.Errorf("failed to scan foreign key info for %s: %w", tableName, err)
+		}
+		foreignKeyColumnsLower[strings.ToLower(fromCol)] = true
+	}
+	if err := fkRows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating foreign keys for %s: %w", tableName, err)
+	}
+
 	tableInfo := &TableInfo{
-		Table:            key,
-		Columns:          columns,
-		ColumnNamesLower: columnNamesLower,
-		TypesByNameLower: typesByNameLower,
-		PrimaryKey:       primaryKey,
-		PrimaryKeyIsBlob: primaryKeyIsBlob,
+		Table:                  key.table,
+		Columns:                columns,
+		ColumnNamesLower:       columnNamesLower,
+		TypesByNameLower:       typesByNameLower,
+		PrimaryKey:             primaryKey,
+		PrimaryKeyIsBlob:       primaryKeyIsBlob,
+		ForeignKeyColumnsLower: foreignKeyColumnsLower,
 	}
 
 	// Cache the result
@@ -146,26 +191,24 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 func (p *TableInfoProvider) ClearCache() {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	p.cache = make(map[string]*TableInfo)
+	p.cache = make(map[tableInfoCacheKey]*TableInfo)
 }
 
-// Global table info provider instance
-var globalTableInfoProvider = NewTableInfoProvider()
-
-// GetTableInfo is a convenience function that uses the global provider
+// GetTableInfo is a convenience function for one-off schema lookups.
+// It intentionally avoids process-wide caching so metadata cannot leak across
+// unrelated databases or test harnesses.
 func GetTableInfo(db *sql.DB, tableName string) (*TableInfo, error) {
-	return globalTableInfoProvider.Get(db, tableName)
+	return NewTableInfoProvider().Get(db, tableName)
 }
 
-// GetTableInfoTx is a convenience function that uses the global provider via a transaction.
-// Use this when running under a single-connection DB (MaxOpenConns=1) and holding an open tx.
+// GetTableInfoTx is a convenience function for one-off schema lookups inside a
+// transaction. Use this when running under a single-connection DB
+// (MaxOpenConns=1) and holding an open tx.
 func GetTableInfoTx(tx *sql.Tx, tableName string) (*TableInfo, error) {
-	return globalTableInfoProvider.Get(tx, tableName)
+	return NewTableInfoProvider().Get(tx, tableName)
 }
 
-// ClearGlobalTableInfoCache clears the global table info cache
-// This should be called when initializing a new database connection to prevent
-// cached data from previous databases from being used
+// ClearGlobalTableInfoCache is a no-op.
+// Convenience lookups no longer use process-wide caching.
 func ClearGlobalTableInfoCache() {
-	globalTableInfoProvider.ClearCache()
 }

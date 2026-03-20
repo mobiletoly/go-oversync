@@ -24,10 +24,8 @@ func TestMobileApp_OnLaunch_BootstrapsClientInfoOnRestore(t *testing.T) {
 		DeviceName:   "Test Device",
 		JWTSecret:    "test-secret",
 		OversqliteConfig: &oversqlite.Config{
-			Schema: "business",
-			Tables: []oversqlite.SyncTable{
-				{TableName: "users"},
-			},
+			Schema:        "business",
+			Tables:        managedSyncTables(),
 			UploadLimit:   1,
 			DownloadLimit: 1,
 		},
@@ -51,9 +49,9 @@ func TestMobileApp_OnLaunch_BootstrapsClientInfoOnRestore(t *testing.T) {
 
 	var sourceID string
 	if err := app.db.QueryRowContext(context.Background(), `
-		SELECT source_id FROM _sync_client_info WHERE user_id = ?
+		SELECT source_id FROM _sync_client_state WHERE user_id = ?
 	`, app.config.UserID).Scan(&sourceID); err != nil {
-		t.Fatalf("expected _sync_client_info row after restore bootstrap: %v", err)
+		t.Fatalf("expected _sync_client_state row after restore bootstrap: %v", err)
 	}
 	if sourceID != app.config.SourceID {
 		t.Fatalf("unexpected source_id: got %q want %q", sourceID, app.config.SourceID)
@@ -62,4 +60,41 @@ func TestMobileApp_OnLaunch_BootstrapsClientInfoOnRestore(t *testing.T) {
 	if _, err := app.GetLastServerSeqSeen(context.Background()); err != nil {
 		t.Fatalf("GetLastServerSeqSeen: %v", err)
 	}
+}
+
+func TestMobileApp_Close_ReleasesClientOwnershipForRestart(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dbFile := filepath.Join(t.TempDir(), "mobile.db")
+	cfg := &MobileAppConfig{
+		DatabaseFile: dbFile,
+		ServerURL:    "http://example.invalid",
+		UserID:       "user-test",
+		SourceID:     "device-test",
+		DeviceName:   "Test Device",
+		JWTSecret:    "test-secret",
+		OversqliteConfig: &oversqlite.Config{
+			Schema:        "business",
+			Tables:        managedSyncTables(),
+			UploadLimit:   1,
+			DownloadLimit: 1,
+		},
+		PreserveDB: true,
+		Logger:     logger,
+	}
+
+	app, err := NewMobileApp(cfg)
+	if err != nil {
+		t.Fatalf("NewMobileApp (first): %v", err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf("Close (first): %v", err)
+	}
+
+	restarted, err := NewMobileApp(cfg)
+	if err != nil {
+		t.Fatalf("NewMobileApp (restart): %v", err)
+	}
+	defer restarted.Close()
 }

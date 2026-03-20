@@ -215,13 +215,8 @@ func (s *Simulator) CreateMobileApp(scenarioConfig *config.ScenarioConfig) (*Mob
 
 	// Create oversqlite config - local tables sync to server business schema
 	oversqliteConfig := &oversqlite.Config{
-		Schema: "business", // Server schema where data will be synced
-		Tables: []oversqlite.SyncTable{ // Local SQLite table names
-			{TableName: "users"},
-			{TableName: "posts"},
-			{TableName: "files"},
-			{TableName: "file_reviews"},
-		},
+		Schema:        "business",          // Server schema where data will be synced
+		Tables:        managedSyncTables(), // Local SQLite table names
 		UploadLimit:   200,
 		DownloadLimit: 1000,
 		BackoffMin:    1 * time.Second,

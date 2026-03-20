@@ -16,7 +16,7 @@ Challenges to solve:
 
 - Conflicts: two devices may edit the same record while offline
 - Ordering: changes must be applied in a consistent order
-- Reliability: uploads can be partially applied; retries must be safe (idempotent)
+- Reliability: retries must be safe (idempotent) and visible state must advance only at durable boundaries
 - Performance: large datasets must sync incrementally and predictably
 
 ## Key Players in the Sync System
@@ -27,20 +27,23 @@ Challenges to solve:
 
 - source_id
     - A stable, opaque identifier for one installation of your app on one device
-    - Lets the system attribute each change to a device; enables excluding a device’s own changes
-      from downloads (to avoid echo)
+    - Lets the system attribute each pushed bundle to a device
     - We often use `device_id` as the term for this on the client side, the both represent the same
       concept
 
-- source_change_id
-    - A per‑device monotonically increasing sequence number (1, 2, 3, …) assigned by the client to
-      each local change
-    - Combined with source_id, it forms a unique idempotency key: (source_id, source_change_id)
+- source_bundle_id
+    - A per-device monotonically increasing sequence number assigned by the client to each logical
+      push bundle
+    - Combined with source_id, it forms the idempotency key: (source_id, source_bundle_id)
 
-- server_version
-    - A monotonically increasing version maintained by the server for each row/object
-    - Enables optimistic concurrency: clients submit expected version; server increments on success
-      and reports conflicts when expectations do not match
+- bundle_seq
+    - A monotonically increasing server sequence for committed bundles
+    - Clients pull complete bundles in bundle_seq order and advance durable checkpoints only after
+      local apply commits
+
+- row_version
+    - A monotonically increasing version maintained by the server per logical row
+    - Enables optimistic concurrency during push
 
 > Terminology note
 >
@@ -56,34 +59,31 @@ Challenges to solve:
     - Unique per user: two active devices for the same user must not share a source_id.
 
 - Why it matters
-    - The idempotency key (user_id, source_id, source_change_id) lets the server accept safe retries
-      without duplicating changes.
+    - The idempotency key (user_id, source_id, source_bundle_id) lets the server accept safe retries
+      without duplicating committed bundles.
     - If two devices share a source_id, their changes can collide and be treated as duplicates.
 
 - Lifecycle best practices
-    - New install: generate a fresh source_id; initialize source_change_id = 1
-    - Reinstall/restore: reuse the old source_id only if no other active device uses it; otherwise,
-      create a new one
+    - New install: generate a fresh source_id; initialize source_bundle_id = 1
+    - Reinstall/restore: prefer a fresh source_id unless you can prove the old one is still safe to
+      reuse
     - Device replacement: prefer a new source_id; idempotency still holds because the key is per
       device
-    - Rotation: if rotated, reset source_change_id to 1; never reuse the same (source_id,
-      source_change_id) pair
+    - Destructive reset-and-rebuild recovery: rotate to a fresh source_id and reset
+      source_bundle_id = 1 before new local writes resume
+    - Rotation: if rotated, reset source_bundle_id to 1; never reuse the same (source_id,
+      source_bundle_id) pair
 
 - Privacy considerations
     - Keep source_id opaque and free of PII; it exists for sync semantics, not tracking
-
-- Self‑exclusion
-    - By default, downloads exclude rows produced by the same source_id (include_self=false)
-    - Temporarily set include_self=true for bootstrap/hydration or device recovery when a device
-      intentionally wants all server changes, including ones it created in the past
 
 ## The Big Picture: How the Flow Works
 
 The system supports three core operations:
 
-- Hydration (Bootstrap): initialize or recover a device by downloading a consistent snapshot
-- Upload: send the device’s local changes to the server
-- Download: fetch new server changes since the device’s last checkpoint
+- Hydration: initialize a device from one consistent server snapshot
+- Push: submit the device’s current local dirty set as one logical bundle
+- Pull: fetch committed server bundles since the device’s last durable checkpoint
 
 ### High‑level flow (end‑to‑end)
 
@@ -96,78 +96,62 @@ sequenceDiagram
   participant P as Persistence (DB)
 
   Note over D: First install or recovery
-  D->>A: Hydration request (include_self=true)
-  A->>S: Request snapshot window and page
-  S->>P: Freeze window upper bound and page changes
-  P-->>S: Page of changes, next cursor, has_more
-  S-->>A: Page + window_until
-  A-->>D: Apply page and repeat until has_more=false
+  D->>A: Snapshot request
+  A->>S: Request consistent snapshot
+  S->>P: Read one snapshot at snapshot_bundle_seq
+  P-->>S: Snapshot rows + snapshot_bundle_seq
+  S-->>A: Snapshot payload
+  A-->>D: Rebuild locally in one deferred-FK transaction
 
   Note over D: Normal operation
-  D->>A: Upload local changes (idempotent keys)
-  A->>S: Process changes per-change (savepoints)
-  S->>P: Apply and attribute to user_id/source_id
-  S-->>A: Per-change statuses (applied/conflict/...)
-  A-->>D: Report statuses + highest sequence
+  D->>A: Push dirty set (source_bundle_id)
+  A->>S: Validate + apply to business tables
+  S->>P: Commit one bundle and capture row effects
+  P-->>S: Committed bundle + bundle_seq
+  S-->>A: Authoritative bundle response
+  A-->>D: Replay authoritative bundle locally
 
-  D->>A: Download since last cursor (include_self=false)
-  A->>S: Request page within frozen window
-  S->>P: Page query using user isolation and cursor
-  P-->>S: Page of changes
-  S-->>A: Page + next cursor + has_more
-  A-->>D: Apply page and repeat until done
+  D->>A: Pull since last_bundle_seq_seen
+  A->>S: Request committed bundles to stable_bundle_seq
+  S->>P: Read complete bundles in sequence order
+  P-->>S: Bundles + stable_bundle_seq
+  S-->>A: Bundle response
+  A-->>D: Apply complete bundles, then advance checkpoint
 ```
 
-### Hydration (client-side concept)
+### Hydration
 
 - Goal: bring a fresh or recovered device to an exact, consistent state
-- Device requests a frozen window and downloads in pages
-- include_self=true so the device receives all history relevant to the user, including records
-  originally uploaded by itself (on older devices)
-- The device applies each page atomically and advances its local cursor after each successful page
+- Device requests one snapshot that corresponds to exactly one `snapshot_bundle_seq`
+- The client rebuilds local managed tables from that snapshot in one deferred-FK transaction
+- On success, the local checkpoint becomes the snapshot bundle sequence
 
-### Upload (Idempotent, Per‑change)
+### Push
 
-- Each local change is identified by (source_id, source_change_id) for safe retry
-- The server processes each change in isolation (savepoint per change) to allow partial success
-- Server returns a per‑change status:
-    - applied: accepted and version advanced
-    - conflict: version expectation failed; client must pull latest and re‑apply
-    - invalid: bad payload or validation failure
-- Materialization failures do **not** change the upload status: the server still returns `applied`
-  (so clients can drop the pending change) and records the failure for admin retry.
+- Each logical push is identified by `(source_id, source_bundle_id)` for safe retry
+- The client submits its full current dirty set as one logical bundle
+- The server either rejects the entire push or commits one bundle
+- On success, the server returns the authoritative committed bundle derived from the actual
+  business-table transaction
 
-### Download (Windowed and Paged)
+### Pull
 
-- Device requests changes after its last known cursor
-- Server freezes an upper bound (window_until) to avoid a moving target while paging
-- By default, exclude own device’s changes (include_self=false) to prevent echo
-- Device applies each page atomically, then advances its cursor; repeat until has_more=false
+- Device requests committed bundles after `last_bundle_seq_seen`
+- Server freezes `stable_bundle_seq` for the pull
+- The response contains complete bundles only; clients never commit partial bundle visibility
+- The client applies bundles in order and advances its checkpoint only after durable local apply
 
-### Materialization
+### Server Truth
 
-Materialization is the process of converting sync data into your application's business tables. When changes are uploaded to the server, they go through two phases:
-
-1. **Sync Storage**: Changes are first stored in the sync metadata tables (sidecar schema) where they're versioned, validated, and prepared for distribution to other devices.
-
-2. **Business Materialization**: Optionally, changes can be materialized into your application's business tables on the server side. This allows:
-   - **Server-side queries**: Your backend can query business data directly without parsing sync metadata
-   - **Reporting and analytics**: Business intelligence tools can access clean, structured data
-   - **API endpoints**: REST APIs can serve data from materialized tables
-   - **Integrations**: Other systems can consume data in familiar table formats
-
-**Key Points:**
-- Materialization is **optional** - sync works perfectly without it
-- If materialization fails, the change is still accepted into sync storage and distributed to devices
-- Failed materializations are logged for admin review and retry
-- The sync system remains the source of truth; materialized tables are derived views
-
-This separation ensures that sync reliability is never compromised by business logic complexity.
+- Business tables are authoritative on the server
+- Sync metadata is derived from committed business-table effects
+- Server-side cascades and trigger-driven writes are captured into bundles naturally because they are
+  part of the committed database transaction
+- There is no projection backlog in the core sync path
 
 ## Summary
 
-- Identity and attribution (user_id, source_id) power isolation and echo‑avoidance
-- Idempotency (source_id, source_change_id) makes retries safe and predictable
-- Optimistic concurrency via server_version detects conflicts early
-- Hydration uses a frozen window to establish a clean baseline; regular sync uses smaller uploads
-  and paged downloads to stay up‑to‑date
+- Identity and attribution (`user_id`, `source_id`) power isolation and idempotency
+- Push retries are safe because `(source_id, source_bundle_id)` identifies one logical bundle
+- Business tables are authoritative; bundles are derived replication history
+- Hydration rebuilds from one consistent snapshot; pull applies complete committed bundles only

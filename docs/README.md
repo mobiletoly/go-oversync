@@ -8,11 +8,18 @@ To run the documentation locally:
 
 ```bash
 cd docs
-bundle install
-bundle exec jekyll serve
+./build-site
 ```
 
 The site will be available at `http://localhost:4000/go-oversync/`
+
+For live local serving instead of a one-off build:
+
+```bash
+cd docs
+BUNDLE_PATH=vendor/bundle bundle install
+RUBYOPT="-r./_plugins/ruby_compat.rb" BUNDLE_PATH=vendor/bundle bundle exec jekyll serve
+```
 
 ## Automatic Publishing
 

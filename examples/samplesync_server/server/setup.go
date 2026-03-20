@@ -36,7 +36,7 @@ type ServerComponents struct {
 
 func (sc *ServerComponents) Close() {
 	if sc.SyncService != nil {
-		sc.SyncService.Close()
+		_ = sc.SyncService.Close(context.Background())
 	}
 	if sc.Pool != nil {
 		sc.Pool.Close()
@@ -90,18 +90,22 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   appName,
 		RegisteredTables: []oversync.RegisteredTable{
-			{Schema: "business", Table: "person", Handler: &PersonHandler{logger: logger}},
-			{Schema: "business", Table: "person_address", Handler: &PersonAddressHandler{logger: logger}},
-			{Schema: "business", Table: "comment", Handler: &CommentHandler{logger: logger}},
+			{Schema: "business", Table: "person", SyncKeyColumns: []string{"id"}},
+			{Schema: "business", Table: "person_address", SyncKeyColumns: []string{"id"}},
+			{Schema: "business", Table: "comment", SyncKeyColumns: []string{"id"}},
 		},
-		DisableAutoMigrateFKs: false,
 	}
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
 		svcCfg.LogStageTimings = true
 	}
 
-	syncService, err := oversync.NewSyncService(pool, svcCfg, logger)
+	syncService, err := oversync.NewRuntimeService(pool, svcCfg, logger)
 	if err != nil {
+		pool.Close()
+		cancel()
+		return nil, err
+	}
+	if err := syncService.Bootstrap(ctx); err != nil {
 		pool.Close()
 		cancel()
 		return nil, err
@@ -113,13 +117,11 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	}
 	jwtAuth := oversync.NewJWTAuth(jwtSecret)
 
-	syncHandlers := oversync.NewHTTPSyncHandlers(syncService, jwtAuth, logger)
+	syncHandlers := oversync.NewHTTPSyncHandlers(syncService, logger)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("GET /health", syncHandlers.HandleHealth)
+	mux.HandleFunc("GET /status", syncHandlers.HandleStatus)
 	mux.HandleFunc("POST /dummy-signin", func(w http.ResponseWriter, r *http.Request) {
 		type req struct{ User, Password, Device string }
 		type resp struct {
@@ -155,15 +157,22 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp{Token: tok, ExpiresIn: 600, User: rr.User, Device: rr.Device})
 	})
-	mux.Handle("POST /sync/upload", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleUpload)), logger, jwtAuth))
-	mux.Handle("GET /sync/download", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDownload)), logger, jwtAuth))
-	mux.Handle("GET /sync/schema-version", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleSchemaVersion)))
+	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreatePushSession)), logger))
+	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandlePushSessionChunk)), logger))
+	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCommitPushSession)), logger))
+	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))
+	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows)), logger))
+	mux.Handle("GET /sync/pull", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandlePull)), logger))
+	mux.Handle("POST /sync/snapshot-sessions", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession)))
+	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk)))
+	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)))
+	mux.Handle("GET /sync/capabilities", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCapabilities)))
 
 	return &ServerComponents{Pool: pool, SyncService: syncService, JWTAuth: jwtAuth, Handler: mux, Logger: logger, ctx: ctx, cancel: cancel}, nil
 }
 
 // LoggingMiddleware logs request/response bodies for development
-func LoggingMiddleware(enable bool, next http.Handler, logger *slog.Logger, jwt *oversync.JWTAuth) http.Handler {
+func LoggingMiddleware(enable bool, next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !enable {
 			next.ServeHTTP(w, r)
@@ -183,64 +192,24 @@ func LoggingMiddleware(enable bool, next http.Handler, logger *slog.Logger, jwt 
 		rw := &respCapture{ResponseWriter: w, status: 200}
 		next.ServeHTTP(rw, r)
 		fields := map[string]any{"status": rw.status, "duration": time.Since(start).String()}
-		if (r.URL.Path == "/sync/download" || r.URL.Path == "/sync/upload") && len(rw.buf) > 0 && len(rw.buf) < 100_000 {
+		if (r.URL.Path == "/sync/pull" || strings.HasPrefix(r.URL.Path, "/sync/push-sessions") || strings.HasPrefix(r.URL.Path, "/sync/committed-bundles/")) && len(rw.buf) > 0 && len(rw.buf) < 100_000 {
 			fields["body"] = string(rw.buf)
 		}
-		// Extra structured logs for dev: upload/download summaries and user id
-		userID, _ := jwt.GetUserID(r)
-		if r.URL.Path == "/sync/upload" && len(rw.buf) > 0 {
-			type upSt struct {
-				Status  string         `json:"status"`
-				Invalid map[string]any `json:"invalid,omitempty"`
-			}
-			type upResp struct {
-				Accepted bool   `json:"accepted"`
-				Statuses []upSt `json:"statuses"`
-			}
-			var ur upResp
-			err := json.Unmarshal(rw.buf, &ur)
-			if err != nil {
-				logger.Error("Failed to unmarshal upload response", "error", err)
-			} else {
-				var applied, conflict, invalid, materr int
-				reasons := map[string]int{}
-				for _, s := range ur.Statuses {
-					switch s.Status {
-					case "applied":
-						applied++
-					case "conflict":
-						conflict++
-					case "invalid":
-						invalid++
-						if s.Invalid != nil {
-							if rv, ok := s.Invalid["reason"].(string); ok {
-								reasons[rv]++
-							}
-						}
-					case "materialize_error":
-						materr++
-					}
-				}
-				logger.Info("Upload summary",
-					"user", userID,
-					"accepted", ur.Accepted,
-					"applied", applied,
-					"conflict", conflict,
-					"invalid", invalid,
-					"materialize_error", materr,
-					"invalid_reasons", reasons,
-				)
-			}
+		// Extra structured logs for dev: push/download summaries and user id
+		actor, _ := oversync.ActorFromContext(r.Context())
+		userID := actor.UserID
+		if strings.HasPrefix(r.URL.Path, "/sync/push-sessions") && len(rw.buf) > 0 {
+			logger.Info("Push session summary", "user", userID, "path", r.URL.Path, "status", rw.status)
 		}
-		if r.URL.Path == "/sync/download" && len(rw.buf) > 0 {
-			type dlResp struct {
-				Changes   []any `json:"changes"`
-				HasMore   bool  `json:"has_more"`
-				NextAfter int64 `json:"next_after"`
+		if r.URL.Path == "/sync/pull" && len(rw.buf) > 0 {
+			type pullResp struct {
+				Bundles         []any `json:"bundles"`
+				HasMore         bool  `json:"has_more"`
+				StableBundleSeq int64 `json:"stable_bundle_seq"`
 			}
-			var dr dlResp
-			if json.Unmarshal(rw.buf, &dr) == nil {
-				logger.Info("Download summary", "user", userID, "changes", len(dr.Changes), "has_more", dr.HasMore, "next_after", dr.NextAfter)
+			var pr pullResp
+			if json.Unmarshal(rw.buf, &pr) == nil {
+				logger.Info("Pull summary", "user", userID, "bundles", len(pr.Bundles), "has_more", pr.HasMore, "stable_bundle_seq", pr.StableBundleSeq)
 			}
 		}
 		//logger.Info("HTTP Response", "path", r.URL.Path, "resp", fields)

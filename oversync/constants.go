@@ -9,21 +9,3 @@ const (
 	OpUpdate = "UPDATE"
 	OpDelete = "DELETE"
 )
-
-// Status constants for change upload statuses
-const (
-	StApplied          = "applied"
-	StConflict         = "conflict"
-	StInvalid          = "invalid"
-	StMaterializeError = "materialize_error"
-)
-
-// Invalid reason constants
-const (
-	ReasonFKMissing         = "fk_missing"
-	ReasonBadPayload        = "bad_payload"
-	ReasonPrecheckError     = "precheck_error"
-	ReasonInternalError     = "internal_error"
-	ReasonUnregisteredTable = "unregistered_table"
-	ReasonBatchTooLarge     = "batch_too_large"
-)

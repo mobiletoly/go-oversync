@@ -6,264 +6,565 @@ package oversync
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 )
-
-// ClientAuthenticator extracts both user and device identity from HTTP requests
-// Implementations should validate auth (e.g., JWT) and provide both identifiers.
-type ClientAuthenticator interface {
-	GetUserID(r *http.Request) (string, error)
-	GetSourceID(r *http.Request) (string, error)
-}
 
 // HTTPSyncHandlers provides HTTP handlers for the two-way sync API
 type HTTPSyncHandlers struct {
-	service       *SyncService
-	authenticator ClientAuthenticator
-	logger        *slog.Logger
+	service *SyncService
+	logger  *slog.Logger
 }
 
 // NewHTTPSyncHandlers creates a new instance of sync handlers
-func NewHTTPSyncHandlers(service *SyncService, authenticator ClientAuthenticator, logger *slog.Logger) *HTTPSyncHandlers {
+func NewHTTPSyncHandlers(service *SyncService, logger *slog.Logger) *HTTPSyncHandlers {
 	return &HTTPSyncHandlers{
-		service:       service,
-		authenticator: authenticator,
-		logger:        logger,
+		service: service,
+		logger:  logger,
 	}
 }
 
-// HandleUpload processes batch upload requests with conflict resolution
-func (h *HTTPSyncHandlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
+func actorFromRequest(r *http.Request) (Actor, error) {
+	actor, ok := ActorFromContext(r.Context())
+	if !ok {
+		return Actor{}, errors.New("authenticated actor not found in request context")
+	}
+	return actor, nil
+}
+
+func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
 		return
 	}
 
-	userID, err := h.authenticator.GetUserID(r)
+	actor, err := actorFromRequest(r)
 	if err != nil {
 		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
 		return
 	}
 
-	sourceID, err := h.authenticator.GetSourceID(r)
+	var req PushSessionCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", "Failed to parse push session request")
+		return
+	}
+
+	response, err := h.service.CreatePushSession(r.Context(), actor, &req)
 	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *PushSessionInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "push_session_invalid", invalidErr.Error())
+			return
+		}
+		h.logger.Error("Failed to create push session", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+		h.writeError(w, http.StatusInternalServerError, "push_session_create_failed", "Failed to create push session")
 		return
 	}
-
-	// Parse upload request
-	var uploadReq UploadRequest
-	if err := json.NewDecoder(r.Body).Decode(&uploadReq); err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "Failed to parse upload request")
-		return
-	}
-
-	// Process the upload with user and device context
-	response, err := h.service.ProcessUpload(r.Context(), userID, sourceID, &uploadReq)
-	if err != nil {
-		h.logger.Error("Failed to process upload", "error", err, "source_id", sourceID)
-		h.writeError(w, http.StatusInternalServerError, "upload_failed", "Failed to process upload")
-		return
-	}
-
-	//h.logger.Info("Successfully processed upload",
-	//	"source_id", sourceID,
-	//	"changes_count", len(uploadReq.Changes),
-	//	"highest_server_seq", response.HighestServerSeq)
 
 	w.Header().Set("Content-Type", "application/json")
-	if err = json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode upload response", "error", err, "source_id", sourceID)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		h.logger.Error("Failed to encode push session response", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
 	}
 }
 
-// HandleDownload processes download requests
-func (h *HTTPSyncHandlers) HandleDownload(w http.ResponseWriter, r *http.Request) {
+func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
+		return
+	}
+
+	actor, err := actorFromRequest(r)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+		return
+	}
+	pushID := strings.TrimSpace(r.PathValue("push_id"))
+
+	var req PushSessionChunkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", "Failed to parse push chunk request")
+		return
+	}
+
+	response, err := h.service.UploadPushChunk(r.Context(), actor, pushID, &req)
+	if err != nil {
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *PushChunkInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "push_chunk_invalid", invalidErr.Error())
+			return
+		}
+		var outOfOrderErr *PushChunkOutOfOrderError
+		if errors.As(err, &outOfOrderErr) {
+			h.writeError(w, http.StatusConflict, "push_chunk_out_of_order", outOfOrderErr.Error())
+			return
+		}
+		var notFoundErr *PushSessionNotFoundError
+		if errors.As(err, &notFoundErr) {
+			h.writeError(w, http.StatusNotFound, "push_session_not_found", notFoundErr.Error())
+			return
+		}
+		var expiredErr *PushSessionExpiredError
+		if errors.As(err, &expiredErr) {
+			h.writeError(w, http.StatusGone, "push_session_expired", expiredErr.Error())
+			return
+		}
+		var forbiddenErr *PushSessionForbiddenError
+		if errors.As(err, &forbiddenErr) {
+			h.writeError(w, http.StatusForbidden, "push_session_forbidden", forbiddenErr.Error())
+			return
+		}
+		h.logger.Error("Failed to upload push chunk", "error", err, "user_id", actor.UserID, "push_id", pushID)
+		h.writeError(w, http.StatusInternalServerError, "push_chunk_failed", "Failed to upload push chunk")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		h.logger.Error("Failed to encode push chunk response", "error", err, "user_id", actor.UserID, "push_id", pushID)
+	}
+}
+
+func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
+		return
+	}
+
+	actor, err := actorFromRequest(r)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+		return
+	}
+	pushID := strings.TrimSpace(r.PathValue("push_id"))
+
+	response, err := h.service.CommitPushSession(r.Context(), actor, pushID)
+	if err != nil {
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *PushCommitInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "push_commit_invalid", invalidErr.Error())
+			return
+		}
+		var conflictErr *PushConflictError
+		if errors.As(err, &conflictErr) {
+			h.writeError(w, http.StatusConflict, "push_conflict", conflictErr.Error())
+			return
+		}
+		var notFoundErr *PushSessionNotFoundError
+		if errors.As(err, &notFoundErr) {
+			h.writeError(w, http.StatusNotFound, "push_session_not_found", notFoundErr.Error())
+			return
+		}
+		var expiredErr *PushSessionExpiredError
+		if errors.As(err, &expiredErr) {
+			h.writeError(w, http.StatusGone, "push_session_expired", expiredErr.Error())
+			return
+		}
+		var forbiddenErr *PushSessionForbiddenError
+		if errors.As(err, &forbiddenErr) {
+			h.writeError(w, http.StatusForbidden, "push_session_forbidden", forbiddenErr.Error())
+			return
+		}
+		h.logger.Error("Failed to commit push session", "error", err, "user_id", actor.UserID, "push_id", pushID)
+		h.writeError(w, http.StatusInternalServerError, "push_session_commit_failed", "Failed to commit push session")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		h.logger.Error("Failed to encode push session commit response", "error", err, "user_id", actor.UserID, "push_id", pushID)
+	}
+}
+
+func (h *HTTPSyncHandlers) HandleGetCommittedBundleRows(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
 		return
 	}
 
-	userID, err := h.authenticator.GetUserID(r)
+	actor, err := actorFromRequest(r)
 	if err != nil {
 		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
 		return
 	}
 
-	sourceID, err := h.authenticator.GetSourceID(r)
+	bundleSeq, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("bundle_seq")), 10, 64)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", "bundle_seq must be an integer")
+		return
+	}
+
+	var afterRowOrdinal *int64
+	if afterStr := r.URL.Query().Get("after_row_ordinal"); afterStr != "" {
+		parsed, err := strconv.ParseInt(afterStr, 10, 64)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", "after_row_ordinal must be an integer")
+			return
+		}
+		afterRowOrdinal = &parsed
+	}
+
+	maxRows := h.service.defaultRowsPerCommittedBundleChunk()
+	if limitStr := r.URL.Query().Get("max_rows"); limitStr != "" {
+		parsed, err := strconv.Atoi(limitStr)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", "max_rows must be an integer")
+			return
+		}
+		maxRows = parsed
+	}
+
+	response, err := h.service.GetCommittedBundleRows(r.Context(), actor, bundleSeq, afterRowOrdinal, maxRows)
+	if err != nil {
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *CommittedBundleChunkInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", invalidErr.Error())
+			return
+		}
+		var notFoundErr *CommittedBundleNotFoundError
+		if errors.As(err, &notFoundErr) {
+			h.writeError(w, http.StatusNotFound, "committed_bundle_not_found", notFoundErr.Error())
+			return
+		}
+		h.logger.Error("Failed to get committed bundle rows", "error", err, "user_id", actor.UserID, "bundle_seq", bundleSeq)
+		h.writeError(w, http.StatusInternalServerError, "committed_bundle_rows_failed", "Failed to fetch committed bundle rows")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		h.logger.Error("Failed to encode committed bundle rows response", "error", err, "user_id", actor.UserID, "bundle_seq", bundleSeq)
+	}
+}
+
+func (h *HTTPSyncHandlers) HandleDeletePushSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only DELETE method is allowed")
+		return
+	}
+
+	actor, err := actorFromRequest(r)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+		return
+	}
+	pushID := strings.TrimSpace(r.PathValue("push_id"))
+
+	if err := h.service.DeletePushSession(r.Context(), actor, pushID); err != nil {
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *PushChunkInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "push_chunk_invalid", invalidErr.Error())
+			return
+		}
+		var notFoundErr *PushSessionNotFoundError
+		if errors.As(err, &notFoundErr) {
+			h.writeError(w, http.StatusNotFound, "push_session_not_found", notFoundErr.Error())
+			return
+		}
+		var expiredErr *PushSessionExpiredError
+		if errors.As(err, &expiredErr) {
+			h.writeError(w, http.StatusGone, "push_session_expired", expiredErr.Error())
+			return
+		}
+		var forbiddenErr *PushSessionForbiddenError
+		if errors.As(err, &forbiddenErr) {
+			h.writeError(w, http.StatusForbidden, "push_session_forbidden", forbiddenErr.Error())
+			return
+		}
+		h.logger.Error("Failed to delete push session", "error", err, "user_id", actor.UserID, "push_id", pushID)
+		h.writeError(w, http.StatusInternalServerError, "push_session_delete_failed", "Failed to delete push session")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandlePull processes bundle pull requests.
+func (h *HTTPSyncHandlers) HandlePull(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
+		return
+	}
+
+	actor, err := actorFromRequest(r)
 	if err != nil {
 		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
 		return
 	}
 
-	// Parse and validate query parameters
-	after := int64(0)
-	if afterStr := r.URL.Query().Get("after"); afterStr != "" {
+	afterBundleSeq := int64(0)
+	if afterStr := r.URL.Query().Get("after_bundle_seq"); afterStr != "" {
 		parsedAfter, err := strconv.ParseInt(afterStr, 10, 64)
 		if err != nil {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", "after must be an integer")
+			h.writeError(w, http.StatusBadRequest, "invalid_request", "after_bundle_seq must be an integer")
 			return
 		}
 		if parsedAfter < 0 {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", "after must be >= 0")
+			h.writeError(w, http.StatusBadRequest, "invalid_request", "after_bundle_seq must be >= 0")
 			return
 		}
-		after = parsedAfter
+		afterBundleSeq = parsedAfter
 	}
 
-	limit := 100
-	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+	maxBundles := defaultPullBundlesPerRequest
+	if limitStr := r.URL.Query().Get("max_bundles"); limitStr != "" {
 		parsedLimit, err := strconv.Atoi(limitStr)
 		if err != nil {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", "limit must be an integer")
+			h.writeError(w, http.StatusBadRequest, "invalid_request", "max_bundles must be an integer")
 			return
 		}
-		if parsedLimit < 1 || parsedLimit > 1000 {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 1000")
+		if parsedLimit < 1 || parsedLimit > defaultMaxBundlesPerPull {
+			h.writeError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("max_bundles must be between 1 and %d", defaultMaxBundlesPerPull))
 			return
 		}
-		limit = parsedLimit
+		maxBundles = parsedLimit
 	}
 
-	// Get optional schema filter and validate if provided
-	schemaFilter := r.URL.Query().Get("schema")
-	if schemaFilter != "" {
-		if !isValidSchemaName(schemaFilter) {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid schema name")
-			return
-		}
-	}
-
-	// Get optional includeSelf flag (for client recovery scenarios)
-	includeSelf := r.URL.Query().Get("include_self") == "true"
-
-	// Optional frozen upper bound for paging window
-	until := int64(0)
-	if untilStr := r.URL.Query().Get("until"); untilStr != "" {
-		v, err := strconv.ParseInt(untilStr, 10, 64)
+	targetBundleSeq := int64(0)
+	if targetStr := r.URL.Query().Get("target_bundle_seq"); targetStr != "" {
+		parsedTarget, err := strconv.ParseInt(targetStr, 10, 64)
 		if err != nil {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", "until must be an integer")
+			h.writeError(w, http.StatusBadRequest, "invalid_request", "target_bundle_seq must be an integer")
 			return
 		}
-		if v < 0 {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", "until must be >= 0")
+		if parsedTarget < 0 {
+			h.writeError(w, http.StatusBadRequest, "invalid_request", "target_bundle_seq must be >= 0")
 			return
 		}
-		until = v
+		targetBundleSeq = parsedTarget
 	}
 
-	// Process the download with user context (windowed)
-	response, err := h.service.ProcessDownloadWindowed(r.Context(), userID, sourceID, after, limit, schemaFilter, includeSelf, until)
+	response, err := h.service.ProcessPull(r.Context(), actor, afterBundleSeq, maxBundles, targetBundleSeq)
 	if err != nil {
-		h.logger.Error("Failed to process download", "error", err, "user_id", userID, "source_id", sourceID)
-		h.writeError(w, http.StatusInternalServerError, "download_failed", "Failed to process download")
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var prunedErr *HistoryPrunedError
+		if errors.As(err, &prunedErr) {
+			h.writeError(w, http.StatusConflict, "history_pruned", prunedErr.Error())
+			return
+		}
+		h.logger.Error("Failed to process pull", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+		h.writeError(w, http.StatusInternalServerError, "pull_failed", "Failed to process pull")
 		return
 	}
-
-	//h.logger.Debug("Successfully processed download",
-	//	"user_id", userID,
-	//	"source_id", sourceID,
-	//	"after", after,
-	//	"until", until,
-	//	"limit", limit,
-	//	"include_self", includeSelf,
-	//	"changes_count", len(response.Changes),
-	//	"has_more", response.HasMore)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err = json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode download response", "error", err, "user_id", userID, "source_id", sourceID)
+		h.logger.Error("Failed to encode pull response", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
 	}
 }
 
-// HandleListFailures lists materializer failures for the authenticated user
-func (h *HTTPSyncHandlers) HandleListFailures(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
-		return
-	}
-	userID, err := h.authenticator.GetUserID(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
-		return
-	}
-	schema := r.URL.Query().Get("schema")
-	table := r.URL.Query().Get("table")
-	limit := 100
-	if ls := r.URL.Query().Get("limit"); ls != "" {
-		if v, e := strconv.Atoi(ls); e == nil && v > 0 {
-			limit = v
-		}
-	}
-	rows, err := h.service.ListMaterializeFailures(r.Context(), userID, schema, table, limit)
-	if err != nil {
-		h.logger.Error("List failures error", "error", err)
-		h.writeError(w, http.StatusInternalServerError, "list_failures_failed", "Failed to list failures")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(rows)
-}
-
-// HandleRetryFailure retries a single failure by id for the authenticated user
-func (h *HTTPSyncHandlers) HandleRetryFailure(w http.ResponseWriter, r *http.Request) {
+// HandleCreateSnapshotSession creates one frozen snapshot session for chunked hydrate/recover.
+func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
 		return
 	}
-	userID, err := h.authenticator.GetUserID(r)
+
+	actor, err := actorFromRequest(r)
 	if err != nil {
 		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
 		return
 	}
-	// Accept id via query (?id=) or JSON body {"id": n}
-	var id int64
-	if qs := r.URL.Query().Get("id"); qs != "" {
-		if v, e := strconv.ParseInt(qs, 10, 64); e == nil {
-			id = v
-		}
-	}
-	if id == 0 {
-		var body struct {
-			ID int64 `json:"id"`
-		}
-		if e := json.NewDecoder(r.Body).Decode(&body); e == nil {
-			id = body.ID
-		}
-	}
-	if id <= 0 {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "missing or invalid id")
-		return
-	}
-	status, err := h.service.RetryMaterializeFailure(r.Context(), userID, id)
+
+	response, err := h.service.CreateSnapshotSession(r.Context(), actor)
 	if err != nil {
-		if errors.Is(err, errMaterializeFailureNotFound) {
-			h.writeError(w, http.StatusNotFound, "not_found", "materialize failure not found")
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
 			return
 		}
-		if errors.Is(err, errMaterializeFailureRetryInProgress) {
-			h.writeError(w, http.StatusConflict, "retry_in_progress", "materialize failure retry is already in progress")
-			return
-		}
-		h.logger.Error("Retry failure error", "error", err, "id", id)
-		h.writeError(w, http.StatusInternalServerError, "retry_failed", err.Error())
+		h.logger.Error("Failed to create snapshot session", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+		h.writeError(w, http.StatusInternalServerError, "snapshot_session_create_failed", "Failed to create snapshot session")
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	if err = json.NewEncoder(w).Encode(response); err != nil {
+		h.logger.Error("Failed to encode snapshot session response", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+	}
 }
 
-// HandleSchemaVersion returns the current schema version
-func (h *HTTPSyncHandlers) HandleSchemaVersion(w http.ResponseWriter, r *http.Request) {
+// HandleGetSnapshotChunk returns one chunk of rows from a frozen snapshot session.
+func (h *HTTPSyncHandlers) HandleGetSnapshotChunk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
 		return
 	}
-	response := SchemaVersionResponse{
-		Version: h.service.GetSchemaVersion(),
+
+	actor, err := actorFromRequest(r)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+		return
 	}
+
+	snapshotID := strings.TrimSpace(r.PathValue("snapshot_id"))
+	afterRowOrdinal := int64(0)
+	if afterStr := r.URL.Query().Get("after_row_ordinal"); afterStr != "" {
+		parsed, err := strconv.ParseInt(afterStr, 10, 64)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", "after_row_ordinal must be an integer")
+			return
+		}
+		afterRowOrdinal = parsed
+	}
+
+	maxRows := h.service.defaultRowsPerSnapshotChunk()
+	if limitStr := r.URL.Query().Get("max_rows"); limitStr != "" {
+		parsed, err := strconv.Atoi(limitStr)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", "max_rows must be an integer")
+			return
+		}
+		maxRows = parsed
+	}
+
+	response, err := h.service.GetSnapshotChunk(r.Context(), actor, snapshotID, afterRowOrdinal, maxRows)
+	if err != nil {
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *SnapshotChunkInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", invalidErr.Error())
+			return
+		}
+		var notFoundErr *SnapshotSessionNotFoundError
+		if errors.As(err, &notFoundErr) {
+			h.writeError(w, http.StatusNotFound, "snapshot_session_not_found", notFoundErr.Error())
+			return
+		}
+		var expiredErr *SnapshotSessionExpiredError
+		if errors.As(err, &expiredErr) {
+			h.writeError(w, http.StatusGone, "snapshot_session_expired", expiredErr.Error())
+			return
+		}
+		var forbiddenErr *SnapshotSessionForbiddenError
+		if errors.As(err, &forbiddenErr) {
+			h.writeError(w, http.StatusForbidden, "snapshot_session_forbidden", forbiddenErr.Error())
+			return
+		}
+		h.logger.Error("Failed to get snapshot chunk", "error", err, "user_id", actor.UserID, "snapshot_id", snapshotID)
+		h.writeError(w, http.StatusInternalServerError, "snapshot_chunk_failed", "Failed to get snapshot chunk")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err = json.NewEncoder(w).Encode(response); err != nil {
+		h.logger.Error("Failed to encode snapshot chunk response", "error", err, "user_id", actor.UserID, "snapshot_id", snapshotID)
+	}
+}
+
+// HandleDeleteSnapshotSession deletes an existing frozen snapshot session.
+func (h *HTTPSyncHandlers) HandleDeleteSnapshotSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only DELETE method is allowed")
+		return
+	}
+
+	actor, err := actorFromRequest(r)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+		return
+	}
+
+	snapshotID := strings.TrimSpace(r.PathValue("snapshot_id"))
+	if err := h.service.DeleteSnapshotSession(r.Context(), actor, snapshotID); err != nil {
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *SnapshotChunkInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", invalidErr.Error())
+			return
+		}
+		var notFoundErr *SnapshotSessionNotFoundError
+		if errors.As(err, &notFoundErr) {
+			h.writeError(w, http.StatusNotFound, "snapshot_session_not_found", notFoundErr.Error())
+			return
+		}
+		var forbiddenErr *SnapshotSessionForbiddenError
+		if errors.As(err, &forbiddenErr) {
+			h.writeError(w, http.StatusForbidden, "snapshot_session_forbidden", forbiddenErr.Error())
+			return
+		}
+		h.logger.Error("Failed to delete snapshot session", "error", err, "user_id", actor.UserID, "snapshot_id", snapshotID)
+		h.writeError(w, http.StatusInternalServerError, "snapshot_session_delete_failed", "Failed to delete snapshot session")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleStatus returns the current lifecycle and operability status snapshot.
+func (h *HTTPSyncHandlers) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
+		return
+	}
+	response, err := h.service.GetStatus(r.Context())
+	if err != nil {
+		h.logger.Error("Failed to get service status", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "status_failed", "Failed to get service status")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// HandleHealth returns a readiness-oriented health response derived from the service status snapshot.
+func (h *HTTPSyncHandlers) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
+		return
+	}
+	response, err := h.service.GetStatus(r.Context())
+	if err != nil {
+		h.logger.Error("Failed to get health status", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "health_failed", "Failed to get health status")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if response.Status == "unhealthy" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+// HandleCapabilities returns the current sync capabilities surface.
+func (h *HTTPSyncHandlers) HandleCapabilities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
+		return
+	}
+	response := h.service.GetCapabilities()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }

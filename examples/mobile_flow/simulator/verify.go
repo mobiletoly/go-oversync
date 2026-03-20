@@ -6,17 +6,17 @@ import (
 	"fmt"
 )
 
-// DebugVerifyPendingCleared checks that the local pending queue is empty.
+// DebugVerifyPendingCleared checks that the local dirty-row queue is empty.
 func (app *MobileApp) DebugVerifyPendingCleared(ctx context.Context) error {
 	if app.db == nil {
 		return fmt.Errorf("database not initialized")
 	}
 	var pending int
-	if err := app.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_pending`).Scan(&pending); err != nil {
-		return fmt.Errorf("failed to count _sync_pending: %w", err)
+	if err := app.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&pending); err != nil {
+		return fmt.Errorf("failed to count _sync_dirty_rows: %w", err)
 	}
 	if pending != 0 {
-		return fmt.Errorf("pending not cleared: %d changes remain", pending)
+		return fmt.Errorf("dirty rows not cleared: %d changes remain", pending)
 	}
 	return nil
 }

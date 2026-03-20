@@ -3,6 +3,7 @@ package oversqlite
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -57,7 +58,7 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 	config := DefaultConfig("test", []SyncTable{
 		{TableName: "users", SyncKeyColumnName: "user_uuid"},
 		{TableName: "products", SyncKeyColumnName: "product_code"},
-		{TableName: "posts"}, // Empty string should default to "id"
+		{TableName: "posts", SyncKeyColumnName: "id"},
 	})
 
 	// Mock token function
@@ -87,27 +88,38 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 		t.Errorf("Expected %d triggers, got %d", expectedTriggers, triggerCount)
 	}
 
-	// Test getPrimaryKeyColumn helper method
+	// Test primaryKeyColumnForTable helper method
 	testCases := []struct {
 		tableName  string
 		expectedPK string
+		expectErr  bool
 	}{
-		{"users", "user_uuid"},
-		{"products", "product_code"},
-		{"posts", "id"},
-		{"nonexistent", "id"}, // Should default to "id" for unknown tables
+		{"users", "user_uuid", false},
+		{"products", "product_code", false},
+		{"posts", "id", false},
+		{"nonexistent", "", true},
 	}
 
 	for _, tc := range testCases {
-		actualPK := client.getPrimaryKeyColumn(tc.tableName)
+		actualPK, err := client.primaryKeyColumnForTable(tc.tableName)
+		if tc.expectErr {
+			if err == nil {
+				t.Errorf("expected error for table %s, got pk %s", tc.tableName, actualPK)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("unexpected error for table %s: %v", tc.tableName, err)
+			continue
+		}
 		if actualPK != tc.expectedPK {
 			t.Errorf("For table %s, expected PK column %s, got %s", tc.tableName, tc.expectedPK, actualPK)
 		}
 	}
 }
 
-// TestDefaultConfigBackwardCompatibility tests that DefaultConfig still works as expected
-func TestDefaultConfigBackwardCompatibility(t *testing.T) {
+// TestNewClient_RequiresExplicitPrimaryKeyConfig verifies that setup fails without SyncKeyColumnName.
+func TestNewClient_RequiresExplicitPrimaryKeyConfig(t *testing.T) {
 	// Create in-memory SQLite database
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
@@ -127,7 +139,7 @@ func TestDefaultConfigBackwardCompatibility(t *testing.T) {
 		t.Fatalf("Failed to create users table: %v", err)
 	}
 
-	// Use DefaultConfig with empty SyncKeyColumnName (defaults to "id")
+	// Use DefaultConfig with empty SyncKeyColumnName - this is now invalid.
 	config := DefaultConfig("test", []SyncTable{
 		{TableName: "users"},
 	})
@@ -142,7 +154,7 @@ func TestDefaultConfigBackwardCompatibility(t *testing.T) {
 		t.Errorf("Expected table name 'users', got '%s'", syncTable.TableName)
 	}
 	if syncTable.SyncKeyColumnName != "" {
-		t.Errorf("Expected empty SyncKeyColumnName (defaults to 'id'), got '%s'", syncTable.SyncKeyColumnName)
+		t.Errorf("Expected empty SyncKeyColumnName, got '%s'", syncTable.SyncKeyColumnName)
 	}
 
 	// Mock token function
@@ -150,16 +162,42 @@ func TestDefaultConfigBackwardCompatibility(t *testing.T) {
 		return "mock-token", nil
 	}
 
-	// Create client - should work without issues
-	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, config)
+	_, err = NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, config)
+	if err == nil {
+		t.Fatal("expected client creation to fail when SyncKeyColumnName is omitted")
+	}
+}
+
+func TestNewClient_FailsWhenSyncKeyColumnDoesNotExist(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create users table: %v", err)
 	}
 
-	// Test that the primary key column defaults to "id"
-	actualPK := client.getPrimaryKeyColumn("users")
-	if actualPK != "id" {
-		t.Errorf("Expected PK column 'id', got '%s'", actualPK)
+	config := DefaultConfig("test", []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "missing_pk"},
+	})
+	tokenFunc := func(ctx context.Context) (string, error) {
+		return "mock-token", nil
+	}
+
+	_, err = NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, config)
+	if err == nil {
+		t.Fatal("expected client creation to fail when SyncKeyColumnName does not exist")
+	}
+	if !strings.Contains(err.Error(), "missing_pk") {
+		t.Fatalf("expected error to mention missing_pk, got: %v", err)
 	}
 }
 
@@ -273,13 +311,13 @@ func TestTriggersWithCustomPKFunctionality(t *testing.T) {
 		t.Fatalf("Failed to create triggers: %v", err)
 	}
 
-	// Set up client info for triggers to work
+	// Set up client state for triggers to work
 	_, err = db.Exec(`
-		INSERT INTO _sync_client_info (user_id, source_id, next_change_id, last_server_seq_seen, apply_mode)
+		INSERT INTO _sync_client_state (user_id, source_id, next_source_bundle_id, last_bundle_seq_seen, apply_mode)
 		VALUES ('test-user', 'test-source', 1, 0, 0)
 	`)
 	if err != nil {
-		t.Fatalf("Failed to insert client info: %v", err)
+		t.Fatalf("Failed to insert client state: %v", err)
 	}
 
 	// Test INSERT trigger
@@ -291,26 +329,13 @@ func TestTriggersWithCustomPKFunctionality(t *testing.T) {
 		t.Fatalf("Failed to insert test item: %v", err)
 	}
 
-	// Verify that sync metadata was created
-	var metaCount int
-	err = db.QueryRow(`
-		SELECT COUNT(*) FROM _sync_row_meta
-		WHERE table_name='test_items' AND pk_uuid='ITEM001'
-	`).Scan(&metaCount)
-	if err != nil {
-		t.Fatalf("Failed to query row meta: %v", err)
-	}
-	if metaCount != 1 {
-		t.Errorf("Expected 1 row meta entry, got %d", metaCount)
-	}
-
-	// Verify that pending change was created
+	// Verify that dirty row was created
 	var pendingCount int
 	var op string
 	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(MAX(op), '') FROM _sync_pending
-		WHERE table_name='test_items' AND pk_uuid='ITEM001'
-	`).Scan(&pendingCount, &op)
+		SELECT COUNT(*), COALESCE(MAX(op), '') FROM _sync_dirty_rows
+		WHERE table_name='test_items' AND key_json=?
+	`, fmt.Sprintf(`{"item_code":"%s"}`, "ITEM001")).Scan(&pendingCount, &op)
 	if err != nil {
 		t.Fatalf("Failed to query pending changes: %v", err)
 	}
@@ -331,9 +356,9 @@ func TestTriggersWithCustomPKFunctionality(t *testing.T) {
 
 	// Verify that pending change was updated (should still be INSERT since it was a new row)
 	err = db.QueryRow(`
-		SELECT COUNT(*), COALESCE(MAX(op), '') FROM _sync_pending
-		WHERE table_name='test_items' AND pk_uuid='ITEM001'
-	`).Scan(&pendingCount, &op)
+		SELECT COUNT(*), COALESCE(MAX(op), '') FROM _sync_dirty_rows
+		WHERE table_name='test_items' AND key_json=?
+	`, fmt.Sprintf(`{"item_code":"%s"}`, "ITEM001")).Scan(&pendingCount, &op)
 	if err != nil {
 		t.Fatalf("Failed to query pending changes after update: %v", err)
 	}
@@ -352,28 +377,27 @@ func TestTriggersWithCustomPKFunctionality(t *testing.T) {
 		t.Fatalf("Failed to delete test item: %v", err)
 	}
 
-	// Verify that the INSERT was canceled (net no-op for unsynced INSERT->DELETE)
+	// INSERT→DELETE remains queued as a delete until push collection removes the no-op.
 	err = db.QueryRow(`
-		SELECT COUNT(*) FROM _sync_pending
-		WHERE table_name='test_items' AND pk_uuid='ITEM001'
-	`).Scan(&pendingCount)
+		SELECT COUNT(*) FROM _sync_dirty_rows
+		WHERE table_name='test_items' AND key_json=?
+	`, fmt.Sprintf(`{"item_code":"%s"}`, "ITEM001")).Scan(&pendingCount)
 	if err != nil {
 		t.Fatalf("Failed to query pending changes after delete: %v", err)
 	}
-	if pendingCount != 0 {
-		t.Errorf("Expected 0 pending changes after delete (INSERT->DELETE should cancel), got %d", pendingCount)
+	if pendingCount != 1 {
+		t.Errorf("Expected 1 queued delete after local delete, got %d", pendingCount)
 	}
 
-	// Verify that row meta was cleaned up for unsynced row
 	err = db.QueryRow(`
-		SELECT COUNT(*) FROM _sync_row_meta
-		WHERE table_name='test_items' AND pk_uuid='ITEM001'
-	`).Scan(&metaCount)
+		SELECT COALESCE(MAX(op), '') FROM _sync_dirty_rows
+		WHERE table_name='test_items' AND key_json=?
+	`, fmt.Sprintf(`{"item_code":"%s"}`, "ITEM001")).Scan(&op)
 	if err != nil {
-		t.Fatalf("Failed to query row meta after delete: %v", err)
+		t.Fatalf("Failed to query queued delete after local delete: %v", err)
 	}
-	if metaCount != 0 {
-		t.Errorf("Expected 0 row meta entries after delete (should be cleaned up), got %d", metaCount)
+	if op != "DELETE" {
+		t.Errorf("Expected queued delete after local delete, got %s", op)
 	}
 }
 

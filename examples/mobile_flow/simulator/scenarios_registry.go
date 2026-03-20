@@ -20,8 +20,8 @@ func GetScenario(simulator *Simulator, scenarioName string) Scenario {
 		return NewConflictsScenario(simulator)
 	case "user-switch":
 		return NewUserSwitchScenario(simulator)
-	case "fk-batch-retry":
-		return NewFKBatchRetryScenario(simulator)
+	case "bundle-fk-atomicity":
+		return NewBundleFKAtomicityScenario(simulator)
 	case "complex-multi-batch":
 		return NewComplexMultiBatchScenario(simulator)
 	case "multi-device-sync":
@@ -45,7 +45,7 @@ func GetAvailableScenarios() []string {
 		"offline-online",
 		"conflicts",
 		"user-switch",
-		"fk-batch-retry",
+		"bundle-fk-atomicity",
 		"complex-multi-batch",
 		"multi-device-sync",
 		"multi-device-complex",

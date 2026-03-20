@@ -3,6 +3,7 @@ package oversqlite
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -20,7 +21,11 @@ func TestInitializeDatabase(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify sync metadata tables were created
-	expectedTables := []string{"_sync_client_info", "_sync_row_meta", "_sync_pending"}
+	expectedTables := []string{
+		"_sync_client_state",
+		"_sync_row_state",
+		"_sync_dirty_rows",
+	}
 	for _, table := range expectedTables {
 		var count int
 		err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count)
@@ -40,6 +45,37 @@ func TestInitializeDatabase(t *testing.T) {
 	err = db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys)
 	require.NoError(t, err)
 	require.Equal(t, 1, foreignKeys)
+}
+
+func TestInitializeDatabase_ResetsStuckApplyModeAfterCrash(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE _sync_client_state (
+			user_id TEXT NOT NULL PRIMARY KEY,
+			source_id TEXT NOT NULL,
+			schema_name TEXT NOT NULL DEFAULT '',
+			next_source_bundle_id INTEGER NOT NULL DEFAULT 1,
+			last_bundle_seq_seen INTEGER NOT NULL DEFAULT 0,
+			apply_mode INTEGER NOT NULL DEFAULT 0
+		)
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_client_state(user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode)
+		VALUES ('u', 'd', 'business', 1, 0, 1)
+	`)
+	require.NoError(t, err)
+
+	err = initializeDatabase(db)
+	require.NoError(t, err)
+
+	var applyMode int
+	err = db.QueryRow(`SELECT COALESCE(MAX(apply_mode), 0) FROM _sync_client_state`).Scan(&applyMode)
+	require.NoError(t, err)
+	require.Equal(t, 0, applyMode)
 }
 
 func TestEnsureSourceID(t *testing.T) {
@@ -70,17 +106,138 @@ func TestEnsureSourceID(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, sourceID1, sourceID3)
 
-	// Verify client info was created correctly
+	// Verify client state was created correctly
 	var storedSourceID string
-	var nextChangeID, lastServerSeq int64
+	var nextBundleID, lastBundleSeq int64
 	err = db.QueryRow(`
-		SELECT source_id, next_change_id, last_server_seq_seen 
-		FROM _sync_client_info WHERE user_id = ?
-	`, userID).Scan(&storedSourceID, &nextChangeID, &lastServerSeq)
+		SELECT source_id, next_source_bundle_id, last_bundle_seq_seen
+		FROM _sync_client_state WHERE user_id = ?
+	`, userID).Scan(&storedSourceID, &nextBundleID, &lastBundleSeq)
 	require.NoError(t, err)
 	require.Equal(t, sourceID1, storedSourceID)
-	require.Equal(t, int64(1), nextChangeID)
-	require.Equal(t, int64(0), lastServerSeq)
+	require.Equal(t, int64(1), nextBundleID)
+	require.Equal(t, int64(0), lastBundleSeq)
+}
+
+func TestBootstrap_PersistsConfiguredSchemaIdentity(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	client, err := NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("business", []SyncTable{
+		{TableName: "users", SyncKeyColumns: []string{"id"}},
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+
+	err = client.Bootstrap(context.Background(), false)
+	require.NoError(t, err)
+
+	var schemaName string
+	err = db.QueryRow(`SELECT schema_name FROM _sync_client_state WHERE user_id = ?`, "test-user").Scan(&schemaName)
+	require.NoError(t, err)
+	require.Equal(t, "business", schemaName)
+}
+
+func TestBootstrap_DifferentSourceClearsLocalStateAndRequiresRebuild(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('stale', 'Stale', 'stale@example.com')`)
+	require.NoError(t, err)
+
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	require.NoError(t, client.updateStructuredRowStateInTx(ctx, tx, "main", "users", rowKeyJSON("stale"), 7, false))
+	require.NoError(t, tx.Commit())
+
+	_, err = db.Exec(`
+		INSERT INTO _sync_push_outbound (
+			source_bundle_id, row_ordinal, schema_name, table_name, key_json, op, base_row_version, payload
+		) VALUES (5, 0, 'main', 'users', ?, 'UPDATE', 7, ?)
+	`, rowKeyJSON("stale"), `{"id":"stale","name":"Stale","email":"stale@example.com"}`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_push_stage (
+			bundle_seq, row_ordinal, schema_name, table_name, key_json, op, row_version, payload
+		) VALUES (9, 0, 'main', 'users', ?, 'UPDATE', 8, ?)
+	`, rowKeyJSON("stale"), `{"id":"stale","name":"Stage","email":"stage@example.com"}`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_snapshot_stage (
+			snapshot_id, row_ordinal, schema_name, table_name, key_json, row_version, payload
+		) VALUES ('snapshot-stale', 1, 'main', 'users', ?, 8, ?)
+	`, rowKeyJSON("stale"), `{"id":"stale","name":"Snapshot","email":"snapshot@example.com"}`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+	UPDATE _sync_client_state
+		SET next_source_bundle_id = 5, last_bundle_seq_seen = 4, rebuild_required = 0
+		WHERE user_id = ?
+	`, client.UserID)
+	require.NoError(t, err)
+	require.NoError(t, client.Close())
+
+	rebound, err := NewClient(db, "http://example.invalid", client.UserID, "replacement-device", func(context.Context) (string, error) {
+		return "token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rebound.Close()) })
+	require.NoError(t, rebound.Bootstrap(ctx, false))
+	require.Equal(t, "replacement-device", rebound.SourceID)
+
+	var (
+		sourceID           string
+		nextSourceBundleID int64
+		lastBundleSeqSeen  int64
+		applyMode          int
+		rebuildRequired    int
+	)
+	require.NoError(t, db.QueryRow(`
+		SELECT source_id, next_source_bundle_id, last_bundle_seq_seen, apply_mode, rebuild_required
+		FROM _sync_client_state
+		WHERE user_id = ?
+	`, rebound.UserID).Scan(&sourceID, &nextSourceBundleID, &lastBundleSeqSeen, &applyMode, &rebuildRequired))
+	require.Equal(t, rebound.SourceID, sourceID)
+	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, int64(0), lastBundleSeqSeen)
+	require.Equal(t, 0, applyMode)
+	require.Equal(t, 1, rebuildRequired)
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
+	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_row_state`).Scan(&count))
+	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&count))
+	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&count))
+	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&count))
+	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_snapshot_stage`).Scan(&count))
+	require.Equal(t, 0, count)
+
+	err = rebound.PushPending(ctx)
+	var rebuildErr *RebuildRequiredError
+	require.ErrorAs(t, err, &rebuildErr)
+
+	err = rebound.PullToStable(ctx)
+	require.ErrorAs(t, err, &rebuildErr)
 }
 
 func TestCreateTriggersForTable(t *testing.T) {
@@ -105,7 +262,7 @@ func TestCreateTriggersForTable(t *testing.T) {
 
 	// Create client with registered table (this will create triggers automatically)
 	config := DefaultConfig("business", []SyncTable{
-		{TableName: "test_table"},
+		{TableName: "test_table", SyncKeyColumns: []string{"id"}},
 	})
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
 	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, config)
@@ -133,30 +290,26 @@ func TestCreateTriggersForTable(t *testing.T) {
 	_, err = db.Exec("INSERT INTO test_table (id, name, value) VALUES (?, ?, ?)", "test-1", "Test Record", 42)
 	require.NoError(t, err)
 
-	// Verify pending change was created
+	// Verify dirty row was created
 	var pendingCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM _sync_pending WHERE table_name = ?", "test_table").Scan(&pendingCount)
+	err = db.QueryRow("SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = ?", "test_table").Scan(&pendingCount)
 	require.NoError(t, err)
 	require.Equal(t, 1, pendingCount)
 
-	// Verify row metadata was created
-	var metaCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM _sync_row_meta WHERE table_name = ?", "test_table").Scan(&metaCount)
-	require.NoError(t, err)
-	require.Equal(t, 1, metaCount)
+	// Local triggers only populate the dirty-row queue. Authoritative row state is recorded after bundle apply.
 
 	// Test update operation
 	_, err = db.Exec("UPDATE test_table SET name = ? WHERE id = ?", "Updated Record", "test-1")
 	require.NoError(t, err)
 
 	// Should still have 1 pending change (coalesced)
-	err = db.QueryRow("SELECT COUNT(*) FROM _sync_pending WHERE table_name = ?", "test_table").Scan(&pendingCount)
+	err = db.QueryRow("SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = ?", "test_table").Scan(&pendingCount)
 	require.NoError(t, err)
 	require.Equal(t, 1, pendingCount)
 
 	// Verify operation is INSERT (preserved from original INSERT, not downgraded to UPDATE)
 	var op string
-	err = db.QueryRow("SELECT op FROM _sync_pending WHERE table_name = ? AND pk_uuid = ?", "test_table", "test-1").Scan(&op)
+	err = db.QueryRow("SELECT op FROM _sync_dirty_rows WHERE table_name = ? AND key_json = ?", "test_table", rowKeyJSON("test-1")).Scan(&op)
 	require.NoError(t, err)
 	require.Equal(t, "INSERT", op, "INSERT→UPDATE should preserve INSERT operation")
 
@@ -164,22 +317,20 @@ func TestCreateTriggersForTable(t *testing.T) {
 	_, err = db.Exec("DELETE FROM test_table WHERE id = ?", "test-1")
 	require.NoError(t, err)
 
-	// Should now have 0 pending changes (INSERT→DELETE becomes no-op)
-	err = db.QueryRow("SELECT COUNT(*) FROM _sync_pending WHERE table_name = ?", "test_table").Scan(&pendingCount)
+	// INSERT→DELETE collapses to a no-op during push collection, not at trigger time.
+	err = db.QueryRow("SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = ?", "test_table").Scan(&pendingCount)
 	require.NoError(t, err)
-	require.Equal(t, 0, pendingCount, "INSERT→DELETE should result in no pending changes")
+	require.Equal(t, 1, pendingCount, "INSERT→DELETE should remain queued until push collection removes the no-op")
 
-	// Verify no pending change exists for this record
+	// The queued no-op is represented as a delete against the unsynced key.
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM _sync_pending WHERE table_name = ? AND pk_uuid = ?", "test_table", "test-1").Scan(&count)
+	err = db.QueryRow("SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = ? AND key_json = ?", "test_table", rowKeyJSON("test-1")).Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, 0, count, "No pending changes should exist after INSERT→DELETE")
+	require.Equal(t, 1, count, "The queued delete should still be present until push collection clears it")
 
-	// Verify that metadata was cleaned up for never-synced INSERT→DELETE
-	var deletedMetaCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM _sync_row_meta WHERE table_name = ? AND pk_uuid = ?", "test_table", "test-1").Scan(&deletedMetaCount)
+	err = db.QueryRow("SELECT op FROM _sync_dirty_rows WHERE table_name = ? AND key_json = ?", "test_table", rowKeyJSON("test-1")).Scan(&op)
 	require.NoError(t, err)
-	require.Equal(t, 0, deletedMetaCount, "Metadata should be cleaned up for never-synced INSERT→DELETE")
+	require.Equal(t, "DELETE", op, "The queued no-op should be represented as a delete intent")
 }
 
 func TestDefaultResolver(t *testing.T) {
@@ -212,6 +363,7 @@ func TestNewClient(t *testing.T) {
 	config := DefaultConfig("business", []SyncTable{})
 	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-device", tokenFunc, config)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	require.NotNil(t, client)
 	require.Equal(t, db, client.DB)
 	require.Equal(t, "http://localhost:8080", client.BaseURL)
@@ -225,4 +377,231 @@ func TestNewClient(t *testing.T) {
 	token, err := client.Token(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "test-token", token)
+}
+
+func TestNewClient_FailsWhenManagedTablesAreNotFKClosed(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TABLE posts (
+			id TEXT PRIMARY KEY,
+			author_id TEXT NOT NULL REFERENCES users(id),
+			title TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "posts", SyncKeyColumns: []string{"id"}},
+	}))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not FK-closed")
+	require.Contains(t, err.Error(), "posts.author_id -> users.id")
+}
+
+func TestNewClient_RejectsSecondActiveClientForSameSQLiteDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "shared.sqlite")
+
+	db1, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db1.Close() })
+
+	_, err = db1.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	client1, err := NewClient(db1, "http://localhost", "test-user", "test-source-a", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "users", SyncKeyColumns: []string{"id"}},
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client1.Close()) })
+
+	db2, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db2.Close() })
+
+	_, err = NewClient(db2, "http://localhost", "test-user", "test-source-b", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "users", SyncKeyColumns: []string{"id"}},
+	}))
+	var ownedErr *DatabaseAlreadyOwnedError
+	require.ErrorAs(t, err, &ownedErr)
+	require.Contains(t, ownedErr.Database, filepath.Base(dbPath))
+}
+
+func TestNewClient_AllowsSecondClientAfterClose(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "shared.sqlite")
+
+	db1, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db1.Close() })
+
+	_, err = db1.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	client1, err := NewClient(db1, "http://localhost", "test-user", "test-source-a", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "users", SyncKeyColumns: []string{"id"}},
+	}))
+	require.NoError(t, err)
+	require.NoError(t, client1.Close())
+
+	db2, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db2.Close() })
+
+	client2, err := NewClient(db2, "http://localhost", "test-user", "test-source-b", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "users", SyncKeyColumns: []string{"id"}},
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client2.Close()) })
+}
+
+func TestNewClient_FailsWhenExistingSyncStateUsesDifferentSchema(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	require.NoError(t, initializeDatabase(db))
+
+	_, err = db.Exec(`
+		INSERT INTO _sync_client_state (user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode)
+		VALUES (?, ?, ?, 1, 0, 0)
+	`, "test-user", "existing-source", "other_business")
+	require.NoError(t, err)
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("business", []SyncTable{
+		{TableName: "users", SyncKeyColumns: []string{"id"}},
+	}))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exactly one configured schema")
+	require.Contains(t, err.Error(), "other_business")
+}
+
+func TestNewClient_AllowsSelfReferencingManagedTable(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE categories (
+			id TEXT PRIMARY KEY,
+			parent_id TEXT REFERENCES categories(id),
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	client, err := NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "categories", SyncKeyColumns: []string{"id"}},
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	require.NotNil(t, client)
+}
+
+func TestNewClient_FailsWhenTableNameIsSchemaQualified(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("business", []SyncTable{
+		{TableName: "main.users", SyncKeyColumns: []string{"id"}},
+	}))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must not include a schema qualifier")
+}
+
+func TestNewClient_FailsWhenCompositeSyncKeyColumnsConfigured(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE pairs (
+			left_id TEXT NOT NULL,
+			right_id TEXT NOT NULL,
+			PRIMARY KEY (left_id, right_id)
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "pairs", SyncKeyColumns: []string{"left_id", "right_id"}},
+	}))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exactly one sync key column")
+}
+
+func TestNewClient_FailsWhenManagedTablesContainCompositeFK(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE parents (
+			id TEXT PRIMARY KEY,
+			code_a TEXT NOT NULL,
+			code_b TEXT NOT NULL,
+			UNIQUE (code_a, code_b)
+		)
+	`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`
+		CREATE TABLE children (
+			id TEXT PRIMARY KEY,
+			parent_code_a TEXT NOT NULL,
+			parent_code_b TEXT NOT NULL,
+			FOREIGN KEY (parent_code_a, parent_code_b) REFERENCES parents(code_a, code_b)
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "parents", SyncKeyColumns: []string{"id"}},
+		{TableName: "children", SyncKeyColumns: []string{"id"}},
+	}))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported composite foreign keys")
 }

@@ -3,77 +3,160 @@
 
 package oversync
 
-import (
-	"encoding/json"
-	"time"
-)
+import "encoding/json"
 
 // REST/JSON models for HTTP API requests and responses
 // These models are used for serialization/deserialization of HTTP requests and responses
 
-// UploadRequest represents a batch upload request from client
-// Note: source_id is derived from JWT did claim, not from request body
-type UploadRequest struct {
-	LastServerSeqSeen int64          `json:"last_server_seq_seen"` // Last server_id client has seen
-	Changes           []ChangeUpload `json:"changes"`              // Batch of changes to upload
+// SyncKey represents the canonical structured identity for a synced row.
+type SyncKey map[string]any
+
+// BundleRow describes one normalized row effect inside a committed sync bundle.
+type BundleRow struct {
+	Schema     string          `json:"schema"`
+	Table      string          `json:"table"`
+	Key        SyncKey         `json:"key"`
+	Op         string          `json:"op"`
+	RowVersion int64           `json:"row_version"`
+	Payload    json.RawMessage `json:"payload,omitempty"`
 }
 
-// ChangeUpload represents a single change in upload request
-type ChangeUpload struct {
-	SourceChangeID int64           `json:"source_change_id"`  // Client-local change ID (from _change_log.id)
-	Schema         string          `json:"schema,omitempty"`  // Schema name (default: "public")
-	Table          string          `json:"table"`             // Table name (e.g., "note")
-	Op             string          `json:"op"`                // INSERT, UPDATE, DELETE
-	PK             string          `json:"pk"`                // UUID as string
-	ServerVersion  int64           `json:"server_version"`    // Expected server version for conflict detection
-	Payload        json.RawMessage `json:"payload,omitempty"` // JSON payload (null for DELETE)
+// Bundle represents one committed durable sync unit in the target bundle-based contract.
+type Bundle struct {
+	BundleSeq      int64       `json:"bundle_seq"`
+	SourceID       string      `json:"source_id"`
+	SourceBundleID int64       `json:"source_bundle_id"`
+	RowCount       int64       `json:"row_count,omitempty"`
+	BundleHash     string      `json:"bundle_hash,omitempty"`
+	Rows           []BundleRow `json:"rows"`
 }
 
-// UploadResponse represents server response to upload request
-type UploadResponse struct {
-	Accepted         bool                 `json:"accepted"`           // Overall success
-	HighestServerSeq int64                `json:"highest_server_seq"` // Current max server_id
-	Statuses         []ChangeUploadStatus `json:"statuses"`           // Per-change results
+// PushRequestRow is one locally dirty row intent sent by the client.
+type PushRequestRow struct {
+	Schema         string          `json:"schema"`
+	Table          string          `json:"table"`
+	Key            SyncKey         `json:"key"`
+	Op             string          `json:"op"`
+	BaseRowVersion int64           `json:"base_row_version"`
+	Payload        json.RawMessage `json:"payload,omitempty"`
 }
 
-// ChangeUploadStatus represents the result of processing a single change
-type ChangeUploadStatus struct {
-	SourceChangeID   int64           `json:"source_change_id"`             // Echo back the client's ID
-	Status           string          `json:"status"`                       // "applied", "conflict", "invalid" (and "materialize_error" for admin retry)
-	NewServerVersion *int64          `json:"new_server_version,omitempty"` // New version if applied
-	ServerRow        json.RawMessage `json:"server_row,omitempty"`         // Current server state if conflict
-	Message          string          `json:"message,omitempty"`            // Optional details for errors
-	Invalid          map[string]any  `json:"invalid,omitempty"`            // Structured invalid information with reason and details
+type PushSessionCreateRequest struct {
+	SourceID        string `json:"source_id"`
+	SourceBundleID  int64  `json:"source_bundle_id"`
+	PlannedRowCount int64  `json:"planned_row_count"`
 }
 
-// DownloadResponse represents server response to download request
-type DownloadResponse struct {
-	Changes     []ChangeDownloadResponse `json:"changes"`      // Changes to apply
-	HasMore     bool                     `json:"has_more"`     // More changes available
-	NextAfter   int64                    `json:"next_after"`   // Next server_id to request
-	WindowUntil int64                    `json:"window_until"` // Upper-bound snapshot for this paging session
+type PushSessionCreateResponse struct {
+	PushID                 string `json:"push_id,omitempty"`
+	Status                 string `json:"status"`
+	PlannedRowCount        int64  `json:"planned_row_count,omitempty"`
+	NextExpectedRowOrdinal int64  `json:"next_expected_row_ordinal,omitempty"`
+	BundleSeq              int64  `json:"bundle_seq,omitempty"`
+	SourceID               string `json:"source_id,omitempty"`
+	SourceBundleID         int64  `json:"source_bundle_id,omitempty"`
+	RowCount               int64  `json:"row_count,omitempty"`
+	BundleHash             string `json:"bundle_hash,omitempty"`
 }
 
-// ChangeDownloadResponse represents a single change in download response
-type ChangeDownloadResponse struct {
-	ServerID       int64           `json:"server_id"`         // Server sequence number
-	Schema         string          `json:"schema"`            // Schema name
-	TableName      string          `json:"table"`             // Table name (renamed from table_name for consistency)
-	Op             string          `json:"op"`                // INSERT, UPDATE, DELETE
-	PK             string          `json:"pk"`                // UUID as string
-	Payload        json.RawMessage `json:"payload,omitempty"` // JSON payload (may be null for DELETE)
-	ServerVersion  int64           `json:"server_version"`    // Current server version from sync_row_meta
-	Deleted        bool            `json:"deleted"`           // Deletion status from sync_row_meta
-	SourceID       string          `json:"source_id"`         // Originating client (for filtering)
-	SourceChangeID int64           `json:"source_change_id"`  // Original client change ID
-	Timestamp      time.Time       `json:"ts"`                // When change was applied (renamed for consistency)
+type PushSessionChunkRequest struct {
+	StartRowOrdinal int64            `json:"start_row_ordinal"`
+	Rows            []PushRequestRow `json:"rows"`
+}
+
+type PushSessionChunkResponse struct {
+	PushID                 string `json:"push_id"`
+	NextExpectedRowOrdinal int64  `json:"next_expected_row_ordinal"`
+}
+
+type PushSessionCommitResponse struct {
+	BundleSeq      int64  `json:"bundle_seq"`
+	SourceID       string `json:"source_id"`
+	SourceBundleID int64  `json:"source_bundle_id"`
+	RowCount       int64  `json:"row_count"`
+	BundleHash     string `json:"bundle_hash"`
+}
+
+type CommittedBundleRowsResponse struct {
+	BundleSeq      int64       `json:"bundle_seq"`
+	SourceID       string      `json:"source_id"`
+	SourceBundleID int64       `json:"source_bundle_id"`
+	RowCount       int64       `json:"row_count"`
+	BundleHash     string      `json:"bundle_hash"`
+	Rows           []BundleRow `json:"rows"`
+	NextRowOrdinal int64       `json:"next_row_ordinal"`
+	HasMore        bool        `json:"has_more"`
+}
+
+// PullResponse returns one or more complete committed bundles.
+type PullResponse struct {
+	StableBundleSeq int64    `json:"stable_bundle_seq"`
+	Bundles         []Bundle `json:"bundles"`
+	HasMore         bool     `json:"has_more"`
+}
+
+// SnapshotRow is the current after-image for one non-deleted row in the bundle-based contract.
+type SnapshotRow struct {
+	Schema     string          `json:"schema"`
+	Table      string          `json:"table"`
+	Key        SyncKey         `json:"key"`
+	RowVersion int64           `json:"row_version"`
+	Payload    json.RawMessage `json:"payload"`
+}
+
+// SnapshotSession describes one frozen server-side snapshot session.
+type SnapshotSession struct {
+	SnapshotID        string `json:"snapshot_id"`
+	SnapshotBundleSeq int64  `json:"snapshot_bundle_seq"`
+	RowCount          int64  `json:"row_count"`
+	ByteCount         int64  `json:"byte_count,omitempty"`
+	ExpiresAt         string `json:"expires_at"`
+}
+
+// SnapshotChunkResponse returns one chunk of snapshot rows from a frozen session.
+type SnapshotChunkResponse struct {
+	SnapshotID        string        `json:"snapshot_id"`
+	SnapshotBundleSeq int64         `json:"snapshot_bundle_seq"`
+	Rows              []SnapshotRow `json:"rows"`
+	NextRowOrdinal    int64         `json:"next_row_ordinal"`
+	HasMore           bool          `json:"has_more"`
 }
 
 // Common response models
 
-// SchemaVersionResponse represents the current schema version
-type SchemaVersionResponse struct {
-	Version int `json:"schema_version"`
+const SyncProtocolVersion = "v1"
+
+// CapabilitiesResponse describes the currently supported sync protocol surface.
+type CapabilitiesResponse struct {
+	ProtocolVersion      string                    `json:"protocol_version"`
+	SchemaVersion        int                       `json:"schema_version"`
+	AppName              string                    `json:"app_name,omitempty"`
+	RegisteredTables     []string                  `json:"registered_tables,omitempty"`
+	RegisteredTableSpecs []RegisteredTableSpec     `json:"registered_table_specs,omitempty"`
+	Features             map[string]bool           `json:"features"`
+	BundleLimits         *BundleCapabilitiesLimits `json:"bundle_limits,omitempty"`
+}
+
+// BundleCapabilitiesLimits reports bundle-oriented guardrails in the target contract.
+type BundleCapabilitiesLimits struct {
+	MaxRowsPerBundle                   int `json:"max_rows_per_bundle,omitempty"`
+	MaxBytesPerBundle                  int `json:"max_bytes_per_bundle,omitempty"`
+	MaxBundlesPerPull                  int `json:"max_bundles_per_pull,omitempty"`
+	DefaultRowsPerPushChunk            int `json:"default_rows_per_push_chunk,omitempty"`
+	MaxRowsPerPushChunk                int `json:"max_rows_per_push_chunk,omitempty"`
+	PushSessionTTLSeconds              int `json:"push_session_ttl_seconds,omitempty"`
+	DefaultRowsPerCommittedBundleChunk int `json:"default_rows_per_committed_bundle_chunk,omitempty"`
+	MaxRowsPerCommittedBundleChunk     int `json:"max_rows_per_committed_bundle_chunk,omitempty"`
+	DefaultRowsPerSnapshotChunk        int `json:"default_rows_per_snapshot_chunk,omitempty"`
+	MaxRowsPerSnapshotChunk            int `json:"max_rows_per_snapshot_chunk,omitempty"`
+	SnapshotSessionTTLSeconds          int `json:"snapshot_session_ttl_seconds,omitempty"`
+}
+
+// RegisteredTableSpec describes one registered sync table in the newer contract surface.
+type RegisteredTableSpec struct {
+	Schema         string   `json:"schema"`
+	Table          string   `json:"table"`
+	SyncKeyColumns []string `json:"sync_key_columns,omitempty"`
 }
 
 // ErrorResponse represents an error response
@@ -84,46 +167,23 @@ type ErrorResponse struct {
 
 // StatusResponse represents service status response
 type StatusResponse struct {
-	Status           string          `json:"status"`            // healthy, degraded, unhealthy
-	Version          string          `json:"version"`           // API version
-	AppName          string          `json:"app_name"`          // Application name
-	RegisteredTables []string        `json:"registered_tables"` // Tables registered for sync
-	Features         map[string]bool `json:"features"`          // Enabled features
-}
-
-// ToChangeDownloadResponse converts a ChangeDownloadEntity to ChangeDownloadResponse
-func (e *ChangeDownloadEntity) ToChangeDownloadResponse() *ChangeDownloadResponse {
-	return &ChangeDownloadResponse{
-		ServerID:       e.ServerID,
-		Schema:         e.SchemaName,
-		TableName:      e.TableName,
-		Op:             e.Op,
-		PK:             e.PkUUID,
-		Payload:        e.Payload,
-		ServerVersion:  e.ServerVersion,
-		Deleted:        e.Deleted,
-		SourceID:       e.SourceID,
-		SourceChangeID: e.SourceChangeID,
-		Timestamp:      e.Timestamp,
-	}
-}
-
-// ToServerChangeLogEntity converts upload change data to ServerChangeLogEntity
-func (c *ChangeUpload) ToServerChangeLogEntity(userID, sourceID string, serverID int64) *ServerChangeLogEntity {
-	schema := c.Schema
-	if schema == "" {
-		schema = "public" // Default schema
-	}
-
-	return &ServerChangeLogEntity{
-		ServerID:       serverID,
-		UserID:         userID,
-		SchemaName:     schema,
-		TableName:      c.Table,
-		Op:             c.Op,
-		PkUUID:         c.PK,
-		Payload:        c.Payload,
-		SourceID:       sourceID,
-		SourceChangeID: c.SourceChangeID,
-	}
+	Status                            string          `json:"status"`                                 // healthy or unhealthy
+	Version                           string          `json:"version"`                                // API version
+	AppName                           string          `json:"app_name"`                               // Application name
+	Lifecycle                         string          `json:"lifecycle"`                              // running, shutting_down, closed
+	AcceptingOperations               bool            `json:"accepting_operations"`                   // Whether new sync operations are accepted
+	InFlightOperations                int             `json:"inflight_operations"`                    // Current in-flight sync operations
+	RegisteredTables                  []string        `json:"registered_tables"`                      // Tables registered for sync
+	Features                          map[string]bool `json:"features"`                               // Enabled features
+	UserStateRetentionFloorAheadCount int64           `json:"user_state_retention_floor_ahead_count"` // user_state rows with retained_bundle_floor > next_bundle_seq - 1
+	LatestBundleSeqMax                int64           `json:"latest_bundle_seq_max"`                  // highest committed bundle seq visible across sync.user_state
+	RetainedBundleFloorMin            int64           `json:"retained_bundle_floor_min"`              // minimum retained_bundle_floor across sync.user_state
+	RetainedBundleFloorMax            int64           `json:"retained_bundle_floor_max"`              // maximum retained_bundle_floor across sync.user_state
+	RetainedBundleWindowMin           int64           `json:"retained_bundle_window_min"`             // minimum retained history window (latest bundle seq - retained floor)
+	RetainedBundleWindowMax           int64           `json:"retained_bundle_window_max"`             // maximum retained history window (latest bundle seq - retained floor)
+	HistoryPrunedErrorCount           int64           `json:"history_pruned_error_count"`             // total history_pruned responses observed by the server
+	AcceptedPushReplayCount           int64           `json:"accepted_push_replay_count"`             // total accepted-push replay hits observed by the server
+	RejectedRegisteredWriteCount      int64           `json:"rejected_registered_write_count"`        // total writes rejected for missing sync bundle context
+	CommittedBundleCount              int64           `json:"committed_bundle_count"`                 // total committed bundle count visible in sync.bundle_log
+	CommittedBundleBytes              int64           `json:"committed_bundle_bytes"`                 // total committed bundle bytes visible in sync.bundle_log
 }

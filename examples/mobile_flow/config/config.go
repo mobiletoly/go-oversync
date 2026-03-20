@@ -40,7 +40,7 @@ type Config struct {
 // DefaultConfig returns a configuration with sensible defaults for mobile simulation
 func DefaultConfig() *Config {
 	return &Config{
-		ServerURL:    "http://localhost:8080",
+		ServerURL:    "http://127.0.0.1:8080",
 		DatabaseURL:  "postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable",
 		EnableVerify: true,
 
@@ -119,7 +119,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 		},
 		"reinstall": {
 			Name:             "Reinstall/Recovery",
-			Description:      "Simulates app reinstall with data recovery using include_self=true",
+			Description:      "Simulates app reinstall with destructive snapshot rebuild recovery",
 			UserID:           "user-reinstall",
 			SourceID:         "device-reinstall-001",
 			DeviceName:       "iPhone Reinstall",
@@ -179,17 +179,17 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			UpdateOperations: 6,
 			DeleteOperations: 1,
 		},
-		"fk-batch-retry": {
-			Name:             "FK Batch Retry",
-			Description:      "Tests batch upload FK constraint handling and retry mechanism",
-			UserID:           "fk-test-user",
-			SourceID:         "device-fk-test",
-			DeviceName:       "iPhone FK Test",
+		"bundle-fk-atomicity": {
+			Name:             "Bundle FK Atomicity",
+			Description:      "Verifies bundle checkpoint correctness, dirty-pull rejection, and self-ref/cycle/cascade FK atomicity across devices",
+			UserID:           "user-bundle-fk-atomicity",
+			SourceID:         "device-bundle-fk",
+			DeviceName:       "iPhone Bundle FK",
 			OfflineMode:      false,
 			CleanDatabase:    true,
-			InitialRecords:   50, // 50 users
-			UpdateOperations: 0,  // No updates needed
-			DeleteOperations: 0,  // No deletes needed
+			InitialRecords:   2,
+			UpdateOperations: 1,
+			DeleteOperations: 1,
 		},
 		"complex-multi-batch": {
 			Name:             "Complex Multi-Batch",

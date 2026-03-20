@@ -5,35 +5,8 @@ package oversync
 
 import (
 	"context"
+	"errors"
 	"time"
-)
-
-const (
-	MetricsOpUpload   = "upload"
-	MetricsOpDownload = "download"
-
-	MetricsStageTotal = "total"
-
-	// Upload transaction (service-level) stages.
-	MetricsStageUploadTxBatched = "tx_batched"
-	MetricsStageUploadTxSlow    = "tx_slow"
-
-	// Upload per-batch stages (tx-level).
-	MetricsStageUpsertsValidate     = "upserts_validate"
-	MetricsStageUpsertsInBatchIndex = "upserts_in_batch_index"
-	MetricsStageUpsertsFKPrecheck   = "upserts_fk_precheck"
-	MetricsStageUpsertsApplyBatched = "upserts_apply_batched"
-	MetricsStageUpsertsApplySlow    = "upserts_apply_slow"
-	MetricsStageUpsertsMaterialize  = "upserts_materialize"
-
-	MetricsStageDeletesValidate     = "deletes_validate"
-	MetricsStageDeletesApplyBatched = "deletes_apply_batched"
-	MetricsStageDeletesApplySlow    = "deletes_apply_slow"
-	MetricsStageDeletesMaterialize  = "deletes_materialize"
-
-	// Download stages.
-	MetricsStageDownloadWatermark = "watermark"
-	MetricsStageDownloadFetch     = "fetch"
 )
 
 type StageTiming struct {
@@ -97,4 +70,8 @@ func (s *SyncService) observeStage(ctx context.Context, op, stage string, start 
 			"error", timing.Error,
 		)
 	}
+}
+
+func (s *SyncService) observeStageErr(ctx context.Context, op, stage string, start time.Time, count, attempt int, err error) {
+	s.observeStage(ctx, op, stage, start, count, attempt, err != nil && !errors.Is(err, errServiceShuttingDown))
 }

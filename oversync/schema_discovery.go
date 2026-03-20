@@ -14,20 +14,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// FK represents a foreign key constraint
-type FK struct {
-	Col       string // Column name (e.g., "user_id")
-	RefSchema string // Referenced schema (e.g., "public")
-	RefTable  string // Referenced table (e.g., "users")
-	RefCol    string // Referenced column (e.g., "id")
-}
-
 // SchemaDiscovery handles automatic discovery of table relationships and ordering
 type SchemaDiscovery struct {
 	pool   *pgxpool.Pool
 	logger *slog.Logger
-
-	tenantScopeColumn string
 }
 
 // ForeignKeyConstraint represents a foreign key relationship
@@ -36,39 +26,27 @@ type ForeignKeyConstraint struct {
 	TableSchema    string // Schema of the child table
 	TableName      string // Name of the child table
 	ColumnName     string // Column in child table
+	Ordinal        int    // Column ordinal within the FK constraint
 	RefSchema      string // Schema of the referenced table
 	RefTable       string // Referenced parent table
 	RefColumn      string // Referenced column in parent table
+	MatchOption    string // SIMPLE / FULL / PARTIAL
+	OnDeleteAction string // CASCADE / RESTRICT / SET NULL / SET DEFAULT / NO ACTION
+	OnUpdateAction string // CASCADE / RESTRICT / SET NULL / SET DEFAULT / NO ACTION
 }
 
 // DiscoveredSchema contains the discovered table relationships
 type DiscoveredSchema struct {
-	TableOrder   []string        // Ordered list of schema.table (parents first)
-	OrderIdx     map[string]int  // schema.table -> order index for O(1) lookups
-	FKMap        map[string][]FK // schema.table -> FK constraints
-	ColumnTypes  map[string]map[string]string
-	Dependencies map[string][]string // schema.table -> list of parent schema.table
+	TableOrder   []string       // Ordered list of schema.table (parents first, cycle members grouped deterministically)
+	OrderIdx     map[string]int // schema.table -> order index for O(1) lookups
+	Dependencies map[string][]string
+	CycleGroup   map[string]int   // schema.table -> SCC id (>0 only when part of a multi-table cycle)
+	Cycles       map[int][]string // SCC id -> sorted cycle members
 }
 
-// Key creates a normalized schema.table key (public helper)
+// Key creates a normalized schema.table key (public helper).
 func Key(schema, table string) string {
 	return strings.ToLower(schema + "." + table)
-}
-
-func (d *DiscoveredSchema) ColumnType(schema, table, column string) string {
-	if d == nil || d.ColumnTypes == nil {
-		return ""
-	}
-	tableKey := Key(schema, table)
-	cols := d.ColumnTypes[tableKey]
-	if cols == nil {
-		return ""
-	}
-	return cols[strings.ToLower(column)]
-}
-
-func (d *DiscoveredSchema) IsUUIDColumn(schema, table, column string) bool {
-	return d.ColumnType(schema, table, column) == "uuid"
 }
 
 // key creates a normalized schema.table key (internal helper)
@@ -84,69 +62,6 @@ func NewSchemaDiscovery(pool *pgxpool.Pool, logger *slog.Logger) *SchemaDiscover
 	}
 }
 
-// SetTenantScopeColumn configures the column name used for tenant-scoped FK precheck reductions.
-// When set, composite FKs of the form (tenant_col, x) can be reduced to a single-column precheck
-// on x, relying on tenant-scoped DB existence queries for correctness.
-func (sd *SchemaDiscovery) SetTenantScopeColumn(col string) {
-	sd.tenantScopeColumn = strings.ToLower(strings.TrimSpace(col))
-}
-
-// DiscoverSchema analyzes registered tables and builds dependency graph
-func (sd *SchemaDiscovery) DiscoverSchema(ctx context.Context, registeredTables map[string]bool) (*DiscoveredSchema, error) {
-	// Step 1: Get all foreign key constraints for registered tables
-	fkConstraints, err := sd.getForeignKeyConstraints(ctx, registeredTables)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get foreign key constraints: %w", err)
-	}
-
-	// Step 1.5: Fetch column types for registered + referenced tables (used by FK precheck for typed queries).
-	columnTypes, err := sd.getColumnTypes(ctx, registeredTables, fkConstraints)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get column types: %w", err)
-	}
-
-	// Step 2: Build dependency graph
-	dependencies := sd.buildDependencyGraph(fkConstraints, registeredTables)
-
-	// Step 3: Perform topological sort to get table ordering
-	tableOrder, err := sd.topologicalSort(dependencies, registeredTables)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sort tables topologically: %w", err)
-	}
-
-	// Step 4: Build FK map for runtime use
-	fkMap := sd.buildFKMap(fkConstraints, registeredTables)
-
-	// Step 5: Validate FK constraints are deferrable (important for batch processing)
-	sd.validateDeferrableConstraints(ctx, fkConstraints, registeredTables)
-
-	// Step 6: Build order index for O(1) lookups
-	orderIdx := make(map[string]int, len(tableOrder))
-	for i, table := range tableOrder {
-		orderIdx[table] = i
-	}
-
-	// Log detailed discovery results
-	fkCounts := make(map[string]int)
-	for table, fks := range fkMap {
-		fkCounts[table] = len(fks)
-	}
-
-	sd.logger.Info("Schema discovery completed",
-		"table_count", len(tableOrder),
-		"fk_constraints_found", len(fkConstraints),
-		"fk_map_entries", len(fkMap),
-		"fk_counts_per_table", fkCounts,
-		"table_order", tableOrder)
-	return &DiscoveredSchema{
-		TableOrder:   tableOrder,
-		OrderIdx:     orderIdx,
-		FKMap:        fkMap,
-		ColumnTypes:  columnTypes,
-		Dependencies: dependencies,
-	}, nil
-}
-
 // DiscoverSchemaWithDependencyOverrides runs schema discovery and merges explicit dependencies
 // (ordering constraints) into the discovered dependency graph.
 // Overrides only affect ordering (TableOrder/OrderIdx/Dependencies) and do not add FK validation rules.
@@ -160,130 +75,152 @@ func (sd *SchemaDiscovery) DiscoverSchemaWithDependencyOverrides(
 	if err != nil {
 		return nil, fmt.Errorf("failed to get foreign key constraints: %w", err)
 	}
-
-	// Step 1.5: Fetch column types for registered + referenced tables (used by FK precheck for typed queries).
-	columnTypes, err := sd.getColumnTypes(ctx, registeredTables, fkConstraints)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get column types: %w", err)
+	if err := validateRegisteredForeignKeyClosure(fkConstraints, registeredTables); err != nil {
+		return nil, err
+	}
+	if err := validateSupportedForeignKeyConstraints(fkConstraints, registeredTables); err != nil {
+		return nil, err
 	}
 
 	// Step 2: Build dependency graph
 	dependencies := sd.buildDependencyGraph(fkConstraints, registeredTables)
 	applyDependencyOverrides(dependencies, registeredTables, dependencyOverrides)
 
-	// Step 3: Perform topological sort to get table ordering
-	tableOrder, err := sd.topologicalSort(dependencies, registeredTables)
+	// Step 3: Perform SCC-aware topological sort to get table ordering
+	tableOrder, cycleGroup, cycles, err := sd.topologicalSort(dependencies, registeredTables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sort tables topologically: %w", err)
 	}
 
-	// Step 4: Build FK map for runtime use
-	fkMap := sd.buildFKMap(fkConstraints, registeredTables)
+	// Step 4: Validate FK constraints are deferrable (important for bundle-era transactional apply)
+	if err := sd.validateDeferrableConstraints(ctx, fkConstraints, registeredTables); err != nil {
+		return nil, err
+	}
 
-	// Step 5: Validate FK constraints are deferrable (important for batch processing)
-	sd.validateDeferrableConstraints(ctx, fkConstraints, registeredTables)
-
-	// Step 6: Build order index for O(1) lookups
+	// Step 5: Build order index for O(1) lookups
 	orderIdx := make(map[string]int, len(tableOrder))
 	for i, table := range tableOrder {
 		orderIdx[table] = i
 	}
 
-	// Log detailed discovery results
-	fkCounts := make(map[string]int)
-	for table, fks := range fkMap {
-		fkCounts[table] = len(fks)
-	}
-
 	sd.logger.Info("Schema discovery completed",
 		"table_count", len(tableOrder),
 		"fk_constraints_found", len(fkConstraints),
-		"fk_map_entries", len(fkMap),
-		"fk_counts_per_table", fkCounts,
+		"dependency_entries", len(dependencies),
 		"table_order", tableOrder)
 	return &DiscoveredSchema{
 		TableOrder:   tableOrder,
 		OrderIdx:     orderIdx,
-		FKMap:        fkMap,
-		ColumnTypes:  columnTypes,
 		Dependencies: dependencies,
+		CycleGroup:   cycleGroup,
+		Cycles:       cycles,
 	}, nil
 }
 
-func (sd *SchemaDiscovery) getColumnTypes(
-	ctx context.Context,
-	registeredTables map[string]bool,
-	fkConstraints []ForeignKeyConstraint,
-) (map[string]map[string]string, error) {
-	// Gather tables: all registered + all FK referenced tables (even if unregistered).
-	toCheck := make(map[string]struct{}, len(registeredTables)+len(fkConstraints))
-	for k := range registeredTables {
-		toCheck[k] = struct{}{}
-	}
-	for _, fk := range fkConstraints {
-		toCheck[key(fk.TableSchema, fk.TableName)] = struct{}{}
-		toCheck[key(fk.RefSchema, fk.RefTable)] = struct{}{}
-	}
-	if len(toCheck) == 0 {
-		return nil, nil
+func validateRegisteredForeignKeyClosure(fkConstraints []ForeignKeyConstraint, registeredTables map[string]bool) error {
+	if len(fkConstraints) == 0 || len(registeredTables) == 0 {
+		return nil
 	}
 
-	schemas := make([]string, 0, len(toCheck))
-	tables := make([]string, 0, len(toCheck))
-	for st := range toCheck {
-		parts := strings.SplitN(st, ".", 2)
-		if len(parts) != 2 {
+	missingByChild := make(map[string][]string)
+	for _, fk := range fkConstraints {
+		childKey := key(fk.TableSchema, fk.TableName)
+		parentKey := key(fk.RefSchema, fk.RefTable)
+		if !registeredTables[childKey] {
 			continue
 		}
-		schemas = append(schemas, parts[0])
-		tables = append(tables, parts[1])
-	}
-	if len(schemas) == 0 {
-		return nil, nil
-	}
-
-	const q = `
-WITH t AS (
-  SELECT * FROM unnest(@schemas::text[], @tables::text[]) AS x(schema_name, table_name)
-)
-SELECT
-  c.table_schema,
-  c.table_name,
-  lower(c.column_name) AS column_name,
-  lower(c.udt_name)    AS udt_name
-FROM information_schema.columns c
-JOIN t
-  ON c.table_schema = t.schema_name
- AND c.table_name = t.table_name`
-
-	rows, err := sd.pool.Query(ctx, q, pgx.NamedArgs{
-		"schemas": schemas,
-		"tables":  tables,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	colTypes := make(map[string]map[string]string)
-	for rows.Next() {
-		var schemaName, tableName, colName, udtName string
-		if scanErr := rows.Scan(&schemaName, &tableName, &colName, &udtName); scanErr != nil {
-			return nil, scanErr
+		if registeredTables[parentKey] {
+			continue
 		}
-		tableKey := key(schemaName, tableName)
-		m := colTypes[tableKey]
-		if m == nil {
-			m = make(map[string]string)
-			colTypes[tableKey] = m
-		}
-		m[colName] = udtName
-	}
-	if rows.Err() != nil {
-		return nil, rows.Err()
+
+		detail := fmt.Sprintf("%s -> %s (%s)", childKey, parentKey, fk.ConstraintName)
+		missingByChild[childKey] = append(missingByChild[childKey], detail)
 	}
 
-	return colTypes, nil
+	if len(missingByChild) == 0 {
+		return nil
+	}
+
+	children := make([]string, 0, len(missingByChild))
+	for child := range missingByChild {
+		children = append(children, child)
+	}
+	sort.Strings(children)
+
+	var details []string
+	for _, child := range children {
+		sort.Strings(missingByChild[child])
+		details = append(details, missingByChild[child]...)
+	}
+
+	return unsupportedSchemaf("registered tables are not FK-closed: %s", strings.Join(details, "; "))
+}
+
+func validateSupportedForeignKeyConstraints(fkConstraints []ForeignKeyConstraint, registeredTables map[string]bool) error {
+	if len(fkConstraints) == 0 || len(registeredTables) == 0 {
+		return nil
+	}
+
+	type fkGroupKey struct {
+		childSchema string
+		childTable  string
+		constraint  string
+	}
+
+	allowedActions := map[string]struct{}{
+		"":            {},
+		"NO ACTION":   {},
+		"RESTRICT":    {},
+		"CASCADE":     {},
+		"SET NULL":    {},
+		"SET DEFAULT": {},
+	}
+
+	groups := make(map[fkGroupKey][]ForeignKeyConstraint)
+	for _, fk := range fkConstraints {
+		childKey := key(fk.TableSchema, fk.TableName)
+		if !registeredTables[childKey] {
+			continue
+		}
+
+		deleteRule := strings.ToUpper(strings.TrimSpace(fk.OnDeleteAction))
+		if _, ok := allowedActions[deleteRule]; !ok {
+			return unsupportedSchemaf("registered schema contains unsupported FK ON DELETE action %q on %s.%s (%s)", fk.OnDeleteAction, fk.TableSchema, fk.TableName, fk.ConstraintName)
+		}
+
+		updateRule := strings.ToUpper(strings.TrimSpace(fk.OnUpdateAction))
+		if _, ok := allowedActions[updateRule]; !ok {
+			return unsupportedSchemaf("registered schema contains unsupported FK ON UPDATE action %q on %s.%s (%s)", fk.OnUpdateAction, fk.TableSchema, fk.TableName, fk.ConstraintName)
+		}
+
+		matchOption := strings.ToUpper(strings.TrimSpace(fk.MatchOption))
+		if matchOption != "" && matchOption != "NONE" && matchOption != "SIMPLE" {
+			return unsupportedSchemaf("registered schema contains unsupported FK MATCH option %q on %s.%s (%s)", fk.MatchOption, fk.TableSchema, fk.TableName, fk.ConstraintName)
+		}
+
+		groupKey := fkGroupKey{
+			childSchema: fk.TableSchema,
+			childTable:  fk.TableName,
+			constraint:  fk.ConstraintName,
+		}
+		groups[groupKey] = append(groups[groupKey], fk)
+	}
+
+	var composite []string
+	for groupKey, group := range groups {
+		if len(group) <= 1 {
+			continue
+		}
+
+		parentKey := key(group[0].RefSchema, group[0].RefTable)
+		composite = append(composite, fmt.Sprintf("%s.%s -> %s (%s)", groupKey.childSchema, groupKey.childTable, parentKey, groupKey.constraint))
+	}
+	if len(composite) > 0 {
+		sort.Strings(composite)
+		return unsupportedSchemaf("registered schema contains unsupported composite FK constraints: %s", strings.Join(composite, "; "))
+	}
+
+	return nil
 }
 
 func applyDependencyOverrides(
@@ -375,9 +312,13 @@ func (sd *SchemaDiscovery) getForeignKeyConstraints(ctx context.Context, registe
 			kcu.table_schema,
 			kcu.table_name,
 			kcu.column_name,
+			kcu.ordinal_position,
 			rc.unique_constraint_schema AS referenced_table_schema,
 			kcu2.table_name AS referenced_table_name,
-			kcu2.column_name AS referenced_column_name
+			kcu2.column_name AS referenced_column_name,
+			rc.match_option,
+			rc.delete_rule,
+			rc.update_rule
 		FROM information_schema.key_column_usage AS kcu
 		JOIN information_schema.referential_constraints AS rc
 			ON kcu.constraint_name = rc.constraint_name
@@ -405,9 +346,13 @@ func (sd *SchemaDiscovery) getForeignKeyConstraints(ctx context.Context, registe
 			&fk.TableSchema,
 			&fk.TableName,
 			&fk.ColumnName,
+			&fk.Ordinal,
 			&fk.RefSchema,
 			&fk.RefTable,
 			&fk.RefColumn,
+			&fk.MatchOption,
+			&fk.OnDeleteAction,
+			&fk.OnUpdateAction,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan foreign key constraint: %w", err)
@@ -459,177 +404,181 @@ func (sd *SchemaDiscovery) buildDependencyGraph(fkConstraints []ForeignKeyConstr
 	return dependencies
 }
 
-// topologicalSort performs topological sorting to determine table order
-func (sd *SchemaDiscovery) topologicalSort(dependencies map[string][]string, registeredTables map[string]bool) ([]string, error) {
-	// Kahn's algorithm for topological sorting
-	inDegree := make(map[string]int)
-	for table := range registeredTables {
-		inDegree[table] = 0
-	}
+// topologicalSort performs SCC-aware topological sorting to determine table order.
+func (sd *SchemaDiscovery) topologicalSort(
+	dependencies map[string][]string,
+	registeredTables map[string]bool,
+) ([]string, map[string]int, map[int][]string, error) {
+	componentByTable, componentMembers := stronglyConnectedComponents(dependencies, registeredTables)
 
-	// Calculate in-degrees (number of dependencies each table has)
-	// Only count dependencies on other registered tables
-	for child, deps := range dependencies {
-		if !registeredTables[child] {
-			continue // Skip unregistered tables
-		}
-		for _, parent := range deps {
-			if registeredTables[parent] {
-				inDegree[child]++
+	componentInDegree := make(map[int]int, len(componentMembers))
+	componentChildren := make(map[int]map[int]struct{}, len(componentMembers))
+	componentLabel := make(map[int]string, len(componentMembers))
+	cycleGroup := make(map[string]int)
+	cycles := make(map[int][]string)
+
+	for compID, members := range componentMembers {
+		componentInDegree[compID] = 0
+		sortedMembers := append([]string(nil), members...)
+		sort.Strings(sortedMembers)
+		componentMembers[compID] = sortedMembers
+		componentLabel[compID] = sortedMembers[0]
+		if len(sortedMembers) > 1 {
+			cycles[compID] = sortedMembers
+			for _, member := range sortedMembers {
+				cycleGroup[member] = compID
 			}
 		}
 	}
 
-	// Find zero-indegree nodes deterministically
-	queue := make([]string, 0, len(inDegree))
-	for table, degree := range inDegree {
-		if degree == 0 {
-			queue = append(queue, table)
+	for child, deps := range dependencies {
+		if !registeredTables[child] {
+			continue
+		}
+		childComp := componentByTable[child]
+		for _, parent := range deps {
+			if !registeredTables[parent] {
+				continue
+			}
+			parentComp := componentByTable[parent]
+			if childComp == parentComp {
+				continue
+			}
+			children := componentChildren[parentComp]
+			if children == nil {
+				children = make(map[int]struct{})
+				componentChildren[parentComp] = children
+			}
+			if _, exists := children[childComp]; exists {
+				continue
+			}
+			children[childComp] = struct{}{}
+			componentInDegree[childComp]++
 		}
 	}
-	sort.Strings(queue) // Ensure deterministic order
 
-	// Helper functions for deterministic queue management
-	pop := func() string {
+	queue := make([]int, 0, len(componentMembers))
+	for compID, degree := range componentInDegree {
+		if degree == 0 {
+			queue = append(queue, compID)
+		}
+	}
+	sort.Slice(queue, func(i, j int) bool {
+		return componentLabel[queue[i]] < componentLabel[queue[j]]
+	})
+
+	pop := func() int {
 		x := queue[0]
 		queue = queue[1:]
 		return x
 	}
-	insertSorted := func(t string) {
-		i := sort.SearchStrings(queue, t)
-		queue = append(queue, "")
+	insertSorted := func(compID int) {
+		label := componentLabel[compID]
+		i := sort.Search(len(queue), func(i int) bool {
+			return componentLabel[queue[i]] >= label
+		})
+		queue = append(queue, 0)
 		copy(queue[i+1:], queue[i:])
-		queue[i] = t
+		queue[i] = compID
 	}
 
 	var result []string
+	processedComponents := 0
 	for len(queue) > 0 {
-		// Remove a table with no incoming edges (deterministic order)
-		current := pop()
-		result = append(result, current)
+		currentComp := pop()
+		processedComponents++
+		result = append(result, componentMembers[currentComp]...)
 
-		// For each table that depends on current table
-		for child, deps := range dependencies {
-			if !registeredTables[child] {
+		for childComp := range componentChildren[currentComp] {
+			componentInDegree[childComp]--
+			if componentInDegree[childComp] == 0 {
+				insertSorted(childComp)
+			}
+		}
+	}
+
+	if processedComponents != len(componentMembers) {
+		return nil, nil, nil, fmt.Errorf("scc condensation graph still contains a cycle")
+	}
+
+	if len(cycles) > 0 {
+		sd.logger.Warn("Circular dependency groups detected; preserving deterministic order within strongly connected components",
+			"cycle_count", len(cycles),
+			"cycles", cycles)
+	}
+
+	return result, cycleGroup, cycles, nil
+}
+
+func stronglyConnectedComponents(dependencies map[string][]string, registeredTables map[string]bool) (map[string]int, map[int][]string) {
+	index := 0
+	stack := make([]string, 0, len(registeredTables))
+	onStack := make(map[string]bool, len(registeredTables))
+	indexByNode := make(map[string]int, len(registeredTables))
+	lowLink := make(map[string]int, len(registeredTables))
+	componentByTable := make(map[string]int, len(registeredTables))
+	componentMembers := make(map[int][]string)
+	componentID := 0
+
+	var visit func(string)
+	visit = func(node string) {
+		indexByNode[node] = index
+		lowLink[node] = index
+		index++
+		stack = append(stack, node)
+		onStack[node] = true
+
+		for _, parent := range dependencies[node] {
+			if !registeredTables[parent] {
 				continue
 			}
-			for _, parent := range deps {
-				if parent == current && registeredTables[parent] {
-					inDegree[child]--
-					if inDegree[child] == 0 {
-						insertSorted(child) // Maintain sorted order
-					}
+			if _, seen := indexByNode[parent]; !seen {
+				visit(parent)
+				if lowLink[parent] < lowLink[node] {
+					lowLink[node] = lowLink[parent]
 				}
+			} else if onStack[parent] && indexByNode[parent] < lowLink[node] {
+				lowLink[node] = indexByNode[parent]
+			}
+		}
+
+		if lowLink[node] != indexByNode[node] {
+			return
+		}
+
+		componentID++
+		for {
+			last := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			onStack[last] = false
+			componentByTable[last] = componentID
+			componentMembers[componentID] = append(componentMembers[componentID], last)
+			if last == node {
+				break
 			}
 		}
 	}
 
-	// Check for circular dependencies
-	if len(result) != len(registeredTables) {
-		sd.logger.Warn("Circular dependency detected, falling back to alphabetical order",
-			"processed", len(result), "registered", len(registeredTables))
-
-		// Fallback to stable alphabetical ordering
-		var fallbackResult []string
-		for table := range registeredTables {
-			fallbackResult = append(fallbackResult, table)
+	nodes := make([]string, 0, len(registeredTables))
+	for table := range registeredTables {
+		nodes = append(nodes, table)
+	}
+	sort.Strings(nodes)
+	for _, node := range nodes {
+		if _, seen := indexByNode[node]; !seen {
+			visit(node)
 		}
-		sort.Strings(fallbackResult)
-		return fallbackResult, nil
 	}
 
-	// Keep schema.table format (do NOT strip schema)
-	return result, nil
+	return componentByTable, componentMembers
 }
 
-// buildFKMap creates the runtime FK map from constraints with composite FK handling
-func (sd *SchemaDiscovery) buildFKMap(fkConstraints []ForeignKeyConstraint, registeredTables map[string]bool) map[string][]FK {
-	// Group constraints by (child_schema, child_table, constraint_name) to handle composites
-	type gkey struct{ childSchema, childTable, constraintName string }
-	groups := make(map[gkey][]ForeignKeyConstraint)
-
-	for _, fk := range fkConstraints {
-		k := gkey{fk.TableSchema, fk.TableName, fk.ConstraintName}
-		groups[k] = append(groups[k], fk)
-	}
-
-	fkMap := make(map[string][]FK)
-	for k, cols := range groups {
-		childTableKey := key(k.childSchema, k.childTable)
-
-		// Handle composite FKs (multiple columns in same constraint)
-		if len(cols) > 1 {
-			tenantCol := sd.tenantScopeColumn
-			if tenantCol != "" {
-				nonTenant := make([]ForeignKeyConstraint, 0, len(cols))
-				for _, col := range cols {
-					if strings.EqualFold(col.RefColumn, tenantCol) {
-						continue
-					}
-					nonTenant = append(nonTenant, col)
-				}
-
-				// For common multi-tenant schemas, composite FKs are often (tenant_col, natural_key).
-				// When the service applies tenant-scoped DB existence checks, we can safely reduce
-				// such constraints to a single-column precheck on the non-tenant key.
-				if len(nonTenant) == 1 {
-					c := nonTenant[0]
-					fk := FK{
-						Col:       c.ColumnName,
-						RefSchema: c.RefSchema,
-						RefTable:  c.RefTable,
-						RefCol:    c.RefColumn,
-					}
-					fkMap[childTableKey] = append(fkMap[childTableKey], fk)
-
-					sd.logger.Info("Composite FK reduced to tenant-scoped precheck",
-						"table", childTableKey,
-						"constraint", k.constraintName,
-						"tenant_column", tenantCol,
-						"validated_column", c.ColumnName,
-						"referenced_table", key(c.RefSchema, c.RefTable),
-						"referenced_column", c.RefColumn,
-					)
-					continue
-				}
-			}
-
-			var columnNames []string
-			var refColumnNames []string
-			for _, col := range cols {
-				columnNames = append(columnNames, col.ColumnName)
-				refColumnNames = append(refColumnNames, col.RefColumn)
-			}
-			sd.logger.Warn("Composite FK skipped for precheck",
-				"table", childTableKey,
-				"constraint", k.constraintName,
-				"column_count", len(cols),
-				"columns", columnNames,
-				"ref_columns", refColumnNames)
-			continue // Skip unsupported composite FKs - let PostgreSQL enforce at COMMIT
-		}
-
-		// Single-column FK
-		c := cols[0]
-
-		// Always include FK in fkMap (for DB existence precheck)
-		// The dependency graph only creates edges for registered parents (handled in buildDependencyGraph)
-		fk := FK{
-			Col:       c.ColumnName,
-			RefSchema: c.RefSchema,
-			RefTable:  c.RefTable,
-			RefCol:    c.RefColumn,
-		}
-		fkMap[childTableKey] = append(fkMap[childTableKey], fk)
-	}
-
-	return fkMap
-}
-
-// validateDeferrableConstraints checks if FK constraints are deferrable and warns if not
-func (sd *SchemaDiscovery) validateDeferrableConstraints(ctx context.Context, fkConstraints []ForeignKeyConstraint, registeredTables map[string]bool) {
+// validateDeferrableConstraints checks if registered-table FK constraints are deferrable.
+// DEFERRABLE is required by the current runtime; INITIALLY DEFERRED remains preferred but optional
+// because the hot path still issues SET CONSTRAINTS ALL DEFERRED.
+func (sd *SchemaDiscovery) validateDeferrableConstraints(ctx context.Context, fkConstraints []ForeignKeyConstraint, registeredTables map[string]bool) error {
 	if len(fkConstraints) == 0 {
-		return
+		return nil
 	}
 
 	// Build constraint names for batch query
@@ -647,7 +596,7 @@ func (sd *SchemaDiscovery) validateDeferrableConstraints(ctx context.Context, fk
 		}
 	}
 	if len(constraintNames) == 0 {
-		return
+		return nil
 	}
 
 	// Query for deferrable status using pg_catalog for better reliability
@@ -666,27 +615,25 @@ func (sd *SchemaDiscovery) validateDeferrableConstraints(ctx context.Context, fk
 		"constraint_names": constraintNames,
 	})
 	if err != nil {
-		sd.logger.Warn("Failed to check FK deferrable status", "error", err)
-		return
+		return fmt.Errorf("check FK deferrable status: %w", err)
 	}
 	defer rows.Close()
 
-	nonDeferrableCount := 0
+	var nonDeferrable []string
 	for rows.Next() {
 		var schemaName, constraintName string
 		var isDeferrable, isDeferred bool
 
 		if err := rows.Scan(&schemaName, &constraintName, &isDeferrable, &isDeferred); err != nil {
-			sd.logger.Warn("Failed to scan FK deferrable status", "error", err)
-			continue
+			return fmt.Errorf("scan FK deferrable status: %w", err)
 		}
 
 		if !isDeferrable {
-			nonDeferrableCount++
-			sd.logger.Warn("FK constraint is NOT DEFERRABLE - may cause batch processing issues",
+			nonDeferrable = append(nonDeferrable, schemaName+"."+constraintName)
+			sd.logger.Error("FK constraint is NOT DEFERRABLE and blocks bootstrap",
 				"schema", schemaName,
 				"constraint", constraintName,
-				"recommendation", "ALTER TABLE ... ALTER CONSTRAINT ... DEFERRABLE INITIALLY DEFERRED")
+				"recommendation", "ALTER TABLE ... ALTER CONSTRAINT ... DEFERRABLE")
 		} else if !isDeferred {
 			sd.logger.Debug("FK constraint is deferrable but not initially deferred",
 				"schema", schemaName,
@@ -694,265 +641,16 @@ func (sd *SchemaDiscovery) validateDeferrableConstraints(ctx context.Context, fk
 				"note", "Will work correctly due to SET CONSTRAINTS ALL DEFERRED, but INITIALLY DEFERRED is preferred")
 		}
 	}
-
-	if nonDeferrableCount > 0 {
-		sd.logger.Warn("Found non-deferrable FK constraints",
-			"count", nonDeferrableCount,
-			"impact", "May cause batch processing failures when parent/child are in same request")
-	}
-}
-
-// Compare returns -1/0/1 comparing two schema.table keys using parent-first order
-func (d *DiscoveredSchema) Compare(aSchema, aTable, bSchema, bTable string) int {
-	aKey := Key(aSchema, aTable)
-	bKey := Key(bSchema, bTable)
-	return d.CompareKeys(aKey, bKey)
-}
-
-// CompareKeys returns -1/0/1 comparing two schema.table keys using parent-first order
-func (d *DiscoveredSchema) CompareKeys(aKey, bKey string) int {
-	aOrder, aExists := d.OrderIdx[aKey]
-	bOrder, bExists := d.OrderIdx[bKey]
-
-	// If neither table is in order map, use alphabetical
-	if !aExists && !bExists {
-		if aKey < bKey {
-			return -1
-		} else if aKey > bKey {
-			return 1
-		}
-		return 0
+	if rows.Err() != nil {
+		return fmt.Errorf("iterate FK deferrable status: %w", rows.Err())
 	}
 
-	// If only one table is in order map, prioritize the one that is
-	if !aExists {
-		return 1 // b comes first
+	if len(nonDeferrable) > 0 {
+		sort.Strings(nonDeferrable)
+		return unsupportedSchemaf(
+			"registered schema contains non-deferrable FK constraints: %s; make these constraints DEFERRABLE before bootstrap (INITIALLY DEFERRED recommended)",
+			strings.Join(nonDeferrable, ", "),
+		)
 	}
-	if !bExists {
-		return -1 // a comes first
-	}
-
-	// Both tables are in order map, compare by order index
-	if aOrder < bOrder {
-		return -1
-	} else if aOrder > bOrder {
-		return 1
-	}
-	return 0
-}
-
-// SortUpserts sorts changes parent-first (in-place), preserving order within same table
-func (d *DiscoveredSchema) SortUpserts(changes []ChangeUpload) {
-	sort.SliceStable(changes, func(i, j int) bool {
-		// Default schema to "public" if not provided
-		schemaI, schemaJ := changes[i].Schema, changes[j].Schema
-		if schemaI == "" {
-			schemaI = "public"
-		}
-		if schemaJ == "" {
-			schemaJ = "public"
-		}
-
-		cmp := d.Compare(schemaI, changes[i].Table, schemaJ, changes[j].Table)
-		return cmp < 0
-	})
-}
-
-// SortDeletes sorts changes child-first (reverse of parent-first), preserving order within same table
-func (d *DiscoveredSchema) SortDeletes(changes []ChangeUpload) {
-	sort.SliceStable(changes, func(i, j int) bool {
-		// Default schema to "public" if not provided
-		schemaI, schemaJ := changes[i].Schema, changes[j].Schema
-		if schemaI == "" {
-			schemaI = "public"
-		}
-		if schemaJ == "" {
-			schemaJ = "public"
-		}
-
-		cmp := d.Compare(schemaI, changes[i].Table, schemaJ, changes[j].Table)
-		return cmp > 0
-	})
-}
-
-// HasDependencies returns true if there are any FK dependencies among the given tables that require ordering
-func (d *DiscoveredSchema) HasDependencies(changes []ChangeUpload) bool {
-	if len(d.Dependencies) == 0 {
-		return false
-	}
-
-	// Check if any of the tables in the changes have dependencies
-	tablesInBatch := make(map[string]bool)
-	for _, ch := range changes {
-		// Default schema to "public" if not provided (same as validation)
-		schema := ch.Schema
-		if schema == "" {
-			schema = "public"
-		}
-		tablesInBatch[Key(schema, ch.Table)] = true
-	}
-
-	// Check if any table in the batch depends on another table in the batch
-	for tableKey := range tablesInBatch {
-		for _, parentKey := range d.Dependencies[tableKey] {
-			if tablesInBatch[parentKey] {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// ParentsMissing returns a list of "schema.table:pk" that are not present
-// in the DB and not scheduled to be created earlier in this request
-// tableHandler is optional and can be used to convert payload keys for database comparison
-func (d *DiscoveredSchema) ParentsMissing(
-	ctx context.Context,
-	tx pgx.Tx,
-	childSchema, childTable string,
-	payload map[string]any,
-	willExist map[string]map[string]struct{}, // batchIndex keyed by "schema.table"
-	tableHandler MaterializationHandler,
-) ([]string, error) {
-	childKey := Key(childSchema, childTable)
-
-	// Get FK constraints for this table
-	fks := d.FKMap[childKey]
-	if len(fks) == 0 {
-		return nil, nil // No FK constraints to check
-	}
-
-	var missing []string
-
-	for _, fk := range fks {
-		// 1) Extract the foreign key value from payload
-		refVal, found := payload[fk.Col]
-		if !found {
-			continue // FK column not present - skip validation
-		}
-
-		dbRefVal, badPayload := convertFKValueForHandler(tableHandler, fk.Col, refVal)
-		if badPayload {
-			return []string{ReasonBadPayload}, nil
-		}
-
-		// Convert to string for comparison with proper type handling
-		refValStr, hasValue := formatFKValue(refVal)
-		if !hasValue {
-			continue // Null or empty FK value - skip validation
-		}
-
-		// Convert database value to string for DB query
-		dbRefValStr, dbHasValue := formatFKValue(dbRefVal)
-		if !dbHasValue {
-			continue // Converted value is null or empty - skip validation
-		}
-
-		// 2) Check if parent will be created in this request (and parent table sorts before this table)
-		parentKey := Key(fk.RefSchema, fk.RefTable)
-		if willExistSet, ok := willExist[parentKey]; ok {
-			if _, exists := willExistSet[dbRefValStr]; exists {
-				// Parent will be created - check if it comes before child in ordering
-				parentOrder, parentExists := d.OrderIdx[parentKey]
-				childOrder, childExists := d.OrderIdx[childKey]
-
-				// For self-references (parentKey == childKey), allow if parent PK will be created
-				// For different tables, require parent to sort before child
-				if parentExists && childExists && (parentKey == childKey || parentOrder < childOrder) {
-					continue // Parent will be created before child (or is self-ref) - OK
-				}
-			}
-		}
-
-		// 3) Check if parent exists in database
-		var exists bool
-		query := fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %s.%s WHERE %s = @ref_val)`,
-			pgx.Identifier{fk.RefSchema}.Sanitize(),
-			pgx.Identifier{fk.RefTable}.Sanitize(),
-			pgx.Identifier{fk.RefCol}.Sanitize())
-
-		if err := tx.QueryRow(ctx, query, pgx.NamedArgs{"ref_val": dbRefValStr}).Scan(&exists); err != nil {
-			return nil, fmt.Errorf("parent check %s.%s(%s): %w", fk.RefSchema, fk.RefTable, fk.RefCol, err)
-		}
-		if exists {
-			continue // Parent exists in DB - OK
-		}
-
-		// Parent is missing
-		missing = append(missing, fmt.Sprintf("%s.%s:%s", fk.RefSchema, fk.RefTable, refValStr))
-	}
-
-	return missing, nil
-}
-
-// formatFKValue converts various FK value types to string for comparison
-func formatFKValue(value any) (string, bool) {
-	if value == nil {
-		return "", false
-	}
-
-	switch v := value.(type) {
-	case string:
-		if v == "" {
-			return "", false
-		}
-		return v, true
-	case []byte:
-		if len(v) == 0 {
-			return "", false
-		}
-		return string(v), true
-	case int, int8, int16, int32, int64:
-		return fmt.Sprintf("%d", v), true
-	case uint, uint8, uint16, uint32, uint64:
-		return fmt.Sprintf("%d", v), true
-	case float32, float64:
-		return fmt.Sprintf("%g", v), true
-	default:
-		// Fallback to string representation
-		str := fmt.Sprintf("%v", v)
-		if str == "" || str == "<nil>" {
-			return "", false
-		}
-		return str, true
-	}
-}
-
-// convertFKValueForHandler safely invokes the table handler for FK conversion without assuming payload type.
-// Returns converted value and a flag indicating whether the payload should be treated as bad.
-func convertFKValueForHandler(handler MaterializationHandler, fieldName string, payloadValue any) (any, bool) {
-	if handler == nil {
-		return payloadValue, false
-	}
-
-	incoming := payloadValue
-	// Common payload types from JSON unmarshalling are string/float64/bool/map; normalize []byte to string.
-	if b, ok := payloadValue.([]byte); ok {
-		incoming = string(b)
-	}
-
-	converted, err := handler.ConvertReferenceKey(fieldName, incoming)
-	if err != nil {
-		return nil, true
-	}
-	return converted, false
-}
-
-// RefreshTopology re-runs schema discovery and atomically updates the DiscoveredSchema
-// This is useful when FK relationships change without restarting the service
-func (sd *SchemaDiscovery) RefreshTopology(ctx context.Context, registeredTables map[string]bool) (*DiscoveredSchema, error) {
-	sd.logger.Info("Refreshing schema topology", "registered_tables", len(registeredTables))
-
-	// Run discovery with current registered tables
-	newSchema, err := sd.DiscoverSchema(ctx, registeredTables)
-	if err != nil {
-		return nil, fmt.Errorf("failed to refresh schema topology: %w", err)
-	}
-
-	sd.logger.Info("Schema topology refreshed successfully",
-		"table_count", len(newSchema.TableOrder),
-		"fk_map_entries", len(newSchema.FKMap))
-
-	return newSchema, nil
+	return nil
 }

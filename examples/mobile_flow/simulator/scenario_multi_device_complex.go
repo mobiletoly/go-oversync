@@ -29,7 +29,8 @@ import (
 // Expected final present IDs: {A2, A3(re-added), B1, B2(updated), B3}; Deleted: {A1}
 // Expected count: 5
 //
-// Notes: After each upload, we run a download-until-empty loop to mirror mobile app behavior.
+// Notes: After each push, we run one bundle-era PullToStable() to converge to the
+// current frozen stable bundle checkpoint.
 
 type MultiDeviceComplexScenario struct {
 	*BaseScenario
@@ -103,13 +104,8 @@ func (s *MultiDeviceComplexScenario) createDeviceApp(scenarioConfig *config.Scen
 
 	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, scenarioConfig.UserID, time.Now().UnixNano()))
 	overs := &oversqlite.Config{
-		Schema: "business",
-		Tables: []oversqlite.SyncTable{
-			{TableName: "users"},
-			{TableName: "posts"},
-			{TableName: "files"},
-			{TableName: "file_reviews"},
-		},
+		Schema:        "business",
+		Tables:        managedSyncTables(),
 		UploadLimit:   100,
 		DownloadLimit: 100,
 	}
@@ -138,10 +134,10 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.device2App.SignIn(ctx, s.userID); err != nil {
 		return err
 	}
-	if err := s.app.PerformHydration(ctx); err != nil {
+	if err := s.app.Hydrate(ctx); err != nil {
 		return err
 	}
-	if err := s.device2App.PerformHydration(ctx); err != nil {
+	if err := s.device2App.Hydrate(ctx); err != nil {
 		return err
 	}
 
@@ -156,7 +152,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.app.CreateUserWithContext(ctx, s.A3, "A3", "a3@example.com"); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.app); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
 		return err
 	}
 
@@ -168,7 +164,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.device2App.CreateUserWithContext(ctx, s.B2, "B2", "b2@example.com"); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.device2App); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
 		return err
 	}
 
@@ -176,7 +172,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.app.UpdateUser(s.A2, "A2-upd", "a2u@example.com"); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.app); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
 		return err
 	}
 
@@ -184,7 +180,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.device2App.DeleteUserWithContext(ctx, s.A1); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.device2App); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
 		return err
 	}
 
@@ -193,7 +189,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.app.CreateUserWithContext(ctx, s.B3, "B3", "b3@example.com"); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.app); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
 		return err
 	}
 
@@ -201,7 +197,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.device2App.UpdateUser(s.B2, "B2-upd", "b2u@example.com"); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.device2App); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
 		return err
 	}
 
@@ -209,7 +205,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.app.DeleteUserWithContext(ctx, s.A3); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.app); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
 		return err
 	}
 
@@ -217,7 +213,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.app.CreateUserWithContext(ctx, s.A3, "A3-re", "a3re@example.com"); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.app); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
 		return err
 	}
 
@@ -225,15 +221,15 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	if err := s.app.UpdateUser(s.A3, "A3-re-upd", "a3reu@example.com"); err != nil {
 		return err
 	}
-	if err := s.fullSyncUploadThenDownload(ctx, s.app); err != nil {
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
 		return err
 	}
 
 	// Final convergence downloads for both devices
-	if _, _, err := s.downloadUntilEmpty(ctx, s.app, 500); err != nil {
+	if _, _, err := s.pullToStable(ctx, s.app); err != nil {
 		return err
 	}
-	if _, _, err := s.downloadUntilEmpty(ctx, s.device2App, 500); err != nil {
+	if _, _, err := s.pullToStable(ctx, s.device2App); err != nil {
 		return err
 	}
 
@@ -253,26 +249,16 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	return nil
 }
 
-func (s *MultiDeviceComplexScenario) fullSyncUploadThenDownload(ctx context.Context, app *MobileApp) error {
-	if err := app.PerformSyncUpload(ctx); err != nil {
+func (s *MultiDeviceComplexScenario) fullSyncUploadThenPull(ctx context.Context, app *MobileApp) error {
+	if err := app.PushPending(ctx); err != nil {
 		return err
 	}
-	_, _, err := s.downloadUntilEmpty(ctx, app, 500)
+	_, _, err := s.pullToStable(ctx, app)
 	return err
 }
 
-func (s *MultiDeviceComplexScenario) downloadUntilEmpty(ctx context.Context, app *MobileApp, limit int) (total int, last int64, err error) {
-	for {
-		applied, next, err := app.PerformSyncDownload(ctx, limit)
-		if err != nil {
-			return total, last, err
-		}
-		total += applied
-		last = next
-		if applied < limit {
-			return total, last, nil
-		}
-	}
+func (s *MultiDeviceComplexScenario) pullToStable(ctx context.Context, app *MobileApp) (total int, last int64, err error) {
+	return app.PullToStable(ctx)
 }
 
 func (s *MultiDeviceComplexScenario) verifyFinalState(ctx context.Context, logger *slog.Logger) error {

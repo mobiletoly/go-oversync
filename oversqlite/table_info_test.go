@@ -65,7 +65,7 @@ func TestTableInfoProvider_ClearCache(t *testing.T) {
 	provider := NewTableInfoProvider()
 
 	// Add some dummy data to cache
-	provider.cache["test_table"] = &TableInfo{Table: "test_table"}
+	provider.cache[tableInfoCacheKey{scope: 1, table: "test_table"}] = &TableInfo{Table: "test_table"}
 
 	if len(provider.cache) != 1 {
 		t.Error("Cache should have 1 entry before clearing")
@@ -474,20 +474,23 @@ func TestGlobalTableInfoProvider(t *testing.T) {
 		t.Error("Expected primary key to be BLOB")
 	}
 
-	// Test that it uses the same global provider (caching works)
+	// Repeated calls should succeed without leaking stale metadata.
 	info2, err := GetTableInfo(db, "global_test")
 	if err != nil {
 		t.Fatalf("Failed to get table info: %v", err)
 	}
 
-	if info != info2 {
-		t.Error("Expected same object from global provider cache")
+	if info2.Table != info.Table {
+		t.Errorf("Expected repeated lookup to return same table name %q, got %q", info.Table, info2.Table)
+	}
+	if info2.PrimaryKeyIsBlob != info.PrimaryKeyIsBlob {
+		t.Errorf("Expected repeated lookup to preserve primary key type, got %v vs %v", info.PrimaryKeyIsBlob, info2.PrimaryKeyIsBlob)
 	}
 }
 
-// TestGlobalTableInfoCacheClear tests that the global cache clearing works correctly
+// TestGlobalTableInfoCacheClear tests that convenience lookups do not leak
+// metadata across databases, even if the no-op clear hook is called.
 func TestGlobalTableInfoCacheClear(t *testing.T) {
-	// Clear the global cache first to ensure clean state
 	ClearGlobalTableInfoCache()
 
 	// Create first in-memory SQLite database
@@ -506,24 +509,14 @@ func TestGlobalTableInfoCacheClear(t *testing.T) {
 		t.Fatalf("Failed to create table in first database: %v", err)
 	}
 
-	// Get table info from first database (should populate cache)
+	// Get table info from first database.
 	info1, err := GetTableInfo(db1, "cache_clear_test")
 	if err != nil {
 		t.Fatalf("Failed to get table info from first database: %v", err)
 	}
 
-	// Verify cache is populated
-	if len(globalTableInfoProvider.cache) != 1 {
-		t.Errorf("Expected cache to have 1 entry, got %d", len(globalTableInfoProvider.cache))
-	}
-
-	// Clear the global cache
+	// Compatibility hook should be harmless.
 	ClearGlobalTableInfoCache()
-
-	// Verify cache is empty
-	if len(globalTableInfoProvider.cache) != 0 {
-		t.Errorf("Expected cache to be empty after clearing, got %d entries", len(globalTableInfoProvider.cache))
-	}
 
 	// Create second in-memory SQLite database with different schema
 	db2, err := sql.Open("sqlite3", ":memory:")
@@ -542,7 +535,7 @@ func TestGlobalTableInfoCacheClear(t *testing.T) {
 		t.Fatalf("Failed to create table in second database: %v", err)
 	}
 
-	// Get table info from second database (should not use cached data from first database)
+	// Get table info from second database; it must not reuse metadata from db1.
 	info2, err := GetTableInfo(db2, "cache_clear_test")
 	if err != nil {
 		t.Fatalf("Failed to get table info from second database: %v", err)

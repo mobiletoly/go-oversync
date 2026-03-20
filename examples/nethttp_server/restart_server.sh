@@ -22,8 +22,12 @@ rm -f "$LOG_FILE"
 # Clean up test data from database
 echo "Cleaning up test data from database..."
 psql "$DB_URL" -c "
-  DELETE FROM sync.server_change_log WHERE user_id LIKE 'user-fresh-%' OR user_id LIKE 'user-%';
-  DELETE FROM sync.sync_row_meta WHERE schema_name = 'business';
+  DELETE FROM sync.bundle_capture_stage;
+  DELETE FROM sync.applied_pushes;
+  DELETE FROM sync.bundle_rows;
+  DELETE FROM sync.bundle_log;
+  DELETE FROM sync.row_state;
+  DELETE FROM sync.user_state;
   DELETE FROM business.posts;
   DELETE FROM business.users;
 " 2>/dev/null || echo "⚠️  Database cleanup failed (database might not exist yet)"
