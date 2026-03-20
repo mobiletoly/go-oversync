@@ -41,4 +41,6 @@ examples/nethttp_server/nethttp_server
 examples/samplesync_server/samplesync_server
 example/mobile_flow/mobile_flow
 
+.drymint
+
 AGENTS.md
