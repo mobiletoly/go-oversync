@@ -1,6 +1,6 @@
 # Troubleshooting Bundle Push Completion
 
-This note covers the current bundle-era failure mode: a client finishes `PushPending()` only after
+This note covers the current bundle-based failure mode: a client finishes `PushPending()` only after
 the server accepts the push and the client durably replays the authoritative committed bundle
 locally.
 
@@ -106,7 +106,7 @@ Look for:
 
 ## Summary
 
-In the bundle-era client:
+In the current client:
 
 - success means accepted by the server and durably replayed locally
 - failure means dirty rows remain and bundle ids do not advance prematurely

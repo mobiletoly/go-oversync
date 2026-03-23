@@ -39,11 +39,14 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		historyPrunedErrorSeqExists      bool
 		bundleCaptureIndexExists         bool
 		rowStateIndexExists              bool
+		rowStateSnapshotIndexExists      bool
 		bundleLogIndexExists             bool
 		bundleRowsIndexExists            bool
+		bundleRowsKeyIndexExists         bool
 		snapshotSessionsTTLIndexExists   bool
 		snapshotSessionRowsIndexExists   bool
 		captureFunctionExists            bool
+		snapshotLastAccessedColumnCount  int
 		primaryKeyCount                  int
 		namedCheckConstraintCount        int
 	)
@@ -63,8 +66,10 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 			to_regclass('sync.history_pruned_error_seq') IS NOT NULL,
 			to_regclass('sync.bcs_tx_user_ordinal_idx') IS NOT NULL,
 			to_regclass('sync.rs_user_table_bundle_idx') IS NOT NULL,
+			to_regclass('sync.rs_user_live_snapshot_idx') IS NOT NULL,
 			to_regclass('sync.bl_user_committed_idx') IS NOT NULL,
 			to_regclass('sync.br_user_bundle_ordinal_idx') IS NOT NULL,
+			to_regclass('sync.br_user_bundle_key_idx') IS NOT NULL,
 			to_regclass('sync.ss_expires_at_idx') IS NOT NULL,
 			to_regclass('sync.ssr_snapshot_row_ordinal_idx') IS NOT NULL,
 			to_regprocedure('sync.capture_registered_row_change()') IS NOT NULL
@@ -82,8 +87,10 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		&historyPrunedErrorSeqExists,
 		&bundleCaptureIndexExists,
 		&rowStateIndexExists,
+		&rowStateSnapshotIndexExists,
 		&bundleLogIndexExists,
 		&bundleRowsIndexExists,
+		&bundleRowsKeyIndexExists,
 		&snapshotSessionsTTLIndexExists,
 		&snapshotSessionRowsIndexExists,
 		&captureFunctionExists,
@@ -102,11 +109,22 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 	require.True(t, historyPrunedErrorSeqExists)
 	require.True(t, bundleCaptureIndexExists)
 	require.True(t, rowStateIndexExists)
+	require.True(t, rowStateSnapshotIndexExists)
 	require.True(t, bundleLogIndexExists)
 	require.True(t, bundleRowsIndexExists)
+	require.True(t, bundleRowsKeyIndexExists)
 	require.True(t, snapshotSessionsTTLIndexExists)
 	require.True(t, snapshotSessionRowsIndexExists)
 	require.True(t, captureFunctionExists)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'sync'
+		  AND table_name = 'snapshot_sessions'
+		  AND column_name = 'last_accessed_at'
+	`).Scan(&snapshotLastAccessedColumnCount))
+	require.Zero(t, snapshotLastAccessedColumnCount)
 
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT COUNT(*)

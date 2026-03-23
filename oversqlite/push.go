@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -73,14 +74,14 @@ func (c *Client) PushPending(ctx context.Context) error {
 		return err
 	}
 	defer c.writeMu.Unlock()
-	return c.pushPendingLocked(ctx)
+	return c.pushPendingLocked(ctx, 0)
 }
 
 func atomicLoadPaused(v *int32) bool {
 	return v != nil && atomic.LoadInt32(v) == 1
 }
 
-func (c *Client) pushPendingLocked(ctx context.Context) error {
+func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) error {
 	rebuildRequired, err := c.rebuildRequired(ctx)
 	if err != nil {
 		return err
@@ -103,6 +104,26 @@ func (c *Client) pushPendingLocked(ctx context.Context) error {
 
 	committed, err := c.commitPushOutboundSnapshot(ctx, snapshot)
 	if err != nil {
+		var conflictErr *PushConflictError
+		if errors.As(err, &conflictErr) {
+			if err := c.resolvePushConflict(ctx, snapshot, conflictErr); err != nil {
+				return err
+			}
+			remainingDirtyCount, err := c.pendingChangeCount(ctx)
+			if err != nil {
+				return err
+			}
+			if remainingDirtyCount > 0 {
+				if conflictRetryCount >= maxPushConflictAutoRetries {
+					return &PushConflictRetryExhaustedError{
+						RetryCount:          maxPushConflictAutoRetries,
+						RemainingDirtyCount: remainingDirtyCount,
+					}
+				}
+				return c.pushPendingLocked(ctx, conflictRetryCount+1)
+			}
+			return nil
+		}
 		return err
 	}
 	if err := c.fetchCommittedPushBundle(ctx, committed); err != nil {
@@ -548,7 +569,7 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE _sync_client_state
 		SET last_bundle_seq_seen = CASE
-				WHEN last_bundle_seq_seen < ? THEN ?
+				WHEN last_bundle_seq_seen + 1 = ? THEN ?
 				ELSE last_bundle_seq_seen
 			END,
 			next_source_bundle_id = CASE
@@ -1017,6 +1038,9 @@ func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedR
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		if conflictErr := decodePushConflictError(resp.StatusCode, body); conflictErr != nil {
+			return nil, conflictErr
+		}
 		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
 	}
 
@@ -1058,6 +1082,9 @@ func (c *Client) uploadPushChunk(ctx context.Context, pushID string, req *oversy
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		if conflictErr := decodePushConflictError(resp.StatusCode, body); conflictErr != nil {
+			return nil, conflictErr
+		}
 		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
 	}
 
@@ -1091,6 +1118,9 @@ func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversyn
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		if conflictErr := decodePushConflictError(resp.StatusCode, body); conflictErr != nil {
+			return nil, conflictErr
+		}
 		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
 	}
 

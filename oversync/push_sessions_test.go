@@ -248,6 +248,14 @@ func decodeErrorResponse(t *testing.T, rec *httptest.ResponseRecorder) ErrorResp
 	return resp
 }
 
+func decodePushConflictResponse(t *testing.T, rec *httptest.ResponseRecorder) PushConflictResponse {
+	t.Helper()
+
+	var resp PushConflictResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	return resp
+}
+
 func TestPushSessions_StagedRowsRemainInvisibleUntilCommit(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
@@ -271,6 +279,103 @@ func TestPushSessions_StagedRowsRemainInvisibleUntilCommit(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pullAfterCommit.Bundles, 1)
 	require.Equal(t, commit.BundleSeq, pullAfterCommit.Bundles[0].BundleSeq)
+}
+
+func TestPushSessions_CommitConflictResponseIncludesStructuredRow(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+
+	rowID := uuid.New()
+	_, err := pushRowsViaSession(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{{
+		Schema:         fixture.schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Server","email":"server@example.com"}`, rowID)),
+	}})
+	require.NoError(t, err)
+
+	session := fixture.createSession(t, ctx, 2, 1)
+	fixture.uploadChunk(t, ctx, session.PushID, 0, PushRequestRow{
+		Schema:         fixture.schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpUpdate,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Client","email":"client@example.com"}`, rowID)),
+	})
+
+	handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
+	rec := doJSONHandlerRequest(
+		t,
+		handlers.HandleCommitPushSession,
+		http.MethodPost,
+		"/sync/push-sessions/"+session.PushID+"/commit",
+		fixture.writer,
+		nil,
+		map[string]string{"push_id": session.PushID},
+	)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+	resp := decodePushConflictResponse(t, rec)
+	require.Equal(t, "push_conflict", resp.Error)
+	require.NotNil(t, resp.Conflict)
+	require.Equal(t, fixture.schemaName, resp.Conflict.Schema)
+	require.Equal(t, "users", resp.Conflict.Table)
+	require.Equal(t, SyncKey{"id": rowID.String()}, resp.Conflict.Key)
+	require.Equal(t, OpUpdate, resp.Conflict.Op)
+	require.Equal(t, int64(0), resp.Conflict.BaseRowVersion)
+	require.Equal(t, int64(1), resp.Conflict.ServerRowVersion)
+	require.False(t, resp.Conflict.ServerRowDeleted)
+	require.JSONEq(t, fmt.Sprintf(`{"id":"%s","name":"Server","email":"server@example.com"}`, rowID), string(resp.Conflict.ServerRow))
+}
+
+func TestPushSessions_DeletedConflictReportsNullServerRow(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+
+	rowID := uuid.New()
+	_, err := pushRowsViaSession(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{{
+		Schema:         fixture.schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Server","email":"server@example.com"}`, rowID)),
+	}})
+	require.NoError(t, err)
+	_, err = pushRowsViaSession(t, ctx, fixture.svc, fixture.writer, 2, []PushRequestRow{{
+		Schema:         fixture.schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpDelete,
+		BaseRowVersion: 1,
+	}})
+	require.NoError(t, err)
+
+	session := fixture.createSession(t, ctx, 3, 1)
+	fixture.uploadChunk(t, ctx, session.PushID, 0, PushRequestRow{
+		Schema:         fixture.schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpUpdate,
+		BaseRowVersion: 1,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Client","email":"client@example.com"}`, rowID)),
+	})
+
+	_, err = fixture.svc.CommitPushSession(ctx, fixture.writer, session.PushID)
+	var conflictErr *PushConflictError
+	require.ErrorAs(t, err, &conflictErr)
+	require.NotNil(t, conflictErr.Conflict)
+	require.Equal(t, fixture.schemaName, conflictErr.Conflict.Schema)
+	require.Equal(t, "users", conflictErr.Conflict.Table)
+	require.Equal(t, SyncKey{"id": rowID.String()}, conflictErr.Conflict.Key)
+	require.Equal(t, OpUpdate, conflictErr.Conflict.Op)
+	require.Equal(t, int64(1), conflictErr.Conflict.BaseRowVersion)
+	require.Equal(t, int64(2), conflictErr.Conflict.ServerRowVersion)
+	require.True(t, conflictErr.Conflict.ServerRowDeleted)
+	require.Nil(t, conflictErr.Conflict.ServerRow)
 }
 
 func TestPushSessions_DuplicateCommitIsIdempotent(t *testing.T) {

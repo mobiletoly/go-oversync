@@ -74,7 +74,18 @@ if err := client.PullToStable(context.Background()); err != nil {
 
 - Payloads are full-row after-images for `INSERT` and `UPDATE`.
 - Push is all-or-nothing at bundle level.
+- Structured `push_conflict` responses are resolved from machine-readable conflict details, not
+  human-readable error strings.
+- `PushPending(ctx)` auto-recovers valid structured conflict outcomes:
+  - `AcceptServer`
+  - `KeepLocal`
+  - `KeepMerged(mergedPayload)`
+- `KeepLocal` and `KeepMerged` retry from a fresh outbound snapshot while preserving the same
+  logical `source_bundle_id`.
+- Structured conflict retries are bounded. Invalid resolutions and retry exhaustion fail closed by
+  clearing `_sync_push_outbound` and restoring replayable intents to `_sync_dirty_rows`.
 - Pull applies complete bundles only and advances `last_bundle_seq_seen` only after durable commit.
+- `last_bundle_seq_seen` is the highest contiguous durably applied bundle, not the highest seen seq.
 - `PullToStable`, `Hydrate`, and `Recover` fail closed while `_sync_push_outbound` exists.
 - `Sync` fails closed while `_sync_client_state.rebuild_required = 1`; only `Hydrate` or `Recover`
   may clear that flag.
@@ -93,6 +104,51 @@ If the server returns `history_pruned`, the client must rebuild from chunked sna
 
 - `Hydrate(ctx)` performs a snapshot rebuild without rotating `source_id`.
 - `Recover(ctx)` performs a destructive rebuild and rotates `source_id` before new writes resume.
+
+## Conflict Resolution
+
+Resolvers now receive structured conflict context:
+
+- `schema`
+- `table`
+- `key`
+- `local op`
+- `local payload`
+- `base row version`
+- `server row version`
+- `server row deleted`
+- `server row payload`
+
+Built-in resolvers:
+
+- `&oversqlite.ServerWinsResolver{}`
+- `&oversqlite.ClientWinsResolver{}`
+
+Example:
+
+```go
+client.Resolver = &oversqlite.ClientWinsResolver{}
+```
+
+Custom resolvers implement:
+
+```go
+type Resolver interface {
+    Resolve(conflict oversqlite.ConflictContext) oversqlite.MergeResult
+}
+```
+
+Possible results:
+
+- `oversqlite.AcceptServer{}`
+- `oversqlite.KeepLocal{}`
+- `oversqlite.KeepMerged{MergedPayload: payload}`
+
+Typed errors:
+
+- `*oversqlite.PushConflictError`: structured conflict payload decoded from transport
+- `*oversqlite.InvalidConflictResolutionError`: resolver returned an invalid outcome for the conflict shape
+- `*oversqlite.PushConflictRetryExhaustedError`: automatic structured conflict retry hit the retry budget
 
 ## Server requirements
 

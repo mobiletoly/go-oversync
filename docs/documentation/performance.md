@@ -1,6 +1,7 @@
 ---
 layout: default
 title: Performance
+permalink: /documentation/performance/
 ---
 
 # Performance

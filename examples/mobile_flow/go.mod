@@ -6,7 +6,7 @@ replace github.com/mobiletoly/go-oversync => ../..
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.1
 	github.com/lib/pq v1.12.0
 	github.com/mattn/go-sqlite3 v1.14.37
 	github.com/mobiletoly/go-oversync v0.0.0-00010101000000-000000000000

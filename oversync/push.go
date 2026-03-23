@@ -25,7 +25,8 @@ func (e *PushValidationError) Error() string {
 }
 
 type PushConflictError struct {
-	Message string
+	Message  string
+	Conflict *PushConflictDetails
 }
 
 func (e *PushConflictError) Error() string {
@@ -321,27 +322,83 @@ func loadRowStateSnapshots(ctx context.Context, tx pgx.Tx, userID string, rows [
 	return states, nil
 }
 
-func validatePushRowConflict(row pushPreparedRow, state *rowStateSnapshot) error {
+func (s *SyncService) pushConflictError(ctx context.Context, tx pgx.Tx, row pushPreparedRow, state *rowStateSnapshot, message string) error {
+	var (
+		serverRowVersion int64
+		serverRowDeleted bool
+		serverRow        json.RawMessage
+	)
+	if state != nil {
+		serverRowVersion = state.rowVersion
+		serverRowDeleted = state.deleted
+	}
+	if state != nil && !state.deleted {
+		var err error
+		serverRow, err = s.loadCurrentServerRowPayload(ctx, tx, row)
+		if err != nil {
+			return err
+		}
+	}
+	return &PushConflictError{
+		Message: message,
+		Conflict: &PushConflictDetails{
+			Schema:           row.schema,
+			Table:            row.table,
+			Key:              SyncKey{row.keyColumn: row.keyUUID.String()},
+			Op:               row.op,
+			BaseRowVersion:   row.baseRowVersion,
+			ServerRowVersion: serverRowVersion,
+			ServerRowDeleted: serverRowDeleted,
+			ServerRow:        serverRow,
+		},
+	}
+}
+
+func (s *SyncService) loadCurrentServerRowPayload(ctx context.Context, tx pgx.Tx, row pushPreparedRow) (json.RawMessage, error) {
+	tableIdent := pgx.Identifier{row.schema, row.table}.Sanitize()
+	keyColumnIdent := pgx.Identifier{row.keyColumn}.Sanitize()
+
+	var payload []byte
+	err := tx.QueryRow(ctx, fmt.Sprintf(`
+		SELECT to_jsonb(src)
+		FROM %s AS src
+		WHERE %s = $1
+	`, tableIdent, keyColumnIdent), row.keyUUID).Scan(&payload)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load current server row payload for %s.%s %s: %w", row.schema, row.table, row.keyUUID.String(), err)
+	}
+
+	canonicalPayload, err := s.canonicalizeWirePayload(row.schema, row.table, payload)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize current server row payload for %s.%s %s: %w", row.schema, row.table, row.keyUUID.String(), err)
+	}
+	return canonicalPayload, nil
+}
+
+func (s *SyncService) validatePushRowConflict(ctx context.Context, tx pgx.Tx, row pushPreparedRow, state *rowStateSnapshot) error {
 	switch row.op {
 	case OpInsert:
 		if state == nil {
 			if row.baseRowVersion != 0 {
-				return &PushConflictError{Message: fmt.Sprintf("insert conflict on %s.%s %s: expected missing row at version 0, got %d", row.schema, row.table, row.keyUUID.String(), row.baseRowVersion)}
+				return s.pushConflictError(ctx, tx, row, nil, fmt.Sprintf("insert conflict on %s.%s %s: expected missing row at version 0, got %d", row.schema, row.table, row.keyUUID.String(), row.baseRowVersion))
 			}
 			return nil
 		}
 		if row.baseRowVersion != state.rowVersion {
-			return &PushConflictError{Message: fmt.Sprintf("insert conflict on %s.%s %s: expected base_row_version %d, got %d", row.schema, row.table, row.keyUUID.String(), state.rowVersion, row.baseRowVersion)}
+			return s.pushConflictError(ctx, tx, row, state, fmt.Sprintf("insert conflict on %s.%s %s: expected base_row_version %d, got %d", row.schema, row.table, row.keyUUID.String(), state.rowVersion, row.baseRowVersion))
 		}
 		if !state.deleted {
-			return &PushConflictError{Message: fmt.Sprintf("insert conflict on %s.%s %s: row already exists at version %d", row.schema, row.table, row.keyUUID.String(), state.rowVersion)}
+			return s.pushConflictError(ctx, tx, row, state, fmt.Sprintf("insert conflict on %s.%s %s: row already exists at version %d", row.schema, row.table, row.keyUUID.String(), state.rowVersion))
 		}
 	case OpUpdate, OpDelete:
 		if state == nil || state.deleted {
-			return &PushConflictError{Message: fmt.Sprintf("%s conflict on %s.%s %s: row does not exist", strings.ToLower(row.op), row.schema, row.table, row.keyUUID.String())}
+			return s.pushConflictError(ctx, tx, row, state, fmt.Sprintf("%s conflict on %s.%s %s: row does not exist", strings.ToLower(row.op), row.schema, row.table, row.keyUUID.String()))
 		}
 		if row.baseRowVersion != state.rowVersion {
-			return &PushConflictError{Message: fmt.Sprintf("%s conflict on %s.%s %s: expected version %d, got %d", strings.ToLower(row.op), row.schema, row.table, row.keyUUID.String(), state.rowVersion, row.baseRowVersion)}
+			return s.pushConflictError(ctx, tx, row, state, fmt.Sprintf("%s conflict on %s.%s %s: expected version %d, got %d", strings.ToLower(row.op), row.schema, row.table, row.keyUUID.String(), state.rowVersion, row.baseRowVersion))
 		}
 	}
 	return nil

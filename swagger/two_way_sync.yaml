@@ -103,7 +103,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/PushSessionChunkResponse'
         '400':
-          description: Invalid or out-of-order chunk upload
+          description: Invalid chunk upload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Out-of-order chunk upload
           content:
             application/json:
               schema:
@@ -178,7 +184,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                $ref: '#/components/schemas/PushConflictResponse'
         '410':
           description: Push session expired
           content:
@@ -278,12 +284,6 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Authentication required
-        '403':
-          description: Bundle belongs to a different user
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Bundle not found
           content:
@@ -853,6 +853,56 @@ components:
           type: string
         message:
           type: string
+
+    PushConflictResponse:
+      type: object
+      required: [error, message, conflict]
+      properties:
+        error:
+          type: string
+          enum: [push_conflict]
+        message:
+          type: string
+        conflict:
+          $ref: '#/components/schemas/PushConflictDetails'
+
+    PushConflictDetails:
+      type: object
+      required:
+        - schema
+        - table
+        - key
+        - op
+        - base_row_version
+        - server_row_version
+        - server_row_deleted
+        - server_row
+      properties:
+        schema:
+          type: string
+        table:
+          type: string
+        key:
+          type: object
+          additionalProperties:
+            type: string
+        op:
+          type: string
+          enum: [INSERT, UPDATE, DELETE]
+        base_row_version:
+          type: integer
+          format: int64
+          minimum: 0
+        server_row_version:
+          type: integer
+          format: int64
+          minimum: 0
+        server_row_deleted:
+          type: boolean
+        server_row:
+          type: object
+          nullable: true
+          additionalProperties: true
 
     StatusResponse:
       type: object

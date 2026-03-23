@@ -32,13 +32,12 @@ func errorJSONResponse(status int, v any) *http.Response {
 }
 
 type staticResolver struct {
-	keepLocal bool
-	merged    json.RawMessage
+	result MergeResult
 }
 
-func (r *staticResolver) Merge(table string, pk string, server json.RawMessage, local json.RawMessage) (json.RawMessage, bool, error) {
-	if r.merged != nil {
-		return r.merged, r.keepLocal, nil
+func (r *staticResolver) Resolve(conflict ConflictContext) MergeResult {
+	if r == nil || r.result == nil {
+		return AcceptServer{}
 	}
-	return server, r.keepLocal, nil
+	return r.result
 }

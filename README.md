@@ -1,181 +1,147 @@
-# go-oversync — PostgreSQL adapter for multi-device sync
+# go-oversync
 
-**A set of libraries that add two-way sync between client databases and PostgreSQL
-servers.**
+go-oversync is a Go library suite for two-way sync between local SQLite clients and PostgreSQL
+servers.
 
-## What is go-oversync?
+The current contract is bundle-based:
 
-go-oversync is a Go library suite designed for applications that need **reliable synchronization**
-between local client databases and a central PostgreSQL backend, across multiple devices and
-platforms.
+- PostgreSQL business tables are authoritative.
+- clients push one logical dirty set at a time through staged push sessions
+- clients pull complete committed bundles only
+- fresh installs and prune recovery rebuild from frozen snapshot sessions
 
-Use it when you want to:
+## Packages
 
-- Sync changes bi-directionally between a client (e.g. mobile or embedded SQLite) and a server (
-  PostgreSQL).
-- Allow offline operation and automatic syncing once connectivity is restored.
-- Handle conflict resolution out of the box.
-- Plug into your existing HTTP server and authentication stack without needing a separate sync
-  server.
+- `oversync/`: PostgreSQL adapter, schema validation, bundle capture, HTTP handlers
+- `oversqlite/`: SQLite client SDK with trigger-based dirty capture and sync loops
+- `examples/nethttp_server/`: reference `net/http` server
+- `examples/mobile_flow/`: end-to-end simulator for the current client/server contract
+- `examples/samplesync_server/`: sample server for the KMP sample app
+- `docs/`: Jekyll site content
+- `swagger/two_way_sync.yaml`: OpenAPI description of the HTTP surface
 
-It includes:
+## Current Supported Envelope
 
-- A **PostgreSQL adapter** that integrates with your server APIs.
-- A **Go SQLite client**, for desktop or backend usage.
-- **Kotlin Multiplatform client** — For Android/iOS apps
-  via [sqlitenow-kmp](https://github.com/mobiletoly/sqlitenow-kmp)
+Server-side registered tables are intentionally constrained:
 
+- one sync key column per registered table
+- that sync key must be the table's single-column UUID primary key
+- registered tables must be FK-closed
+- supported foreign keys must be single-column and `DEFERRABLE`
+- unsupported key shapes or FK shapes fail during bootstrap
 
-## Why go-oversync?
+The SQLite client is likewise fail-closed:
 
-- **Library, not server** — Integrate with your existing server architecture
-- **Bring your own auth** — Works with any authentication system (JWT, sessions, API keys)
-- **Clean architecture** — No invasive columns in your business tables
-- **Offline-first** — Works seamlessly with poor connectivity
-- **Multi-device** — Perfect sync across phones, tablets, and web
-
-## How It Works
-
-**You control the server:** go-oversync provides libraries that integrate into your existing HTTP
-server. You handle routing, middleware, authentication, and business logic.
-
-**Multiple client options:** Use the Go SQLite client for Go apps, or the Kotlin Multiplatform
-client for Android/iOS apps. Both sync with the same PostgreSQL adapter. More client libraries
-are coming.
-
-**Simple integration:** Register your tables with go-oversync, add a few HTTP handlers to your
-routes, and the library handles chunked push-session upload, bundle capture, conflict detection,
-and sync protocol details.
-
-**Flexible authentication:** Works with any auth system — JWT, sessions, API keys, or custom
-authentication. You extract user/device IDs and pass them to go-oversync.
-
-```
-┌──────────────────┐    Your HTTP      ┌──────────────────┐
-│ Client Database  │    Server with    │   PostgreSQL     │
-│ (SQLite, etc.)   │ ◄─ go-oversync ─► │ + go-oversync    │
-│ + Client Library │    handlers       │   Library        │
-└──────────────────┘    and auth       └──────────────────┘
-```
-
+- one configured remote schema per SQLite database
+- one `oversqlite.Client` process owner per SQLite database
+- managed local tables must be FK-closed
 
 ## Quick Start
 
-### 1. Install
+Install the module:
 
 ```bash
 go get github.com/mobiletoly/go-oversync
 ```
 
-### 2. Try the Example
+Run the fast checks:
 
 ```bash
-# Start the example server
-go run ./examples/nethttp_server
-
-# In another terminal, run the mobile simulator
-cd examples/mobile_flow && go run .
+go test ./oversync ./oversqlite
 ```
 
-The mobile simulator runs 11 comprehensive scenarios including multi-device sync, conflict
-resolution, and edge cases. All scenarios pass with 100% success rate.
+Start the reference server:
 
-### 3. Integrate with Your Server
+```bash
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable" \
+JWT_SECRET="dev-secret" \
+go run ./examples/nethttp_server
+```
+
+Run an implemented simulator scenario:
+
+```bash
+cd examples/mobile_flow
+go run . --scenario=fresh-install --cleanup=false
+```
+
+## Server Integration
 
 ```go
-// 1. Configure go-oversync for your tables
 cfg := &oversync.ServiceConfig{
     MaxSupportedSchemaVersion: 1,
-    AppName: "my-app",
+    AppName:                   "my-sync-app",
     RegisteredTables: []oversync.RegisteredTable{
         {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
         {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
     },
 }
 
-svc, _ := oversync.NewRuntimeService(pool, cfg, logger)
+svc, err := oversync.NewRuntimeService(pool, cfg, logger)
+if err != nil {
+    log.Fatal(err)
+}
 if err := svc.Bootstrap(ctx); err != nil {
     log.Fatal(err)
 }
-// Bootstrap also prepares the runtime topology snapshot.
-// Runtime schema changes are restart-only for now.
 
-// 2. Create handlers (works with any auth system)
-h := oversync.NewHTTPSyncHandlers(svc, logger)
+handlers := oversync.NewHTTPSyncHandlers(svc, logger)
 
-// 3. Add to your existing HTTP server
-mux.Handle("POST /sync/push-sessions", yourAuthMiddleware(http.HandlerFunc(h.HandleCreatePushSession)))
-mux.Handle("POST /sync/push-sessions/{push_id}/chunks", yourAuthMiddleware(http.HandlerFunc(h.HandlePushSessionChunk)))
-mux.Handle("POST /sync/push-sessions/{push_id}/commit", yourAuthMiddleware(http.HandlerFunc(h.HandleCommitPushSession)))
-mux.Handle("DELETE /sync/push-sessions/{push_id}", yourAuthMiddleware(http.HandlerFunc(h.HandleDeletePushSession)))
-mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", yourAuthMiddleware(http.HandlerFunc(h.HandleGetCommittedBundleRows)))
-mux.Handle("GET /sync/pull", yourAuthMiddleware(http.HandlerFunc(h.HandlePull)))
-mux.Handle("POST /sync/snapshot-sessions", yourAuthMiddleware(http.HandlerFunc(h.HandleCreateSnapshotSession)))
-mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", yourAuthMiddleware(http.HandlerFunc(h.HandleGetSnapshotChunk)))
-mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", yourAuthMiddleware(http.HandlerFunc(h.HandleDeleteSnapshotSession)))
-mux.Handle("GET /sync/capabilities", yourAuthMiddleware(http.HandlerFunc(h.HandleCapabilities)))
+mux := http.NewServeMux()
+mux.Handle("POST /sync/push-sessions", auth(http.HandlerFunc(handlers.HandleCreatePushSession)))
+mux.Handle("POST /sync/push-sessions/{push_id}/chunks", auth(http.HandlerFunc(handlers.HandlePushSessionChunk)))
+mux.Handle("POST /sync/push-sessions/{push_id}/commit", auth(http.HandlerFunc(handlers.HandleCommitPushSession)))
+mux.Handle("DELETE /sync/push-sessions/{push_id}", auth(http.HandlerFunc(handlers.HandleDeletePushSession)))
+mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", auth(http.HandlerFunc(handlers.HandleGetCommittedBundleRows)))
+mux.Handle("GET /sync/pull", auth(http.HandlerFunc(handlers.HandlePull)))
+mux.Handle("POST /sync/snapshot-sessions", auth(http.HandlerFunc(handlers.HandleCreateSnapshotSession)))
+mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", auth(http.HandlerFunc(handlers.HandleGetSnapshotChunk)))
+mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", auth(http.HandlerFunc(handlers.HandleDeleteSnapshotSession)))
+mux.Handle("GET /sync/capabilities", auth(http.HandlerFunc(handlers.HandleCapabilities)))
+mux.HandleFunc("GET /health", handlers.HandleHealth)
+mux.HandleFunc("GET /status", handlers.HandleStatus)
 ```
 
-**Your auth, your rules:** Use JWT, sessions, API keys, or any authentication system. Your middleware should
-authenticate the request and inject an `oversync.Actor{UserID, SourceID}` into request context before calling the handlers.
+Your auth middleware must authenticate the request and inject
+`oversync.Actor{UserID, SourceID}` into request context before calling the sync handlers.
 
+## SQLite Client
 
-### 4. Client Setup
+```go
+cfg := oversqlite.DefaultConfig("business", []oversqlite.SyncTable{
+    {TableName: "users", SyncKeyColumnName: "id"},
+    {TableName: "posts", SyncKeyColumnName: "id"},
+})
 
-Both clients sync with the same PostgreSQL adapter using identical protocols, ensuring perfect
-compatibility across platforms.
+client, err := oversqlite.NewClient(db, "http://localhost:8080", "user-123", "device-abc", tokenProvider, cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
 
-#### Option A: Go SQLite Client
+if err := client.Bootstrap(ctx, true); err != nil {
+    log.Fatal(err)
+}
 
-- **Location:** `oversqlite/` package in this repo
-- **Use case:** Go applications, desktop apps, server-to-server sync
-- **Database:** SQLite with automatic trigger-based change tracking
-- **Features:** bundle push/pull, chunked snapshot rebuild, conflict resolution, offline-first design
-
-#### Option B: Kotlin Multiplatform Client (Android/iOS)
-
-- **Repository:** [sqlitenow-kmp](https://github.com/mobiletoly/sqlitenow-kmp)
-- **Use case:** Android and iOS mobile applications
-- **Database:** SQLite with the same sync protocol
-- **Features:** Cross-platform mobile support, same sync guarantees
-
-
-## Key Features
-
-- **Conflict Resolution** — Optimistic concurrency with automatic conflict detection
-- **Batch Processing** — FK-aware ordering and efficient batch operations
-- **User Isolation** — Each user has completely isolated sync streams
-- **Multi-Platform** — Go client for servers/desktop, Kotlin Multiplatform for mobile
-- **Offline-First** — Works perfectly with intermittent connectivity
-
+if err := client.Sync(ctx); err != nil {
+    log.Fatal(err)
+}
+```
 
 ## Documentation
 
-- **[Documentation](https://mobiletoly.github.io/go-oversync/)** - Documentation home page
+- docs site: <https://mobiletoly.github.io/go-oversync/>
+- getting started: `docs/getting-started.md`
+- server reference: `docs/documentation/server.md`
+- client reference: `docs/documentation/client.md`
+- HTTP API reference: `docs/documentation/api.md`
 
 ## Examples
 
-- **[nethttp_server](examples/nethttp_server/)** — Server reference implementation
-- **[mobile_flow](examples/mobile_flow/)** — Comprehensive sync simulator with 11 scenarios
-- **[samplesync_server](examples/samplesync_server/)** — Multi-tenant server example to
-  to be used with Kotlin Multiplatform sample app
-  [samplesync-kmp](https://github.com/mobiletoly/sqlitenow-kmp/tree/main/samplesync-kmp)
+- `examples/nethttp_server/`: reference server with JWT auth and test helpers
+- `examples/mobile_flow/`: simulator for implemented and scaffolded sync scenarios
+- `examples/samplesync_server/`: sample server used by the Kotlin sample app
 
+## License
 
-# License
-
-```
-Copyright 2025 Toly Pochkin
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
+Apache 2.0. See `LICENSE` if present in your distribution or the source headers in this repository.

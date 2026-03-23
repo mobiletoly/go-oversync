@@ -20,6 +20,8 @@ func TestSyncService_GetCapabilities(t *testing.T) {
 			PushSessionTTL:                     17 * time.Second,
 			DefaultRowsPerCommittedBundleChunk: 45,
 			MaxRowsPerCommittedBundleChunk:     67,
+			MaxRowsPerSnapshotSession:          890,
+			MaxBytesPerSnapshotSession:         98765,
 			RegisteredTables: []RegisteredTable{
 				{Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
 				{Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
@@ -73,7 +75,9 @@ func TestSyncService_GetCapabilities(t *testing.T) {
 		caps.BundleLimits.MaxRowsPerCommittedBundleChunk != 67 ||
 		caps.BundleLimits.DefaultRowsPerSnapshotChunk != defaultRowsPerSnapshotChunk ||
 		caps.BundleLimits.MaxRowsPerSnapshotChunk != defaultMaxRowsPerSnapshotChunk ||
-		caps.BundleLimits.SnapshotSessionTTLSeconds != int(defaultSnapshotSessionTTL.Seconds()) {
+		caps.BundleLimits.SnapshotSessionTTLSeconds != int(defaultSnapshotSessionTTL.Seconds()) ||
+		caps.BundleLimits.MaxRowsPerSnapshotSession != 890 ||
+		caps.BundleLimits.MaxBytesPerSnapshotSession != 98765 {
 		t.Fatalf("unexpected bundle limits: %#v", caps.BundleLimits)
 	}
 }

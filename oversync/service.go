@@ -130,6 +130,8 @@ type ServiceConfig struct {
 	DefaultRowsPerSnapshotChunk int
 	MaxRowsPerSnapshotChunk     int
 	SnapshotSessionTTL          time.Duration
+	MaxRowsPerSnapshotSession   int64
+	MaxBytesPerSnapshotSession  int64
 	// UploadLockTimeout bounds lock waits inside upload transactions.
 	// Zero disables SET LOCAL lock_timeout so lock waits are governed only by the request context,
 	// which is the reliability-first default.
@@ -202,6 +204,20 @@ func (s *SyncService) snapshotSessionTTL() time.Duration {
 		return s.config.SnapshotSessionTTL
 	}
 	return defaultSnapshotSessionTTL
+}
+
+func (s *SyncService) maxRowsPerSnapshotSession() int64 {
+	if s != nil && s.config != nil && s.config.MaxRowsPerSnapshotSession > 0 {
+		return s.config.MaxRowsPerSnapshotSession
+	}
+	return 0
+}
+
+func (s *SyncService) maxBytesPerSnapshotSession() int64 {
+	if s != nil && s.config != nil && s.config.MaxBytesPerSnapshotSession > 0 {
+		return s.config.MaxBytesPerSnapshotSession
+	}
+	return 0
 }
 
 // NewRuntimeService creates a runtime-only sync service instance from an existing pool.
@@ -725,6 +741,8 @@ func (s *SyncService) GetCapabilities() CapabilitiesResponse {
 			DefaultRowsPerSnapshotChunk:        s.defaultRowsPerSnapshotChunk(),
 			MaxRowsPerSnapshotChunk:            s.maxRowsPerSnapshotChunk(),
 			SnapshotSessionTTLSeconds:          int(s.snapshotSessionTTL().Seconds()),
+			MaxRowsPerSnapshotSession:          s.maxRowsPerSnapshotSession(),
+			MaxBytesPerSnapshotSession:         s.maxBytesPerSnapshotSession(),
 		},
 	}
 }

@@ -6,6 +6,7 @@ This example shows a bundle-based go-oversync server built with the standard Go 
 
 - `POST /dummy-signin`
 - `POST /test/reset`
+- `POST /test/retention-floor`
 - `POST /sync/push-sessions`
 - `POST /sync/push-sessions/{push_id}/chunks`
 - `POST /sync/push-sessions/{push_id}/commit`
@@ -55,6 +56,17 @@ curl -X POST http://localhost:8080/test/reset
 
 This drops and recreates the example business schema plus the local `sync` schema used by
 `nethttp_server`.
+
+## Force prune recovery for one user
+
+```bash
+curl -X POST http://localhost:8080/test/retention-floor \
+  -H "Authorization: Bearer <jwt-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"retained_bundle_floor": 999999}'
+```
+
+This is a test helper for forcing the `history_pruned` path and snapshot recovery flows.
 
 ## Example push session flow
 

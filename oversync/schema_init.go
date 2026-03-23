@@ -28,8 +28,10 @@ SELECT
 	AND to_regclass('sync.cl_user_schema_seq_idx') IS NOT NULL
 	AND to_regclass('sync.bcs_tx_user_ordinal_idx') IS NOT NULL
 	AND to_regclass('sync.rs_user_table_bundle_idx') IS NOT NULL
+	AND to_regclass('sync.rs_user_live_snapshot_idx') IS NOT NULL
 	AND to_regclass('sync.bl_user_committed_idx') IS NOT NULL
 	AND to_regclass('sync.br_user_bundle_ordinal_idx') IS NOT NULL
+	AND to_regclass('sync.br_user_bundle_key_idx') IS NOT NULL
 	AND to_regclass('sync.ss_expires_at_idx') IS NOT NULL
 	AND to_regclass('sync.ssr_snapshot_row_ordinal_idx') IS NOT NULL
 	AND to_regprocedure('sync.capture_registered_row_change()') IS NOT NULL
@@ -164,8 +166,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			row_count BIGINT NOT NULL DEFAULT 0,
 			byte_count BIGINT NOT NULL DEFAULT 0,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			expires_at TIMESTAMPTZ NOT NULL,
-			last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			expires_at TIMESTAMPTZ NOT NULL
 		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.snapshot_session_rows (
 			snapshot_id UUID NOT NULL REFERENCES sync.snapshot_sessions(snapshot_id) ON DELETE CASCADE,
@@ -288,10 +289,6 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			RETURN NEW;
 		END;
 		$$`,
-		`ALTER TABLE sync.bundle_log ADD COLUMN IF NOT EXISTS bundle_hash TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE sync.applied_pushes ADD COLUMN IF NOT EXISTS row_count BIGINT NOT NULL DEFAULT 0`,
-		`ALTER TABLE sync.applied_pushes ADD COLUMN IF NOT EXISTS bundle_hash TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE sync.applied_pushes ADD COLUMN IF NOT EXISTS committed_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
 	}
 
 	// Run all migrations within the provided transaction
@@ -305,14 +302,15 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 	bootstrapIndexes := []string{
 		`CREATE INDEX IF NOT EXISTS bcs_tx_user_ordinal_idx ON sync.bundle_capture_stage(txid, user_id, capture_id)`,
 		`CREATE INDEX IF NOT EXISTS rs_user_table_bundle_idx ON sync.row_state(user_id, schema_name, table_name, bundle_seq DESC)`,
+		`CREATE INDEX IF NOT EXISTS rs_user_live_snapshot_idx ON sync.row_state(user_id, schema_name, table_name, key_json, bundle_seq) WHERE deleted = FALSE`,
 		`CREATE INDEX IF NOT EXISTS bl_user_committed_idx ON sync.bundle_log(user_id, committed_at DESC, bundle_seq DESC)`,
 		`CREATE INDEX IF NOT EXISTS br_user_bundle_ordinal_idx ON sync.bundle_rows(user_id, bundle_seq, row_ordinal)`,
+		`CREATE INDEX IF NOT EXISTS br_user_bundle_key_idx ON sync.bundle_rows(user_id, bundle_seq, schema_name, table_name, key_json)`,
 		`CREATE INDEX IF NOT EXISTS ps_expires_at_idx ON sync.push_sessions(expires_at)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ps_active_tuple_idx ON sync.push_sessions(user_id, source_id, source_bundle_id) WHERE status = 'staging'`,
 		`CREATE INDEX IF NOT EXISTS psr_push_row_ordinal_idx ON sync.push_session_rows(push_id, row_ordinal)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ap_user_bundle_seq_idx ON sync.applied_pushes(user_id, bundle_seq)`,
 		`CREATE INDEX IF NOT EXISTS ss_expires_at_idx ON sync.snapshot_sessions(expires_at)`,
-		`CREATE INDEX IF NOT EXISTS ss_user_created_idx ON sync.snapshot_sessions(user_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS ssr_snapshot_row_ordinal_idx ON sync.snapshot_session_rows(snapshot_id, row_ordinal)`,
 	}
 	for _, stmt := range bootstrapIndexes {

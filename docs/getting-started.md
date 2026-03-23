@@ -5,40 +5,41 @@ title: Getting Started
 
 # Getting Started
 
-This guide shows the current bundle-based go-oversync contract: business tables are authoritative
-on the server, clients push one logical dirty set at a time, and clients pull complete committed
-bundles or rebuild from a stable snapshot.
+This guide reflects the current contract implemented in this repository:
+
+- PostgreSQL business tables are authoritative
+- clients push one logical dirty set through staged push sessions
+- clients replay the authoritative committed bundle after push commit
+- clients pull complete committed bundles only
+- fresh installs and prune recovery rebuild through snapshot sessions
 
 ## Supported Envelope
 
-The current production-ready contract is intentionally narrow:
+The supported envelope is intentionally narrow:
 
-- single-column UUID sync keys
+- single-column UUID sync keys on registered PostgreSQL tables
 - single-column foreign keys between registered tables
-- FK-closed client/server table sets
+- FK-closed server and client table sets
 - fail-closed bootstrap if schema or config falls outside that envelope
 
-If your schema is outside that envelope, startup should fail instead of degrading into best-effort
-runtime behavior.
+## PostgreSQL Table Requirements
 
-## Schema Requirements For Registered Tables
+Registered PostgreSQL tables must satisfy these rules:
 
-If you register a table for sync, the table creator must define it according to the supported
-contract. go-oversync does not rewrite table definitions during bootstrap.
-
-Required in the current first cut:
-
-- each registered table must have exactly one sync key column, and it must be a `UUID` primary key
+- each registered table must have exactly one sync key column, and it must be the table's `UUID`
+  primary key
 - every registered foreign key must point to another registered table or to the same registered
   table for self-references
 - every supported foreign key on a registered table must be `DEFERRABLE`
-- `INITIALLY DEFERRED` is recommended
+- supported `ON DELETE` / `ON UPDATE` actions are `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`,
+  or `SET DEFAULT`
+- supported `MATCH` options are empty, `NONE`, or `SIMPLE`
+- `DEFERRABLE INITIALLY DEFERRED` is recommended
 - `DEFERRABLE INITIALLY IMMEDIATE` is accepted because the runtime defers constraints inside sync
   transactions
-- composite primary keys and composite foreign keys are unsupported and cause bootstrap failure
+- composite primary keys and composite foreign keys are unsupported
 
-If a table violates these rules, `Bootstrap()` fails with an `UnsupportedSchemaError` that includes
-the offending table or constraint name and a hint about what to fix.
+If a table violates these rules, `Bootstrap()` fails with an `UnsupportedSchemaError`.
 
 Recommended pattern:
 
@@ -59,72 +60,28 @@ CREATE TABLE business.posts (
 );
 ```
 
-Accepted but less preferred:
+## Core Terms
 
-```sql
-CREATE TABLE business.categories (
-    id UUID PRIMARY KEY,
-    parent_id UUID,
-    name TEXT NOT NULL,
-    CONSTRAINT categories_parent_id_fkey
-        FOREIGN KEY (parent_id) REFERENCES business.categories(id)
-        DEFERRABLE INITIALLY IMMEDIATE
-);
-```
-
-Unsupported in the current first cut:
-
-```sql
-CREATE TABLE business.memberships (
-    user_id UUID NOT NULL,
-    group_id UUID NOT NULL,
-    PRIMARY KEY (user_id, group_id)
-);
-```
-
-## Core Concepts
-
-### User ID
-
-- Identifies one isolated sync stream.
-- Comes from your authentication system.
-- Every pushed or pulled bundle is scoped to exactly one user.
-
-### Device ID / Source ID
-
-- Identifies one app installation.
-- Used for idempotent push replay.
-- Must stay stable across normal app restarts.
-
-### Bundle
-
-- The smallest durable sync unit.
-- Represents the net committed effects of one accepted server transaction.
-- Is pulled and applied as a whole, never row-by-row as a public contract.
-
-### Row Version
-
-- Monotonic version of one synced row.
-- Used for optimistic concurrency on push.
-
-### Snapshot
-
-- Full current after-image at one exact `snapshot_bundle_seq`.
-- Used by `Hydrate()` and `Recover()` when a client is new, reset, or falls behind retained
-  history.
+- `user_id`: one isolated sync stream
+- `source_id`: one app installation or device identity
+- `source_bundle_id`: per-device monotonically increasing push id
+- `bundle_seq`: server-side committed bundle sequence
+- `row_version`: authoritative row version used for optimistic concurrency
+- `snapshot_bundle_seq`: the frozen bundle ceiling attached to a snapshot rebuild
 
 ## Server Metadata
 
-go-oversync derives sync metadata from committed business-table effects. The main bundle-era tables
-are:
+The server keeps sync metadata in the `sync` schema. The main runtime tables are:
 
 - `sync.user_state`
 - `sync.row_state`
 - `sync.bundle_log`
 - `sync.bundle_rows`
 - `sync.applied_pushes`
-
-Your business tables remain the source of truth.
+- `sync.push_sessions`
+- `sync.push_session_rows`
+- `sync.snapshot_sessions`
+- `sync.snapshot_session_rows`
 
 ## Step 1: Start PostgreSQL
 
@@ -133,7 +90,8 @@ docker run --name oversync-pg \
   -e POSTGRES_PASSWORD=postgres \
   -p 5432:5432 \
   -d postgres:16
-createdb my_sync_app
+
+docker exec oversync-pg createdb -U postgres my_sync_app
 ```
 
 ## Step 2: Create Your Business Tables
@@ -189,7 +147,7 @@ func main() {
 
     cfg := &oversync.ServiceConfig{
         MaxSupportedSchemaVersion: 1,
-        AppName: "my-sync-app",
+        AppName:                   "my-sync-app",
         RegisteredTables: []oversync.RegisteredTable{
             {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
             {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
@@ -225,7 +183,7 @@ func main() {
 ```
 
 `yourAuthMiddleware` must authenticate the request and inject
-`oversync.Actor{UserID, SourceID}` into the request context.
+`oversync.Actor{UserID, SourceID}` into request context.
 
 ## Step 4: Create The SQLite Client
 
@@ -242,6 +200,8 @@ import (
 )
 
 func main() {
+    ctx := context.Background()
+
     db, err := sql.Open("sqlite3", "app.db")
     if err != nil {
         log.Fatal(err)
@@ -287,8 +247,9 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
+    defer client.Close()
 
-    if err := client.Bootstrap(context.Background(), false); err != nil {
+    if err := client.Bootstrap(ctx, true); err != nil {
         log.Fatal(err)
     }
 }
@@ -296,7 +257,7 @@ func main() {
 
 ## Step 5: Sync
 
-Once the client exists, the supported high-level operations are:
+The supported high-level operations are:
 
 ```go
 ctx := context.Background()
@@ -331,21 +292,23 @@ Behavior to expect:
 - `PushPending()` freezes one outbound snapshot, uploads it through push sessions, fetches the
   committed authoritative rows, and replays them locally.
 - `PullToStable()` drains complete bundles until the frozen `stable_bundle_seq` is reached.
+- `PullToStable()` rebuilds automatically through snapshot sessions if the server returns
+  `history_pruned`.
 - `Hydrate()` rebuilds through chunked snapshot sessions.
 - `Recover()` rebuilds through chunked snapshot sessions and rotates `source_id`.
 
 ## Important Client Rules
 
-- Every managed table must declare its sync key explicitly.
-- Managed tables must be FK-closed.
-- `PullToStable()`, `Hydrate()`, and `Recover()` fail closed while `_sync_push_outbound` exists.
-- `Sync()` fails closed while `_sync_client_state.rebuild_required = 1`.
-- The durable read checkpoint is `_sync_client_state.last_bundle_seq_seen`.
-- The next outgoing client bundle id is `_sync_client_state.next_source_bundle_id`.
+- every managed table must declare its sync key explicitly
+- managed tables must be FK-closed
+- `PullToStable()`, `Hydrate()`, and `Recover()` fail closed while `_sync_push_outbound` exists
+- `Sync()` fails closed while `_sync_client_state.rebuild_required = 1`
+- the durable read checkpoint is `_sync_client_state.last_bundle_seq_seen`
+- the next outgoing client bundle id is `_sync_client_state.next_source_bundle_id`
 
 ## Endpoints
 
-The supported HTTP endpoints are:
+The server exposes:
 
 - `POST /sync/push-sessions`
 - `POST /sync/push-sessions/{push_id}/chunks`
@@ -370,4 +333,4 @@ The supported HTTP endpoints are:
 
 - Run the reference server in `examples/nethttp_server/`.
 - Run the simulator in `examples/mobile_flow/`.
-- Inspect the public API contract in `docs/documentation/api.md`.
+- Inspect the API contract in `docs/documentation/api.md`.

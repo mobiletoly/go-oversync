@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -297,6 +298,14 @@ func TestSnapshotSessions_DeleteInvalidatesFurtherChunkFetches(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, svc.DeleteSnapshotSession(ctx, reader, session.SnapshotID))
 
+	var storedRowCount int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_session_rows
+		WHERE snapshot_id = $1::uuid
+	`, session.SnapshotID).Scan(&storedRowCount))
+	require.Zero(t, storedRowCount)
+
 	_, err = svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
 	var notFoundErr *SnapshotSessionNotFoundError
 	require.ErrorAs(t, err, &notFoundErr)
@@ -453,4 +462,339 @@ func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
 	var payload map[string]any
 	require.NoError(t, json.Unmarshal(rows[0].Payload, &payload))
 	require.Equal(t, "Alpha", payload["name"])
+}
+
+func TestSnapshotSessions_CreateEmptySnapshot(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_empty_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-empty-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users"},
+		},
+	}, logger)
+
+	reader := Actor{UserID: "snapshot-empty-user-" + suffix, SourceID: "reader"}
+	session, err := svc.CreateSnapshotSession(ctx, reader)
+	require.NoError(t, err)
+	require.Zero(t, session.RowCount)
+	require.Zero(t, session.ByteCount)
+
+	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	require.NoError(t, err)
+	require.Empty(t, chunk.Rows)
+	require.False(t, chunk.HasMore)
+	require.Zero(t, chunk.NextRowOrdinal)
+}
+
+func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_no_update_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-no-update-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users"},
+		},
+	}, logger)
+
+	userID := "snapshot-no-update-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	rowID := uuid.New()
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, rowID, "Alpha")
+
+	session, err := svc.CreateSnapshotSession(ctx, reader)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION pg_temp.reject_snapshot_session_updates()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			RAISE EXCEPTION 'unexpected snapshot session update';
+		END;
+		$$
+	`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		CREATE TRIGGER reject_snapshot_session_updates
+		BEFORE UPDATE ON sync.snapshot_sessions
+		FOR EACH ROW
+		EXECUTE FUNCTION pg_temp.reject_snapshot_session_updates()
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS reject_snapshot_session_updates ON sync.snapshot_sessions`)
+	})
+
+	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, chunk.Rows, 1)
+	require.Equal(t, rowID.String(), chunk.Rows[0].Key["id"])
+}
+
+func TestSnapshotSessions_CreateRejectsRowLimitAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_row_cap_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion:  1,
+		AppName:                    "snapshot-row-cap-test",
+		MaxRowsPerSnapshotSession:  1,
+		MaxBytesPerSnapshotSession: 0,
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users"},
+		},
+	}, logger)
+
+	userID := "snapshot-row-cap-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, uuid.New(), "Bravo")
+
+	_, err := svc.CreateSnapshotSession(ctx, reader)
+	var limitErr *SnapshotSessionLimitExceededError
+	require.ErrorAs(t, err, &limitErr)
+	require.Equal(t, "row_count", limitErr.Dimension)
+	require.Equal(t, int64(2), limitErr.Actual)
+	require.Equal(t, int64(1), limitErr.Limit)
+
+	var sessionCount int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.snapshot_sessions WHERE user_id = $1`, userID).Scan(&sessionCount))
+	require.Zero(t, sessionCount)
+
+	var rowCount int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_session_rows ssr
+		JOIN sync.snapshot_sessions ss ON ss.snapshot_id = ssr.snapshot_id
+		WHERE ss.user_id = $1
+	`, userID).Scan(&rowCount))
+	require.Zero(t, rowCount)
+}
+
+func TestSnapshotSessions_CreateRejectsByteLimitAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_byte_cap_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion:  1,
+		AppName:                    "snapshot-byte-cap-test",
+		MaxRowsPerSnapshotSession:  0,
+		MaxBytesPerSnapshotSession: 1,
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users"},
+		},
+	}, logger)
+
+	userID := "snapshot-byte-cap-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+
+	_, err := svc.CreateSnapshotSession(ctx, reader)
+	var limitErr *SnapshotSessionLimitExceededError
+	require.ErrorAs(t, err, &limitErr)
+	require.Equal(t, "byte_count", limitErr.Dimension)
+	require.Greater(t, limitErr.Actual, int64(1))
+	require.Equal(t, int64(1), limitErr.Limit)
+
+	var sessionCount int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.snapshot_sessions WHERE user_id = $1`, userID).Scan(&sessionCount))
+	require.Zero(t, sessionCount)
+}
+
+func TestSnapshotSessions_CreateSucceedsUnderConfiguredLimits(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_under_cap_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion:  1,
+		AppName:                    "snapshot-under-cap-test",
+		MaxRowsPerSnapshotSession:  10,
+		MaxBytesPerSnapshotSession: 1 << 20,
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users"},
+		},
+	}, logger)
+
+	userID := "snapshot-under-cap-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	rowID := uuid.New()
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, rowID, "Alpha")
+
+	session, err := svc.CreateSnapshotSession(ctx, reader)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), session.RowCount)
+	require.Greater(t, session.ByteCount, int64(0))
+}
+
+func TestSnapshotSessions_CleanupExpiredSessionsRemovesRows(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_cleanup_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-cleanup-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users"},
+		},
+	}, logger)
+
+	userID := "snapshot-cleanup-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+
+	session, err := svc.CreateSnapshotSession(ctx, reader)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		UPDATE sync.snapshot_sessions
+		SET expires_at = now() - interval '1 second'
+		WHERE snapshot_id = $1::uuid
+	`, session.SnapshotID)
+	require.NoError(t, err)
+	require.NoError(t, cleanupExpiredSnapshotSessionsQuerier(ctx, pool))
+
+	var sessionCount int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_sessions
+		WHERE snapshot_id = $1::uuid
+	`, session.SnapshotID).Scan(&sessionCount))
+	require.Zero(t, sessionCount)
+
+	var rowCount int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_session_rows
+		WHERE snapshot_id = $1::uuid
+	`, session.SnapshotID).Scan(&rowCount))
+	require.Zero(t, rowCount)
+}
+
+func TestSnapshotSessions_CreateQueryPlanUsesSnapshotIndexes(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_plan_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-plan-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users"},
+		},
+	}, logger)
+
+	userID := "snapshot-plan-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	for i := 0; i < 8; i++ {
+		mustPushUserBundle(t, ctx, svc, writer, schemaName, int64(i+1), uuid.New(), fmt.Sprintf("User%d", i))
+	}
+
+	var planLines []string
+	err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SET LOCAL enable_hashjoin = off`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SET LOCAL enable_mergejoin = off`); err != nil {
+			return err
+		}
+
+		rows, err := tx.Query(ctx, `
+			EXPLAIN (COSTS OFF)
+			SELECT
+				rs.schema_name,
+				rs.table_name,
+				rs.key_json,
+				rs.row_version,
+				br.payload
+			FROM sync.row_state AS rs
+			JOIN sync.bundle_rows AS br
+			  ON br.user_id = rs.user_id
+			 AND br.bundle_seq = rs.bundle_seq
+			 AND br.schema_name = rs.schema_name
+			 AND br.table_name = rs.table_name
+			 AND br.key_json = rs.key_json
+			WHERE rs.user_id = $1
+			  AND rs.deleted = FALSE
+			ORDER BY rs.schema_name, rs.table_name, rs.key_json
+		`, userID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				return err
+			}
+			planLines = append(planLines, line)
+		}
+		return rows.Err()
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, planLines)
+
+	planText := strings.Join(planLines, "\n")
+	require.Contains(t, planText, "rs_user_live_snapshot_idx")
+	require.Contains(t, planText, "br_user_bundle_key_idx")
+	require.True(t, slices.ContainsFunc(planLines, func(line string) bool {
+		return strings.Contains(line, "Index") && strings.Contains(line, "rs_user_live_snapshot_idx")
+	}))
+	require.True(t, slices.ContainsFunc(planLines, func(line string) bool {
+		return strings.Contains(line, "Index") && strings.Contains(line, "br_user_bundle_key_idx")
+	}))
 }

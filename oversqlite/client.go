@@ -234,13 +234,6 @@ type Config struct {
 	BackoffMax        time.Duration // 60s
 }
 
-// Resolver interface for conflict resolution
-type Resolver interface {
-	// Merge returns merged JSON to store locally & attempt to upload as UPDATE,
-	// or (nil, keepLocal bool=false) to accept server and drop local pending.
-	Merge(table string, pk string, server json.RawMessage, local json.RawMessage) (merged json.RawMessage, keepLocal bool, err error)
-}
-
 // DefaultConfig returns a default configuration for the specified tables.
 // Schema must be provided explicitly by the caller to avoid business-specific defaults.
 // Each table must also declare SyncKeyColumnName explicitly.
@@ -372,7 +365,7 @@ func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx contex
 		Token:          tok,
 		SourceID:       sourceID,
 		UserID:         userID,
-		Resolver:       &DefaultResolver{},
+		Resolver:       &ServerWinsResolver{},
 		HTTP:           &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
 		config:         config,
 		logger:         slog.Default(),
@@ -932,7 +925,7 @@ func (c *Client) Sync(ctx context.Context) error {
 	}
 	defer c.writeMu.Unlock()
 	if atomic.LoadInt32(&c.uploadPaused) == 0 {
-		if err := c.pushPendingLocked(ctx); err != nil {
+		if err := c.pushPendingLocked(ctx, 0); err != nil {
 			return err
 		}
 	}

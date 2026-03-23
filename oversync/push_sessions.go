@@ -393,7 +393,7 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 			if rowStates[i].found {
 				state = &rowStates[i].rowStateSnapshot
 			}
-			if err := validatePushRowConflict(row, state); err != nil {
+			if err := s.validatePushRowConflict(ctx, tx, row, state); err != nil {
 				return err
 			}
 		}

@@ -10,11 +10,7 @@ plugins:
   - jekyll-sitemap
   - jekyll-seo-tag
 
-# Top navigation pages (now handled by _data/navigation.yml)
-# header_pages:
-#   - index.markdown
-#   - getting-started.md
-#   - documentation.md
+# Top navigation is handled by _data/navigation.yml.
 
 # Repository information
 repository: mobiletoly/go-oversync

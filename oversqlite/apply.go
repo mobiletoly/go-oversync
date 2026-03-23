@@ -11,14 +11,6 @@ import (
 	"strings"
 )
 
-// DefaultResolver provides a simple conflict resolution strategy
-type DefaultResolver struct{}
-
-func (r *DefaultResolver) Merge(table string, pk string, server json.RawMessage, local json.RawMessage) (merged json.RawMessage, keepLocal bool, err error) {
-	// Simple strategy: server wins
-	return server, false, nil
-}
-
 func (c *Client) upsertRowInTx(ctx context.Context, tx *sql.Tx, table string, payload map[string]interface{}) error {
 	tableInfo, err := c.getTableInfoTx(tx, strings.ToLower(table))
 	if err != nil {

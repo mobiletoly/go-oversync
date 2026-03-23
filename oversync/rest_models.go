@@ -139,17 +139,19 @@ type CapabilitiesResponse struct {
 
 // BundleCapabilitiesLimits reports bundle-oriented guardrails in the target contract.
 type BundleCapabilitiesLimits struct {
-	MaxRowsPerBundle                   int `json:"max_rows_per_bundle,omitempty"`
-	MaxBytesPerBundle                  int `json:"max_bytes_per_bundle,omitempty"`
-	MaxBundlesPerPull                  int `json:"max_bundles_per_pull,omitempty"`
-	DefaultRowsPerPushChunk            int `json:"default_rows_per_push_chunk,omitempty"`
-	MaxRowsPerPushChunk                int `json:"max_rows_per_push_chunk,omitempty"`
-	PushSessionTTLSeconds              int `json:"push_session_ttl_seconds,omitempty"`
-	DefaultRowsPerCommittedBundleChunk int `json:"default_rows_per_committed_bundle_chunk,omitempty"`
-	MaxRowsPerCommittedBundleChunk     int `json:"max_rows_per_committed_bundle_chunk,omitempty"`
-	DefaultRowsPerSnapshotChunk        int `json:"default_rows_per_snapshot_chunk,omitempty"`
-	MaxRowsPerSnapshotChunk            int `json:"max_rows_per_snapshot_chunk,omitempty"`
-	SnapshotSessionTTLSeconds          int `json:"snapshot_session_ttl_seconds,omitempty"`
+	MaxRowsPerBundle                   int   `json:"max_rows_per_bundle,omitempty"`
+	MaxBytesPerBundle                  int   `json:"max_bytes_per_bundle,omitempty"`
+	MaxBundlesPerPull                  int   `json:"max_bundles_per_pull,omitempty"`
+	DefaultRowsPerPushChunk            int   `json:"default_rows_per_push_chunk,omitempty"`
+	MaxRowsPerPushChunk                int   `json:"max_rows_per_push_chunk,omitempty"`
+	PushSessionTTLSeconds              int   `json:"push_session_ttl_seconds,omitempty"`
+	DefaultRowsPerCommittedBundleChunk int   `json:"default_rows_per_committed_bundle_chunk,omitempty"`
+	MaxRowsPerCommittedBundleChunk     int   `json:"max_rows_per_committed_bundle_chunk,omitempty"`
+	DefaultRowsPerSnapshotChunk        int   `json:"default_rows_per_snapshot_chunk,omitempty"`
+	MaxRowsPerSnapshotChunk            int   `json:"max_rows_per_snapshot_chunk,omitempty"`
+	SnapshotSessionTTLSeconds          int   `json:"snapshot_session_ttl_seconds,omitempty"`
+	MaxRowsPerSnapshotSession          int64 `json:"max_rows_per_snapshot_session,omitempty"`
+	MaxBytesPerSnapshotSession         int64 `json:"max_bytes_per_snapshot_session,omitempty"`
 }
 
 // RegisteredTableSpec describes one registered sync table in the newer contract surface.
@@ -163,6 +165,31 @@ type RegisteredTableSpec struct {
 type ErrorResponse struct {
 	Error   string `json:"error"`
 	Message string `json:"message"`
+}
+
+// PushConflictDetails describes one authoritative row state that rejected a push commit.
+// The payload is deterministic:
+//   - schema/table are normalized lowercase identifiers
+//   - key uses the same canonical sync-key JSON shape as the rest of the API
+//   - server_row_version is 0 when no authoritative row_state exists yet
+//   - server_row_deleted distinguishes tombstones from an absent row when server_row is null
+//   - server_row is the canonical wire-format full row after-image, or null if deleted/missing
+type PushConflictDetails struct {
+	Schema           string          `json:"schema"`
+	Table            string          `json:"table"`
+	Key              SyncKey         `json:"key"`
+	Op               string          `json:"op"`
+	BaseRowVersion   int64           `json:"base_row_version"`
+	ServerRowVersion int64           `json:"server_row_version"`
+	ServerRowDeleted bool            `json:"server_row_deleted"`
+	ServerRow        json.RawMessage `json:"server_row"`
+}
+
+// PushConflictResponse preserves the legacy error/message envelope while adding machine-readable conflict details.
+type PushConflictResponse struct {
+	Error    string               `json:"error"`
+	Message  string               `json:"message"`
+	Conflict *PushConflictDetails `json:"conflict,omitempty"`
 }
 
 // StatusResponse represents service status response

@@ -168,7 +168,31 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)))
 	mux.Handle("GET /sync/capabilities", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCapabilities)))
 
-	return &ServerComponents{Pool: pool, SyncService: syncService, JWTAuth: jwtAuth, Handler: mux, Logger: logger, ctx: ctx, cancel: cancel}, nil
+	return &ServerComponents{
+		Pool:        pool,
+		SyncService: syncService,
+		JWTAuth:     jwtAuth,
+		Handler:     BrowserTestCORSMiddleware(mux),
+		Logger:      logger,
+		ctx:         ctx,
+		cancel:      cancel,
+	}, nil
+}
+
+// BrowserTestCORSMiddleware keeps the example server usable from browser-based demos.
+// It is intentionally permissive because this binary is a local sample server.
+func BrowserTestCORSMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // LoggingMiddleware logs request/response bodies for development

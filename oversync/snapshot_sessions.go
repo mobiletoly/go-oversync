@@ -43,13 +43,14 @@ func (e *SnapshotSessionForbiddenError) Error() string {
 	return fmt.Sprintf("snapshot session %s does not belong to the authenticated user", e.SnapshotID)
 }
 
-type snapshotSessionRowRecord struct {
-	rowOrdinal int64
-	schemaName string
-	tableName  string
-	keyJSON    string
-	rowVersion int64
-	payload    []byte
+type SnapshotSessionLimitExceededError struct {
+	Dimension string
+	Actual    int64
+	Limit     int64
+}
+
+func (e *SnapshotSessionLimitExceededError) Error() string {
+	return fmt.Sprintf("snapshot session %s %d exceeds limit %d", e.Dimension, e.Actual, e.Limit)
 }
 
 func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor) (_ *SnapshotSession, err error) {
@@ -73,83 +74,69 @@ func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor) (_
 			return err
 		}
 
-		rows, err := tx.Query(ctx, `
-SELECT
-	rs.schema_name,
-	rs.table_name,
-	rs.key_json,
-	rs.row_version,
-	br.payload
-FROM sync.row_state AS rs
-JOIN sync.bundle_rows AS br
-  ON br.user_id = rs.user_id
- AND br.bundle_seq = rs.bundle_seq
- AND br.schema_name = rs.schema_name
- AND br.table_name = rs.table_name
- AND br.key_json = rs.key_json
-WHERE rs.user_id = $1
-  AND rs.deleted = FALSE
-ORDER BY rs.schema_name, rs.table_name, rs.key_json
-		`, actor.UserID)
-		if err != nil {
-			return fmt.Errorf("query snapshot rows: %w", err)
-		}
-		defer rows.Close()
-
 		snapshotID := uuid.NewString()
 		expiresAt := time.Now().UTC().Add(s.snapshotSessionTTL())
-		staged := make([]snapshotSessionRowRecord, 0)
-		rowOrdinal := int64(0)
-		byteCount := int64(0)
-
-		for rows.Next() {
-			var rec snapshotSessionRowRecord
-			rowOrdinal++
-			rec.rowOrdinal = rowOrdinal
-			if err := rows.Scan(&rec.schemaName, &rec.tableName, &rec.keyJSON, &rec.rowVersion, &rec.payload); err != nil {
-				return fmt.Errorf("scan snapshot row: %w", err)
-			}
-			byteCount += int64(len(rec.payload))
-			staged = append(staged, rec)
-		}
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("iterate snapshot rows: %w", err)
-		}
-
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO sync.snapshot_sessions (
 				snapshot_id, user_id, snapshot_bundle_seq, row_count, byte_count, expires_at
-			) VALUES ($1::uuid, $2, $3, $4, $5, $6)
-		`, snapshotID, actor.UserID, snapshotBundleSeq, len(staged), byteCount, expiresAt); err != nil {
+			) VALUES ($1::uuid, $2, $3, 0, 0, $4)
+		`, snapshotID, actor.UserID, snapshotBundleSeq, expiresAt); err != nil {
 			return fmt.Errorf("insert snapshot session: %w", err)
 		}
 
-		if len(staged) > 0 {
-			rowsData := make([][]any, 0, len(staged))
-			for _, rec := range staged {
-				rowsData = append(rowsData, []any{
-					snapshotID,
-					rec.rowOrdinal,
-					rec.schemaName,
-					rec.tableName,
-					rec.keyJSON,
-					rec.rowVersion,
-					rec.payload,
-				})
-			}
-			if _, err := tx.CopyFrom(ctx,
-				pgx.Identifier{"sync", "snapshot_session_rows"},
-				[]string{"snapshot_id", "row_ordinal", "schema_name", "table_name", "key_json", "row_version", "payload"},
-				pgx.CopyFromRows(rowsData),
-			); err != nil {
-				return fmt.Errorf("insert snapshot session rows: %w", err)
-			}
+		var (
+			rowCount  int64
+			byteCount int64
+		)
+		if err := tx.QueryRow(ctx, `
+			WITH inserted AS (
+				INSERT INTO sync.snapshot_session_rows (
+					snapshot_id, row_ordinal, schema_name, table_name, key_json, row_version, payload
+				)
+				SELECT
+					$1::uuid,
+					row_number() OVER (ORDER BY rs.schema_name, rs.table_name, rs.key_json),
+					rs.schema_name,
+					rs.table_name,
+					rs.key_json,
+					rs.row_version,
+					br.payload
+				FROM sync.row_state AS rs
+				JOIN sync.bundle_rows AS br
+				  ON br.user_id = rs.user_id
+				 AND br.bundle_seq = rs.bundle_seq
+				 AND br.schema_name = rs.schema_name
+				 AND br.table_name = rs.table_name
+				 AND br.key_json = rs.key_json
+				WHERE rs.user_id = $2
+				  AND rs.deleted = FALSE
+				ORDER BY rs.schema_name, rs.table_name, rs.key_json
+				RETURNING payload
+			)
+			SELECT COUNT(*), COALESCE(SUM(octet_length(payload::text)), 0)
+			FROM inserted
+		`, snapshotID, actor.UserID).Scan(&rowCount, &byteCount); err != nil {
+			return fmt.Errorf("materialize snapshot session rows: %w", err)
+		}
+		if limit := s.maxRowsPerSnapshotSession(); limit > 0 && rowCount > limit {
+			return &SnapshotSessionLimitExceededError{Dimension: "row_count", Actual: rowCount, Limit: limit}
+		}
+		if limit := s.maxBytesPerSnapshotSession(); limit > 0 && byteCount > limit {
+			return &SnapshotSessionLimitExceededError{Dimension: "byte_count", Actual: byteCount, Limit: limit}
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE sync.snapshot_sessions
+			SET row_count = $2,
+			    byte_count = $3
+			WHERE snapshot_id = $1::uuid
+		`, snapshotID, rowCount, byteCount); err != nil {
+			return fmt.Errorf("update snapshot session counts: %w", err)
 		}
 
 		resp = &SnapshotSession{
 			SnapshotID:        snapshotID,
 			SnapshotBundleSeq: snapshotBundleSeq,
-			RowCount:          int64(len(staged)),
+			RowCount:          rowCount,
 			ByteCount:         byteCount,
 			ExpiresAt:         expiresAt.Format(time.RFC3339Nano),
 		}
@@ -205,14 +192,6 @@ func (s *SyncService) GetSnapshotChunk(ctx context.Context, actor Actor, snapsho
 		}
 		if time.Now().UTC().After(expiresAt) {
 			return &SnapshotSessionExpiredError{SnapshotID: snapshotID}
-		}
-
-		if _, err := tx.Exec(ctx, `
-			UPDATE sync.snapshot_sessions
-			SET last_accessed_at = now()
-			WHERE snapshot_id = $1::uuid
-		`, snapshotID); err != nil {
-			return fmt.Errorf("update snapshot session access time: %w", err)
 		}
 
 		rows, err := tx.Query(ctx, `

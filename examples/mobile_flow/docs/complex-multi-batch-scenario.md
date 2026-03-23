@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`complex-multi-batch` is the large offline-dirty-set scenario for the bundle-era client contract.
+`complex-multi-batch` is the large offline-dirty-set scenario for the current bundle-based client contract.
 It checks that a client can:
 
 - accumulate a large local dirty set while offline
@@ -117,7 +117,7 @@ Look at:
 ## Why This Scenario Still Matters
 
 This scenario is no longer about old upload-status-array behavior. It is now a stress test for the
-bundle-era guarantees:
+bundle-based guarantees:
 
 - one logical dirty-set push
 - multi-chunk push-session upload for that one logical push

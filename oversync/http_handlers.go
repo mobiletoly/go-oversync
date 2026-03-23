@@ -162,7 +162,7 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 		}
 		var conflictErr *PushConflictError
 		if errors.As(err, &conflictErr) {
-			h.writeError(w, http.StatusConflict, "push_conflict", conflictErr.Error())
+			h.writePushConflict(w, conflictErr)
 			return
 		}
 		var notFoundErr *PushSessionNotFoundError
@@ -584,4 +584,26 @@ func (h *HTTPSyncHandlers) writeError(w http.ResponseWriter, statusCode int, err
 		"status_code", statusCode,
 		"error_code", errorCode,
 		"message", message)
+}
+
+func (h *HTTPSyncHandlers) writePushConflict(w http.ResponseWriter, conflictErr *PushConflictError) {
+	if conflictErr == nil {
+		h.writeError(w, http.StatusConflict, "push_conflict", "push conflict")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+
+	response := PushConflictResponse{
+		Error:    "push_conflict",
+		Message:  conflictErr.Error(),
+		Conflict: conflictErr.Conflict,
+	}
+	_ = json.NewEncoder(w).Encode(response)
+
+	h.logger.Debug("HTTP push conflict response",
+		"status_code", http.StatusConflict,
+		"error_code", "push_conflict",
+		"message", conflictErr.Error())
 }

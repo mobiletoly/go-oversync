@@ -1,60 +1,76 @@
 ---
 layout: default
 title: Server
+permalink: /documentation/server/
 ---
 
 # Server
 
-The server treats registered business tables as authoritative state.
+The server treats registered PostgreSQL business tables as authoritative state.
 
-## Core metadata
+## Runtime Tables
 
-- `sync.user_state`: per-user bundle sequencing and retained floor tracking.
-- `sync.row_state`: authoritative per-row row-version/deleted state keyed by structured key.
-- `sync.bundle_log`: one row per committed sync bundle.
-- `sync.bundle_rows`: normalized row effects captured from committed business-table writes.
-- `sync.applied_pushes`: accepted-push replay table keyed by `(user_id, source_id, source_bundle_id)`.
+Authoritative replication state:
 
-## Write path
+- `sync.user_state`: per-user bundle sequencing and retained-floor tracking
+- `sync.row_state`: authoritative per-row row-version and tombstone state
+- `sync.bundle_log`: one row per committed sync bundle
+- `sync.bundle_rows`: normalized row effects for each committed bundle
+- `sync.applied_pushes`: accepted-push replay table keyed by `(user_id, source_id, source_bundle_id)`
 
-- Client writes arrive through staged push sessions:
-  - `POST /sync/push-sessions`
-  - `POST /sync/push-sessions/{push_id}/chunks`
-  - `POST /sync/push-sessions/{push_id}/commit`
-- Accepted-push recovery fetches authoritative rows through
-  `GET /sync/committed-bundles/{bundle_seq}/rows`.
-- Server-originated writes must execute inside `WithinSyncBundle(...)`.
-- Registered-table writes are captured by bundle triggers and finalized atomically with the
-  business-table transaction.
-- First cut is single-user only: one push session, one committed bundle, and one
-  `WithinSyncBundle(...)` transaction belong to exactly one `user_id`. If application logic needs
-  to affect multiple users, it must split that work into separate per-user transactions / bundles
-  before calling oversync.
+Transport/session state:
+
+- `sync.push_sessions`: active staged push sessions
+- `sync.push_session_rows`: staged rows for each push session
+- `sync.snapshot_sessions`: active frozen snapshot session metadata
+- `sync.snapshot_session_rows`: materialized rows for each snapshot session
+
+## Write Path
+
+- clients create staged push sessions with `POST /sync/push-sessions`
+- clients upload ordered chunks with `POST /sync/push-sessions/{push_id}/chunks`
+- clients commit the staged push with `POST /sync/push-sessions/{push_id}/commit`
+- accepted-push recovery fetches authoritative rows through
+  `GET /sync/committed-bundles/{bundle_seq}/rows`
+- server-originated registered-table writes should run inside `WithinSyncBundle(...)`
+- registered-table writes are captured by bundle triggers and finalized atomically with the
+  business-table transaction
+
+One push session, one committed bundle, and one `WithinSyncBundle(...)` transaction belong to
+exactly one `user_id`. If application logic needs to affect multiple users, split that work into
+separate per-user transactions or bundles.
 
 ## Registered Table DDL Requirements
 
-Table creators are responsible for defining registered business tables so they satisfy the sync
-contract before bootstrap.
-
-Current first-cut requirements:
+Registered PostgreSQL tables must satisfy these rules before bootstrap:
 
 - one `UUID` primary key per registered table
 - one sync key column, matching that primary key
 - registered table sets must be FK-closed
 - supported foreign keys on registered tables must be `DEFERRABLE`
+- supported `ON DELETE` / `ON UPDATE` actions are `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`,
+  and `SET DEFAULT`
+- supported `MATCH` options are empty, `NONE`, or `SIMPLE`
 - `DEFERRABLE INITIALLY DEFERRED` is recommended
 - `DEFERRABLE INITIALLY IMMEDIATE` is accepted
 - composite primary keys and composite foreign keys are unsupported
 
-Bootstrap validates these requirements and fails closed with an `UnsupportedSchemaError` if a
-registered schema falls outside the supported envelope. The error includes the offending table or
-constraint name and, for non-deferrable FKs, a hint to make the constraint `DEFERRABLE` before
-bootstrap.
+Bootstrap validates these requirements and fails closed with an `UnsupportedSchemaError` if the
+registered schema is outside the supported envelope.
 
-## Read path
+## Read Path
 
-- `GET /sync/pull` returns complete committed bundles only.
-- `POST /sync/snapshot-sessions` freezes one current after-image and returns a snapshot session id.
-- `GET /sync/snapshot-sessions/{snapshot_id}` returns deterministic chunks from that frozen snapshot.
-- If a client checkpoint falls behind the retained bundle floor, the server returns
-  `history_pruned` and the client rebuilds through chunked snapshot sessions.
+- `GET /sync/pull` returns complete committed bundles only
+- `POST /sync/snapshot-sessions` materializes one frozen current after-image inside PostgreSQL and
+  returns a snapshot session id
+- `GET /sync/snapshot-sessions/{snapshot_id}` returns deterministic chunks from that frozen
+  snapshot without holding one long-lived database transaction across client round trips
+- snapshot session creation may be bounded by optional row and byte caps in `ServiceConfig`
+- if a client checkpoint falls behind the retained bundle floor, the server returns
+  `history_pruned`
+
+## Auth Contract
+
+The handlers expect the caller to authenticate first and place
+`oversync.Actor{UserID, SourceID}` into request context. The example servers do this with JWT
+middleware, but the runtime does not require any specific auth stack.

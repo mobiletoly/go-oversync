@@ -2,7 +2,7 @@ Samplesync Server (PostgreSQL)
 
 This example runs a minimal bundle-based go-oversync server for the `samplesync-kmp` app.
 
-The server uses business tables as authoritative state and exposes only the supported bundle-era
+The server uses business tables as authoritative state and exposes only the supported bundle-based
 sync endpoints.
 
 Endpoints

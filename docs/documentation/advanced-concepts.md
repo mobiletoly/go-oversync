@@ -1,11 +1,12 @@
 ---
 layout: default
 title: Advanced Concepts
+permalink: /documentation/advanced-concepts/
 ---
 
 # Advanced Concepts
 
-This page describes the supported bundle-era sync model.
+This page describes the supported bundle-based sync model.
 
 ## Authoritative state
 

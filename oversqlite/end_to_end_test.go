@@ -230,6 +230,175 @@ func TestEndToEnd_PushHydratePullAndServerCascade(t *testing.T) {
 	require.Equal(t, 0, postCount)
 }
 
+func TestEndToEnd_PushThenOwnPushThenPullStillFetchesEarlierPeerBundle(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_push_gap_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newBundleEndToEndServer(t, ctx, schema, []oversync.RegisteredTable{
+		{Schema: schema, Table: "users", SyncKeyColumns: []string{"id"}},
+	})
+
+	tables := []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "id"},
+	}
+	usersDDL := `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`
+
+	userID := "e2e-user-gap-" + uuid.NewString()
+	clientA, dbA := newBundleHTTPClient(t, server, userID, "device-a", tables, usersDDL)
+	clientB, dbB := newBundleHTTPClient(t, server, userID, "device-b", tables, usersDDL)
+
+	rowAID := uuid.NewString()
+	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
+	require.NoError(t, err)
+	require.NoError(t, clientA.PushPending(ctx))
+
+	rowBID := uuid.NewString()
+	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowBID, "From B", "from-b@example.com")
+	require.NoError(t, err)
+	require.NoError(t, clientB.PushPending(ctx))
+	require.NoError(t, clientB.PullToStable(ctx))
+
+	var nameA string
+	var nameB string
+	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowAID).Scan(&nameA))
+	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowBID).Scan(&nameB))
+	require.Equal(t, "From A", nameA)
+	require.Equal(t, "From B", nameB)
+
+	var lastBundleSeq int64
+	require.NoError(t, dbB.QueryRow(`
+		SELECT last_bundle_seq_seen
+		FROM _sync_client_state
+		WHERE user_id = ?
+	`, clientB.UserID).Scan(&lastBundleSeq))
+	require.Equal(t, int64(2), lastBundleSeq)
+}
+
+func TestEndToEnd_ThreeDevicesPushWithoutPullThenAllPullConverge(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_three_device_gap_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newBundleEndToEndServer(t, ctx, schema, []oversync.RegisteredTable{
+		{Schema: schema, Table: "users", SyncKeyColumns: []string{"id"}},
+	})
+
+	tables := []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "id"},
+	}
+	usersDDL := `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`
+
+	userID := "e2e-user-three-gap-" + uuid.NewString()
+	clientA, dbA := newBundleHTTPClient(t, server, userID, "device-a", tables, usersDDL)
+	clientB, dbB := newBundleHTTPClient(t, server, userID, "device-b", tables, usersDDL)
+	clientC, dbC := newBundleHTTPClient(t, server, userID, "device-c", tables, usersDDL)
+
+	rowAID := uuid.NewString()
+	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
+	require.NoError(t, err)
+	require.NoError(t, clientA.PushPending(ctx))
+
+	rowBID := uuid.NewString()
+	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowBID, "From B", "from-b@example.com")
+	require.NoError(t, err)
+	require.NoError(t, clientB.PushPending(ctx))
+
+	rowCID := uuid.NewString()
+	_, err = dbC.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowCID, "From C", "from-c@example.com")
+	require.NoError(t, err)
+	require.NoError(t, clientC.PushPending(ctx))
+
+	require.NoError(t, clientA.PullToStable(ctx))
+	require.NoError(t, clientB.PullToStable(ctx))
+	require.NoError(t, clientC.PullToStable(ctx))
+
+	for _, db := range []*sql.DB{dbA, dbB, dbC} {
+		var userCount int
+		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&userCount))
+		require.Equal(t, 3, userCount)
+	}
+
+	var name string
+	require.NoError(t, dbA.QueryRow(`SELECT name FROM users WHERE id = ?`, rowCID).Scan(&name))
+	require.Equal(t, "From C", name)
+	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowAID).Scan(&name))
+	require.Equal(t, "From A", name)
+	require.NoError(t, dbC.QueryRow(`SELECT name FROM users WHERE id = ?`, rowBID).Scan(&name))
+	require.Equal(t, "From B", name)
+
+	for _, client := range []*Client{clientA, clientB, clientC} {
+		var lastBundleSeq int64
+		require.NoError(t, client.DB.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&lastBundleSeq))
+		require.Equal(t, int64(3), lastBundleSeq)
+	}
+}
+
+func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_restart_gap_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newBundleEndToEndServer(t, ctx, schema, []oversync.RegisteredTable{
+		{Schema: schema, Table: "users", SyncKeyColumns: []string{"id"}},
+	})
+
+	tables := []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "id"},
+	}
+	usersDDL := `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`
+
+	userID := "e2e-user-restart-gap-" + uuid.NewString()
+	clientA, dbA := newBundleHTTPClient(t, server, userID, "device-a", tables, usersDDL)
+	clientB, dbB := newBundleHTTPClient(t, server, userID, "device-b", tables, usersDDL)
+
+	rowAID := uuid.NewString()
+	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
+	require.NoError(t, err)
+	require.NoError(t, clientA.PushPending(ctx))
+
+	rowBID := uuid.NewString()
+	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowBID, "From B", "from-b@example.com")
+	require.NoError(t, err)
+	require.NoError(t, clientB.PushPending(ctx))
+	require.NoError(t, clientB.Close())
+
+	restarted, err := NewClient(dbB, server.baseURL, userID, clientB.SourceID, func(context.Context) (string, error) {
+		return server.jwt.GenerateToken(userID, clientB.SourceID, time.Hour)
+	}, DefaultConfig(schema, tables))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, restarted.Close()) }()
+	require.NoError(t, restarted.Bootstrap(ctx, false))
+	require.NoError(t, restarted.PullToStable(ctx))
+
+	var nameA string
+	var nameB string
+	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowAID).Scan(&nameA))
+	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowBID).Scan(&nameB))
+	require.Equal(t, "From A", nameA)
+	require.Equal(t, "From B", nameB)
+
+	var lastBundleSeq int64
+	require.NoError(t, dbB.QueryRow(`
+		SELECT last_bundle_seq_seen
+		FROM _sync_client_state
+		WHERE user_id = ?
+	`, restarted.UserID).Scan(&lastBundleSeq))
+	require.Equal(t, int64(2), lastBundleSeq)
+}
+
 func TestEndToEnd_ExampleServerSchemaTimestampParity(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_example_schema_" + strings.ReplaceAll(uuid.NewString(), "-", "")
@@ -435,6 +604,7 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	clientA, dbA := newBundleHTTPClient(t, server, userID, "device-a", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersDDL)
 	clientB, dbB := newBundleHTTPClient(t, server, userID, "device-b", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersDDL)
 	clientB.config.UploadLimit = 2
+	clientB.Resolver = &ClientWinsResolver{}
 
 	conflictUserID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Grace", "grace@example.com")
@@ -466,32 +636,31 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 
 	clientB.ResetPushTransferDiagnostics()
 	err = clientB.PushPending(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "409")
+	require.NoError(t, err)
 
 	pushStats := clientB.PushTransferDiagnostics()
-	require.Equal(t, int64(1), pushStats.SessionsCreated)
-	require.Greater(t, pushStats.ChunksUploaded, int64(1))
+	require.Equal(t, int64(2), pushStats.SessionsCreated)
+	require.Greater(t, pushStats.ChunksUploaded, int64(2))
 
 	var dirtyCount, outboundCount, stagedCount int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
 	require.Equal(t, 0, dirtyCount)
-	require.Equal(t, 3, outboundCount)
+	require.Equal(t, 0, outboundCount)
 	require.Equal(t, 0, stagedCount)
 
 	var nextSourceBundleID int64
 	require.NoError(t, dbB.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&nextSourceBundleID))
-	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, int64(2), nextSourceBundleID)
 
 	var serverName string
 	require.NoError(t, server.pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id = $1`, pgx.Identifier{server.schema}.Sanitize()), conflictUserID).Scan(&serverName))
-	require.Equal(t, "Grace Server", serverName)
+	require.Equal(t, "Grace Client", serverName)
 
 	var extraCount int
 	require.NoError(t, server.pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.users WHERE id IN ($1, $2)`, pgx.Identifier{server.schema}.Sanitize()), extraUserOne, extraUserTwo).Scan(&extraCount))
-	require.Equal(t, 0, extraCount)
+	require.Equal(t, 2, extraCount)
 }
 
 func TestEndToEnd_PullRetryPruneFallbackAndRecover(t *testing.T) {

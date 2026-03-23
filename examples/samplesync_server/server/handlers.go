@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS business.person(
   phone      TEXT,
   birth_date TEXT,
   created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
   score      DOUBLE PRECISION,
   is_active  BOOLEAN NOT NULL DEFAULT true,
   ssn        BIGINT,

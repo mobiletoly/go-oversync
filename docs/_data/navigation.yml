@@ -8,6 +8,12 @@ main:
     children:
       - title: "Core Concepts"
         url: "/documentation/core-concepts/"
+      - title: "Server"
+        url: "/documentation/server/"
+      - title: "Client"
+        url: "/documentation/client/"
+      - title: "HTTP API"
+        url: "/documentation/api/"
       - title: "Advanced Concepts"
         url: "/documentation/advanced-concepts/"
       - title: "Performance"

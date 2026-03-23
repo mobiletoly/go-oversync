@@ -336,14 +336,9 @@ func TestCreateTriggersForTable(t *testing.T) {
 func TestDefaultResolver(t *testing.T) {
 	resolver := &DefaultResolver{}
 
-	serverData := []byte(`{"id": "test", "name": "Server Name", "version": 2}`)
-	localData := []byte(`{"id": "test", "name": "Local Name", "version": 1}`)
-
 	// Test that server wins by default
-	merged, keepLocal, err := resolver.Merge("test_table", "test-id", serverData, localData)
-	require.NoError(t, err)
-	require.False(t, keepLocal)
-	require.Equal(t, string(serverData), string(merged))
+	result := resolver.Resolve(ConflictContext{})
+	require.IsType(t, AcceptServer{}, result)
 }
 
 func TestNewClient(t *testing.T) {

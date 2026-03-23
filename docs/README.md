@@ -1,19 +1,20 @@
-# go-oversync Documentation
+# Documentation
 
-This directory contains the Jekyll-based documentation for go-oversync, automatically published to GitHub Pages.
+This directory contains the Jekyll source for the go-oversync documentation site.
+
+The docs should describe the current repository state only. If code and docs disagree, update the
+docs to match the verified runtime, tests, examples, or shipped API contract.
 
 ## Local Development
 
-To run the documentation locally:
+Build the site once:
 
 ```bash
 cd docs
 ./build-site
 ```
 
-The site will be available at `http://localhost:4000/go-oversync/`
-
-For live local serving instead of a one-off build:
+Serve it locally:
 
 ```bash
 cd docs
@@ -21,42 +22,29 @@ BUNDLE_PATH=vendor/bundle bundle install
 RUBYOPT="-r./_plugins/ruby_compat.rb" BUNDLE_PATH=vendor/bundle bundle exec jekyll serve
 ```
 
-## Automatic Publishing
+Default local URL:
 
-The documentation is automatically published to GitHub Pages via GitHub Actions when:
-
-- Changes are pushed to the `main` branch in the `docs/` directory
-- Pull requests are opened that modify the `docs/` directory (build-only, no deployment)
-
-The workflow:
-1. **Builds** the Jekyll site using the same environment as GitHub Pages
-2. **Tests** that the build succeeds on pull requests
-3. **Deploys** to GitHub Pages on pushes to main
+```text
+http://localhost:4000/go-oversync/
+```
 
 ## Site Structure
 
-- `index.markdown` - Home page with overview and features
-- `getting-started.md` - Complete tutorial for building a sync-enabled server
-- `documentation.md` - Links to detailed API and implementation docs
-- `documentation/` - Detailed documentation pages
-  - `api.md` - HTTP API reference
-  - `server.md` - Server integration guide
-  - `client.md` - Client library documentation
+- `index.markdown`: landing page
+- `getting-started.md`: current setup guide
+- `architecture.md`: bundle-based architecture overview
+- `documentation/core-concepts.md`: vocabulary and end-to-end model
+- `documentation/server.md`: PostgreSQL/server runtime contract
+- `documentation/client.md`: SQLite client runtime contract
+- `documentation/api.md`: HTTP API reference
+- `documentation/advanced-concepts.md`: deeper contract notes
+- `documentation/performance.md`: current operational hotspots
+- `_data/navigation.yml`: top navigation
 
-## Configuration
+## Maintenance Rule
 
-The site is configured in `_config.yml` with:
-- **Base URL**: `/go-oversync` (for GitHub Pages)
-- **Theme**: Minima (GitHub Pages compatible)
-- **Plugins**: Jekyll Feed for RSS, Remote Theme support
-- **Navigation**: Automatic header navigation from `header_pages`
+Avoid documenting:
 
-## GitHub Pages Setup
-
-To enable GitHub Pages for this repository:
-
-1. Go to repository **Settings** → **Pages**
-2. Set **Source** to "GitHub Actions"
-3. The workflow will automatically deploy on the next push to main
-
-The documentation will be available at: `https://mobiletoly.github.io/go-oversync/`
+- planned features as if they exist
+- historical workflows unless they still matter to current users
+- counts, guarantees, or CI claims unless they are verified in the current repo state

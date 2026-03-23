@@ -3,89 +3,41 @@ layout: default
 title: Home
 ---
 
-# go-oversync — PostgreSQL adapter for multi-device sync
+# go-oversync
 
-**A set of libraries that add two-way sync between client databases and PostgreSQL
-servers.**
+go-oversync is a Go library suite for bundle-based sync between local SQLite clients and
+PostgreSQL servers.
 
-## What is go-oversync?
+## Current Model
 
-go-oversync is a Go library suite designed for applications that need **reliable synchronization**
-between local client databases and a central PostgreSQL backend, across multiple devices and
-platforms.
+The verified contract in this repository is:
 
-Use it when you want to:
+- PostgreSQL business tables are authoritative
+- clients push one logical dirty set through staged push sessions
+- clients replay the authoritative committed bundle returned by the server
+- clients pull complete committed bundles only
+- fresh installs and prune recovery rebuild through frozen snapshot sessions
 
-- Sync changes bi-directionally between a client (e.g. mobile or embedded SQLite) and a server (
-  PostgreSQL).
-- Allow offline operation and automatic syncing once connectivity is restored.
-- Handle conflict resolution out of the box.
-- Plug into your existing HTTP server and authentication stack without needing a separate sync
-  server.
+## Repository Surface
 
-It includes:
+- `oversync/`: PostgreSQL adapter, bundle capture, schema validation, HTTP handlers
+- `oversqlite/`: SQLite client SDK with trigger-based dirty capture
+- `examples/nethttp_server/`: reference `net/http` server
+- `examples/mobile_flow/`: simulator for the current sync contract
+- `swagger/two_way_sync.yaml`: OpenAPI description of the HTTP surface
 
-- A **PostgreSQL adapter** that integrates with your server APIs.
-- A **Go SQLite client**, for desktop or backend usage.
-- **Kotlin Multiplatform client** — For Android/iOS apps
-  via [sqlitenow-kmp](https://github.com/mobiletoly/sqlitenow-kmp)
+## Design Constraints
 
+The runtime is intentionally fail-closed.
 
-## Why go-oversync?
+- registered PostgreSQL tables must use a single-column UUID sync key
+- registered and managed table sets must be FK-closed
+- unsupported key shapes and unsupported FK shapes fail during bootstrap
+- one `oversqlite.Client` owns one SQLite database at a time
+- one SQLite database maps to one configured remote schema
 
-- **Library, not server** — Integrate with your existing server architecture
-- **Bring your own auth** — Works with any authentication system (JWT, sessions, API keys)
-- **Clean architecture** — No invasive columns in your business tables
-- **Offline-first** — Works seamlessly with poor connectivity
-- **Multi-device** — Perfect sync across phones, tablets, and web
+## Start Here
 
-## How It Works
-
-**You control the server:** go-oversync provides libraries that integrate into your existing HTTP
-server. You handle routing, middleware, authentication, and business logic.
-
-**Multiple client options:** Use the Go SQLite client for Go apps, or the Kotlin Multiplatform
-client for Android/iOS apps. Both sync with the same PostgreSQL adapter. More client libraries
-are coming.
-
-**Simple integration:** Register your tables with go-oversync, add a few HTTP handlers to your
-routes, and the library handles change tracking, conflict resolution, and sync protocol details.
-
-**Flexible authentication:** Works with any auth system — JWT, sessions, API keys, or custom
-authentication. You extract user/device IDs and pass them to go-oversync.
-
-## Key Features
-
-- **Conflict Resolution** — Optimistic concurrency with automatic conflict detection
-- **Batch Processing** — FK-aware ordering and efficient batch operations
-- **User Isolation** — Each user has completely isolated sync streams
-- **Multi-Platform** — Go client for servers/desktop, Kotlin Multiplatform for mobile
-- **Offline-First** — Works perfectly with intermittent connectivity
-
-
-## Client Libraries
-
-### Go SQLite Client (This Repository)
-
-- **Location:** `oversqlite/` package in this repo
-- **Use case:** Go applications, desktop apps, server-to-server sync
-- **Database:** SQLite with automatic trigger-based change tracking
-- **Features:** Batch uploads, conflict resolution, offline-first design
-
-### Kotlin Multiplatform Client (Separate Repository)
-
-- **Repository:** [sqlitenow-kmp](https://github.com/mobiletoly/sqlitenow-kmp)
-- **Use case:** Android and iOS mobile applications
-- **Database:** SQLite with the same sync protocol
-- **Features:** Cross-platform mobile support, same sync guarantees
-
-Both clients sync with the same PostgreSQL backend using identical protocols, ensuring perfect
-compatibility across platforms.
-
-## Ready to try it?
-
-- First get familiar with [Core Concepts](documentation/core-concepts/) guide to understand the key components
-  and vocabulary
-- Start with the [Getting Started](getting-started.html) guide to build your first sync-enabled
-  server
-
+- Read [Core Concepts](documentation/core-concepts/) for the vocabulary and end-to-end model.
+- Use [Getting Started](getting-started.html) to stand up a server and client.
+- Use [HTTP API](documentation/api/) for the wire contract.
