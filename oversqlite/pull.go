@@ -146,6 +146,8 @@ func (c *Client) applyPulledBundleLocked(ctx context.Context, bundle *oversync.B
 		return fmt.Errorf("failed to begin pulled bundle transaction: %w", err)
 	}
 	defer tx.Rollback()
+	stmtCache := newTxStmtCache(tx)
+	defer stmtCache.Close()
 
 	if err := c.setBundleApplyModeInTx(ctx, tx, true); err != nil {
 		return err
@@ -166,10 +168,10 @@ func (c *Client) applyPulledBundleLocked(ctx context.Context, bundle *oversync.B
 		if currentState.Exists && currentState.RowVersion >= row.RowVersion {
 			continue
 		}
-		if err := c.applyBundleRowAuthoritativelyInTx(ctx, tx, &row, localPK); err != nil {
+		if err := c.applyBundleRowAuthoritativelyInTxUsing(ctx, stmtCache, tx, &row, localPK); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := stmtCache.ExecContext(ctx, `
 			DELETE FROM _sync_dirty_rows
 			WHERE schema_name = ? AND table_name = ? AND key_json = ?
 		`, row.Schema, row.Table, keyJSON); err != nil {
@@ -431,6 +433,8 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 		return fmt.Errorf("failed to begin staged snapshot apply transaction: %w", err)
 	}
 	defer tx.Rollback()
+	stmtCache := newTxStmtCache(tx)
+	defer stmtCache.Close()
 
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
 		return fmt.Errorf("failed to defer foreign keys for staged snapshot apply: %w", err)
@@ -478,7 +482,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 			RowVersion: rowVersion,
 			Payload:    json.RawMessage(payload),
 		}
-		if err := c.applyBundleRowAuthoritativelyInTx(ctx, tx, &bundleRow, localPK); err != nil {
+		if err := c.applyBundleRowAuthoritativelyInTxUsing(ctx, stmtCache, tx, &bundleRow, localPK); err != nil {
 			return fmt.Errorf("failed to apply staged snapshot row for %s.%s: %w", schemaName, tableName, err)
 		}
 		stagedRowCount++

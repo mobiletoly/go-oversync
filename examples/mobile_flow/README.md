@@ -77,6 +77,10 @@ Useful flags:
   - two devices syncing through the same authoritative server state
 - `multi-device-complex`
   - longer mixed-operation convergence flow across two devices
+- `conflicts`
+  - structured conflict recovery under moderate multi-chunk load, covering built-in server-wins,
+    built-in client-wins, and a custom `updated_at`-based merge resolver using UTC RFC3339Nano
+    timestamp strings in SQLite `TEXT` columns
 - `files-sync`
   - narrow BLOB-focused scenario for quick debugging of `files` / `file_reviews`
 
@@ -87,7 +91,6 @@ These names are accepted by the simulator today but are not implemented yet:
 - `reinstall`
 - `device-replacement`
 - `offline-online`
-- `conflicts`
 - `user-switch`
 
 ## Simulator Architecture

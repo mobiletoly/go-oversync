@@ -12,6 +12,10 @@ import (
 )
 
 func (c *Client) upsertRowInTx(ctx context.Context, tx *sql.Tx, table string, payload map[string]interface{}) error {
+	return c.upsertRowInTxUsing(ctx, tx, tx, table, payload)
+}
+
+func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, tx *sql.Tx, table string, payload map[string]interface{}) error {
 	tableInfo, err := c.getTableInfoTx(tx, strings.ToLower(table))
 	if err != nil {
 		return fmt.Errorf("failed to get table info for %s: %w", table, err)
@@ -92,7 +96,7 @@ func (c *Client) upsertRowInTx(ctx context.Context, tx *sql.Tx, table string, pa
 		query += fmt.Sprintf(" ON CONFLICT(%s) DO UPDATE SET %s", quoteIdent(pkColumn), strings.Join(updateAssignments, ", "))
 	}
 
-	if _, err := tx.ExecContext(ctx, query, values...); err != nil {
+	if _, err := execer.ExecContext(ctx, query, values...); err != nil {
 		return fmt.Errorf("failed to execute upsert: %w", err)
 	}
 	return nil
@@ -114,11 +118,15 @@ func (c *Client) updateRowMeta(ctx context.Context, pk, tableName string, server
 }
 
 func (c *Client) updateRowMetaInTx(ctx context.Context, tx *sql.Tx, pk, tableName string, serverVersion int64, deleted bool) error {
+	return c.updateRowMetaInTxUsing(ctx, tx, tx, pk, tableName, serverVersion, deleted)
+}
+
+func (c *Client) updateRowMetaInTxUsing(ctx context.Context, execer execContexter, tx *sql.Tx, pk, tableName string, serverVersion int64, deleted bool) error {
 	keyJSON, err := c.syncKeyJSONForPKInTx(tx, tableName, pk)
 	if err != nil {
 		return err
 	}
-	if err := c.updateStructuredRowStateInTx(ctx, tx, c.config.Schema, tableName, keyJSON, serverVersion, deleted); err != nil {
+	if err := c.updateStructuredRowStateInTxUsing(ctx, execer, c.config.Schema, tableName, keyJSON, serverVersion, deleted); err != nil {
 		return err
 	}
 	return nil
@@ -140,11 +148,15 @@ func (c *Client) syncKeyJSONForPKInTx(tx *sql.Tx, tableName, pk string) (string,
 }
 
 func (c *Client) updateStructuredRowStateInTx(ctx context.Context, tx *sql.Tx, schemaName, tableName, keyJSON string, rowVersion int64, deleted bool) error {
+	return c.updateStructuredRowStateInTxUsing(ctx, tx, schemaName, tableName, keyJSON, rowVersion, deleted)
+}
+
+func (c *Client) updateStructuredRowStateInTxUsing(ctx context.Context, execer execContexter, schemaName, tableName, keyJSON string, rowVersion int64, deleted bool) error {
 	deletedInt := 0
 	if deleted {
 		deletedInt = 1
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := execer.ExecContext(ctx, `
 		INSERT INTO _sync_row_state(schema_name, table_name, key_json, row_version, deleted, updated_at)
 		VALUES(?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		ON CONFLICT(schema_name, table_name, key_json) DO UPDATE SET

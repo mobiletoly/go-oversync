@@ -74,6 +74,8 @@ if err := client.PullToStable(context.Background()); err != nil {
 
 - Payloads are full-row after-images for `INSERT` and `UPDATE`.
 - Push is all-or-nothing at bundle level.
+- Syncable application timestamps should be stored as SQLite `TEXT` in UTC RFC3339/RFC3339Nano
+  form such as `2026-03-24T18:02:00Z` or `2026-03-24T18:02:00.123456789Z`.
 - Structured `push_conflict` responses are resolved from machine-readable conflict details, not
   human-readable error strings.
 - `PushPending(ctx)` auto-recovers valid structured conflict outcomes:
@@ -97,6 +99,19 @@ if err := client.PullToStable(context.Background()); err != nil {
   SQLite file or handle.
 - Local FK cascades and local trigger-generated writes on managed tables are captured into `_sync_dirty_rows`.
 - Primary-key changes are represented as delete-plus-upsert on the client dirty set.
+
+## Timestamp fields
+
+`oversqlite` does not impose a special SQLite datetime type for your business rows. Syncable
+application timestamp columns should use:
+
+- SQLite column type: `TEXT`
+- value format: UTC RFC3339 or RFC3339Nano
+- resolver behavior: parse timestamps as time values; do not compare raw strings unless your format
+  is fixed and normalized
+
+The client runtime's own metadata tables also use UTC text timestamps. Older ad hoc formats such as
+`yyyy:mm:dd hh:mm:ss` are not the recommended sync format.
 
 ## Recovery
 

@@ -155,7 +155,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 		},
 		"conflicts": {
 			Name:             "Multi-Device Conflicts",
-			Description:      "Simulates concurrent edits from multiple devices",
+			Description:      "Exercises structured conflict recovery under chunked multi-device load with server-wins, client-wins, and latest-updated_at merge rules",
 			UserID:           "user-conflicts",
 			SourceID:         "device-conflicts-001",
 			DeviceName:       "iPhone Conflicts",

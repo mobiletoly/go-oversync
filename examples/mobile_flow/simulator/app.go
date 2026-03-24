@@ -36,6 +36,7 @@ type MobileApp struct {
 
 	db     *sql.DB
 	client *oversqlite.Client
+	stmts  mobileAppStatements
 
 	session *Session
 	ui      *UISimulator
@@ -43,6 +44,15 @@ type MobileApp struct {
 
 	isRunning bool
 	mu        sync.RWMutex
+}
+
+type mobileAppStatements struct {
+	createUser *sql.Stmt
+	createPost *sql.Stmt
+	updateUser *sql.Stmt
+	updatePost *sql.Stmt
+	deleteUser *sql.Stmt
+	deletePost *sql.Stmt
 }
 
 func NewMobileApp(config *MobileAppConfig) (*MobileApp, error) {
@@ -89,6 +99,9 @@ func (app *MobileApp) initializeDatabase() error {
 	if err := app.createBusinessTables(); err != nil {
 		return fmt.Errorf("failed to create business tables: %w", err)
 	}
+	if err := app.prepareStatements(); err != nil {
+		return fmt.Errorf("failed to prepare business statements: %w", err)
+	}
 
 	client, err := oversqlite.NewClient(
 		db,
@@ -111,6 +124,65 @@ func (app *MobileApp) initializeDatabase() error {
 	}
 
 	return nil
+}
+
+func (app *MobileApp) prepareStatements() error {
+	if app.db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	ctx := context.Background()
+	var err error
+
+	if app.stmts.createUser, err = app.db.PrepareContext(ctx, `
+		INSERT INTO users (id, name, email, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)`); err != nil {
+		return err
+	}
+	if app.stmts.createPost, err = app.db.PrepareContext(ctx, `
+		INSERT INTO posts (id, title, content, author_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`); err != nil {
+		return err
+	}
+	if app.stmts.updateUser, err = app.db.PrepareContext(ctx, `
+		UPDATE users SET name = ?, email = ?, updated_at = ?
+		WHERE id = ?`); err != nil {
+		return err
+	}
+	if app.stmts.updatePost, err = app.db.PrepareContext(ctx, `
+		UPDATE posts SET title = ?, content = ?, updated_at = ?
+		WHERE id = ?`); err != nil {
+		return err
+	}
+	if app.stmts.deletePost, err = app.db.PrepareContext(ctx, `DELETE FROM posts WHERE id = ?`); err != nil {
+		return err
+	}
+	if app.stmts.deleteUser, err = app.db.PrepareContext(ctx, `DELETE FROM users WHERE id = ?`); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (app *MobileApp) closeStatements() error {
+	var firstErr error
+	closeStmt := func(name string, stmt *sql.Stmt) {
+		if stmt == nil {
+			return
+		}
+		if err := stmt.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close %s statement: %w", name, err)
+		}
+	}
+
+	closeStmt("createUser", app.stmts.createUser)
+	closeStmt("createPost", app.stmts.createPost)
+	closeStmt("updateUser", app.stmts.updateUser)
+	closeStmt("updatePost", app.stmts.updatePost)
+	closeStmt("deleteUser", app.stmts.deleteUser)
+	closeStmt("deletePost", app.stmts.deletePost)
+	app.stmts = mobileAppStatements{}
+	return firstErr
 }
 
 // createBusinessTables creates the local business tables that will be synced
@@ -358,10 +430,7 @@ func (app *MobileApp) CreateUserWithIDReturningID(userID, name, email string) (s
 func (app *MobileApp) createUserWithID(ctx context.Context, userID, name, email string) (string, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
-	_, err := app.db.ExecContext(ctx, `
-		INSERT INTO users (id, name, email, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)`,
-		userID, name, email, now, now)
+	_, err := app.stmts.createUser.ExecContext(ctx, userID, name, email, now, now)
 
 	if err != nil {
 		return "", fmt.Errorf("failed to create user: %w", err)
@@ -376,10 +445,9 @@ func (app *MobileApp) createUserWithID(ctx context.Context, userID, name, email 
 // CreateUserTx inserts a user row within an existing transaction
 func (app *MobileApp) CreateUserTx(tx *sql.Tx, userID, name, email string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := tx.Exec(`
-        INSERT INTO users (id, name, email, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)`,
-		userID, name, email, now, now)
+	stmt := tx.StmtContext(context.Background(), app.stmts.createUser)
+	defer stmt.Close()
+	_, err := stmt.ExecContext(context.Background(), userID, name, email, now, now)
 	if err != nil {
 		return fmt.Errorf("failed to create user (tx): %w", err)
 	}
@@ -402,10 +470,7 @@ func (app *MobileApp) CreatePostWithID(ctx context.Context, postID, authorID, ti
 func (app *MobileApp) createPostWithID(ctx context.Context, postID, authorID, title, content string) (string, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
-	_, err := app.db.ExecContext(ctx, `
-		INSERT INTO posts (id, title, content, author_id, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		postID, title, content, authorID, now, now)
+	_, err := app.stmts.createPost.ExecContext(ctx, postID, title, content, authorID, now, now)
 
 	if err != nil {
 		return "", fmt.Errorf("failed to create post: %w", err)
@@ -420,10 +485,9 @@ func (app *MobileApp) createPostWithID(ctx context.Context, postID, authorID, ti
 // CreatePostTx inserts a post row within an existing transaction
 func (app *MobileApp) CreatePostTx(tx *sql.Tx, postID, authorID, title, content string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := tx.Exec(`
-        INSERT INTO posts (id, title, content, author_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)`,
-		postID, title, content, authorID, now, now)
+	stmt := tx.StmtContext(context.Background(), app.stmts.createPost)
+	defer stmt.Close()
+	_, err := stmt.ExecContext(context.Background(), postID, title, content, authorID, now, now)
 	if err != nil {
 		return fmt.Errorf("failed to create post (tx): %w", err)
 	}
@@ -434,10 +498,7 @@ func (app *MobileApp) CreatePostTx(tx *sql.Tx, postID, authorID, title, content 
 func (app *MobileApp) UpdateUser(userID, name, email string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
-	_, err := app.db.Exec(`
-		UPDATE users SET name = ?, email = ?, updated_at = ?
-		WHERE id = ?`,
-		name, email, now, userID)
+	_, err := app.stmts.updateUser.Exec(name, email, now, userID)
 
 	if err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
@@ -453,10 +514,7 @@ func (app *MobileApp) UpdateUser(userID, name, email string) error {
 func (app *MobileApp) UpdatePost(postID, title, content string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
-	_, err := app.db.Exec(`
-		UPDATE posts SET title = ?, content = ?, updated_at = ?
-		WHERE id = ?`,
-		title, content, now, postID)
+	_, err := app.stmts.updatePost.Exec(title, content, now, postID)
 	if err != nil {
 		return fmt.Errorf("failed to update post: %w", err)
 	}
@@ -469,7 +527,7 @@ func (app *MobileApp) UpdatePost(postID, title, content string) error {
 
 // DeletePost deletes a post record
 func (app *MobileApp) DeletePost(postID string) error {
-	_, err := app.db.Exec(`DELETE FROM posts WHERE id = ?`, postID)
+	_, err := app.stmts.deletePost.Exec(postID)
 	if err != nil {
 		return fmt.Errorf("failed to delete post: %w", err)
 	}
@@ -482,7 +540,7 @@ func (app *MobileApp) DeletePost(postID string) error {
 
 // DeleteUser deletes a user record
 func (app *MobileApp) DeleteUser(userID string) error {
-	_, err := app.db.Exec(`DELETE FROM users WHERE id = ?`, userID)
+	_, err := app.stmts.deleteUser.Exec(userID)
 	if err != nil {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
@@ -499,7 +557,7 @@ func (app *MobileApp) DeleteUserWithContext(ctx context.Context, userID string) 
 		return fmt.Errorf("database not initialized")
 	}
 
-	_, err := app.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, userID)
+	_, err := app.stmts.deleteUser.ExecContext(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
@@ -556,6 +614,9 @@ func (app *MobileApp) Close() error {
 			return fmt.Errorf("failed to close oversqlite client: %w", err)
 		}
 		app.client = nil
+	}
+	if err := app.closeStatements(); err != nil {
+		return err
 	}
 
 	if app.db != nil {

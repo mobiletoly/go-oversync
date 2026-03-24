@@ -26,6 +26,7 @@ type ServerConfig struct {
 	Logger         *slog.Logger
 	AppName        string
 	BusinessSchema string
+	StageMetrics   oversync.StageMetricsRecorder
 }
 
 // ServerComponents holds the initialized server components
@@ -121,6 +122,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	serviceConfig := &oversync.ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   appName,
+		StageMetrics:              config.StageMetrics,
 		RegisteredTables: []oversync.RegisteredTable{
 			{Schema: businessSchema, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: businessSchema, Table: "posts", SyncKeyColumns: []string{"id"}},
@@ -129,6 +131,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			{Schema: businessSchema, Table: "team_members"},
 			{Schema: businessSchema, Table: "files", SyncKeyColumns: []string{"id"}},
 			{Schema: businessSchema, Table: "file_reviews", SyncKeyColumns: []string{"id"}},
+			{Schema: businessSchema, Table: "typed_rows", SyncKeyColumns: []string{"id"}},
 		},
 	}
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
@@ -139,6 +142,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		"users_key", serviceConfig.RegisteredTables[0].Schema+"."+serviceConfig.RegisteredTables[0].Table,
 		"posts_key", serviceConfig.RegisteredTables[1].Schema+"."+serviceConfig.RegisteredTables[1].Table,
 		"files_key", serviceConfig.RegisteredTables[5].Schema+"."+serviceConfig.RegisteredTables[5].Table,
+		"typed_rows_key", serviceConfig.RegisteredTables[7].Schema+"."+serviceConfig.RegisteredTables[7].Table,
 	)
 
 	// Build runtime service, then bootstrap bundle-capture schema and topology explicitly.

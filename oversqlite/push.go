@@ -356,6 +356,8 @@ func (c *Client) stageCommittedBundleChunk(ctx context.Context, chunk *oversync.
 		return fmt.Errorf("failed to begin committed bundle stage transaction: %w", err)
 	}
 	defer tx.Rollback()
+	stmtCache := newTxStmtCache(tx)
+	defer stmtCache.Close()
 
 	startOrdinal := int64(0)
 	if afterRowOrdinal != nil {
@@ -370,11 +372,11 @@ func (c *Client) stageCommittedBundleChunk(ctx context.Context, chunk *oversync.
 			return err
 		}
 		rowOrdinal := startOrdinal + int64(idx)
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO _sync_push_stage (
-				bundle_seq, row_ordinal, schema_name, table_name, key_json, op, row_version, payload
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, chunk.BundleSeq, rowOrdinal, row.Schema, row.Table, keyJSON, row.Op, row.RowVersion, nullStringValue(sql.NullString{
+		if _, err := stmtCache.ExecContext(ctx, `
+				INSERT INTO _sync_push_stage (
+					bundle_seq, row_ordinal, schema_name, table_name, key_json, op, row_version, payload
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`, chunk.BundleSeq, rowOrdinal, row.Schema, row.Table, keyJSON, row.Op, row.RowVersion, nullStringValue(sql.NullString{
 			String: string(row.Payload),
 			Valid:  row.Op != oversync.OpDelete,
 		})); err != nil {
@@ -473,6 +475,8 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 		return fmt.Errorf("failed to begin staged push replay transaction: %w", err)
 	}
 	defer tx.Rollback()
+	stmtCache := newTxStmtCache(tx)
+	defer stmtCache.Close()
 
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
 		return fmt.Errorf("failed to defer foreign keys for staged push replay: %w", err)
@@ -542,11 +546,11 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 		}
 		rowDecision, hasDecision := decisions[row.SchemaName+"\x00"+row.TableName+"\x00"+row.KeyJSON]
 		if !hasDecision || !rowDecision.skipApply {
-			if err := c.applyBundleRowAuthoritativelyInTx(ctx, tx, &bundleRow, row.LocalPK); err != nil {
+			if err := c.applyBundleRowAuthoritativelyInTxUsing(ctx, stmtCache, tx, &bundleRow, row.LocalPK); err != nil {
 				return err
 			}
 			if hasDecision {
-				if _, err := tx.ExecContext(ctx, `
+				if _, err := stmtCache.ExecContext(ctx, `
 					DELETE FROM _sync_dirty_rows
 					WHERE schema_name = ? AND table_name = ? AND key_json = ?
 				`, row.SchemaName, row.TableName, row.KeyJSON); err != nil {
@@ -556,7 +560,7 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 			continue
 		}
 
-		if err := c.updateRowMetaInTx(ctx, tx, row.LocalPK, row.TableName, row.RowVersion, row.Op == oversync.OpDelete); err != nil {
+		if err := c.updateRowMetaInTxUsing(ctx, stmtCache, tx, row.LocalPK, row.TableName, row.RowVersion, row.Op == oversync.OpDelete); err != nil {
 			return err
 		}
 		if rowDecision.needsRequeue {
@@ -638,10 +642,22 @@ func (c *Client) collectDirtyRowsForPushInTx(ctx context.Context, tx *sql.Tx) (s
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT schema_name, table_name, key_json, base_row_version, dirty_ordinal
-		FROM _sync_dirty_rows
-		ORDER BY dirty_ordinal, table_name, key_json
-	`)
+			SELECT
+				d.schema_name,
+				d.table_name,
+				d.key_json,
+				d.base_row_version,
+				d.payload,
+				d.dirty_ordinal,
+				CASE WHEN rs.key_json IS NULL THEN 0 ELSE 1 END AS state_exists,
+				COALESCE(rs.deleted, 0) AS state_deleted
+			FROM _sync_dirty_rows AS d
+			LEFT JOIN _sync_row_state AS rs
+				ON rs.schema_name = d.schema_name
+				AND rs.table_name = d.table_name
+				AND rs.key_json = d.key_json
+			ORDER BY d.dirty_ordinal, d.table_name, d.key_json
+		`)
 	if err != nil {
 		return 0, 0, nil, nil, fmt.Errorf("failed to query dirty rows: %w", err)
 	}
@@ -657,15 +673,35 @@ func (c *Client) collectDirtyRowsForPushInTx(ctx context.Context, tx *sql.Tx) (s
 		tableName      string
 		keyJSON        string
 		baseRowVersion int64
+		payload        sql.NullString
 		dirtyOrdinal   int64
+		stateExists    bool
+		stateDeleted   bool
 	}
 	snapshotRows := make([]dirtySnapshotRow, 0)
 	noOpKeys := make([]noOpKey, 0)
 
 	for rows.Next() {
-		var schemaName, tableName, keyJSON string
-		var baseRowVersion, dirtyOrdinal int64
-		if err := rows.Scan(&schemaName, &tableName, &keyJSON, &baseRowVersion, &dirtyOrdinal); err != nil {
+		var (
+			schemaName      string
+			tableName       string
+			keyJSON         string
+			baseRowVersion  int64
+			payload         sql.NullString
+			dirtyOrdinal    int64
+			stateExistsInt  int
+			stateDeletedInt int
+		)
+		if err := rows.Scan(
+			&schemaName,
+			&tableName,
+			&keyJSON,
+			&baseRowVersion,
+			&payload,
+			&dirtyOrdinal,
+			&stateExistsInt,
+			&stateDeletedInt,
+		); err != nil {
 			return 0, 0, nil, nil, fmt.Errorf("failed to scan dirty row: %w", err)
 		}
 		snapshotRows = append(snapshotRows, dirtySnapshotRow{
@@ -673,7 +709,10 @@ func (c *Client) collectDirtyRowsForPushInTx(ctx context.Context, tx *sql.Tx) (s
 			tableName:      tableName,
 			keyJSON:        keyJSON,
 			baseRowVersion: baseRowVersion,
+			payload:        payload,
 			dirtyOrdinal:   dirtyOrdinal,
+			stateExists:    stateExistsInt == 1,
+			stateDeleted:   stateDeletedInt == 1,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -690,17 +729,7 @@ func (c *Client) collectDirtyRowsForPushInTx(ctx context.Context, tx *sql.Tx) (s
 			return 0, 0, nil, nil, err
 		}
 
-		state, err := c.loadStructuredRowStateInTx(ctx, tx, schemaName, tableName, keyJSON)
-		if err != nil {
-			return 0, 0, nil, nil, err
-		}
-
-		livePayload, liveExists, err := c.serializeExistingRowInTx(ctx, tx, tableName, localPK)
-		if err != nil {
-			return 0, 0, nil, nil, err
-		}
-
-		if !liveExists && (!state.Exists || state.Deleted) {
+		if !snapshot.payload.Valid && (!snapshot.stateExists || snapshot.stateDeleted) {
 			noOpKeys = append(noOpKeys, noOpKey{schemaName: schemaName, tableName: tableName, keyJSON: keyJSON})
 			continue
 		}
@@ -712,11 +741,11 @@ func (c *Client) collectDirtyRowsForPushInTx(ctx context.Context, tx *sql.Tx) (s
 			LocalPK:        localPK,
 			WireKey:        wireKey,
 			BaseRowVersion: snapshot.baseRowVersion,
+			LocalPayload:   snapshot.payload,
 			DirtyOrdinal:   snapshot.dirtyOrdinal,
 		}
-		if liveExists {
-			dirty.LocalPayload = sql.NullString{String: string(livePayload), Valid: true}
-			if state.Exists && !state.Deleted {
+		if snapshot.payload.Valid {
+			if snapshot.stateExists && !snapshot.stateDeleted {
 				dirty.Op = oversync.OpUpdate
 			} else {
 				dirty.Op = oversync.OpInsert
@@ -760,16 +789,18 @@ func (c *Client) freezePushOutboundSnapshotInTx(ctx context.Context, tx *sql.Tx)
 	if err != nil {
 		return nil, err
 	}
+	stmtCache := newTxStmtCache(tx)
+	defer stmtCache.Close()
 
 	for _, noOpKey := range noOpKeys {
 		parts := strings.SplitN(noOpKey, "\x00", 3)
 		if len(parts) != 3 {
 			return nil, fmt.Errorf("invalid no-op dirty row key encoding")
 		}
-		if _, err := tx.ExecContext(ctx, `
-			DELETE FROM _sync_dirty_rows
-			WHERE schema_name = ? AND table_name = ? AND key_json = ?
-		`, parts[0], parts[1], parts[2]); err != nil {
+		if _, err := stmtCache.ExecContext(ctx, `
+				DELETE FROM _sync_dirty_rows
+				WHERE schema_name = ? AND table_name = ? AND key_json = ?
+			`, parts[0], parts[1], parts[2]); err != nil {
 			return nil, fmt.Errorf("failed to clear no-op dirty row %s.%s %s: %w", parts[0], parts[1], parts[2], err)
 		}
 	}
@@ -779,17 +810,17 @@ func (c *Client) freezePushOutboundSnapshotInTx(ctx context.Context, tx *sql.Tx)
 	}
 
 	for idx, row := range dirtyRows {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO _sync_push_outbound (
-				source_bundle_id, row_ordinal, schema_name, table_name, key_json, op, base_row_version, payload
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, sourceBundleID, idx, row.SchemaName, row.TableName, row.KeyJSON, row.Op, row.BaseRowVersion, nullStringValue(row.LocalPayload)); err != nil {
+		if _, err := stmtCache.ExecContext(ctx, `
+				INSERT INTO _sync_push_outbound (
+					source_bundle_id, row_ordinal, schema_name, table_name, key_json, op, base_row_version, payload
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`, sourceBundleID, idx, row.SchemaName, row.TableName, row.KeyJSON, row.Op, row.BaseRowVersion, nullStringValue(row.LocalPayload)); err != nil {
 			return nil, fmt.Errorf("failed to freeze outbound push row %d for %s.%s: %w", idx, row.SchemaName, row.TableName, err)
 		}
-		if _, err := tx.ExecContext(ctx, `
-			DELETE FROM _sync_dirty_rows
-			WHERE schema_name = ? AND table_name = ? AND key_json = ?
-		`, row.SchemaName, row.TableName, row.KeyJSON); err != nil {
+		if _, err := stmtCache.ExecContext(ctx, `
+				DELETE FROM _sync_dirty_rows
+				WHERE schema_name = ? AND table_name = ? AND key_json = ?
+			`, row.SchemaName, row.TableName, row.KeyJSON); err != nil {
 			return nil, fmt.Errorf("failed to move dirty row %s.%s %s into outbound snapshot: %w", row.SchemaName, row.TableName, row.KeyJSON, err)
 		}
 	}
@@ -891,10 +922,10 @@ func (c *Client) loadStructuredRowStateInTx(ctx context.Context, tx *sql.Tx, sch
 	state := &structuredRowState{}
 	var deletedInt int
 	err := tx.QueryRowContext(ctx, `
-		SELECT row_version, deleted
-		FROM _sync_row_state
-		WHERE schema_name = ? AND table_name = ? AND key_json = ?
-	`, schemaName, tableName, keyJSON).Scan(&state.RowVersion, &deletedInt)
+			SELECT row_version, deleted
+			FROM _sync_row_state
+			WHERE schema_name = ? AND table_name = ? AND key_json = ?
+		`, schemaName, tableName, keyJSON).Scan(&state.RowVersion, &deletedInt)
 	if err == sql.ErrNoRows {
 		return state, nil
 	}
@@ -909,10 +940,10 @@ func (c *Client) loadStructuredRowStateInTx(ctx context.Context, tx *sql.Tx, sch
 func (c *Client) loadDirtyUploadStateInTx(ctx context.Context, tx *sql.Tx, schemaName, tableName, keyJSON string) (dirtyUploadState, error) {
 	var state dirtyUploadState
 	err := tx.QueryRowContext(ctx, `
-		SELECT op, payload, base_row_version, dirty_ordinal
-		FROM _sync_dirty_rows
-		WHERE schema_name = ? AND table_name = ? AND key_json = ?
-	`, schemaName, tableName, keyJSON).Scan(&state.Op, &state.Payload, &state.BaseRowVersion, &state.CurrentOrdinal)
+			SELECT op, payload, base_row_version, dirty_ordinal
+			FROM _sync_dirty_rows
+			WHERE schema_name = ? AND table_name = ? AND key_json = ?
+		`, schemaName, tableName, keyJSON).Scan(&state.Op, &state.Payload, &state.BaseRowVersion, &state.CurrentOrdinal)
 	if err == sql.ErrNoRows {
 		return dirtyUploadState{}, nil
 	}
@@ -963,13 +994,17 @@ func (c *Client) requeueDirtyIntentInTx(ctx context.Context, tx *sql.Tx, schemaN
 }
 
 func (c *Client) applyBundleRowAuthoritativelyInTx(ctx context.Context, tx *sql.Tx, row *oversync.BundleRow, localPK string) error {
+	return c.applyBundleRowAuthoritativelyInTxUsing(ctx, tx, tx, row, localPK)
+}
+
+func (c *Client) applyBundleRowAuthoritativelyInTxUsing(ctx context.Context, execer execContexter, tx *sql.Tx, row *oversync.BundleRow, localPK string) error {
 	switch row.Op {
 	case oversync.OpInsert, oversync.OpUpdate:
 		var payload map[string]any
 		if err := json.Unmarshal(row.Payload, &payload); err != nil {
 			return fmt.Errorf("failed to decode bundle row payload for %s.%s: %w", row.Schema, row.Table, err)
 		}
-		if err := c.upsertRowInTx(ctx, tx, row.Table, payload); err != nil {
+		if err := c.upsertRowInTxUsing(ctx, execer, tx, row.Table, payload); err != nil {
 			return fmt.Errorf("failed to apply authoritative upsert for %s.%s: %w", row.Schema, row.Table, err)
 		}
 	case oversync.OpDelete:
@@ -982,14 +1017,14 @@ func (c *Client) applyBundleRowAuthoritativelyInTx(ctx context.Context, tx *sql.
 			return fmt.Errorf("failed to convert local key for delete: %w", err)
 		}
 		query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", quoteIdent(row.Table), quoteIdent(pkColumn))
-		if _, err := tx.ExecContext(ctx, query, pkValue); err != nil {
+		if _, err := execer.ExecContext(ctx, query, pkValue); err != nil {
 			return fmt.Errorf("failed to apply authoritative delete for %s.%s: %w", row.Schema, row.Table, err)
 		}
 	default:
 		return fmt.Errorf("unsupported bundle row op %q", row.Op)
 	}
 
-	if err := c.updateRowMetaInTx(ctx, tx, localPK, row.Table, row.RowVersion, row.Op == oversync.OpDelete); err != nil {
+	if err := c.updateRowMetaInTxUsing(ctx, execer, tx, localPK, row.Table, row.RowVersion, row.Op == oversync.OpDelete); err != nil {
 		return err
 	}
 	return nil

@@ -28,6 +28,7 @@ func InitializeApplicationTables(ctx context.Context, pool *pgxpool.Pool, logger
 		teamMembersTable := qualifiedTable(schema, "team_members")
 		filesTable := qualifiedTable(schema, "files")
 		fileReviewsTable := qualifiedTable(schema, "file_reviews")
+		typedRowsTable := qualifiedTable(schema, "typed_rows")
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schemaName)); err != nil {
 			return fmt.Errorf("failed to create business schema: %w", err)
@@ -132,6 +133,21 @@ CREATE TABLE IF NOT EXISTS %s (
 )
 `, fileReviewsTable, filesTable)); err != nil {
 			return fmt.Errorf("failed to create file_reviews table: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s (
+	id UUID PRIMARY KEY,
+	name TEXT NOT NULL,
+	note TEXT NULL,
+	count_value BIGINT NULL,
+	enabled_flag BIGINT NOT NULL,
+	rating DOUBLE PRECISION NULL,
+	data BYTEA NULL,
+	created_at TIMESTAMPTZ NULL
+)
+`, typedRowsTable)); err != nil {
+			return fmt.Errorf("failed to create typed_rows table: %w", err)
 		}
 
 		logger.Info("Initialized business schema and tables", "schema", schema)

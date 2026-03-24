@@ -502,8 +502,9 @@ func (sd *SchemaDiscovery) topologicalSort(
 	}
 
 	if len(cycles) > 0 {
-		sd.logger.Warn("Circular dependency groups detected; preserving deterministic order within strongly connected components",
-			"cycle_count", len(cycles),
+		sd.logger.Info("Circular dependency groups detected; preserving deterministic order within strongly connected components",
+			"cycle_count", len(cycles))
+		sd.logger.Debug("Circular dependency group details",
 			"cycles", cycles)
 	}
 

@@ -354,7 +354,8 @@ func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx contex
 		return nil, err
 	}
 
-	pkByTable, keyByTable, tableOrder, err := validateSyncTables(db, config.Tables)
+	tableInfoProvider := NewTableInfoProvider()
+	validatedTables, err := validateSyncTables(db, tableInfoProvider, config.Tables)
 	if err != nil {
 		return nil, err
 	}
@@ -369,16 +370,17 @@ func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx contex
 		HTTP:           &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
 		config:         config,
 		logger:         slog.Default(),
-		pkByTable:      pkByTable,
-		keyByTable:     keyByTable,
-		tableOrder:     tableOrder,
-		tableInfo:      NewTableInfoProvider(),
+		pkByTable:      validatedTables.pkByTable,
+		keyByTable:     validatedTables.keyByTable,
+		tableOrder:     validatedTables.tableOrder,
+		tableInfo:      tableInfoProvider,
 		dbOwnershipKey: identity.Key,
 	}
 
 	// Create triggers for all registered tables (after sync tables are created)
 	for _, syncTable := range config.Tables {
-		if err := createTriggersForTable(db, config.Schema, syncTable); err != nil {
+		tableName := strings.ToLower(strings.TrimSpace(syncTable.TableName))
+		if err := createTriggersForTableWithInfo(db, config.Schema, syncTable, validatedTables.tableInfoByKey[tableName]); err != nil {
 			return nil, fmt.Errorf("failed to create triggers for table %s: %w", syncTable.TableName, err)
 		}
 	}
@@ -421,52 +423,69 @@ func (c *Client) getTableInfoTx(tx *sql.Tx, tableName string) (*TableInfo, error
 	return c.tableInfoProvider().Get(tx, strings.ToLower(tableName))
 }
 
-func validateSyncTables(db *sql.DB, tables []SyncTable) (map[string]string, map[string][]string, map[string]int, error) {
+type validatedSyncTables struct {
+	pkByTable      map[string]string
+	keyByTable     map[string][]string
+	tableOrder     map[string]int
+	tableInfoByKey map[string]*TableInfo
+}
+
+func validateSyncTables(db *sql.DB, provider *TableInfoProvider, tables []SyncTable) (*validatedSyncTables, error) {
+	if provider == nil {
+		provider = NewTableInfoProvider()
+	}
 	pkByTable := make(map[string]string, len(tables))
 	keyByTable := make(map[string][]string, len(tables))
+	tableInfoByKey := make(map[string]*TableInfo, len(tables))
 	managedTables := make(map[string]struct{}, len(tables))
 	for _, syncTable := range tables {
 		tableName := strings.ToLower(strings.TrimSpace(syncTable.TableName))
 		if tableName == "" {
-			return nil, nil, nil, fmt.Errorf("sync table name must be provided")
+			return nil, fmt.Errorf("sync table name must be provided")
 		}
 		if strings.Contains(tableName, ".") {
-			return nil, nil, nil, fmt.Errorf("table %s must not include a schema qualifier; oversqlite supports exactly one config.Schema per local database", syncTable.TableName)
+			return nil, fmt.Errorf("table %s must not include a schema qualifier; oversqlite supports exactly one config.Schema per local database", syncTable.TableName)
 		}
 		if _, exists := pkByTable[tableName]; exists {
-			return nil, nil, nil, fmt.Errorf("duplicate sync table registration for %s", tableName)
+			return nil, fmt.Errorf("duplicate sync table registration for %s", tableName)
 		}
 		managedTables[tableName] = struct{}{}
 
 		keyColumns, err := normalizedSyncKeyColumns(syncTable)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 		if len(keyColumns) != 1 {
-			return nil, nil, nil, fmt.Errorf("table %s must declare exactly one sync key column in the current client runtime", syncTable.TableName)
+			return nil, fmt.Errorf("table %s must declare exactly one sync key column in the current client runtime", syncTable.TableName)
 		}
 
-		tableInfo, err := GetTableInfo(db, tableName)
+		tableInfo, err := provider.Get(db, tableName)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to inspect table %s: %w", syncTable.TableName, err)
+			return nil, fmt.Errorf("failed to inspect table %s: %w", syncTable.TableName, err)
 		}
 
 		resolvedPK, err := configuredPrimaryKeyColumn(tableInfo, syncTable)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 
 		pkByTable[tableName] = resolvedPK
 		keyByTable[tableName] = append([]string(nil), keyColumns...)
+		tableInfoByKey[tableName] = tableInfo
 	}
-	if err := validateManagedForeignKeyClosure(db, managedTables); err != nil {
-		return nil, nil, nil, err
+	if err := validateManagedForeignKeyClosure(managedTables, tableInfoByKey); err != nil {
+		return nil, err
 	}
-	tableOrder, err := computeManagedTableOrder(db, tables)
+	tableOrder, err := computeManagedTableOrder(tables, tableInfoByKey)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
-	return pkByTable, keyByTable, tableOrder, nil
+	return &validatedSyncTables{
+		pkByTable:      pkByTable,
+		keyByTable:     keyByTable,
+		tableOrder:     tableOrder,
+		tableInfoByKey: tableInfoByKey,
+	}, nil
 }
 
 func validateClientSchemaScope(db *sql.DB, schemaName string) error {
@@ -548,36 +567,20 @@ func normalizedSyncKeyColumns(syncTable SyncTable) ([]string, error) {
 	return columns, nil
 }
 
-func validateManagedForeignKeyClosure(db *sql.DB, managedTables map[string]struct{}) error {
+func validateManagedForeignKeyClosure(managedTables map[string]struct{}, tableInfoByKey map[string]*TableInfo) error {
 	for tableName := range managedTables {
-		rows, err := db.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", quoteIdent(tableName)))
-		if err != nil {
-			return fmt.Errorf("failed to inspect foreign keys for table %s: %w", tableName, err)
+		tableInfo := tableInfoByKey[tableName]
+		if tableInfo == nil {
+			return fmt.Errorf("missing table metadata for %s", tableName)
 		}
-
 		var unsupportedCompositeRefs []string
 		var missingRefs []string
-		for rows.Next() {
-			var (
-				id       int
-				seq      int
-				refTable string
-				fromCol  string
-				toCol    string
-				onUpdate string
-				onDelete string
-				match    string
-			)
-			if err := rows.Scan(&id, &seq, &refTable, &fromCol, &toCol, &onUpdate, &onDelete, &match); err != nil {
-				rows.Close()
-				return fmt.Errorf("failed to scan foreign key metadata for table %s: %w", tableName, err)
-			}
-
-			refKey := strings.ToLower(strings.TrimSpace(refTable))
+		for _, fk := range tableInfo.ForeignKeys {
+			refKey := strings.ToLower(strings.TrimSpace(fk.RefTable))
 			if refKey == "" {
 				continue
 			}
-			if seq > 0 {
+			if fk.Seq > 0 {
 				unsupportedCompositeRefs = append(unsupportedCompositeRefs, fmt.Sprintf("%s -> %s", tableName, refKey))
 				continue
 			}
@@ -585,13 +588,8 @@ func validateManagedForeignKeyClosure(db *sql.DB, managedTables map[string]struc
 				continue
 			}
 
-			missingRefs = append(missingRefs, fmt.Sprintf("%s.%s -> %s.%s", tableName, fromCol, refKey, toCol))
+			missingRefs = append(missingRefs, fmt.Sprintf("%s.%s -> %s.%s", tableName, fk.FromCol, refKey, fk.ToCol))
 		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return fmt.Errorf("failed to iterate foreign key metadata for table %s: %w", tableName, err)
-		}
-		rows.Close()
 
 		if len(unsupportedCompositeRefs) > 0 {
 			sort.Strings(unsupportedCompositeRefs)
@@ -606,7 +604,7 @@ func validateManagedForeignKeyClosure(db *sql.DB, managedTables map[string]struc
 	return nil
 }
 
-func computeManagedTableOrder(db *sql.DB, tables []SyncTable) (map[string]int, error) {
+func computeManagedTableOrder(tables []SyncTable, tableInfoByKey map[string]*TableInfo) (map[string]int, error) {
 	orderByTable := make(map[string]int, len(tables))
 	originalOrder := make(map[string]int, len(tables))
 	managed := make(map[string]struct{}, len(tables))
@@ -624,27 +622,12 @@ func computeManagedTableOrder(db *sql.DB, tables []SyncTable) (map[string]int, e
 
 	for _, table := range tables {
 		tableName := strings.ToLower(strings.TrimSpace(table.TableName))
-		rows, err := db.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", quoteIdent(tableName)))
-		if err != nil {
-			return nil, fmt.Errorf("failed to inspect foreign keys for table %s: %w", tableName, err)
+		tableInfo := tableInfoByKey[tableName]
+		if tableInfo == nil {
+			return nil, fmt.Errorf("missing table metadata for %s", tableName)
 		}
-
-		for rows.Next() {
-			var (
-				id       int
-				seq      int
-				refTable string
-				fromCol  string
-				toCol    string
-				onUpdate string
-				onDelete string
-				match    string
-			)
-			if err := rows.Scan(&id, &seq, &refTable, &fromCol, &toCol, &onUpdate, &onDelete, &match); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("failed to scan foreign key metadata for table %s: %w", tableName, err)
-			}
-			refName := strings.ToLower(strings.TrimSpace(refTable))
+		for _, fk := range tableInfo.ForeignKeys {
+			refName := strings.ToLower(strings.TrimSpace(fk.RefTable))
 			if refName == "" || refName == tableName {
 				continue
 			}
@@ -657,11 +640,6 @@ func computeManagedTableOrder(db *sql.DB, tables []SyncTable) (map[string]int, e
 			dependents[refName][tableName] = struct{}{}
 			inDegree[tableName]++
 		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("failed to iterate foreign key metadata for table %s: %w", tableName, err)
-		}
-		rows.Close()
 	}
 
 	queue := make([]string, 0, len(tables))

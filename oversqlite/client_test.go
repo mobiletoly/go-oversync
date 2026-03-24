@@ -333,10 +333,9 @@ func TestCreateTriggersForTable(t *testing.T) {
 	require.Equal(t, "DELETE", op, "The queued no-op should be represented as a delete intent")
 }
 
-func TestDefaultResolver(t *testing.T) {
+func TestDefaultResolver_CompatibilityAliasUsesServerWins(t *testing.T) {
 	resolver := &DefaultResolver{}
 
-	// Test that server wins by default
 	result := resolver.Resolve(ConflictContext{})
 	require.IsType(t, AcceptServer{}, result)
 }

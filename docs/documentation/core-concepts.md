@@ -134,12 +134,36 @@ sequenceDiagram
 - On success, the server returns the authoritative committed bundle derived from the actual
   business-table transaction
 
+### Structured push conflicts
+
+- A push conflict is not just a string error; it includes machine-readable conflict details for the
+  first rejected row
+- The conflict payload describes schema, table, key, local op, base row version, server row
+  version, deleted state, and current authoritative row payload when one exists
+- Clients can resolve that conflict with one of three explicit outcomes:
+  - accept server state
+  - keep the latest local intent
+  - keep an explicit merged full-row payload
+- Valid conflict resolutions are applied locally, surviving intents are requeued, and the client
+  retries from a fresh outbound snapshot
+- Invalid resolutions and retry exhaustion fail closed while preserving replayable local intent
+
+### Timestamp fields in synced rows
+
+- For application timestamps such as `created_at` and `updated_at`, use SQLite `TEXT` columns with
+  UTC RFC3339 or RFC3339Nano values
+- Merge policies should parse those timestamps as time values rather than rely on informal string
+  conventions
+- Older ad hoc formats such as `yyyy:mm:dd hh:mm:ss` are not part of the recommended sync contract
+
 ### Pull
 
 - Device requests committed bundles after `last_bundle_seq_seen`
 - Server freezes `stable_bundle_seq` for the pull
 - The response contains complete bundles only; clients never commit partial bundle visibility
 - The client applies bundles in order and advances its checkpoint only after durable local apply
+- `last_bundle_seq_seen` means the highest contiguous durably applied bundle, not merely the highest
+  seen sequence
 
 ### Server Truth
 
@@ -153,5 +177,6 @@ sequenceDiagram
 
 - Identity and attribution (`user_id`, `source_id`) power isolation and idempotency
 - Push retries are safe because `(source_id, source_bundle_id)` identifies one logical bundle
+- Structured push conflicts are resolved from typed conflict data rather than human-readable errors
 - Business tables are authoritative; bundles are derived replication history
 - Hydration rebuilds from one consistent snapshot; pull applies complete committed bundles only

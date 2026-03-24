@@ -446,6 +446,120 @@ func TestPushPending_RepeatedLocalEditsCollapseIntoOneDirtyRowAndAdvanceBundleSt
 	require.Equal(t, int64(1), lastBundleSeq)
 }
 
+func TestCollectDirtyRowsForPushInTx_LocalInsertBuildsInsertFromDirtyPayload(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := "u-local-insert"
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Local", "local@example.com")
+	require.NoError(t, err)
+
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	sourceBundleID, baseBundleSeq, dirtyRows, noOps, err := client.collectDirtyRowsForPushInTx(ctx, tx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), sourceBundleID)
+	require.Equal(t, int64(0), baseBundleSeq)
+	require.Len(t, dirtyRows, 1)
+	require.Empty(t, noOps)
+	require.Equal(t, oversync.OpInsert, dirtyRows[0].Op)
+	require.Equal(t, rowKeyJSON(userID), dirtyRows[0].KeyJSON)
+	require.True(t, dirtyRows[0].LocalPayload.Valid)
+	require.Equal(t, "Local", decodeDirtyPayload(t, dirtyRows[0].LocalPayload.String)["name"])
+}
+
+func TestCollectDirtyRowsForPushInTx_SyncedUpdateBuildsUpdateFromDirtyPayload(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := "u-synced-update"
+	seedSyncedUserRow(t, client, db, userID, "Before", 41)
+	_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "After", "after@example.com", userID)
+	require.NoError(t, err)
+
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	_, _, dirtyRows, noOps, err := client.collectDirtyRowsForPushInTx(ctx, tx)
+	require.NoError(t, err)
+	require.Len(t, dirtyRows, 1)
+	require.Empty(t, noOps)
+	require.Equal(t, oversync.OpUpdate, dirtyRows[0].Op)
+	require.Equal(t, int64(41), dirtyRows[0].BaseRowVersion)
+	require.True(t, dirtyRows[0].LocalPayload.Valid)
+	require.Equal(t, "After", decodeDirtyPayload(t, dirtyRows[0].LocalPayload.String)["name"])
+}
+
+func TestCollectDirtyRowsForPushInTx_UnsyncedInsertDeleteBecomesNoOp(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := "u-noop"
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, userID, "Temp", "temp@example.com")
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM users WHERE id = ?`, userID)
+	require.NoError(t, err)
+
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	_, _, dirtyRows, noOps, err := client.collectDirtyRowsForPushInTx(ctx, tx)
+	require.NoError(t, err)
+	require.Empty(t, dirtyRows)
+	require.Equal(t, []string{"main\x00users\x00" + rowKeyJSON(userID)}, noOps)
+}
+
+func TestCollectDirtyRowsForPushInTx_SyncedDeleteBuildsDeleteWithoutPayload(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	userID := "u-synced-delete"
+	seedSyncedUserRow(t, client, db, userID, "Gone", 12)
+	_, err := db.Exec(`DELETE FROM users WHERE id = ?`, userID)
+	require.NoError(t, err)
+
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	_, _, dirtyRows, noOps, err := client.collectDirtyRowsForPushInTx(ctx, tx)
+	require.NoError(t, err)
+	require.Len(t, dirtyRows, 1)
+	require.Empty(t, noOps)
+	require.Equal(t, oversync.OpDelete, dirtyRows[0].Op)
+	require.Equal(t, int64(12), dirtyRows[0].BaseRowVersion)
+	require.False(t, dirtyRows[0].LocalPayload.Valid)
+	require.Equal(t, rowKeyJSON(userID), dirtyRows[0].KeyJSON)
+}
+
 func TestPushPending_EmptyDirtyQueueIsNoOpBeforeOutboundStateIsCreated(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
@@ -530,6 +644,34 @@ func TestPushPending_DirtySetLargerThanOneChunkSucceeds(t *testing.T) {
 	`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeq))
 	require.Equal(t, int64(2), nextSourceBundleID)
 	require.Equal(t, int64(1), lastBundleSeq)
+}
+
+func TestPushPending_RealColumnReplayDoesNotRequeueEquivalentValue(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			score REAL NOT NULL
+		)
+	`)
+
+	server := newMockPushSessionServer(t)
+	server.commitHook = newFixedVersionCommitHook(t, server, 2)
+	client.HTTP = &http.Client{Transport: server}
+
+	_, err := db.Exec(`INSERT INTO users (id, name, score) VALUES (?, ?, ?)`, "local-user", "Local Bob", 6.57111473696007)
+	require.NoError(t, err)
+
+	require.NoError(t, client.PushPending(ctx))
+
+	var dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 0, dirtyCount)
+
+	var outboundCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.Equal(t, 0, outboundCount)
 }
 
 func TestPushPending_OrdersUpsertsParentFirstAndDeletesChildFirst(t *testing.T) {
@@ -1449,6 +1591,314 @@ func TestPushPending_RebasesSameKeyLocalIntentDuringAuthoritativeReplay(t *testi
 			require.NoError(t, err)
 			require.NoError(t, client.fetchCommittedPushBundle(ctx, committed))
 			require.NoError(t, client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed))
+
+			name, _, exists := loadUserForKey(t, db, rowID)
+			require.Equal(t, tc.expectedVisible, exists)
+			if tc.expectedVisible {
+				require.Equal(t, tc.expectedName, name)
+			}
+
+			rowVersion, deleted, metaExists := loadUserRowStateForKey(t, db, rowKeyJSON(rowID))
+			require.True(t, metaExists)
+			require.Equal(t, committedRowVersion, rowVersion)
+			require.Equal(t, tc.expectedDeleted, deleted)
+
+			op, baseRowVersion, payload, dirtyExists := loadDirtyRowForKey(t, db, rowKeyJSON(rowID))
+			require.Equal(t, tc.expectedDirty, dirtyExists)
+			if tc.expectedDirty {
+				require.Equal(t, tc.expectedDirtyOp, op)
+				require.Equal(t, committedRowVersion, baseRowVersion)
+				if tc.expectedDirtyOp == oversync.OpDelete {
+					require.False(t, payload.Valid)
+				} else {
+					require.True(t, payload.Valid)
+					payloadObj := decodeDirtyPayload(t, payload.String)
+					require.Equal(t, tc.expectedDirtyName, payloadObj["name"])
+				}
+			}
+		})
+	}
+}
+
+func TestPushPending_RebasesSameKeyLocalIntentMutatedDuringUpload(t *testing.T) {
+	ctx := context.Background()
+	const committedRowVersion int64 = 11
+
+	cases := []struct {
+		name                 string
+		seed                 func(*testing.T, *Client, *sql.DB, string)
+		firstMutation        func(*testing.T, *sql.DB, string)
+		duringUploadMutation func(*testing.T, *sql.DB, string)
+		expectedVisible      bool
+		expectedName         string
+		expectedDeleted      bool
+		expectedDirtyOp      string
+		expectedDirty        bool
+		expectedDirtyName    string
+		expectedUploadOp     string
+		expectedUploadName   string
+	}{
+		{
+			name: "edit during upload",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "First", "first@example.com", id)
+				require.NoError(t, err)
+			},
+			duringUploadMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "Second", "second@example.com", id)
+				require.NoError(t, err)
+			},
+			expectedVisible:    true,
+			expectedName:       "Second",
+			expectedDeleted:    false,
+			expectedDirty:      true,
+			expectedDirtyOp:    oversync.OpUpdate,
+			expectedDirtyName:  "Second",
+			expectedUploadOp:   oversync.OpUpdate,
+			expectedUploadName: "First",
+		},
+		{
+			name: "delete during upload",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "First", "first@example.com", id)
+				require.NoError(t, err)
+			},
+			duringUploadMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)
+				require.NoError(t, err)
+			},
+			expectedVisible:    false,
+			expectedDeleted:    false,
+			expectedDirty:      true,
+			expectedDirtyOp:    oversync.OpDelete,
+			expectedUploadOp:   oversync.OpUpdate,
+			expectedUploadName: "First",
+		},
+		{
+			name: "reinsert during upload",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)
+				require.NoError(t, err)
+			},
+			duringUploadMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, id, "Recreated", "recreated@example.com")
+				require.NoError(t, err)
+			},
+			expectedVisible:   true,
+			expectedName:      "Recreated",
+			expectedDeleted:   true,
+			expectedDirty:     true,
+			expectedDirtyOp:   oversync.OpInsert,
+			expectedDirtyName: "Recreated",
+			expectedUploadOp:  oversync.OpDelete,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+				CREATE TABLE users (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					email TEXT NOT NULL
+				)
+			`)
+
+			rowID := uuid.NewString()
+			if tc.seed != nil {
+				tc.seed(t, client, db, rowID)
+			}
+			tc.firstMutation(t, db, rowID)
+
+			client.SetBeforePushCommitHook(func(context.Context) error {
+				tc.duringUploadMutation(t, db, rowID)
+				return nil
+			})
+
+			server := newMockPushSessionServer(t)
+			server.commitHook = newFixedVersionCommitHook(t, server, committedRowVersion)
+			client.HTTP = &http.Client{Transport: server}
+
+			require.NoError(t, client.PushPending(ctx))
+			require.Len(t, server.chunkRequests, 1)
+			require.Len(t, server.chunkRequests[0].Rows, 1)
+			require.Equal(t, tc.expectedUploadOp, server.chunkRequests[0].Rows[0].Op)
+			if tc.expectedUploadOp != oversync.OpDelete {
+				require.Equal(t, tc.expectedUploadName, mustPushPayloadName(t, server.chunkRequests[0].Rows[0].Payload))
+			}
+
+			name, _, exists := loadUserForKey(t, db, rowID)
+			require.Equal(t, tc.expectedVisible, exists)
+			if tc.expectedVisible {
+				require.Equal(t, tc.expectedName, name)
+			}
+
+			rowVersion, deleted, metaExists := loadUserRowStateForKey(t, db, rowKeyJSON(rowID))
+			require.True(t, metaExists)
+			require.Equal(t, committedRowVersion, rowVersion)
+			require.Equal(t, tc.expectedDeleted, deleted)
+
+			op, baseRowVersion, payload, dirtyExists := loadDirtyRowForKey(t, db, rowKeyJSON(rowID))
+			require.Equal(t, tc.expectedDirty, dirtyExists)
+			if tc.expectedDirty {
+				require.Equal(t, tc.expectedDirtyOp, op)
+				require.Equal(t, committedRowVersion, baseRowVersion)
+				if tc.expectedDirtyOp == oversync.OpDelete {
+					require.False(t, payload.Valid)
+				} else {
+					require.True(t, payload.Valid)
+					payloadObj := decodeDirtyPayload(t, payload.String)
+					require.Equal(t, tc.expectedDirtyName, payloadObj["name"])
+				}
+			}
+		})
+	}
+}
+
+func TestPushPending_RebasesSameKeyLocalIntentAfterRestartBeforeReplay(t *testing.T) {
+	ctx := context.Background()
+	const committedRowVersion int64 = 11
+
+	cases := []struct {
+		name                 string
+		seed                 func(*testing.T, *Client, *sql.DB, string)
+		firstMutation        func(*testing.T, *sql.DB, string)
+		duringUploadMutation func(*testing.T, *sql.DB, string)
+		expectedVisible      bool
+		expectedName         string
+		expectedDeleted      bool
+		expectedDirtyOp      string
+		expectedDirty        bool
+		expectedDirtyName    string
+		expectedUploadOp     string
+		expectedUploadName   string
+	}{
+		{
+			name: "edit during upload",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "First", "first@example.com", id)
+				require.NoError(t, err)
+			},
+			duringUploadMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "Second", "second@example.com", id)
+				require.NoError(t, err)
+			},
+			expectedVisible:    true,
+			expectedName:       "Second",
+			expectedDeleted:    false,
+			expectedDirty:      true,
+			expectedDirtyOp:    oversync.OpUpdate,
+			expectedDirtyName:  "Second",
+			expectedUploadOp:   oversync.OpUpdate,
+			expectedUploadName: "First",
+		},
+		{
+			name: "delete during upload",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`UPDATE users SET name = ?, email = ? WHERE id = ?`, "First", "first@example.com", id)
+				require.NoError(t, err)
+			},
+			duringUploadMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)
+				require.NoError(t, err)
+			},
+			expectedVisible:    false,
+			expectedDeleted:    false,
+			expectedDirty:      true,
+			expectedDirtyOp:    oversync.OpDelete,
+			expectedUploadOp:   oversync.OpUpdate,
+			expectedUploadName: "First",
+		},
+		{
+			name: "reinsert during upload",
+			seed: func(t *testing.T, client *Client, db *sql.DB, id string) {
+				seedSyncedUserRow(t, client, db, id, "Original", 7)
+			},
+			firstMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)
+				require.NoError(t, err)
+			},
+			duringUploadMutation: func(t *testing.T, db *sql.DB, id string) {
+				_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, id, "Recreated", "recreated@example.com")
+				require.NoError(t, err)
+			},
+			expectedVisible:   true,
+			expectedName:      "Recreated",
+			expectedDeleted:   true,
+			expectedDirty:     true,
+			expectedDirtyOp:   oversync.OpInsert,
+			expectedDirtyName: "Recreated",
+			expectedUploadOp:  oversync.OpDelete,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+				CREATE TABLE users (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					email TEXT NOT NULL
+				)
+			`)
+
+			rowID := uuid.NewString()
+			if tc.seed != nil {
+				tc.seed(t, client, db, rowID)
+			}
+			tc.firstMutation(t, db, rowID)
+
+			client.SetBeforePushCommitHook(func(context.Context) error {
+				tc.duringUploadMutation(t, db, rowID)
+				return nil
+			})
+			client.SetBeforePushReplayHook(func(context.Context) error {
+				return fmt.Errorf("simulated crash before replay")
+			})
+
+			server := newMockPushSessionServer(t)
+			server.commitHook = newFixedVersionCommitHook(t, server, committedRowVersion)
+			client.HTTP = &http.Client{Transport: server}
+
+			err := client.PushPending(ctx)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "simulated crash before replay")
+			require.Len(t, server.chunkRequests, 1)
+			require.Len(t, server.chunkRequests[0].Rows, 1)
+			require.Equal(t, tc.expectedUploadOp, server.chunkRequests[0].Rows[0].Op)
+			if tc.expectedUploadOp != oversync.OpDelete {
+				require.Equal(t, tc.expectedUploadName, mustPushPayloadName(t, server.chunkRequests[0].Rows[0].Payload))
+			}
+
+			require.NoError(t, client.Close())
+
+			restarted, err := NewClient(db, "http://example.invalid", "bundle-user", client.SourceID, func(context.Context) (string, error) {
+				return "token", nil
+			}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, restarted.Close()) })
+			restarted.HTTP = &http.Client{Transport: server}
+			require.NoError(t, restarted.Bootstrap(ctx, false))
+			require.NoError(t, restarted.PushPending(ctx))
+			require.Equal(t, int64(0), restarted.PushTransferDiagnostics().SessionsCreated)
+			require.Equal(t, int64(0), restarted.PushTransferDiagnostics().ChunksUploaded)
+			require.Equal(t, int64(1), restarted.PushTransferDiagnostics().CommittedBundleChunksRead)
+			require.Len(t, server.chunkRequests, 1)
 
 			name, _, exists := loadUserForKey(t, db, rowID)
 			require.Equal(t, tc.expectedVisible, exists)

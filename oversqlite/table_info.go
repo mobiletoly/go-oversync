@@ -42,9 +42,17 @@ type TableInfo struct {
 	Columns                []ColumnInfo
 	ColumnNamesLower       []string
 	TypesByNameLower       map[string]string
+	ForeignKeys            []ForeignKeyInfo
 	PrimaryKey             *ColumnInfo
 	PrimaryKeyIsBlob       bool
 	ForeignKeyColumnsLower map[string]bool
+}
+
+type ForeignKeyInfo struct {
+	Seq      int
+	RefTable string
+	FromCol  string
+	ToCol    string
 }
 
 // TableInfoProvider manages cached table information
@@ -146,6 +154,7 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 	}
 
 	foreignKeyColumnsLower := make(map[string]bool)
+	foreignKeys := make([]ForeignKeyInfo, 0)
 	fkRows, err := queryer.Query(fmt.Sprintf("PRAGMA foreign_key_list(%s)", key.table))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get foreign keys for %s: %w", tableName, err)
@@ -167,6 +176,12 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 			return nil, fmt.Errorf("failed to scan foreign key info for %s: %w", tableName, err)
 		}
 		foreignKeyColumnsLower[strings.ToLower(fromCol)] = true
+		foreignKeys = append(foreignKeys, ForeignKeyInfo{
+			Seq:      seq,
+			RefTable: refTable,
+			FromCol:  fromCol,
+			ToCol:    toCol,
+		})
 	}
 	if err := fkRows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating foreign keys for %s: %w", tableName, err)
@@ -177,6 +192,7 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 		Columns:                columns,
 		ColumnNamesLower:       columnNamesLower,
 		TypesByNameLower:       typesByNameLower,
+		ForeignKeys:            foreignKeys,
 		PrimaryKey:             primaryKey,
 		PrimaryKeyIsBlob:       primaryKeyIsBlob,
 		ForeignKeyColumnsLower: foreignKeyColumnsLower,

@@ -11,6 +11,28 @@ import (
 	"text/template"
 )
 
+var triggerSQLTemplates = []struct {
+	name   string
+	suffix string
+	tmpl   *template.Template
+}{
+	{
+		name:   "insert",
+		suffix: "ai",
+		tmpl:   template.Must(template.New("insert").Parse(insertTriggerTemplate)),
+	},
+	{
+		name:   "update",
+		suffix: "au",
+		tmpl:   template.Must(template.New("update").Parse(updateTriggerTemplate)),
+	},
+	{
+		name:   "delete",
+		suffix: "ad",
+		tmpl:   template.Must(template.New("delete").Parse(deleteTriggerTemplate)),
+	},
+}
+
 // TriggerData holds the data needed for trigger template rendering
 type TriggerData struct {
 	SchemaName string
@@ -24,7 +46,7 @@ type TriggerData struct {
 }
 
 // Template for INSERT trigger
-const insertTriggerTemplate = `CREATE TRIGGER IF NOT EXISTS trg_{{.TableName}}_ai
+const insertTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_ai
 AFTER INSERT ON {{.TableName}}
 WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
 BEGIN
@@ -60,7 +82,7 @@ BEGIN
 END`
 
 // Template for UPDATE trigger
-const updateTriggerTemplate = `CREATE TRIGGER IF NOT EXISTS trg_{{.TableName}}_au
+const updateTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_au
 AFTER UPDATE ON {{.TableName}}
 WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
 BEGIN
@@ -119,7 +141,7 @@ BEGIN
 END`
 
 // Template for DELETE trigger
-const deleteTriggerTemplate = `CREATE TRIGGER IF NOT EXISTS trg_{{.TableName}}_ad
+const deleteTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_ad
 AFTER DELETE ON {{.TableName}}
 WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
 BEGIN
@@ -154,8 +176,8 @@ func buildJsonObjectExprHexAware(tableInfo *TableInfo, prefix string) string {
 		name := strings.ToLower(col.Name)
 		var expr string
 		if col.IsBlob() {
-			// Use hex encoding for BLOB columns to preserve binary data
-			expr = fmt.Sprintf("lower(hex(%s.%s))", prefix, col.Name)
+			// Preserve NULL blobs as JSON null instead of collapsing them to empty hex text.
+			expr = fmt.Sprintf("CASE WHEN %s.%s IS NULL THEN NULL ELSE lower(hex(%s.%s)) END", prefix, col.Name, prefix, col.Name)
 		} else {
 			// Use column value directly for non-BLOB columns
 			expr = fmt.Sprintf("%s.%s", prefix, col.Name)
@@ -172,7 +194,7 @@ func buildKeyJSONObjectExprHexAware(tableInfo *TableInfo, keyColumn, prefix stri
 		}
 		name := strings.ToLower(col.Name)
 		if col.IsBlob() {
-			return fmt.Sprintf("json_object('%s', lower(hex(%s.%s)))", name, prefix, col.Name)
+			return fmt.Sprintf("json_object('%s', CASE WHEN %s.%s IS NULL THEN NULL ELSE lower(hex(%s.%s)) END)", name, prefix, col.Name, prefix, col.Name)
 		}
 		return fmt.Sprintf("json_object('%s', %s.%s)", name, prefix, col.Name)
 	}
@@ -204,13 +226,18 @@ func createTriggersForTable(db *sql.DB, args ...any) error {
 	default:
 		return fmt.Errorf("createTriggersForTable requires SyncTable argument")
 	}
+	tableInfo, err := GetTableInfo(db, strings.ToLower(syncTable.TableName))
+	if err != nil {
+		return fmt.Errorf("failed to get table info for %s: %w", syncTable.TableName, err)
+	}
+	return createTriggersForTableWithInfo(db, schemaName, syncTable, tableInfo)
+}
+
+func createTriggersForTableWithInfo(db *sql.DB, schemaName string, syncTable SyncTable, tableInfo *TableInfo) error {
 	tableName := syncTable.TableName
 	tableLc := strings.ToLower(tableName)
-
-	// Get table information
-	tableInfo, err := GetTableInfo(db, tableLc)
-	if err != nil {
-		return fmt.Errorf("failed to get table info for %s: %w", tableName, err)
+	if tableInfo == nil {
+		return fmt.Errorf("table info is required for %s", tableName)
 	}
 
 	pkColumn, err := configuredPrimaryKeyColumn(tableInfo, syncTable)
@@ -248,45 +275,72 @@ func createTriggersForTable(db *sql.DB, args ...any) error {
 		PKExprOld:  pkExprOld,
 	}
 
-	// Parse and execute templates
-	templates := []struct {
-		name     string
-		template string
-	}{
-		{"insert", insertTriggerTemplate},
-		{"update", updateTriggerTemplate},
-		{"delete", deleteTriggerTemplate},
+	existingSQLByName, err := loadExistingTriggerSQLs(db, tableLc)
+	if err != nil {
+		return fmt.Errorf("failed to inspect triggers for table %s: %w", tableName, err)
 	}
 
-	for _, tmpl := range templates {
-		triggerName := fmt.Sprintf("trg_%s_%s", tableLc, map[string]string{
-			"insert": "ai",
-			"update": "au",
-			"delete": "ad",
-		}[tmpl.name])
-		if _, err := db.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s", quoteIdent(triggerName))); err != nil {
-			return fmt.Errorf("failed to drop %s trigger for table %s: %w", tmpl.name, tableName, err)
-		}
-
-		// Parse template
-		t, err := template.New(tmpl.name).Parse(tmpl.template)
+	for _, tmpl := range triggerSQLTemplates {
+		triggerName := fmt.Sprintf("trg_%s_%s", tableLc, tmpl.suffix)
+		triggerSQL, err := renderTriggerSQL(tmpl.tmpl, data)
 		if err != nil {
-			return fmt.Errorf("failed to parse %s trigger template for table %s: %w", tmpl.name, tableName, err)
+			return fmt.Errorf("failed to render %s trigger template for table %s: %w", tmpl.name, tableName, err)
 		}
 
-		// Execute template
-		var buf bytes.Buffer
-		if err := t.Execute(&buf, data); err != nil {
-			return fmt.Errorf("failed to execute %s trigger template for table %s: %w", tmpl.name, tableName, err)
+		existingSQL, exists := existingSQLByName[triggerName]
+		if exists && sameTriggerSQL(existingSQL, triggerSQL) {
+			continue
 		}
-
-		// Create trigger
-		if _, err := db.Exec(buf.String()); err != nil {
+		if exists {
+			if _, err := db.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s", quoteIdent(triggerName))); err != nil {
+				return fmt.Errorf("failed to drop %s trigger for table %s: %w", tmpl.name, tableName, err)
+			}
+		}
+		if _, err := db.Exec(triggerSQL); err != nil {
 			return fmt.Errorf("failed to create %s trigger for table %s: %w", tmpl.name, tableName, err)
 		}
 	}
 
 	return nil
+}
+
+func renderTriggerSQL(tmpl *template.Template, data TriggerData) (string, error) {
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func loadExistingTriggerSQLs(db *sql.DB, tableName string) (map[string]string, error) {
+	rows, err := db.Query(`SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?`, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	triggerSQLByName := make(map[string]string)
+	for rows.Next() {
+		var triggerName string
+		var sqlText sql.NullString
+		if err := rows.Scan(&triggerName, &sqlText); err != nil {
+			return nil, err
+		}
+		triggerSQLByName[triggerName] = sqlText.String
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return triggerSQLByName, nil
+}
+
+func sameTriggerSQL(left, right string) bool {
+	return normalizeTriggerSQL(left) == normalizeTriggerSQL(right)
+}
+
+func normalizeTriggerSQL(sqlText string) string {
+	normalized := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(sqlText)), " "))
+	return strings.ReplaceAll(normalized, "create trigger if not exists", "create trigger")
 }
 
 func configuredPrimaryKeyColumn(tableInfo *TableInfo, syncTable SyncTable) (string, error) {
