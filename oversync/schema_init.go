@@ -34,6 +34,7 @@ SELECT
 	AND to_regclass('sync.br_user_bundle_key_idx') IS NOT NULL
 	AND to_regclass('sync.ss_expires_at_idx') IS NOT NULL
 	AND to_regclass('sync.ssr_snapshot_row_ordinal_idx') IS NOT NULL
+	AND to_regprocedure('sync.enforce_registered_row_owner()') IS NOT NULL
 	AND to_regprocedure('sync.capture_registered_row_change()') IS NOT NULL
 `
 
@@ -181,6 +182,80 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 		`CREATE SEQUENCE IF NOT EXISTS sync.accepted_push_replay_seq`,
 		`CREATE SEQUENCE IF NOT EXISTS sync.rejected_registered_write_seq`,
 		`CREATE SEQUENCE IF NOT EXISTS sync.history_pruned_error_seq`,
+		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.enforce_registered_row_owner()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		DECLARE
+			bundle_user_id TEXT;
+		BEGIN
+			bundle_user_id := NULLIF(current_setting('oversync.bundle_user_id', true), '');
+			IF bundle_user_id IS NULL THEN
+				PERFORM nextval('sync.rejected_registered_write_seq');
+				RAISE EXCEPTION USING
+					ERRCODE = 'P0001',
+					MESSAGE = format(
+						'write to registered table %I.%I requires oversync sync bundle context',
+						TG_TABLE_SCHEMA,
+						TG_TABLE_NAME
+					);
+			END IF;
+
+			IF TG_OP = 'INSERT' THEN
+				IF NEW._sync_scope_id IS NULL OR NEW._sync_scope_id = '' THEN
+					NEW._sync_scope_id := bundle_user_id;
+				ELSIF NEW._sync_scope_id <> bundle_user_id THEN
+					RAISE EXCEPTION USING
+						ERRCODE = 'P0001',
+						MESSAGE = format(
+							'scope mismatch on registered table %I.%I: actor %s cannot write owner %s',
+							TG_TABLE_SCHEMA,
+							TG_TABLE_NAME,
+							bundle_user_id,
+							NEW._sync_scope_id
+						);
+				END IF;
+				RETURN NEW;
+			END IF;
+
+			IF TG_OP = 'UPDATE' THEN
+				IF OLD._sync_scope_id <> bundle_user_id THEN
+					RAISE EXCEPTION USING
+						ERRCODE = 'P0001',
+						MESSAGE = format(
+							'scope mismatch on registered table %I.%I: actor %s cannot update owner %s',
+							TG_TABLE_SCHEMA,
+							TG_TABLE_NAME,
+							bundle_user_id,
+							OLD._sync_scope_id
+						);
+				END IF;
+				IF NEW._sync_scope_id IS DISTINCT FROM OLD._sync_scope_id THEN
+					RAISE EXCEPTION USING
+						ERRCODE = 'P0001',
+						MESSAGE = format(
+							'scope mutation is not allowed on registered table %I.%I',
+							TG_TABLE_SCHEMA,
+							TG_TABLE_NAME
+						);
+				END IF;
+				RETURN NEW;
+			END IF;
+
+			IF OLD._sync_scope_id <> bundle_user_id THEN
+				RAISE EXCEPTION USING
+					ERRCODE = 'P0001',
+					MESSAGE = format(
+						'scope mismatch on registered table %I.%I: actor %s cannot delete owner %s',
+						TG_TABLE_SCHEMA,
+						TG_TABLE_NAME,
+						bundle_user_id,
+						OLD._sync_scope_id
+					);
+			END IF;
+			RETURN OLD;
+		END;
+		$$`,
 		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.capture_registered_row_change()
 		RETURNS TRIGGER
 		LANGUAGE plpgsql
@@ -217,6 +292,9 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			END IF;
 
 			IF TG_OP = 'DELETE' THEN
+				IF OLD._sync_scope_id <> bundle_user_id THEN
+					RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+				END IF;
 				old_key := jsonb_build_object(key_column, to_jsonb(OLD)->key_column);
 				INSERT INTO sync.bundle_capture_stage (
 					txid, user_id, source_id, source_bundle_id, schema_name, table_name, op, key_json, payload
@@ -235,8 +313,14 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 				RETURN OLD;
 			END IF;
 
+			IF NEW._sync_scope_id <> bundle_user_id THEN
+				RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+			END IF;
 			new_key := jsonb_build_object(key_column, to_jsonb(NEW)->key_column);
 			IF TG_OP = 'UPDATE' THEN
+				IF OLD._sync_scope_id <> bundle_user_id THEN
+					RAISE EXCEPTION 'oversync capture scope mismatch for %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
+				END IF;
 				old_key := jsonb_build_object(key_column, to_jsonb(OLD)->key_column);
 				IF old_key IS DISTINCT FROM new_key THEN
 					INSERT INTO sync.bundle_capture_stage (
@@ -265,7 +349,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 						TG_TABLE_NAME,
 						'INSERT',
 						new_key::text,
-						to_jsonb(NEW)
+						to_jsonb(NEW) - '_sync_scope_id'
 					);
 					RETURN NEW;
 				END IF;
@@ -283,7 +367,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 				TG_TABLE_NAME,
 				TG_OP,
 				new_key::text,
-				to_jsonb(NEW)
+				to_jsonb(NEW) - '_sync_scope_id'
 			);
 
 			RETURN NEW;
@@ -331,7 +415,7 @@ func (s *SyncService) discoverSchemaRelationships(ctx context.Context) error {
 	}
 
 	discovery := NewSchemaDiscovery(s.pool, s.logger)
-	discoveredSchema, err := discovery.DiscoverSchemaWithDependencyOverrides(ctx, s.registeredTables, s.config.DependencyOverrides)
+	discoveredSchema, err := discovery.DiscoverSchemaWithDependencyOverrides(ctx, s.registeredTables, s.registeredTableInfo, s.config.DependencyOverrides)
 	if err != nil {
 		return fmt.Errorf("failed to discover schema relationships: %w", err)
 	}

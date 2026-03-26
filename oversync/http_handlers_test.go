@@ -1,6 +1,7 @@
 package oversync
 
 import (
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -110,6 +111,9 @@ func TestHTTPSyncHandlers_HandleCapabilities(t *testing.T) {
 	}
 	if resp.SchemaVersion != 2 {
 		t.Fatalf("expected schema version 2, got %d", resp.SchemaVersion)
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"sync_key_type"`)) {
+		t.Fatalf("expected capabilities response to omit visible sync key type, got %s", rec.Body.String())
 	}
 }
 

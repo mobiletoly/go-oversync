@@ -16,7 +16,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const registeredTableCaptureTriggerName = "oversync_bundle_capture_row"
+const (
+	registeredTableCaptureTriggerName = "oversync_bundle_capture_row"
+	registeredTableOwnerGuardTrigger  = "oversync_bundle_owner_guard"
+)
 
 // BundleSource identifies one server-side committed bundle source.
 type BundleSource struct {
@@ -72,6 +75,19 @@ func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context)
 			stmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableCaptureTriggerName, tableIdent)
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("drop capture trigger for %s: %w", table.normalizedKey(), err)
+			}
+			stmt = fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableOwnerGuardTrigger, tableIdent)
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("drop owner guard trigger for %s: %w", table.normalizedKey(), err)
+			}
+
+			stmt = fmt.Sprintf(
+				`CREATE TRIGGER %s BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.enforce_registered_row_owner()`,
+				registeredTableOwnerGuardTrigger,
+				tableIdent,
+			)
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("create owner guard trigger for %s: %w", table.normalizedKey(), err)
 			}
 
 			stmt = fmt.Sprintf(

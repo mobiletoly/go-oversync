@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -38,7 +37,9 @@ type pushPreparedRow struct {
 	table          string
 	op             string
 	keyColumn      string
-	keyUUID        uuid.UUID
+	keyType        string
+	keyString      string
+	keyValue       any
 	keyJSON        string
 	baseRowVersion int64
 	payload        []byte
@@ -91,36 +92,14 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 			return nil, &PushValidationError{Message: fmt.Sprintf("invalid op %q", row.Op)}
 		}
 
-		keyColumn, err := s.syncKeyColumnForTable(schemaName, tableName)
+		normalizedKey, err := s.normalizeVisibleSyncKey(schemaName, tableName, row.Key)
 		if err != nil {
 			return nil, err
 		}
-		keyValue, ok := row.Key[keyColumn]
-		if !ok {
-			return nil, &PushValidationError{Message: fmt.Sprintf("row key for %s.%s must include %q", schemaName, tableName, keyColumn)}
-		}
-		keyString, ok := keyValue.(string)
-		if !ok {
-			return nil, &PushValidationError{Message: fmt.Sprintf("row key %s.%s.%s must be a string", schemaName, tableName, keyColumn)}
-		}
-		keyUUID, err := uuid.Parse(keyString)
-		if err != nil {
-			return nil, &PushValidationError{Message: fmt.Sprintf("row key %s.%s.%s must be a UUID", schemaName, tableName, keyColumn)}
-		}
 
-		keyRaw, err := json.Marshal(map[string]any{keyColumn: keyUUID.String()})
-		if err != nil {
-			return nil, &PushValidationError{Message: fmt.Sprintf("marshal row key for %s.%s: %v", schemaName, tableName, err)}
-		}
-		keyJSONBytes, err := canonicalJSON(keyRaw)
-		if err != nil {
-			return nil, &PushValidationError{Message: fmt.Sprintf("canonicalize row key for %s.%s: %v", schemaName, tableName, err)}
-		}
-		keyJSON := string(keyJSONBytes)
-
-		targetKey := schemaName + "\x00" + tableName + "\x00" + keyJSON
+		targetKey := schemaName + "\x00" + tableName + "\x00" + normalizedKey.keyJSON
 		if _, exists := seenTargets[targetKey]; exists {
-			return nil, &PushValidationError{Message: fmt.Sprintf("duplicate target row in push request: %s.%s %s", schemaName, tableName, keyUUID.String())}
+			return nil, &PushValidationError{Message: fmt.Sprintf("duplicate target row in push request: %s.%s %s", schemaName, tableName, normalizedKey.keyString)}
 		}
 		seenTargets[targetKey] = struct{}{}
 
@@ -139,13 +118,11 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 			if err := json.Unmarshal(row.Payload, &payloadObj); err != nil || payloadObj == nil {
 				return nil, &PushValidationError{Message: fmt.Sprintf("payload for %s.%s must be a JSON object", schemaName, tableName)}
 			}
-			if existingKey, ok := payloadObj[keyColumn]; ok {
-				existingKeyString, ok := existingKey.(string)
-				if !ok || existingKeyString != keyUUID.String() {
-					return nil, &PushValidationError{Message: fmt.Sprintf("payload key %s.%s.%s must match request key", schemaName, tableName, keyColumn)}
-				}
-			} else {
-				payloadObj[keyColumn] = keyUUID.String()
+			if _, ok := payloadObj[syncScopeColumnName]; ok {
+				return nil, &PushValidationError{Message: fmt.Sprintf("payload for %s.%s must not include hidden scope column %q", schemaName, tableName, syncScopeColumnName)}
+			}
+			if err := normalizePayloadVisibleSyncKey(payloadObj, normalizedKey, schemaName, tableName); err != nil {
+				return nil, err
 			}
 
 			for col := range payloadObj {
@@ -173,9 +150,11 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 			schema:         schemaName,
 			table:          tableName,
 			op:             op,
-			keyColumn:      keyColumn,
-			keyUUID:        keyUUID,
-			keyJSON:        keyJSON,
+			keyColumn:      normalizedKey.column,
+			keyType:        normalizedKey.keyType,
+			keyString:      normalizedKey.keyString,
+			keyValue:       normalizedKey.dbValue,
+			keyJSON:        normalizedKey.keyJSON,
 			baseRowVersion: row.BaseRowVersion,
 			payload:        payload,
 			payloadColumns: payloadColumns,
@@ -219,23 +198,6 @@ func (s *SyncService) tableOrderIndex(schemaName, tableName string) int {
 		return idx
 	}
 	return 0
-}
-
-func (s *SyncService) syncKeyColumnForTable(schemaName, tableName string) (string, error) {
-	if s == nil || s.config == nil {
-		return "", &PushValidationError{Message: fmt.Sprintf("table %s.%s is not configured for sync", schemaName, tableName)}
-	}
-	for _, table := range s.config.RegisteredTables {
-		if table.normalizedSchema() != schemaName || table.normalizedTable() != tableName {
-			continue
-		}
-		keyColumns := table.normalizedSyncKeyColumns()
-		if len(keyColumns) != 1 {
-			return "", &PushValidationError{Message: fmt.Sprintf("table %s.%s must declare exactly one sync key column", schemaName, tableName)}
-		}
-		return keyColumns[0], nil
-	}
-	return "", &PushValidationError{Message: fmt.Sprintf("table %s.%s is not configured for sync", schemaName, tableName)}
 }
 
 func loadRowStateSnapshot(ctx context.Context, tx pgx.Tx, userID, schemaName, tableName, keyJSON string) (*rowStateSnapshot, error) {
@@ -322,7 +284,7 @@ func loadRowStateSnapshots(ctx context.Context, tx pgx.Tx, userID string, rows [
 	return states, nil
 }
 
-func (s *SyncService) pushConflictError(ctx context.Context, tx pgx.Tx, row pushPreparedRow, state *rowStateSnapshot, message string) error {
+func (s *SyncService) pushConflictError(ctx context.Context, tx pgx.Tx, ownerUserID string, row pushPreparedRow, state *rowStateSnapshot, message string) error {
 	var (
 		serverRowVersion int64
 		serverRowDeleted bool
@@ -334,7 +296,7 @@ func (s *SyncService) pushConflictError(ctx context.Context, tx pgx.Tx, row push
 	}
 	if state != nil && !state.deleted {
 		var err error
-		serverRow, err = s.loadCurrentServerRowPayload(ctx, tx, row)
+		serverRow, err = s.loadCurrentServerRowPayload(ctx, tx, ownerUserID, row)
 		if err != nil {
 			return err
 		}
@@ -344,7 +306,7 @@ func (s *SyncService) pushConflictError(ctx context.Context, tx pgx.Tx, row push
 		Conflict: &PushConflictDetails{
 			Schema:           row.schema,
 			Table:            row.table,
-			Key:              SyncKey{row.keyColumn: row.keyUUID.String()},
+			Key:              SyncKey{row.keyColumn: row.keyString},
 			Op:               row.op,
 			BaseRowVersion:   row.baseRowVersion,
 			ServerRowVersion: serverRowVersion,
@@ -354,76 +316,83 @@ func (s *SyncService) pushConflictError(ctx context.Context, tx pgx.Tx, row push
 	}
 }
 
-func (s *SyncService) loadCurrentServerRowPayload(ctx context.Context, tx pgx.Tx, row pushPreparedRow) (json.RawMessage, error) {
+func (s *SyncService) loadCurrentServerRowPayload(ctx context.Context, tx pgx.Tx, ownerUserID string, row pushPreparedRow) (json.RawMessage, error) {
 	tableIdent := pgx.Identifier{row.schema, row.table}.Sanitize()
 	keyColumnIdent := pgx.Identifier{row.keyColumn}.Sanitize()
+	ownerColumnIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
 
 	var payload []byte
 	err := tx.QueryRow(ctx, fmt.Sprintf(`
-		SELECT to_jsonb(src)
+		SELECT to_jsonb(src) - '_sync_scope_id'
 		FROM %s AS src
 		WHERE %s = $1
-	`, tableIdent, keyColumnIdent), row.keyUUID).Scan(&payload)
+		  AND %s = $2
+	`, tableIdent, keyColumnIdent, ownerColumnIdent), row.keyValue, ownerUserID).Scan(&payload)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("load current server row payload for %s.%s %s: %w", row.schema, row.table, row.keyUUID.String(), err)
+		return nil, fmt.Errorf("load current server row payload for %s.%s %s: %w", row.schema, row.table, row.keyString, err)
 	}
 
 	canonicalPayload, err := s.canonicalizeWirePayload(row.schema, row.table, payload)
 	if err != nil {
-		return nil, fmt.Errorf("canonicalize current server row payload for %s.%s %s: %w", row.schema, row.table, row.keyUUID.String(), err)
+		return nil, fmt.Errorf("canonicalize current server row payload for %s.%s %s: %w", row.schema, row.table, row.keyString, err)
 	}
 	return canonicalPayload, nil
 }
 
-func (s *SyncService) validatePushRowConflict(ctx context.Context, tx pgx.Tx, row pushPreparedRow, state *rowStateSnapshot) error {
+func (s *SyncService) validatePushRowConflict(ctx context.Context, tx pgx.Tx, ownerUserID string, row pushPreparedRow, state *rowStateSnapshot) error {
 	switch row.op {
 	case OpInsert:
 		if state == nil {
 			if row.baseRowVersion != 0 {
-				return s.pushConflictError(ctx, tx, row, nil, fmt.Sprintf("insert conflict on %s.%s %s: expected missing row at version 0, got %d", row.schema, row.table, row.keyUUID.String(), row.baseRowVersion))
+				return s.pushConflictError(ctx, tx, ownerUserID, row, nil, fmt.Sprintf("insert conflict on %s.%s %s: expected missing row at version 0, got %d", row.schema, row.table, row.keyString, row.baseRowVersion))
 			}
 			return nil
 		}
 		if row.baseRowVersion != state.rowVersion {
-			return s.pushConflictError(ctx, tx, row, state, fmt.Sprintf("insert conflict on %s.%s %s: expected base_row_version %d, got %d", row.schema, row.table, row.keyUUID.String(), state.rowVersion, row.baseRowVersion))
+			return s.pushConflictError(ctx, tx, ownerUserID, row, state, fmt.Sprintf("insert conflict on %s.%s %s: expected base_row_version %d, got %d", row.schema, row.table, row.keyString, state.rowVersion, row.baseRowVersion))
 		}
 		if !state.deleted {
-			return s.pushConflictError(ctx, tx, row, state, fmt.Sprintf("insert conflict on %s.%s %s: row already exists at version %d", row.schema, row.table, row.keyUUID.String(), state.rowVersion))
+			return s.pushConflictError(ctx, tx, ownerUserID, row, state, fmt.Sprintf("insert conflict on %s.%s %s: row already exists at version %d", row.schema, row.table, row.keyString, state.rowVersion))
 		}
 	case OpUpdate, OpDelete:
 		if state == nil || state.deleted {
-			return s.pushConflictError(ctx, tx, row, state, fmt.Sprintf("%s conflict on %s.%s %s: row does not exist", strings.ToLower(row.op), row.schema, row.table, row.keyUUID.String()))
+			return s.pushConflictError(ctx, tx, ownerUserID, row, state, fmt.Sprintf("%s conflict on %s.%s %s: row does not exist", strings.ToLower(row.op), row.schema, row.table, row.keyString))
 		}
 		if row.baseRowVersion != state.rowVersion {
-			return s.pushConflictError(ctx, tx, row, state, fmt.Sprintf("%s conflict on %s.%s %s: expected version %d, got %d", strings.ToLower(row.op), row.schema, row.table, row.keyUUID.String(), state.rowVersion, row.baseRowVersion))
+			return s.pushConflictError(ctx, tx, ownerUserID, row, state, fmt.Sprintf("%s conflict on %s.%s %s: expected version %d, got %d", strings.ToLower(row.op), row.schema, row.table, row.keyString, state.rowVersion, row.baseRowVersion))
 		}
 	}
 	return nil
 }
 
-func applyPreparedPushRow(ctx context.Context, tx pgx.Tx, row pushPreparedRow) error {
+func applyPreparedPushRow(ctx context.Context, tx pgx.Tx, ownerUserID string, row pushPreparedRow) error {
 	tableIdent := pgx.Identifier{row.schema, row.table}.Sanitize()
 	keyColumnIdent := pgx.Identifier{row.keyColumn}.Sanitize()
+	ownerColumnIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
 
 	switch row.op {
 	case OpDelete:
-		stmt := fmt.Sprintf(`DELETE FROM %s WHERE %s = $1`, tableIdent, keyColumnIdent)
-		if _, err := tx.Exec(ctx, stmt, row.keyUUID); err != nil {
-			return fmt.Errorf("delete %s.%s %s: %w", row.schema, row.table, row.keyUUID.String(), err)
+		stmt := fmt.Sprintf(`DELETE FROM %s WHERE %s = $1 AND %s = $2`, tableIdent, keyColumnIdent, ownerColumnIdent)
+		if _, err := tx.Exec(ctx, stmt, row.keyValue, ownerUserID); err != nil {
+			return fmt.Errorf("delete %s.%s %s: %w", row.schema, row.table, row.keyString, err)
 		}
 		return nil
 	case OpInsert:
-		columnList := quotedColumnList(row.payloadColumns)
+		payloadWithOwner, err := injectOwnerUserIDPayload(row.payload, ownerUserID)
+		if err != nil {
+			return fmt.Errorf("inject owner into insert payload for %s.%s %s: %w", row.schema, row.table, row.keyString, err)
+		}
+		columnList := quotedInsertColumnList(row.payloadColumns)
 		stmt := fmt.Sprintf(`
 			INSERT INTO %s (%s)
 			SELECT %s
 			FROM jsonb_populate_record(NULL::%s, $1::jsonb)
 		`, tableIdent, columnList, columnList, tableIdent)
-		if _, err := tx.Exec(ctx, stmt, row.payload); err != nil {
-			return fmt.Errorf("insert %s.%s %s: %w", row.schema, row.table, row.keyUUID.String(), err)
+		if _, err := tx.Exec(ctx, stmt, payloadWithOwner); err != nil {
+			return fmt.Errorf("insert %s.%s %s: %w", row.schema, row.table, row.keyString, err)
 		}
 		return nil
 	case OpUpdate:
@@ -437,9 +406,10 @@ func applyPreparedPushRow(ctx context.Context, tx pgx.Tx, row pushPreparedRow) e
 			SET %s
 			FROM (SELECT * FROM jsonb_populate_record(NULL::%s, $1::jsonb)) AS src
 			WHERE dst.%s = $2
-		`, tableIdent, strings.Join(setClauses, ", "), tableIdent, keyColumnIdent)
-		if _, err := tx.Exec(ctx, stmt, row.payload, row.keyUUID); err != nil {
-			return fmt.Errorf("update %s.%s %s: %w", row.schema, row.table, row.keyUUID.String(), err)
+			  AND dst.%s = $3
+		`, tableIdent, strings.Join(setClauses, ", "), tableIdent, keyColumnIdent, ownerColumnIdent)
+		if _, err := tx.Exec(ctx, stmt, row.payload, row.keyValue, ownerUserID); err != nil {
+			return fmt.Errorf("update %s.%s %s: %w", row.schema, row.table, row.keyString, err)
 		}
 		return nil
 	default:
@@ -468,6 +438,7 @@ func canBatchPreparedPushRows(a, b pushPreparedRow) bool {
 	return a.schema == b.schema &&
 		a.table == b.table &&
 		a.op == b.op &&
+		a.keyType == b.keyType &&
 		a.keyColumn == b.keyColumn &&
 		sameStrings(a.payloadColumns, b.payloadColumns)
 }
@@ -484,45 +455,42 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
-func applyPreparedPushRowBatch(ctx context.Context, tx pgx.Tx, rows []pushPreparedRow) error {
+func applyPreparedPushRowBatch(ctx context.Context, tx pgx.Tx, ownerUserID string, rows []pushPreparedRow) error {
 	if len(rows) == 0 {
 		return nil
 	}
 	if len(rows) == 1 {
-		return applyPreparedPushRow(ctx, tx, rows[0])
+		return applyPreparedPushRow(ctx, tx, ownerUserID, rows[0])
 	}
 
 	switch rows[0].op {
 	case OpDelete:
-		return applyPreparedDeleteBatch(ctx, tx, rows)
+		return applyPreparedDeleteBatch(ctx, tx, ownerUserID, rows)
 	case OpInsert:
-		return applyPreparedInsertBatch(ctx, tx, rows)
+		return applyPreparedInsertBatch(ctx, tx, ownerUserID, rows)
 	case OpUpdate:
-		return applyPreparedUpdateBatch(ctx, tx, rows)
+		return applyPreparedUpdateBatch(ctx, tx, ownerUserID, rows)
 	default:
 		return &PushValidationError{Message: fmt.Sprintf("unsupported op %q", rows[0].op)}
 	}
 }
 
-func applyPreparedDeleteBatch(ctx context.Context, tx pgx.Tx, rows []pushPreparedRow) error {
+func applyPreparedDeleteBatch(ctx context.Context, tx pgx.Tx, ownerUserID string, rows []pushPreparedRow) error {
 	tableIdent := pgx.Identifier{rows[0].schema, rows[0].table}.Sanitize()
 	keyColumnIdent := pgx.Identifier{rows[0].keyColumn}.Sanitize()
-	keys := make([]uuid.UUID, len(rows))
-	for i, row := range rows {
-		keys[i] = row.keyUUID
-	}
+	ownerColumnIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
 
-	stmt := fmt.Sprintf(`DELETE FROM %s WHERE %s = ANY($1)`, tableIdent, keyColumnIdent)
-	if _, err := tx.Exec(ctx, stmt, keys); err != nil {
+	stmt := fmt.Sprintf(`DELETE FROM %s WHERE %s = $1 AND %s = ANY($2)`, tableIdent, ownerColumnIdent, keyColumnIdent)
+	if _, err := tx.Exec(ctx, stmt, ownerUserID, syncKeyArray(rows)); err != nil {
 		return fmt.Errorf("delete batch %s.%s (%d rows): %w", rows[0].schema, rows[0].table, len(rows), err)
 	}
 	return nil
 }
 
-func applyPreparedInsertBatch(ctx context.Context, tx pgx.Tx, rows []pushPreparedRow) error {
+func applyPreparedInsertBatch(ctx context.Context, tx pgx.Tx, ownerUserID string, rows []pushPreparedRow) error {
 	tableIdent := pgx.Identifier{rows[0].schema, rows[0].table}.Sanitize()
-	columnList := quotedColumnList(rows[0].payloadColumns)
-	payloadArray, err := marshalPayloadJSONArray(rows)
+	columnList := quotedInsertColumnList(rows[0].payloadColumns)
+	payloadArray, err := marshalPayloadJSONArray(rows, ownerUserID)
 	if err != nil {
 		return fmt.Errorf("marshal insert batch payload for %s.%s: %w", rows[0].schema, rows[0].table, err)
 	}
@@ -538,10 +506,11 @@ func applyPreparedInsertBatch(ctx context.Context, tx pgx.Tx, rows []pushPrepare
 	return nil
 }
 
-func applyPreparedUpdateBatch(ctx context.Context, tx pgx.Tx, rows []pushPreparedRow) error {
+func applyPreparedUpdateBatch(ctx context.Context, tx pgx.Tx, ownerUserID string, rows []pushPreparedRow) error {
 	tableIdent := pgx.Identifier{rows[0].schema, rows[0].table}.Sanitize()
 	keyColumnIdent := pgx.Identifier{rows[0].keyColumn}.Sanitize()
-	payloadArray, err := marshalPayloadJSONArray(rows)
+	ownerColumnIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
+	payloadArray, err := marshalPayloadJSONArray(rows, "")
 	if err != nil {
 		return fmt.Errorf("marshal update batch payload for %s.%s: %w", rows[0].schema, rows[0].table, err)
 	}
@@ -556,21 +525,30 @@ func applyPreparedUpdateBatch(ctx context.Context, tx pgx.Tx, rows []pushPrepare
 		SET %s
 		FROM jsonb_populate_recordset(NULL::%s, $1::jsonb) AS src
 		WHERE dst.%s = src.%s
-	`, tableIdent, strings.Join(setClauses, ", "), tableIdent, keyColumnIdent, keyColumnIdent)
-	if _, err := tx.Exec(ctx, stmt, payloadArray); err != nil {
+		  AND dst.%s = $2
+	`, tableIdent, strings.Join(setClauses, ", "), tableIdent, keyColumnIdent, keyColumnIdent, ownerColumnIdent)
+	if _, err := tx.Exec(ctx, stmt, payloadArray, ownerUserID); err != nil {
 		return fmt.Errorf("update batch %s.%s (%d rows): %w", rows[0].schema, rows[0].table, len(rows), err)
 	}
 	return nil
 }
 
-func marshalPayloadJSONArray(rows []pushPreparedRow) ([]byte, error) {
+func marshalPayloadJSONArray(rows []pushPreparedRow, ownerUserID string) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteByte('[')
 	for i, row := range rows {
 		if i > 0 {
 			buf.WriteByte(',')
 		}
-		buf.Write(row.payload)
+		payload := row.payload
+		if ownerUserID != "" {
+			var err error
+			payload, err = injectOwnerUserIDPayload(row.payload, ownerUserID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		buf.Write(payload)
 	}
 	buf.WriteByte(']')
 	return buf.Bytes(), nil
@@ -582,6 +560,13 @@ func quotedColumnList(columns []string) string {
 		quoted = append(quoted, pgx.Identifier{col}.Sanitize())
 	}
 	return strings.Join(quoted, ", ")
+}
+
+func quotedInsertColumnList(columns []string) string {
+	insertColumns := make([]string, 0, len(columns)+1)
+	insertColumns = append(insertColumns, syncScopeColumnName)
+	insertColumns = append(insertColumns, columns...)
+	return quotedColumnList(insertColumns)
 }
 
 func (s *SyncService) loadCommittedBundle(ctx context.Context, tx pgx.Tx, userID string, bundleSeq int64) (*Bundle, error) {

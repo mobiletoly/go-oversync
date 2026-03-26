@@ -43,6 +43,7 @@ permalink: /documentation/client/
   `_sync_dirty_rows`
 - non-key binary payload fields use standard base64 on the wire
 - UUID-valued keys and UUID-valued key columns use dashed UUID text on the wire
+- visible sync keys on the wire are always JSON strings
 - the current client runtime supports exactly one configured remote schema per local SQLite
   database
 - run exactly one client runtime against one SQLite database at a time
@@ -101,7 +102,13 @@ Fail-closed behavior:
 ## Local Schema Rules
 
 - every managed table must declare its sync key explicitly
+- every managed table must declare exactly one visible sync key column
+- the visible sync key column must also be the local SQLite `PRIMARY KEY` in the current runtime
+- supported local visible sync key shapes are:
+  - `TEXT PRIMARY KEY`
+  - UUID-backed `BLOB PRIMARY KEY`
 - managed tables must be FK-closed
 - composite sync keys are rejected by the current client runtime
+- integer-like sync key primary keys are rejected during startup
 - schema-qualified local table registrations are rejected
 - unsupported local schema shapes fail during startup instead of degrading at runtime

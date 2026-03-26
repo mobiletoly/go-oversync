@@ -3,7 +3,6 @@ package simulator
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // NormalUsageScenario simulates normal app usage with established sync
@@ -35,6 +34,7 @@ func (s *NormalUsageScenario) Execute(ctx context.Context) error {
 	if err := s.app.OnSignIn(ctx, s.config.UserID); err != nil {
 		return fmt.Errorf("failed to sign in: %w", err)
 	}
+	s.app.StopSync()
 
 	// Simulate normal CRUD operations with immediate sync
 	logger.Info("📱 Performing normal CRUD operations")
@@ -51,12 +51,6 @@ func (s *NormalUsageScenario) Execute(ctx context.Context) error {
 			return fmt.Errorf("failed to create user %d: %w", i+1, err)
 		}
 		userIDs = append(userIDs, userID)
-
-		// Trigger sync after each operation
-		s.app.sync.TriggerUpload()
-
-		// Small delay to simulate user interaction
-		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Update records
@@ -69,9 +63,6 @@ func (s *NormalUsageScenario) Execute(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to update user %d: %w", i+1, err)
 		}
-
-		s.app.sync.TriggerUpload()
-		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Delete records
@@ -80,13 +71,11 @@ func (s *NormalUsageScenario) Execute(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to delete user: %w", err)
 		}
-
-		s.app.sync.TriggerUpload()
-		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Wait for final sync
-	time.Sleep(2 * time.Second)
+	if err := s.app.PushPending(ctx); err != nil {
+		return fmt.Errorf("failed to push normal usage changes: %w", err)
+	}
 
 	logger.Info("✅ Normal Usage Scenario completed successfully")
 

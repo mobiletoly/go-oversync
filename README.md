@@ -25,9 +25,11 @@ The current contract is bundle-based:
 Server-side registered tables are intentionally constrained:
 
 - one sync key column per registered table
-- that sync key must be the table's single-column UUID primary key
+- visible sync key type must be `uuid` or `text`
+- registered PostgreSQL tables must include `_sync_scope_id TEXT NOT NULL`
+- registered PostgreSQL row identity must be scope-bound through `(_sync_scope_id, sync_key)`
 - registered tables must be FK-closed
-- supported foreign keys must be single-column and `DEFERRABLE`
+- registered-to-registered foreign keys must be scope-inclusive and `DEFERRABLE`
 - unsupported key shapes or FK shapes fail during bootstrap
 
 The SQLite client is likewise fail-closed:
@@ -104,6 +106,8 @@ mux.HandleFunc("GET /status", handlers.HandleStatus)
 
 Your auth middleware must authenticate the request and inject
 `oversync.Actor{UserID, SourceID}` into request context before calling the sync handlers.
+The runtime derives `_sync_scope_id` from `Actor.UserID`; clients never send or receive
+`_sync_scope_id` in visible sync payloads.
 
 ## SQLite Client
 

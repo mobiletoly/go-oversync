@@ -12,6 +12,28 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	localSyncKeyKindUUID = "uuid"
+	localSyncKeyKindText = "text"
+)
+
+func supportedLocalSyncKeyKind(tableInfo *TableInfo, pkColumn, tableName string) (string, error) {
+	for _, col := range tableInfo.Columns {
+		if !strings.EqualFold(col.Name, pkColumn) {
+			continue
+		}
+		if col.IsBlob() {
+			return localSyncKeyKindUUID, nil
+		}
+		declaredType := strings.ToLower(strings.TrimSpace(col.DeclaredType))
+		if strings.Contains(declaredType, "text") {
+			return localSyncKeyKindText, nil
+		}
+		return "", fmt.Errorf("table %s uses unsupported local sync key column %s type %q; oversqlite supports only TEXT keys and UUID-backed BLOB keys", tableName, col.Name, col.DeclaredType)
+	}
+	return "", fmt.Errorf("table %s does not contain configured primary key column %s", tableName, pkColumn)
+}
+
 func (c *Client) isPrimaryKeyBlob(tableName string) (bool, error) {
 	tableInfo, err := c.getTableInfo(strings.ToLower(tableName))
 	if err != nil {
@@ -20,6 +42,9 @@ func (c *Client) isPrimaryKeyBlob(tableName string) (bool, error) {
 
 	pkColumn, err := c.primaryKeyColumnForTable(tableName)
 	if err != nil {
+		return false, err
+	}
+	if _, err := supportedLocalSyncKeyKind(tableInfo, pkColumn, tableName); err != nil {
 		return false, err
 	}
 	for _, col := range tableInfo.Columns {
@@ -38,6 +63,9 @@ func (c *Client) isPrimaryKeyBlobInTx(tx *sql.Tx, tableName string) (bool, error
 
 	pkColumn, err := c.primaryKeyColumnForTable(tableName)
 	if err != nil {
+		return false, err
+	}
+	if _, err := supportedLocalSyncKeyKind(tableInfo, pkColumn, tableName); err != nil {
 		return false, err
 	}
 	for _, col := range tableInfo.Columns {

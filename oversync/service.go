@@ -37,6 +37,17 @@ const (
 
 var errServiceShuttingDown = errors.New("sync service is shutting down")
 
+const (
+	syncScopeColumnName = "_sync_scope_id"
+	syncKeyTypeUUID     = "uuid"
+	syncKeyTypeText     = "text"
+)
+
+type registeredTableRuntimeInfo struct {
+	syncKeyColumn string
+	syncKeyType   string
+}
+
 // RegisteredTable represents a table that is registered for sync operations
 type RegisteredTable struct {
 	Schema         string   `json:"schema"`                     // Schema name (e.g., "public", "crm", "business")
@@ -95,11 +106,12 @@ func (t RegisteredTable) effectiveSyncKeyColumns(primaryKeyColumn string) []stri
 // SyncService provides the core synchronization functionality
 // This is the main SDK component that developers integrate into their applications
 type SyncService struct {
-	pool               *pgxpool.Pool
-	logger             *slog.Logger
-	config             *ServiceConfig
-	registeredTables   map[string]bool // Set of "schema.table" combinations allowed in sync operations
-	columnTypesByTable map[string]map[string]string
+	pool                *pgxpool.Pool
+	logger              *slog.Logger
+	config              *ServiceConfig
+	registeredTables    map[string]bool // Set of "schema.table" combinations allowed in sync operations
+	registeredTableInfo map[string]registeredTableRuntimeInfo
+	columnTypesByTable  map[string]map[string]string
 
 	// Schema discovery snapshot for bootstrap validation and FK-safe bundle ordering.
 	discoveredSchema *DiscoveredSchema
@@ -234,12 +246,13 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 	}
 
 	service := &SyncService{
-		pool:               pool,
-		logger:             logger,
-		config:             config,
-		registeredTables:   make(map[string]bool),
-		columnTypesByTable: make(map[string]map[string]string),
-		lifecycle:          serviceLifecycleRunning,
+		pool:                pool,
+		logger:              logger,
+		config:              config,
+		registeredTables:    make(map[string]bool),
+		registeredTableInfo: make(map[string]registeredTableRuntimeInfo),
+		columnTypesByTable:  make(map[string]map[string]string),
+		lifecycle:           serviceLifecycleRunning,
 	}
 
 	// Initialize registered tables set and handlers
@@ -291,68 +304,11 @@ func (s *SyncService) normalizeAndValidateRegisteredSyncKeys(ctx context.Context
 		return nil
 	}
 
-	type pkInfo struct {
-		count int
-		first string
-	}
-
-	type columnInfo struct {
-		column string
-		udt    string
-	}
-
 	schemas := make([]string, 0, len(s.config.RegisteredTables))
 	tables := make([]string, 0, len(s.config.RegisteredTables))
 	for _, tbl := range s.config.RegisteredTables {
 		schemas = append(schemas, tbl.normalizedSchema())
 		tables = append(tables, tbl.normalizedTable())
-	}
-
-	pkRows, err := s.pool.Query(ctx, `
-WITH t AS (
-  SELECT * FROM unnest(@schemas::text[], @tables::text[]) AS x(schema_name, table_name)
-)
-SELECT
-  kcu.table_schema,
-  kcu.table_name,
-  lower(kcu.column_name) AS column_name,
-  kcu.ordinal_position
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_schema = kcu.constraint_schema
- AND tc.constraint_name = kcu.constraint_name
-JOIN t
-  ON kcu.table_schema = t.schema_name
- AND kcu.table_name = t.table_name
-WHERE tc.constraint_type = 'PRIMARY KEY'
-ORDER BY kcu.table_schema, kcu.table_name, kcu.ordinal_position
-`, pgx.NamedArgs{
-		"schemas": schemas,
-		"tables":  tables,
-	})
-	if err != nil {
-		return fmt.Errorf("load registered table primary keys: %w", err)
-	}
-	defer pkRows.Close()
-
-	primaryKeys := make(map[string]pkInfo, len(s.config.RegisteredTables))
-	for pkRows.Next() {
-		var schemaName, tableName, columnName string
-		var ordinal int
-		if err := pkRows.Scan(&schemaName, &tableName, &columnName, &ordinal); err != nil {
-			return fmt.Errorf("scan registered table primary keys: %w", err)
-		}
-
-		tableKey := Key(schemaName, tableName)
-		info := primaryKeys[tableKey]
-		info.count++
-		if ordinal == 1 {
-			info.first = columnName
-		}
-		primaryKeys[tableKey] = info
-	}
-	if pkRows.Err() != nil {
-		return fmt.Errorf("iterate registered table primary keys: %w", pkRows.Err())
 	}
 
 	colRows, err := s.pool.Query(ctx, `
@@ -395,33 +351,142 @@ JOIN t
 		return fmt.Errorf("iterate registered table column types: %w", colRows.Err())
 	}
 
+	type uniqueIndexInfo struct {
+		name           string
+		columns        []string
+		isPartial      bool
+		hasExpressions bool
+	}
+
+	uniqueRows, err := s.pool.Query(ctx, `
+WITH t AS (
+  SELECT * FROM unnest(@schemas::text[], @tables::text[]) AS x(schema_name, table_name)
+)
+SELECT
+  n.nspname AS table_schema,
+  c.relname AS table_name,
+  i.relname AS index_name,
+  idx.indpred IS NOT NULL AS is_partial,
+  idx.indexprs IS NOT NULL AS has_expressions,
+  ord.ordinality AS column_ordinal,
+  lower(COALESCE(a.attname, '')) AS column_name
+FROM pg_class c
+JOIN pg_namespace n
+  ON n.oid = c.relnamespace
+JOIN t
+  ON n.nspname = t.schema_name
+ AND c.relname = t.table_name
+JOIN pg_index idx
+  ON idx.indrelid = c.oid
+JOIN pg_class i
+  ON i.oid = idx.indexrelid
+LEFT JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS ord(attnum, ordinality)
+  ON TRUE
+LEFT JOIN pg_attribute a
+  ON a.attrelid = c.oid
+ AND a.attnum = ord.attnum
+WHERE idx.indisunique
+ORDER BY n.nspname, c.relname, i.relname, ord.ordinality
+`, pgx.NamedArgs{
+		"schemas": schemas,
+		"tables":  tables,
+	})
+	if err != nil {
+		return fmt.Errorf("load registered table unique indexes: %w", err)
+	}
+	defer uniqueRows.Close()
+
+	type uniqueIndexKey struct {
+		tableKey  string
+		indexName string
+	}
+	uniqueIndexes := make(map[string][]uniqueIndexInfo, len(s.config.RegisteredTables))
+	indexPosByKey := make(map[uniqueIndexKey]int)
+	for uniqueRows.Next() {
+		var schemaName, tableName, indexName, columnName string
+		var (
+			isPartial      bool
+			hasExpressions bool
+			columnOrdinal  *int64
+		)
+		if err := uniqueRows.Scan(&schemaName, &tableName, &indexName, &isPartial, &hasExpressions, &columnOrdinal, &columnName); err != nil {
+			return fmt.Errorf("scan registered table unique indexes: %w", err)
+		}
+		tableKey := Key(schemaName, tableName)
+		lookupKey := uniqueIndexKey{tableKey: tableKey, indexName: indexName}
+		indexPos, exists := indexPosByKey[lookupKey]
+		if !exists {
+			indexPos = len(uniqueIndexes[tableKey])
+			indexPosByKey[lookupKey] = indexPos
+			uniqueIndexes[tableKey] = append(uniqueIndexes[tableKey], uniqueIndexInfo{
+				name:           indexName,
+				isPartial:      isPartial,
+				hasExpressions: hasExpressions,
+			})
+		}
+		if columnOrdinal != nil {
+			uniqueIndexes[tableKey][indexPos].columns = append(uniqueIndexes[tableKey][indexPos].columns, columnName)
+		}
+	}
+	if uniqueRows.Err() != nil {
+		return fmt.Errorf("iterate registered table unique indexes: %w", uniqueRows.Err())
+	}
+
+	registeredInfo := make(map[string]registeredTableRuntimeInfo, len(s.config.RegisteredTables))
 	for i := range s.config.RegisteredTables {
 		tbl := &s.config.RegisteredTables[i]
 		tableKey := tbl.normalizedKey()
-		pk := primaryKeys[tableKey]
-		if pk.count != 1 || pk.first == "" {
-			return unsupportedSchemaf("registered table %s must have a single-column primary key for the current server runtime", tableKey)
-		}
-
-		effective := tbl.effectiveSyncKeyColumns(pk.first)
-		if len(effective) != 1 {
+		keyColumns := tbl.normalizedSyncKeyColumns()
+		if len(keyColumns) != 1 {
 			return unsupportedSchemaf("registered table %s must resolve to exactly one sync key column for the current server runtime", tableKey)
 		}
-		if effective[0] != pk.first {
-			return unsupportedSchemaf("registered table %s declares sync key column %s, but the current server runtime requires the table primary key %s", tableKey, effective[0], pk.first)
+		if keyColumns[0] == syncScopeColumnName {
+			return unsupportedSchemaf("registered table %s cannot use hidden scope column %s as its visible sync key", tableKey, syncScopeColumnName)
 		}
 
 		cols := columnTypes[tableKey]
 		if cols == nil {
 			return fmt.Errorf("registered table %s could not load column metadata for sync key validation", tableKey)
 		}
-		if cols[pk.first] != "uuid" {
-			return unsupportedSchemaf("registered table %s uses unsupported sync key column type %s for %s; the current server runtime requires uuid", tableKey, cols[pk.first], pk.first)
+		if cols[syncScopeColumnName] != syncKeyTypeText {
+			return unsupportedSchemaf("registered table %s must define %s TEXT", tableKey, syncScopeColumnName)
+		}
+		keyType := cols[keyColumns[0]]
+		if keyType != syncKeyTypeUUID && keyType != syncKeyTypeText {
+			return unsupportedSchemaf("registered table %s uses unsupported sync key column type %s for %s; the current server runtime allows only uuid and text", tableKey, keyType, keyColumns[0])
 		}
 
-		tbl.SyncKeyColumns = []string{pk.first}
+		indexes := uniqueIndexes[tableKey]
+		if len(indexes) == 0 {
+			return unsupportedSchemaf("registered table %s must provide unique indexes or constraints for scope-aware identity", tableKey)
+		}
+		hasOwnerScopedIdentity := false
+		for _, idx := range indexes {
+			if idx.isPartial || idx.hasExpressions {
+				return unsupportedSchemaf("registered table %s uses unsupported partial or expression unique index %s", tableKey, idx.name)
+			}
+			if len(idx.columns) == 0 {
+				return unsupportedSchemaf("registered table %s uses unsupported unique index %s without column entries", tableKey, idx.name)
+			}
+			if idx.columns[0] != syncScopeColumnName {
+				return unsupportedSchemaf("registered table %s has unique index %s that does not begin with %s", tableKey, idx.name, syncScopeColumnName)
+			}
+			if len(idx.columns) == 2 && idx.columns[0] == syncScopeColumnName && idx.columns[1] == keyColumns[0] {
+				hasOwnerScopedIdentity = true
+			}
+		}
+		if !hasOwnerScopedIdentity {
+			return unsupportedSchemaf("registered table %s must provide unique identity (%s, %s)", tableKey, syncScopeColumnName, keyColumns[0])
+		}
+
+		tbl.SyncKeyColumns = []string{keyColumns[0]}
+		registeredInfo[tableKey] = registeredTableRuntimeInfo{
+			syncKeyColumn: keyColumns[0],
+			syncKeyType:   keyType,
+		}
 	}
 
+	s.registeredTableInfo = registeredInfo
 	s.columnTypesByTable = make(map[string]map[string]string, len(columnTypes))
 	for tableKey, cols := range columnTypes {
 		cloned := make(map[string]string, len(cols))

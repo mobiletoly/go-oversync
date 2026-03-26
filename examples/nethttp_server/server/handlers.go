@@ -36,11 +36,13 @@ func InitializeApplicationTables(ctx context.Context, pool *pgxpool.Pool, logger
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-	id UUID PRIMARY KEY,
+	_sync_scope_id TEXT NOT NULL,
+	id UUID NOT NULL,
 	name TEXT NOT NULL,
 	email TEXT NOT NULL,
 	created_at TIMESTAMPTZ DEFAULT now(),
-	updated_at TIMESTAMPTZ DEFAULT now()
+	updated_at TIMESTAMPTZ DEFAULT now(),
+	PRIMARY KEY (_sync_scope_id, id)
 )
 `, usersTable)); err != nil {
 			return fmt.Errorf("failed to create users table: %w", err)
@@ -48,12 +50,16 @@ CREATE TABLE IF NOT EXISTS %s (
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-	id UUID PRIMARY KEY,
+	_sync_scope_id TEXT NOT NULL,
+	id UUID NOT NULL,
 	title TEXT NOT NULL,
 	content TEXT NOT NULL,
-	author_id UUID REFERENCES %s(id) DEFERRABLE INITIALLY DEFERRED,
+	author_id UUID,
 	created_at TIMESTAMPTZ DEFAULT now(),
-	updated_at TIMESTAMPTZ DEFAULT now()
+	updated_at TIMESTAMPTZ DEFAULT now(),
+	PRIMARY KEY (_sync_scope_id, id),
+	CONSTRAINT posts_author_id_fkey
+		FOREIGN KEY (_sync_scope_id, author_id) REFERENCES %s(_sync_scope_id, id) DEFERRABLE INITIALLY DEFERRED
 )
 `, postsTable, usersTable)); err != nil {
 			return fmt.Errorf("failed to create posts table: %w", err)
@@ -61,9 +67,13 @@ CREATE TABLE IF NOT EXISTS %s (
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-	id UUID PRIMARY KEY,
+	_sync_scope_id TEXT NOT NULL,
+	id UUID NOT NULL,
 	name TEXT NOT NULL,
-	parent_id UUID REFERENCES %s(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+	parent_id UUID,
+	PRIMARY KEY (_sync_scope_id, id),
+	CONSTRAINT categories_parent_id_fkey
+		FOREIGN KEY (_sync_scope_id, parent_id) REFERENCES %s(_sync_scope_id, id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 )
 `, categoriesTable, categoriesTable)); err != nil {
 			return fmt.Errorf("failed to create categories table: %w", err)
@@ -71,9 +81,11 @@ CREATE TABLE IF NOT EXISTS %s (
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-	id UUID PRIMARY KEY,
+	_sync_scope_id TEXT NOT NULL,
+	id UUID NOT NULL,
 	name TEXT NOT NULL,
-	captain_member_id UUID
+	captain_member_id UUID,
+	PRIMARY KEY (_sync_scope_id, id)
 )
 `, teamsTable)); err != nil {
 			return fmt.Errorf("failed to create teams table: %w", err)
@@ -81,9 +93,13 @@ CREATE TABLE IF NOT EXISTS %s (
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-	id UUID PRIMARY KEY,
+	_sync_scope_id TEXT NOT NULL,
+	id UUID NOT NULL,
 	name TEXT NOT NULL,
-	team_id UUID NOT NULL REFERENCES %s(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+	team_id UUID NOT NULL,
+	PRIMARY KEY (_sync_scope_id, id),
+	CONSTRAINT team_members_team_id_fkey
+		FOREIGN KEY (_sync_scope_id, team_id) REFERENCES %s(_sync_scope_id, id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 )
 `, teamMembersTable, teamsTable)); err != nil {
 			return fmt.Errorf("failed to create team_members table: %w", err)
@@ -107,8 +123,8 @@ CREATE TABLE IF NOT EXISTS %s (
 			if _, err := tx.Exec(ctx, fmt.Sprintf(`
 				ALTER TABLE %s
 				ADD CONSTRAINT teams_captain_member_id_fkey
-				FOREIGN KEY (captain_member_id)
-				REFERENCES %s(id)
+				FOREIGN KEY (_sync_scope_id, captain_member_id)
+				REFERENCES %s(_sync_scope_id, id)
 				DEFERRABLE INITIALLY DEFERRED
 			`, teamsTable, teamMembersTable)); err != nil {
 				return fmt.Errorf("failed to add teams captain_member_id FK: %w", err)
@@ -117,9 +133,11 @@ CREATE TABLE IF NOT EXISTS %s (
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-	id UUID PRIMARY KEY,
+	_sync_scope_id TEXT NOT NULL,
+	id UUID NOT NULL,
 	name TEXT NOT NULL,
-	data BYTEA NOT NULL
+	data BYTEA NOT NULL,
+	PRIMARY KEY (_sync_scope_id, id)
 )
 `, filesTable)); err != nil {
 			return fmt.Errorf("failed to create files table: %w", err)
@@ -127,9 +145,13 @@ CREATE TABLE IF NOT EXISTS %s (
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-	id UUID PRIMARY KEY,
+	_sync_scope_id TEXT NOT NULL,
+	id UUID NOT NULL,
 	review TEXT NOT NULL,
-	file_id UUID NOT NULL REFERENCES %s(id) DEFERRABLE INITIALLY DEFERRED
+	file_id UUID NOT NULL,
+	PRIMARY KEY (_sync_scope_id, id),
+	CONSTRAINT file_reviews_file_id_fkey
+		FOREIGN KEY (_sync_scope_id, file_id) REFERENCES %s(_sync_scope_id, id) DEFERRABLE INITIALLY DEFERRED
 )
 `, fileReviewsTable, filesTable)); err != nil {
 			return fmt.Errorf("failed to create file_reviews table: %w", err)
@@ -137,14 +159,16 @@ CREATE TABLE IF NOT EXISTS %s (
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
-	id UUID PRIMARY KEY,
+	_sync_scope_id TEXT NOT NULL,
+	id UUID NOT NULL,
 	name TEXT NOT NULL,
 	note TEXT NULL,
 	count_value BIGINT NULL,
 	enabled_flag BIGINT NOT NULL,
 	rating DOUBLE PRECISION NULL,
 	data BYTEA NULL,
-	created_at TIMESTAMPTZ NULL
+	created_at TIMESTAMPTZ NULL,
+	PRIMARY KEY (_sync_scope_id, id)
 )
 `, typedRowsTable)); err != nil {
 			return fmt.Errorf("failed to create typed_rows table: %w", err)

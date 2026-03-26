@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
@@ -52,7 +53,7 @@ func newPushSessionFixture(t *testing.T, ctx context.Context, opts pushSessionFi
 		PushSessionTTL:                     opts.pushSessionTTL,
 		DefaultRowsPerCommittedBundleChunk: opts.defaultRowsPerCommittedBundleChunk,
 		MaxRowsPerCommittedBundleChunk:     opts.maxRowsPerCommittedBundleChunk,
-		RegisteredTables:                   []RegisteredTable{{Schema: schemaName, Table: "users"}},
+		RegisteredTables:                   []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
 	}, logger)
 
 	return &pushSessionFixture{
@@ -1072,4 +1073,107 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			require.Equal(t, "push_session_expired", errResp.Error)
 		})
 	}
+}
+
+func TestPushSessions_RejectsHiddenOwnerColumnInPayload(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+
+	rowID := uuid.New()
+	session := fixture.createSession(t, ctx, 1, 1)
+	_, err := fixture.svc.UploadPushChunk(ctx, fixture.writer, session.PushID, &PushSessionChunkRequest{
+		StartRowOrdinal: 0,
+		Rows: []PushRequestRow{{
+			Schema:         fixture.schemaName,
+			Table:          "users",
+			Key:            SyncKey{"id": rowID.String()},
+			Op:             OpInsert,
+			BaseRowVersion: 0,
+			Payload: json.RawMessage(fmt.Sprintf(
+				`{"id":"%s","_sync_scope_id":"malicious-user","name":"Mallory","email":"mallory@example.com"}`,
+				rowID,
+			)),
+		}},
+	})
+	var chunkErr *PushChunkInvalidError
+	require.ErrorAs(t, err, &chunkErr)
+	require.Contains(t, err.Error(), "must not include hidden scope column")
+}
+
+func TestPushSessions_RejectsNonCanonicalUUIDVisibleKey(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+
+	rowID := strings.ToUpper(uuid.New().String())
+	session := fixture.createSession(t, ctx, 1, 1)
+	_, err := fixture.svc.UploadPushChunk(ctx, fixture.writer, session.PushID, &PushSessionChunkRequest{
+		StartRowOrdinal: 0,
+		Rows: []PushRequestRow{{
+			Schema:         fixture.schemaName,
+			Table:          "users",
+			Key:            SyncKey{"id": rowID},
+			Op:             OpInsert,
+			BaseRowVersion: 0,
+			Payload: json.RawMessage(fmt.Sprintf(
+				`{"id":"%s","name":"Upper","email":"upper@example.com"}`,
+				rowID,
+			)),
+		}},
+	})
+	var chunkErr *PushChunkInvalidError
+	require.ErrorAs(t, err, &chunkErr)
+	require.Contains(t, err.Error(), "canonical dashed lowercase UUID text")
+}
+
+func TestPushSessions_AcceptsTextVisibleSyncKey(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "push_text_key_" + suffix
+	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.docs (
+			_sync_scope_id TEXT NOT NULL,
+			doc_id TEXT NOT NULL,
+			body TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, doc_id)
+		)`, schemaIdent))
+	require.NoError(t, err)
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "push-text-key-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "docs", SyncKeyColumns: []string{"doc_id"}},
+		},
+	}, logger)
+
+	actor := Actor{UserID: "push-text-key-user-" + suffix, SourceID: "writer"}
+	bundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, []PushRequestRow{{
+		Schema:         schemaName,
+		Table:          "docs",
+		Key:            SyncKey{"doc_id": "doc-42"},
+		Op:             OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(`{"doc_id":"doc-42","body":"Hello text key"}`),
+	}})
+	require.NoError(t, err)
+	require.Len(t, bundle.Rows, 1)
+	require.Equal(t, SyncKey{"doc_id": "doc-42"}, bundle.Rows[0].Key)
+	require.NotContains(t, string(bundle.Rows[0].Payload), `"_sync_scope_id"`)
+
+	var body string
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT body
+		FROM %s.docs
+		WHERE _sync_scope_id = $1 AND doc_id = $2
+	`, schemaIdent), actor.UserID, "doc-42").Scan(&body))
+	require.Equal(t, "Hello text key", body)
 }

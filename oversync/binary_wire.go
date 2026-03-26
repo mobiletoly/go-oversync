@@ -50,6 +50,9 @@ func (s *SyncService) canonicalizeWirePayload(schemaName, tableName string, payl
 	}
 
 	changed := false
+	if stripHiddenOwnerColumn(payloadObject) {
+		changed = true
+	}
 	for columnName, rawValue := range payloadObject {
 		if columnTypes[strings.ToLower(columnName)] != "bytea" {
 			continue

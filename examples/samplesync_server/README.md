@@ -29,8 +29,9 @@ Database
   - `business.person_address`
   - `business.comment`
 
-Primary keys are UUIDs. The synced table set is FK-closed.
-Registered tables use single-column UUID sync keys.
+Registered tables use scope-bound PostgreSQL identity with `_sync_scope_id TEXT NOT NULL`.
+Each registered table keeps one visible UUID sync key column, scope-plus-key uniqueness, and
+scope-inclusive foreign keys. The synced table set is FK-closed.
 
 Run locally
 

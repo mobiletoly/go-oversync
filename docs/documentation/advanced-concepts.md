@@ -25,8 +25,9 @@ A bundle is the smallest durable sync unit.
 ## Structured keys
 
 Rows are identified by structured sync keys, not by an implicit single `pk` field on the wire.
-In the current supported envelope, sync keys are still single-column UUID keys, but the protocol
-surface is shaped around structured keys so bootstrap can fail closed on unsupported shapes.
+In the current supported envelope, each registered table still exposes exactly one visible sync
+key column, but that column may be `uuid` or `text`. Visible sync key values are strings on the
+wire, and UUID-valued keys must use canonical dashed lowercase UUID text.
 
 ## Row state
 
@@ -107,8 +108,9 @@ The supported envelope is intentionally strict.
 
 The current contract is designed to be reliable for:
 
-- single-column UUID sync keys
-- single-column FKs between registered/managed tables
+- exactly one visible sync key column per registered/managed table
+- scope-bound registered PostgreSQL identity with `_sync_scope_id`
+- scope-inclusive FKs between registered PostgreSQL tables
 - self-references
 - multi-table cycles
 - `ON DELETE CASCADE`

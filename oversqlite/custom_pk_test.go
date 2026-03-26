@@ -401,6 +401,68 @@ func TestTriggersWithCustomPKFunctionality(t *testing.T) {
 	}
 }
 
+func TestNewClient_FailsWhenSyncKeyColumnUsesIntegerPrimaryKey(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create users table: %v", err)
+	}
+
+	tokenFunc := func(ctx context.Context) (string, error) {
+		return "mock-token", nil
+	}
+	_, err = NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "id"},
+	}))
+	if err == nil {
+		t.Fatal("expected integer sync key setup to fail")
+	}
+	if !strings.Contains(err.Error(), "supports only TEXT keys and UUID-backed BLOB keys") {
+		t.Fatalf("expected integer sync key error, got: %v", err)
+	}
+}
+
+func TestNewClient_FailsWhenSyncKeyColumnUsesBigIntPrimaryKey(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id BIGINT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create users table: %v", err)
+	}
+
+	tokenFunc := func(ctx context.Context) (string, error) {
+		return "mock-token", nil
+	}
+	_, err = NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "users", SyncKeyColumnName: "id"},
+	}))
+	if err == nil {
+		t.Fatal("expected BIGINT sync key setup to fail")
+	}
+	if !strings.Contains(err.Error(), "supports only TEXT keys and UUID-backed BLOB keys") {
+		t.Fatalf("expected BIGINT sync key error, got: %v", err)
+	}
+}
+
 // TestTemplateBasedTriggerGeneration tests that the template-based trigger generation produces correct SQL
 func TestTemplateBasedTriggerGeneration(t *testing.T) {
 	// Create in-memory SQLite database

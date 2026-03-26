@@ -27,12 +27,13 @@ func TestBootstrap_InstallsRegisteredTableCaptureTriggers(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "bundle-trigger-bootstrap-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
-			{Schema: schemaName, Table: "posts"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
-	var triggerCount int
+	var captureTriggerCount int
+	var ownerGuardTriggerCount int
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM pg_trigger t
@@ -42,8 +43,19 @@ func TestBootstrap_InstallsRegisteredTableCaptureTriggers(t *testing.T) {
 		  AND c.relname IN ('users', 'posts')
 		  AND t.tgname = $2
 		  AND NOT t.tgisinternal
-	`, schemaName, registeredTableCaptureTriggerName).Scan(&triggerCount))
-	require.Equal(t, 2, triggerCount)
+	`, schemaName, registeredTableCaptureTriggerName).Scan(&captureTriggerCount))
+	require.Equal(t, 2, captureTriggerCount)
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relname IN ('users', 'posts')
+		  AND t.tgname = $2
+		  AND NOT t.tgisinternal
+	`, schemaName, registeredTableOwnerGuardTrigger).Scan(&ownerGuardTriggerCount))
+	require.Equal(t, 2, ownerGuardTriggerCount)
 
 	require.NoError(t, svc.Close(context.Background()))
 }
@@ -62,7 +74,7 @@ func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "bundle-direct-write-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -152,7 +164,7 @@ func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "bundle-rollback-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -209,8 +221,8 @@ func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "bundle-cascade-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
-			{Schema: schemaName, Table: "posts"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -292,17 +304,21 @@ func TestWithinSyncBundle_CapturesCascadeUpdates(t *testing.T) {
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.parents (
-			id UUID PRIMARY KEY,
-			name TEXT NOT NULL
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			name TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
 		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.children (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			parent_id UUID NOT NULL,
 			name TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id),
 			CONSTRAINT children_parent_id_fkey
-				FOREIGN KEY (parent_id) REFERENCES %s.parents(id)
+				FOREIGN KEY (_sync_scope_id, parent_id) REFERENCES %s.parents(_sync_scope_id, id)
 				ON UPDATE CASCADE
 				ON DELETE CASCADE
 				DEFERRABLE INITIALLY IMMEDIATE
@@ -313,8 +329,8 @@ func TestWithinSyncBundle_CapturesCascadeUpdates(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "bundle-cascade-update-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "parents"},
-			{Schema: schemaName, Table: "children"},
+			{Schema: schemaName, Table: "parents", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "children", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -424,15 +440,19 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.users (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			name TEXT NOT NULL,
-			email TEXT NOT NULL
+			email TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
 		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.profiles (
-			id UUID PRIMARY KEY,
-			nickname TEXT NOT NULL
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			nickname TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
 		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
@@ -441,8 +461,8 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 		LANGUAGE plpgsql
 		AS $$
 		BEGIN
-			INSERT INTO %s.profiles (id, nickname)
-			VALUES (NEW.id, NEW.name);
+			INSERT INTO %s.profiles (_sync_scope_id, id, nickname)
+			VALUES (NEW._sync_scope_id, NEW.id, NEW.name);
 			RETURN NEW;
 		END;
 		$$
@@ -460,8 +480,8 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "bundle-trigger-write-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
-			{Schema: schemaName, Table: "profiles"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "profiles", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -509,4 +529,122 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 		WHERE id = $1
 	`, schemaIdent), rowID).Scan(&nickname))
 	require.Equal(t, "Trigger User", nickname)
+}
+
+func TestWithinSyncBundle_RejectsMismatchedOwnerOnInsert(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "bundle_owner_insert_reject_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "bundle-owner-insert-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	rowID := uuid.New()
+	err := svc.WithinSyncBundle(ctx, Actor{UserID: "actor-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s.users (_sync_scope_id, id, name, email)
+			VALUES ($1, $2, $3, $4)
+		`, pgx.Identifier{schemaName}.Sanitize()), "actor-b", rowID, "Mallory", "mallory@example.com")
+		return err
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "scope mismatch")
+}
+
+func TestWithinSyncBundle_RejectsCrossOwnerWriteByVisibleKeyAlone(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "bundle_cross_owner_reject_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "bundle-cross-owner-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	rowID := uuid.New()
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: "owner-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s.users (id, name, email)
+			VALUES ($1, $2, $3)
+		`, pgx.Identifier{schemaName}.Sanitize()), rowID, "Owner A", "owner-a@example.com")
+		return err
+	}))
+
+	err := svc.WithinSyncBundle(ctx, Actor{UserID: "owner-b"}, BundleSource{SourceID: "server-app", SourceBundleID: 2}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			UPDATE %s.users
+			SET name = $2
+			WHERE id = $1
+		`, pgx.Identifier{schemaName}.Sanitize()), rowID, "Intruder")
+		return err
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "scope mismatch")
+
+	err = svc.WithinSyncBundle(ctx, Actor{UserID: "owner-b"}, BundleSource{SourceID: "server-app", SourceBundleID: 3}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			DELETE FROM %s.users
+			WHERE id = $1
+		`, pgx.Identifier{schemaName}.Sanitize()), rowID)
+		return err
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "scope mismatch")
+}
+
+func TestWithinSyncBundle_RejectsOwnerMutationOnUpdate(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "bundle_owner_update_reject_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "bundle-owner-update-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	rowID := uuid.New()
+	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: "owner-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s.users (id, name, email)
+			VALUES ($1, $2, $3)
+		`, pgx.Identifier{schemaName}.Sanitize()), rowID, "Owner A", "owner-a@example.com")
+		return err
+	}))
+
+	err := svc.WithinSyncBundle(ctx, Actor{UserID: "owner-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 2}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			UPDATE %s.users
+			SET _sync_scope_id = $2
+			WHERE id = $1
+		`, pgx.Identifier{schemaName}.Sanitize()), rowID, "owner-b")
+		return err
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "scope mutation is not allowed")
 }

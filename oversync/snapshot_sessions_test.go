@@ -67,7 +67,7 @@ func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
 		DefaultRowsPerSnapshotChunk: 2,
 		MaxRowsPerSnapshotChunk:     2,
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -92,6 +92,7 @@ func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
 	require.Equal(t, session.SnapshotID, chunk1.SnapshotID)
 	require.Equal(t, session.SnapshotBundleSeq, chunk1.SnapshotBundleSeq)
 	require.Len(t, chunk1.Rows, 2)
+	require.NotContains(t, string(chunk1.Rows[0].Payload), `"_sync_scope_id"`)
 	require.True(t, chunk1.HasMore)
 	require.Equal(t, int64(2), chunk1.NextRowOrdinal)
 
@@ -142,7 +143,7 @@ func TestSnapshotSessions_OneChunkStillUsesSessionStorage(t *testing.T) {
 		DefaultRowsPerSnapshotChunk: 1000,
 		MaxRowsPerSnapshotChunk:     5000,
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -189,7 +190,7 @@ func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
 		DefaultRowsPerSnapshotChunk: 2,
 		MaxRowsPerSnapshotChunk:     2,
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -242,7 +243,7 @@ func TestSnapshotSessions_RepeatedSessionCreationUsesDeterministicRowOrdering(t 
 		DefaultRowsPerSnapshotChunk: 10,
 		MaxRowsPerSnapshotChunk:     10,
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -285,7 +286,7 @@ func TestSnapshotSessions_DeleteInvalidatesFurtherChunkFetches(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-delete-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -325,7 +326,7 @@ func TestSnapshotSessions_InvalidCursorRejected(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-invalid-cursor-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -361,7 +362,7 @@ func TestSnapshotSessions_WrongUserRejected(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-wrong-user-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -395,7 +396,7 @@ func TestSnapshotSessions_ExpiredSessionRejected(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-expired-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -432,7 +433,7 @@ func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-after-image-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -478,7 +479,7 @@ func TestSnapshotSessions_CreateEmptySnapshot(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-empty-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -509,7 +510,7 @@ func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-no-update-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -566,7 +567,7 @@ func TestSnapshotSessions_CreateRejectsRowLimitAndRollsBack(t *testing.T) {
 		MaxRowsPerSnapshotSession:  1,
 		MaxBytesPerSnapshotSession: 0,
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -613,7 +614,7 @@ func TestSnapshotSessions_CreateRejectsByteLimitAndRollsBack(t *testing.T) {
 		MaxRowsPerSnapshotSession:  0,
 		MaxBytesPerSnapshotSession: 1,
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -650,7 +651,7 @@ func TestSnapshotSessions_CreateSucceedsUnderConfiguredLimits(t *testing.T) {
 		MaxRowsPerSnapshotSession:  10,
 		MaxBytesPerSnapshotSession: 1 << 20,
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -680,7 +681,7 @@ func TestSnapshotSessions_CleanupExpiredSessionsRemovesRows(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-cleanup-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -730,7 +731,7 @@ func TestSnapshotSessions_CreateQueryPlanUsesSnapshotIndexes(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-plan-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -790,11 +791,17 @@ func TestSnapshotSessions_CreateQueryPlanUsesSnapshotIndexes(t *testing.T) {
 
 	planText := strings.Join(planLines, "\n")
 	require.Contains(t, planText, "rs_user_live_snapshot_idx")
-	require.Contains(t, planText, "br_user_bundle_key_idx")
+	require.True(t,
+		strings.Contains(planText, "br_user_bundle_key_idx") ||
+			strings.Contains(planText, "br_user_bundle_ordinal_idx"),
+		"expected snapshot join to use a bundle_rows covering index, got:\n%s",
+		planText,
+	)
 	require.True(t, slices.ContainsFunc(planLines, func(line string) bool {
 		return strings.Contains(line, "Index") && strings.Contains(line, "rs_user_live_snapshot_idx")
 	}))
 	require.True(t, slices.ContainsFunc(planLines, func(line string) bool {
-		return strings.Contains(line, "Index") && strings.Contains(line, "br_user_bundle_key_idx")
+		return strings.Contains(line, "Index") &&
+			(strings.Contains(line, "br_user_bundle_key_idx") || strings.Contains(line, "br_user_bundle_ordinal_idx"))
 	}))
 }

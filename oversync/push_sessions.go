@@ -363,7 +363,7 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 			}
 			targetKey := row.schema + "\x00" + row.table + "\x00" + row.keyJSON
 			if _, exists := seenTargets[targetKey]; exists {
-				return &PushCommitInvalidError{Message: fmt.Sprintf("duplicate target row in staged push session: %s.%s %s", row.schema, row.table, row.keyUUID.String())}
+				return &PushCommitInvalidError{Message: fmt.Sprintf("duplicate target row in staged push session: %s.%s %s", row.schema, row.table, row.keyString)}
 			}
 			seenTargets[targetKey] = struct{}{}
 		}
@@ -393,13 +393,13 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 			if rowStates[i].found {
 				state = &rowStates[i].rowStateSnapshot
 			}
-			if err := s.validatePushRowConflict(ctx, tx, row, state); err != nil {
+			if err := s.validatePushRowConflict(ctx, tx, actor.UserID, row, state); err != nil {
 				return err
 			}
 		}
 
 		for _, group := range batchPreparedPushRows(rows) {
-			if err := applyPreparedPushRowBatch(ctx, tx, group); err != nil {
+			if err := applyPreparedPushRowBatch(ctx, tx, actor.UserID, group); err != nil {
 				return err
 			}
 		}
@@ -692,23 +692,21 @@ func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx
 		if err != nil {
 			return nil, err
 		}
-		row.keyColumn = keyColumn
-		key, err := decodeSyncKeyJSON(row.keyJSON)
+		keyType, err := s.syncKeyTypeForTable(row.schema, row.table)
 		if err != nil {
-			return nil, fmt.Errorf("decode push session key: %w", err)
+			return nil, err
 		}
-		rawKey, ok := key[keyColumn]
-		if !ok {
-			return nil, fmt.Errorf("push session key missing %s for %s.%s", keyColumn, row.schema, row.table)
-		}
-		keyString, ok := rawKey.(string)
-		if !ok {
-			return nil, fmt.Errorf("push session key %s.%s.%s must be string", row.schema, row.table, keyColumn)
-		}
-		row.keyUUID, err = uuid.Parse(keyString)
+		normalizedKey, err := decodeNormalizedStoredSyncKey(row.schema, row.table, registeredTableRuntimeInfo{
+			syncKeyColumn: keyColumn,
+			syncKeyType:   keyType,
+		}, row.keyJSON)
 		if err != nil {
-			return nil, fmt.Errorf("push session key %s.%s.%s must be UUID: %w", row.schema, row.table, keyColumn, err)
+			return nil, err
 		}
+		row.keyColumn = normalizedKey.column
+		row.keyType = normalizedKey.keyType
+		row.keyString = normalizedKey.keyString
+		row.keyValue = normalizedKey.dbValue
 		row.payload = payload
 		if row.op != OpDelete {
 			var payloadObj map[string]any

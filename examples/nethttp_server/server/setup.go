@@ -126,9 +126,9 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		RegisteredTables: []oversync.RegisteredTable{
 			{Schema: businessSchema, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: businessSchema, Table: "posts", SyncKeyColumns: []string{"id"}},
-			{Schema: businessSchema, Table: "categories"},
-			{Schema: businessSchema, Table: "teams"},
-			{Schema: businessSchema, Table: "team_members"},
+			{Schema: businessSchema, Table: "categories", SyncKeyColumns: []string{"id"}},
+			{Schema: businessSchema, Table: "teams", SyncKeyColumns: []string{"id"}},
+			{Schema: businessSchema, Table: "team_members", SyncKeyColumns: []string{"id"}},
 			{Schema: businessSchema, Table: "files", SyncKeyColumns: []string{"id"}},
 			{Schema: businessSchema, Table: "file_reviews", SyncKeyColumns: []string{"id"}},
 			{Schema: businessSchema, Table: "typed_rows", SyncKeyColumns: []string{"id"}},

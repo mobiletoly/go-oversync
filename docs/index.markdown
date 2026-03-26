@@ -30,7 +30,10 @@ The verified contract in this repository is:
 
 The runtime is intentionally fail-closed.
 
-- registered PostgreSQL tables must use a single-column UUID sync key
+- registered PostgreSQL tables must define exactly one visible sync key column of type `uuid` or
+  `text`
+- registered PostgreSQL tables must define `_sync_scope_id TEXT NOT NULL` and scope-inclusive
+  identity / foreign keys
 - registered and managed table sets must be FK-closed
 - unsupported key shapes and unsupported FK shapes fail during bootstrap
 - one `oversqlite.Client` owns one SQLite database at a time

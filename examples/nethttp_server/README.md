@@ -27,7 +27,8 @@ This example shows a bundle-based go-oversync server built with the standard Go 
 - The supported push transport is staged push sessions plus authoritative committed-bundle fetch.
 - Clients still push one logical dirty-set bundle and pull complete committed bundles.
 - Hydration and destructive recovery rebuild through chunked snapshot sessions.
-- Registered tables in this example use single-column UUID sync keys.
+- Registered tables in this example use hidden server ownership via `_sync_scope_id TEXT` and
+  scope-inclusive keys/FKs on PostgreSQL.
 - The example schema exercises cascades, self-references, and a two-table cycle inside the
   supported FK envelope.
 

@@ -2,8 +2,10 @@ package oversync
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -129,6 +131,29 @@ func TestSyncService_GetStatusHealthyByDefault(t *testing.T) {
 	}
 	if status.UserStateRetentionFloorAheadCount != 0 {
 		t.Fatalf("expected zero invariant violations, got %#v", status)
+	}
+}
+
+func TestSyncService_GetCapabilities_DoesNotAdvertiseVisibleSyncKeyType(t *testing.T) {
+	svc, err := NewRuntimeService(nil, &ServiceConfig{
+		AppName: "capabilities-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: "business", Table: "docs", SyncKeyColumns: []string{"doc_id"}},
+		},
+	}, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected constructor error: %v", err)
+	}
+
+	payload, err := json.Marshal(svc.GetCapabilities())
+	if err != nil {
+		t.Fatalf("marshal capabilities: %v", err)
+	}
+	if string(payload) == "" {
+		t.Fatal("expected non-empty capabilities payload")
+	}
+	if strings.Contains(string(payload), `"sync_key_type"`) || strings.Contains(string(payload), `"_sync_scope_id"`) {
+		t.Fatalf("expected hidden-owner design to stay out of capabilities payload, got %s", payload)
 	}
 }
 

@@ -45,6 +45,7 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		bundleRowsKeyIndexExists         bool
 		snapshotSessionsTTLIndexExists   bool
 		snapshotSessionRowsIndexExists   bool
+		ownerGuardFunctionExists         bool
 		captureFunctionExists            bool
 		snapshotLastAccessedColumnCount  int
 		primaryKeyCount                  int
@@ -72,6 +73,7 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 			to_regclass('sync.br_user_bundle_key_idx') IS NOT NULL,
 			to_regclass('sync.ss_expires_at_idx') IS NOT NULL,
 			to_regclass('sync.ssr_snapshot_row_ordinal_idx') IS NOT NULL,
+			to_regprocedure('sync.enforce_registered_row_owner()') IS NOT NULL,
 			to_regprocedure('sync.capture_registered_row_change()') IS NOT NULL
 	`).Scan(
 		&userStateExists,
@@ -93,6 +95,7 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		&bundleRowsKeyIndexExists,
 		&snapshotSessionsTTLIndexExists,
 		&snapshotSessionRowsIndexExists,
+		&ownerGuardFunctionExists,
 		&captureFunctionExists,
 	))
 
@@ -115,6 +118,7 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 	require.True(t, bundleRowsKeyIndexExists)
 	require.True(t, snapshotSessionsTTLIndexExists)
 	require.True(t, snapshotSessionRowsIndexExists)
+	require.True(t, ownerGuardFunctionExists)
 	require.True(t, captureFunctionExists)
 
 	require.NoError(t, pool.QueryRow(ctx, `
@@ -160,12 +164,21 @@ func TestBootstrap_FailsWhenRegisteredTablesAreNotFKClosed(t *testing.T) {
 	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
 	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.users (id UUID PRIMARY KEY)`, schemaIdent))
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.users (
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
+		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.posts (
-			id UUID PRIMARY KEY,
-			author_id UUID NOT NULL REFERENCES %s.users(id)
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			author_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id),
+			CONSTRAINT posts_author_id_fkey
+				FOREIGN KEY (_sync_scope_id, author_id) REFERENCES %s.users(_sync_scope_id, id)
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 
@@ -173,7 +186,7 @@ func TestBootstrap_FailsWhenRegisteredTablesAreNotFKClosed(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "fk-closure-reject-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "posts"},
+			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 	require.NoError(t, err)
@@ -204,10 +217,12 @@ func TestBootstrap_AllowsSelfReferencingRegisteredTable(t *testing.T) {
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.categories (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			parent_id UUID,
+			PRIMARY KEY (_sync_scope_id, id),
 			CONSTRAINT categories_parent_id_fkey
-				FOREIGN KEY (parent_id) REFERENCES %s.categories(id)
+				FOREIGN KEY (_sync_scope_id, parent_id) REFERENCES %s.categories(_sync_scope_id, id)
 				DEFERRABLE INITIALLY IMMEDIATE
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
@@ -216,7 +231,7 @@ func TestBootstrap_AllowsSelfReferencingRegisteredTable(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "fk-self-ref-ok-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "categories"},
+			{Schema: schemaName, Table: "categories", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 	require.NoError(t, err)
@@ -224,7 +239,7 @@ func TestBootstrap_AllowsSelfReferencingRegisteredTable(t *testing.T) {
 	require.NoError(t, svc.Close(context.Background()))
 }
 
-func TestBootstrap_FailsWhenRegisteredTableUsesUnsupportedNonUUIDSyncKey(t *testing.T) {
+func TestBootstrap_AcceptsTextVisibleSyncKey(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -241,29 +256,27 @@ func TestBootstrap_FailsWhenRegisteredTableUsesUnsupportedNonUUIDSyncKey(t *test
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.products (
-			code TEXT PRIMARY KEY,
-			name TEXT NOT NULL
+			_sync_scope_id TEXT NOT NULL,
+			code TEXT NOT NULL,
+			name TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, code)
 		)`, schemaIdent))
 	require.NoError(t, err)
 
 	svc, err := NewRuntimeService(pool, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
-		AppName:                   "fk-key-type-reject-test",
+		AppName:                   "fk-key-type-accept-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "products"},
+			{Schema: schemaName, Table: "products", SyncKeyColumns: []string{"code"}},
 		},
 	}, logger)
 	require.NoError(t, err)
 
-	err = svc.Bootstrap(ctx)
-	require.Error(t, err)
-	var schemaErr *UnsupportedSchemaError
-	require.ErrorAs(t, err, &schemaErr)
-	require.Contains(t, err.Error(), "unsupported sync key column type")
-	require.Contains(t, err.Error(), schemaName+".products")
+	require.NoError(t, svc.Bootstrap(ctx))
+	require.NoError(t, svc.Close(context.Background()))
 }
 
-func TestBootstrap_FailsWhenRegisteredTableUsesCompositePrimaryKey(t *testing.T) {
+func TestBootstrap_FailsWhenRegisteredTableUsesUnsupportedNumericSyncKey(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -280,17 +293,18 @@ func TestBootstrap_FailsWhenRegisteredTableUsesCompositePrimaryKey(t *testing.T)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.memberships (
-			user_id UUID NOT NULL,
-			group_id UUID NOT NULL,
-			PRIMARY KEY (user_id, group_id)
+			_sync_scope_id TEXT NOT NULL,
+			membership_no BIGINT NOT NULL,
+			name TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, membership_no)
 		)`, schemaIdent))
 	require.NoError(t, err)
 
 	svc, err := NewRuntimeService(pool, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
-		AppName:                   "fk-composite-key-reject-test",
+		AppName:                   "fk-key-type-reject-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "memberships"},
+			{Schema: schemaName, Table: "memberships", SyncKeyColumns: []string{"membership_no"}},
 		},
 	}, logger)
 	require.NoError(t, err)
@@ -299,11 +313,52 @@ func TestBootstrap_FailsWhenRegisteredTableUsesCompositePrimaryKey(t *testing.T)
 	require.Error(t, err)
 	var schemaErr *UnsupportedSchemaError
 	require.ErrorAs(t, err, &schemaErr)
-	require.Contains(t, err.Error(), "must have a single-column primary key")
+	require.Contains(t, err.Error(), "allows only uuid and text")
 	require.Contains(t, err.Error(), schemaName+".memberships")
 }
 
-func TestBootstrap_FailsWhenDeclaredSyncKeyDoesNotMatchPrimaryKey(t *testing.T) {
+func TestBootstrap_FailsWhenRegisteredTableUsesUnsupportedIntegerSyncKey(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "fk_integer_key_reject_" + suffix
+	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
+
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.counters (
+			_sync_scope_id TEXT NOT NULL,
+			counter_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, counter_id)
+		)`, schemaIdent))
+	require.NoError(t, err)
+
+	svc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "fk-integer-key-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "counters", SyncKeyColumns: []string{"counter_id"}},
+		},
+	}, logger)
+	require.NoError(t, err)
+
+	err = svc.Bootstrap(ctx)
+	require.Error(t, err)
+	var schemaErr *UnsupportedSchemaError
+	require.ErrorAs(t, err, &schemaErr)
+	require.Contains(t, err.Error(), "allows only uuid and text")
+	require.Contains(t, err.Error(), schemaName+".counters")
+}
+
+func TestBootstrap_AllowsVisibleSyncKeyThatDiffersFromPrimaryKey(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -320,8 +375,11 @@ func TestBootstrap_FailsWhenDeclaredSyncKeyDoesNotMatchPrimaryKey(t *testing.T) 
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.users (
-			id UUID PRIMARY KEY,
-			external_id UUID UNIQUE
+			_sync_scope_id TEXT NOT NULL,
+			pk_id UUID NOT NULL,
+			external_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, pk_id),
+			UNIQUE (_sync_scope_id, external_id)
 		)`, schemaIdent))
 	require.NoError(t, err)
 
@@ -334,15 +392,52 @@ func TestBootstrap_FailsWhenDeclaredSyncKeyDoesNotMatchPrimaryKey(t *testing.T) 
 	}, logger)
 	require.NoError(t, err)
 
+	require.NoError(t, svc.Bootstrap(ctx))
+	require.NoError(t, svc.Close(context.Background()))
+}
+
+func TestBootstrap_FailsWhenRegisteredTableLacksOwnerScopedSyncKeyUniqueness(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "fk_owner_uniqueness_reject_" + suffix
+	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
+
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.docs (
+			_sync_scope_id TEXT NOT NULL,
+			pk_id UUID NOT NULL,
+			doc_id UUID NOT NULL,
+			title TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, pk_id)
+		)`, schemaIdent))
+	require.NoError(t, err)
+
+	svc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "fk-owner-uniqueness-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "docs", SyncKeyColumns: []string{"doc_id"}},
+		},
+	}, logger)
+	require.NoError(t, err)
+
 	err = svc.Bootstrap(ctx)
 	require.Error(t, err)
 	var schemaErr *UnsupportedSchemaError
 	require.ErrorAs(t, err, &schemaErr)
-	require.Contains(t, err.Error(), "requires the table primary key")
-	require.Contains(t, err.Error(), "external_id")
+	require.Contains(t, err.Error(), "must provide unique identity (_sync_scope_id, doc_id)")
 }
 
-func TestBootstrap_FailsWhenRegisteredSchemaContainsCompositeFKConstraint(t *testing.T) {
+func TestBootstrap_FailsWhenRegisteredSchemaContainsOwnerlessUniqueConstraint(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -358,28 +453,20 @@ func TestBootstrap_FailsWhenRegisteredSchemaContainsCompositeFKConstraint(t *tes
 	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		CREATE TABLE %s.parent (
-			id UUID PRIMARY KEY,
-			tenant_id UUID NOT NULL,
-			UNIQUE (tenant_id, id)
+		CREATE TABLE %s.profiles (
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			name TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id),
+			UNIQUE (name)
 		)`, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		CREATE TABLE %s.child (
-			id UUID PRIMARY KEY,
-			tenant_id UUID NOT NULL,
-			parent_id UUID NOT NULL,
-			CONSTRAINT child_parent_composite_fk
-				FOREIGN KEY (tenant_id, parent_id) REFERENCES %s.parent(tenant_id, id)
-		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 
 	svc, err := NewRuntimeService(pool, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
-		AppName:                   "fk-composite-reject-test",
+		AppName:                   "ownerless-unique-reject-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "parent"},
-			{Schema: schemaName, Table: "child"},
+			{Schema: schemaName, Table: "profiles", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 	require.NoError(t, err)
@@ -388,8 +475,8 @@ func TestBootstrap_FailsWhenRegisteredSchemaContainsCompositeFKConstraint(t *tes
 	require.Error(t, err)
 	var schemaErr *UnsupportedSchemaError
 	require.ErrorAs(t, err, &schemaErr)
-	require.Contains(t, err.Error(), "unsupported composite FK constraints")
-	require.Contains(t, err.Error(), "child_parent_composite_fk")
+	require.Contains(t, err.Error(), "does not begin with _sync_scope_id")
+	require.Contains(t, err.Error(), "profiles")
 }
 
 func TestBootstrap_FailsClosedWhenRegisteredFKRemainsNonDeferrable(t *testing.T) {
@@ -407,14 +494,21 @@ func TestBootstrap_FailsClosedWhenRegisteredFKRemainsNonDeferrable(t *testing.T)
 	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
 	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.parent (id UUID PRIMARY KEY)`, schemaIdent))
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.parent (
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
+		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.child (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			parent_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id),
 			CONSTRAINT child_parent_fk
-				FOREIGN KEY (parent_id) REFERENCES %s.parent(id)
+				FOREIGN KEY (_sync_scope_id, parent_id) REFERENCES %s.parent(_sync_scope_id, id)
 				NOT DEFERRABLE
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
@@ -423,8 +517,8 @@ func TestBootstrap_FailsClosedWhenRegisteredFKRemainsNonDeferrable(t *testing.T)
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "fk-nondeferrable-reject-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "parent"},
-			{Schema: schemaName, Table: "child"},
+			{Schema: schemaName, Table: "parent", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "child", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 	require.NoError(t, err)
@@ -436,6 +530,187 @@ func TestBootstrap_FailsClosedWhenRegisteredFKRemainsNonDeferrable(t *testing.T)
 	require.Contains(t, err.Error(), "non-deferrable FK constraints")
 	require.Contains(t, err.Error(), schemaName+".child_parent_fk")
 	require.Contains(t, err.Error(), "make these constraints DEFERRABLE before bootstrap")
+}
+
+func TestBootstrap_FailsWhenOwnerColumnIsNotText(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "owner_type_reject_" + suffix
+	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
+
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.docs (
+			_sync_scope_id UUID NOT NULL,
+			id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
+		)`, schemaIdent))
+	require.NoError(t, err)
+
+	svc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "owner-type-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "docs", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+	require.NoError(t, err)
+
+	err = svc.Bootstrap(ctx)
+	require.Error(t, err)
+	var schemaErr *UnsupportedSchemaError
+	require.ErrorAs(t, err, &schemaErr)
+	require.Contains(t, err.Error(), "must define _sync_scope_id TEXT")
+}
+
+func TestBootstrap_FailsWhenRegisteredTableUsesPartialUniqueIndex(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "partial_unique_reject_" + suffix
+	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
+
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.docs (
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			deleted_at TIMESTAMPTZ
+		)`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE UNIQUE INDEX docs_owner_id_live_idx
+		ON %s.docs (_sync_scope_id, id)
+		WHERE deleted_at IS NULL
+	`, schemaIdent))
+	require.NoError(t, err)
+
+	svc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "partial-unique-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "docs", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+	require.NoError(t, err)
+
+	err = svc.Bootstrap(ctx)
+	require.Error(t, err)
+	var schemaErr *UnsupportedSchemaError
+	require.ErrorAs(t, err, &schemaErr)
+	require.Contains(t, err.Error(), "partial or expression unique index")
+}
+
+func TestBootstrap_FailsWhenRegisteredTableUsesExpressionUniqueIndex(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "expression_unique_reject_" + suffix
+	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
+
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.docs (
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			title TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
+		)`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE UNIQUE INDEX docs_owner_title_expr_uidx
+		ON %s.docs (_sync_scope_id, lower(title))
+	`, schemaIdent))
+	require.NoError(t, err)
+
+	svc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "expression-unique-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "docs", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+	require.NoError(t, err)
+
+	err = svc.Bootstrap(ctx)
+	require.Error(t, err)
+	var schemaErr *UnsupportedSchemaError
+	require.ErrorAs(t, err, &schemaErr)
+	require.Contains(t, err.Error(), "partial or expression unique index")
+}
+
+func TestBootstrap_FailsWhenRegisteredChildFKOmitsOwnerColumn(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "fk_ownerless_reject_" + suffix
+	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
+
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.parent (
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
+		)`, schemaIdent))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.child (
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			parent_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id),
+			CONSTRAINT child_parent_fk
+				FOREIGN KEY (parent_id, _sync_scope_id) REFERENCES %s.parent(id, _sync_scope_id)
+				DEFERRABLE INITIALLY IMMEDIATE
+		)`, schemaIdent, schemaIdent))
+	require.NoError(t, err)
+
+	svc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "fk-ownerless-reject-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "parent", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "child", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+	require.NoError(t, err)
+
+	err = svc.Bootstrap(ctx)
+	require.Error(t, err)
+	var schemaErr *UnsupportedSchemaError
+	require.ErrorAs(t, err, &schemaErr)
+	require.Contains(t, err.Error(), "scope-inclusive")
+	require.Contains(t, err.Error(), "child_parent_fk")
 }
 
 func TestBootstrap_AllowsDeferrableButInitiallyImmediateFKs(t *testing.T) {
@@ -453,14 +728,21 @@ func TestBootstrap_AllowsDeferrableButInitiallyImmediateFKs(t *testing.T) {
 	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
 	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.parent (id UUID PRIMARY KEY)`, schemaIdent))
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s.parent (
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
+		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.child (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			parent_id UUID,
+			PRIMARY KEY (_sync_scope_id, id),
 			CONSTRAINT child_parent_fk
-				FOREIGN KEY (parent_id) REFERENCES %s.parent(id)
+				FOREIGN KEY (_sync_scope_id, parent_id) REFERENCES %s.parent(_sync_scope_id, id)
 				DEFERRABLE INITIALLY IMMEDIATE
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
@@ -469,8 +751,8 @@ func TestBootstrap_AllowsDeferrableButInitiallyImmediateFKs(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "fk-initially-immediate-ok-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "parent"},
-			{Schema: schemaName, Table: "child"},
+			{Schema: schemaName, Table: "parent", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "child", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 	require.NoError(t, err)

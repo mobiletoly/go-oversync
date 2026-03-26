@@ -57,7 +57,7 @@ func TestProcessPull_FreezesStableBundleSeqAndPagesByBundleCount(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "pull-bundles-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -82,6 +82,7 @@ func TestProcessPull_FreezesStableBundleSeqAndPagesByBundleCount(t *testing.T) {
 	require.Equal(t, int64(3), page1.StableBundleSeq)
 	require.Len(t, page1.Bundles, 1)
 	require.Equal(t, int64(1), page1.Bundles[0].BundleSeq)
+	require.NotContains(t, string(page1.Bundles[0].Rows[0].Payload), `"_sync_scope_id"`)
 	require.True(t, page1.HasMore)
 
 	resp4 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 4, row4, "Four")
@@ -116,7 +117,7 @@ func TestProcessPull_RejectsCheckpointBelowRetainedBundleFloor(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "pull-pruned-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 

@@ -138,6 +138,54 @@ func TestPullToStable_AppliesMultipleBundlesToFrozenCeiling(t *testing.T) {
 	require.Equal(t, int64(3), lastBundleSeq)
 }
 
+func TestPullToStable_AppliesTextSyncKeyBundleRows(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "docs", SyncKeyColumnName: "doc_id"}}, `
+		CREATE TABLE docs (
+			doc_id TEXT PRIMARY KEY,
+			body TEXT NOT NULL
+		)
+	`)
+
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/sync/pull", r.URL.Path)
+		return jsonResponse(oversync.PullResponse{
+			StableBundleSeq: 1,
+			HasMore:         false,
+			Bundles: []oversync.Bundle{{
+				BundleSeq:      1,
+				SourceID:       "peer-a",
+				SourceBundleID: 11,
+				Rows: []oversync.BundleRow{{
+					Schema:     "main",
+					Table:      "docs",
+					Key:        oversync.SyncKey{"doc_id": "doc-1"},
+					Op:         oversync.OpInsert,
+					RowVersion: 1,
+					Payload:    []byte(`{"doc_id":"doc-1","body":"Hello text key"}`),
+				}},
+			}},
+		}), nil
+	})}
+
+	require.NoError(t, client.PullToStable(ctx))
+
+	var body string
+	require.NoError(t, db.QueryRow(`SELECT body FROM docs WHERE doc_id = ?`, "doc-1").Scan(&body))
+	require.Equal(t, "Hello text key", body)
+
+	var rowVersion int64
+	var deleted int
+	require.NoError(t, db.QueryRow(`
+		SELECT row_version, deleted
+		FROM _sync_row_state
+		WHERE schema_name = 'main' AND table_name = 'docs' AND key_json = ?
+	`, `{"doc_id":"doc-1"}`).Scan(&rowVersion, &deleted))
+	require.Equal(t, int64(1), rowVersion)
+	require.Equal(t, 0, deleted)
+}
+
 func TestPullToStable_RejectsDirtyRows(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `

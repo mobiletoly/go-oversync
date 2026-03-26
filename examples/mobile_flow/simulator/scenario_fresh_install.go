@@ -3,7 +3,6 @@ package simulator
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // FreshInstallScenario simulates a fresh app installation
@@ -103,16 +102,13 @@ func (s *FreshInstallScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("failed to sign in: %w", err)
 	}
 
-	// Wait for initial sync to complete using background loops
-	logger.Info("⏳ Waiting for initial sync to complete...")
-	time.Sleep(5 * time.Second)
-
-	// Trigger sync manually to ensure completion
-	s.app.sync.TriggerUpload()
-	s.app.sync.TriggerDownload()
-
-	// Wait a bit more for sync to finish
-	time.Sleep(3 * time.Second)
+	// Use explicit sync calls here so the scenario remains deterministic even if
+	// the background downloader wakes up before the uploader.
+	s.app.StopSync()
+	logger.Info("⏳ Uploading initial dirty set explicitly...")
+	if err := s.app.PushPending(ctx); err != nil {
+		return fmt.Errorf("failed to push initial dirty set: %w", err)
+	}
 
 	logger.Info("✅ Phase 2 complete: First sync finished")
 

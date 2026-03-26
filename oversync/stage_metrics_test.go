@@ -64,7 +64,7 @@ func TestProcessPull_EmitsStageMetrics(t *testing.T) {
 		AppName:                   "pull-metrics-test",
 		StageMetrics:              recorder,
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 

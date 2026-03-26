@@ -10,6 +10,11 @@ All `/sync/*` endpoints are expected to be mounted behind authentication. The ha
 authenticated `oversync.Actor{UserID, SourceID}` in request context. `GET /health` and
 `GET /status` do not require an authenticated actor.
 
+All visible sync keys are structured JSON objects whose values are strings on the wire. UUID-valued
+keys use canonical dashed lowercase UUID strings. Hidden server ownership columns such as
+`_sync_scope_id` never appear in client-visible payloads, conflicts, committed bundle rows, or
+snapshot rows.
+
 ## POST `/sync/push-sessions`
 
 Create one staging push session for a logical dirty-set bundle.

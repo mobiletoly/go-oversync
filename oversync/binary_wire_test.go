@@ -72,7 +72,7 @@ func TestBinaryWire_ProcessPushAcceptedBundleCanonicalizesByteaPayload(t *testin
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "push-binary-wire-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "files"},
+			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -85,6 +85,7 @@ func TestBinaryWire_ProcessPushAcceptedBundleCanonicalizesByteaPayload(t *testin
 	require.Len(t, bundle.Rows, 1)
 	require.Equal(t, "files", bundle.Rows[0].Table)
 	requirePayloadFieldBase64(t, bundle.Rows[0].Payload, "data", fileData)
+	require.NotContains(t, string(bundle.Rows[0].Payload), `"_sync_scope_id"`)
 
 	var persistedData []byte
 	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
@@ -117,7 +118,7 @@ func TestBinaryWire_ProcessPullCanonicalizesByteaPayload(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "pull-binary-wire-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "files"},
+			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -152,7 +153,7 @@ func TestBinaryWire_SnapshotChunkCanonicalizesByteaPayload(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "snapshot-binary-wire-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "files"},
+			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 

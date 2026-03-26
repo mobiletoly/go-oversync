@@ -357,6 +357,9 @@ func configuredPrimaryKeyColumn(tableInfo *TableInfo, syncTable SyncTable) (stri
 			if !col.IsPrimaryKey {
 				return "", fmt.Errorf("configured primary key column %s for table %s is not declared as PRIMARY KEY", col.Name, syncTable.TableName)
 			}
+			if _, err := supportedLocalSyncKeyKind(tableInfo, col.Name, syncTable.TableName); err != nil {
+				return "", err
+			}
 			return col.Name, nil
 		}
 	}

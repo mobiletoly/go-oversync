@@ -6,7 +6,9 @@ info:
     Bundle-based two-way sync API for single-user multi-device replication.
 
     The server treats business tables as authoritative. Replication history is derived from
-    committed business-table effects and exposed as complete committed bundles.
+    committed business-table effects and exposed as complete committed bundles. Registered
+    PostgreSQL tables are scope-bound on the server, but the hidden server owner column does not
+    appear on the wire.
 servers:
   - url: http://localhost:8080
     description: Development server
@@ -493,7 +495,7 @@ components:
     SyncKey:
       type: object
       additionalProperties: true
-      description: Canonical structured sync key for a row. UUID-valued sync keys use dashed UUID strings on the wire.
+      description: Canonical structured sync key for a row. Visible sync key values are strings on the wire. UUID-valued sync keys use canonical dashed lowercase UUID strings.
 
     BundleRow:
       type: object
@@ -517,7 +519,7 @@ components:
           type: object
           nullable: true
           additionalProperties: true
-          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE in HTTP JSON. For bundle-hash verification, omitted DELETE payload normalizes to logical JSON null before hashing. Non-key binary payload fields use standard base64 on the wire.
+          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE in HTTP JSON. Hidden server columns such as _sync_scope_id are excluded. For bundle-hash verification, omitted DELETE payload normalizes to logical JSON null before hashing. Non-key binary payload fields use standard base64 on the wire.
 
     Bundle:
       type: object
@@ -561,7 +563,7 @@ components:
           type: object
           nullable: true
           additionalProperties: true
-          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE. Non-key binary payload fields use standard base64 on the wire.
+          description: Full-row after-image for INSERT/UPDATE; omitted for DELETE. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64 on the wire.
 
     PushSessionCreateRequest:
       type: object
@@ -694,7 +696,7 @@ components:
         payload:
           type: object
           additionalProperties: true
-          description: Full-row after-image for one current row. Non-key binary payload fields use standard base64 on the wire.
+          description: Full-row after-image for one current row. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64 on the wire.
 
     CommittedBundleRowsResponse:
       type: object
@@ -903,6 +905,7 @@ components:
           type: object
           nullable: true
           additionalProperties: true
+          description: Authoritative server row after-image for conflict recovery. Hidden server columns such as _sync_scope_id are excluded.
 
     StatusResponse:
       type: object

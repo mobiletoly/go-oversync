@@ -44,16 +44,19 @@ separate per-user transactions or bundles.
 
 Registered PostgreSQL tables must satisfy these rules before bootstrap:
 
-- one `UUID` primary key per registered table
-- one sync key column, matching that primary key
+- exactly one visible sync key column per registered table
+- visible sync key type must be `uuid` or `text`
+- every registered table must define `_sync_scope_id TEXT NOT NULL`
+- `(_sync_scope_id, sync_key)` must be unique
+- every unique constraint or unique index on a registered table must include `_sync_scope_id`
 - registered table sets must be FK-closed
-- supported foreign keys on registered tables must be `DEFERRABLE`
+- registered-to-registered foreign keys must be scope-inclusive and `DEFERRABLE`
 - supported `ON DELETE` / `ON UPDATE` actions are `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`,
   and `SET DEFAULT`
 - supported `MATCH` options are empty, `NONE`, or `SIMPLE`
 - `DEFERRABLE INITIALLY DEFERRED` is recommended
 - `DEFERRABLE INITIALLY IMMEDIATE` is accepted
-- composite primary keys and composite foreign keys are unsupported
+- partial, predicate, and expression unique indexes are unsupported on registered tables
 
 Bootstrap validates these requirements and fails closed with an `UnsupportedSchemaError` if the
 registered schema is outside the supported envelope.
@@ -73,4 +76,6 @@ registered schema is outside the supported envelope.
 
 The handlers expect the caller to authenticate first and place
 `oversync.Actor{UserID, SourceID}` into request context. The example servers do this with JWT
-middleware, but the runtime does not require any specific auth stack.
+middleware, but the runtime does not require any specific auth stack. `_sync_scope_id` is derived
+from `Actor.UserID`, enforced only on the authoritative PostgreSQL side, and excluded from
+client-visible payloads, conflicts, pulls, and snapshots.

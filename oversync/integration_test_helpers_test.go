@@ -71,21 +71,25 @@ func resetTestBusinessSchema(ctx context.Context, pool *pgxpool.Pool, schema str
 
 	if _, err := pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.users (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			name TEXT NOT NULL,
-			email TEXT NOT NULL
+			email TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
 		)`, schemaIdent)); err != nil {
 		return fmt.Errorf("create %s.users: %w", schema, err)
 	}
 
 	if _, err := pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.posts (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			title TEXT NOT NULL,
 			content TEXT NOT NULL,
 			author_id UUID NOT NULL,
-			CONSTRAINT posts_author_id_fkey FOREIGN KEY (author_id)
-				REFERENCES %s.users(id)
+			PRIMARY KEY (_sync_scope_id, id),
+			CONSTRAINT posts_author_id_fkey FOREIGN KEY (_sync_scope_id, author_id)
+				REFERENCES %s.users(_sync_scope_id, id)
 				ON DELETE CASCADE
 				DEFERRABLE INITIALLY DEFERRED
 		)`, schemaIdent, schemaIdent)); err != nil {
@@ -94,20 +98,24 @@ func resetTestBusinessSchema(ctx context.Context, pool *pgxpool.Pool, schema str
 
 	if _, err := pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.files (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			name TEXT NOT NULL,
-			data BYTEA NOT NULL
+			data BYTEA NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
 		)`, schemaIdent)); err != nil {
 		return fmt.Errorf("create %s.files: %w", schema, err)
 	}
 
 	if _, err := pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.file_reviews (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			review TEXT NOT NULL,
 			file_id UUID NOT NULL,
-			CONSTRAINT file_reviews_file_id_fkey FOREIGN KEY (file_id)
-				REFERENCES %s.files(id)
+			PRIMARY KEY (_sync_scope_id, id),
+			CONSTRAINT file_reviews_file_id_fkey FOREIGN KEY (_sync_scope_id, file_id)
+				REFERENCES %s.files(_sync_scope_id, id)
 				ON DELETE CASCADE
 				DEFERRABLE INITIALLY DEFERRED
 		)`, schemaIdent, schemaIdent)); err != nil {

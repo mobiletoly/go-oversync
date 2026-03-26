@@ -17,8 +17,10 @@ This guide reflects the current contract implemented in this repository:
 
 The supported envelope is intentionally narrow:
 
-- single-column UUID sync keys on registered PostgreSQL tables
-- single-column foreign keys between registered tables
+- exactly one visible sync key column per registered PostgreSQL table
+- visible sync key type `uuid` or `text` on registered PostgreSQL tables
+- scope-bound registered PostgreSQL identity through `_sync_scope_id TEXT NOT NULL`
+- scope-inclusive foreign keys between registered PostgreSQL tables
 - FK-closed server and client table sets
 - fail-closed bootstrap if schema or config falls outside that envelope
 
@@ -26,10 +28,14 @@ The supported envelope is intentionally narrow:
 
 Registered PostgreSQL tables must satisfy these rules:
 
-- each registered table must have exactly one sync key column, and it must be the table's `UUID`
-  primary key
+- each registered table must have exactly one visible sync key column
+- visible sync key type must be `uuid` or `text`
+- each registered table must define `_sync_scope_id TEXT NOT NULL`
+- `(_sync_scope_id, sync_key)` must be unique
+- every unique constraint and unique index on a registered table must include `_sync_scope_id`
 - every registered foreign key must point to another registered table or to the same registered
   table for self-references
+- every registered foreign key must include `_sync_scope_id`
 - every supported foreign key on a registered table must be `DEFERRABLE`
 - supported `ON DELETE` / `ON UPDATE` actions are `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`,
   or `SET DEFAULT`
@@ -37,7 +43,7 @@ Registered PostgreSQL tables must satisfy these rules:
 - `DEFERRABLE INITIALLY DEFERRED` is recommended
 - `DEFERRABLE INITIALLY IMMEDIATE` is accepted because the runtime defers constraints inside sync
   transactions
-- composite primary keys and composite foreign keys are unsupported
+- partial, predicate, and expression unique indexes are unsupported on registered tables
 
 If a table violates these rules, `Bootstrap()` fails with an `UnsupportedSchemaError`.
 
@@ -45,16 +51,20 @@ Recommended pattern:
 
 ```sql
 CREATE TABLE business.users (
-    id UUID PRIMARY KEY,
+    _sync_scope_id TEXT NOT NULL,
+    id UUID NOT NULL,
     name TEXT NOT NULL
+    PRIMARY KEY (_sync_scope_id, id)
 );
 
 CREATE TABLE business.posts (
-    id UUID PRIMARY KEY,
+    _sync_scope_id TEXT NOT NULL,
+    id UUID NOT NULL,
     author_id UUID NOT NULL,
     title TEXT NOT NULL,
+    PRIMARY KEY (_sync_scope_id, id),
     CONSTRAINT posts_author_id_fkey
-        FOREIGN KEY (author_id) REFERENCES business.users(id)
+        FOREIGN KEY (_sync_scope_id, author_id) REFERENCES business.users(_sync_scope_id, id)
         ON DELETE CASCADE
         DEFERRABLE INITIALLY DEFERRED
 );
@@ -100,20 +110,25 @@ docker exec oversync-pg createdb -U postgres my_sync_app
 CREATE SCHEMA IF NOT EXISTS business;
 
 CREATE TABLE IF NOT EXISTS business.users (
-    id UUID PRIMARY KEY,
+    _sync_scope_id TEXT NOT NULL,
+    id UUID NOT NULL,
     name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    email TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (_sync_scope_id, id),
+    UNIQUE (_sync_scope_id, email)
 );
 
 CREATE TABLE IF NOT EXISTS business.posts (
-    id UUID PRIMARY KEY,
+    _sync_scope_id TEXT NOT NULL,
+    id UUID NOT NULL,
     author_id UUID NOT NULL,
     title TEXT NOT NULL,
     content TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (_sync_scope_id, id),
     CONSTRAINT posts_author_id_fkey
-        FOREIGN KEY (author_id) REFERENCES business.users(id)
+        FOREIGN KEY (_sync_scope_id, author_id) REFERENCES business.users(_sync_scope_id, id)
         ON DELETE CASCADE
         DEFERRABLE INITIALLY DEFERRED
 );
@@ -183,9 +198,14 @@ func main() {
 ```
 
 `yourAuthMiddleware` must authenticate the request and inject
-`oversync.Actor{UserID, SourceID}` into request context.
+`oversync.Actor{UserID, SourceID}` into request context. The server derives `_sync_scope_id` from
+`Actor.UserID`, so clients must not send `_sync_scope_id` in push payloads.
 
 ## Step 4: Create The SQLite Client
+
+Local SQLite managed tables must declare exactly one visible sync key column, and that column
+must also be the local SQLite `PRIMARY KEY` in the current runtime. Supported local key shapes are
+`TEXT PRIMARY KEY` and UUID-backed `BLOB PRIMARY KEY`.
 
 ```go
 package main

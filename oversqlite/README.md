@@ -99,6 +99,10 @@ if err := client.PullToStable(context.Background()); err != nil {
   SQLite file or handle.
 - Local FK cascades and local trigger-generated writes on managed tables are captured into `_sync_dirty_rows`.
 - Primary-key changes are represented as delete-plus-upsert on the client dirty set.
+- Each managed table must declare exactly one visible sync key column.
+- The visible sync key column must also be the local SQLite `PRIMARY KEY` in the current runtime.
+- Supported local visible sync key shapes are `TEXT PRIMARY KEY` and UUID-backed `BLOB PRIMARY KEY`.
+- Integer-like local sync key primary keys are rejected during client startup.
 
 ## Timestamp fields
 

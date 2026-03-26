@@ -51,7 +51,7 @@ func TestPushSessions_ConflictRejectsWholeBundle(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "push-conflict-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -79,6 +79,8 @@ func TestPushSessions_ConflictRejectsWholeBundle(t *testing.T) {
 	}})
 	var conflictErr *PushConflictError
 	require.ErrorAs(t, err, &conflictErr)
+	require.NotNil(t, conflictErr.Conflict)
+	require.NotContains(t, string(conflictErr.Conflict.ServerRow), `"_sync_scope_id"`)
 
 	var bundleCount int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_id = $1`, userID).Scan(&bundleCount))
@@ -87,6 +89,141 @@ func TestPushSessions_ConflictRejectsWholeBundle(t *testing.T) {
 	var name string
 	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id = $1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&name))
 	require.Equal(t, "Alice", name)
+}
+
+func TestPushSessions_AllowsSameVisibleSyncKeyForDifferentUsers(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "push_same_key_users_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "push-same-key-users-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	rowID := uuid.New()
+	actorA := Actor{UserID: "push-same-key-user-a-" + suffix, SourceID: "device-a"}
+	actorB := Actor{UserID: "push-same-key-user-b-" + suffix, SourceID: "device-b"}
+
+	_, err := pushRowsViaSession(t, ctx, svc, actorA, 1, []PushRequestRow{{
+		Schema:         schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alice","email":"alice@example.com"}`, rowID)),
+	}})
+	require.NoError(t, err)
+
+	_, err = pushRowsViaSession(t, ctx, svc, actorB, 1, []PushRequestRow{{
+		Schema:         schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Bob","email":"bob@example.com"}`, rowID)),
+	}})
+	require.NoError(t, err)
+
+	var rowCount int
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.users WHERE id = $1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&rowCount))
+	require.Equal(t, 2, rowCount)
+
+	var nameA string
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT name
+		FROM %s.users
+		WHERE _sync_scope_id = $1 AND id = $2
+	`, pgx.Identifier{schemaName}.Sanitize()), actorA.UserID, rowID).Scan(&nameA))
+	require.Equal(t, "Alice", nameA)
+
+	var nameB string
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT name
+		FROM %s.users
+		WHERE _sync_scope_id = $1 AND id = $2
+	`, pgx.Identifier{schemaName}.Sanitize()), actorB.UserID, rowID).Scan(&nameB))
+	require.Equal(t, "Bob", nameB)
+}
+
+func TestPushSessions_WrongOwnerUpdateDeleteDoNotAffectAnotherUsersRow(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "push_wrong_owner_conflict_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "push-wrong-scope-conflict-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	rowID := uuid.New()
+	actorA := Actor{UserID: "push-owner-a-" + suffix, SourceID: "device-a"}
+	actorB := Actor{UserID: "push-owner-b-" + suffix, SourceID: "device-b"}
+
+	_, err := pushRowsViaSession(t, ctx, svc, actorA, 1, []PushRequestRow{{
+		Schema:         schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Owner A","email":"owner-a@example.com"}`, rowID)),
+	}})
+	require.NoError(t, err)
+
+	_, err = pushRowsViaSession(t, ctx, svc, actorB, 1, []PushRequestRow{{
+		Schema:         schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpUpdate,
+		BaseRowVersion: 1,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Intruder","email":"intruder@example.com"}`, rowID)),
+	}})
+	var updateConflict *PushConflictError
+	require.ErrorAs(t, err, &updateConflict)
+	require.Equal(t, SyncKey{"id": rowID.String()}, updateConflict.Conflict.Key)
+
+	_, err = pushRowsViaSession(t, ctx, svc, actorB, 2, []PushRequestRow{{
+		Schema:         schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             OpDelete,
+		BaseRowVersion: 1,
+	}})
+	var deleteConflict *PushConflictError
+	require.ErrorAs(t, err, &deleteConflict)
+	require.Equal(t, SyncKey{"id": rowID.String()}, deleteConflict.Conflict.Key)
+
+	var name string
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT name
+		FROM %s.users
+		WHERE _sync_scope_id = $1 AND id = $2
+	`, pgx.Identifier{schemaName}.Sanitize()), actorA.UserID, rowID).Scan(&name))
+	require.Equal(t, "Owner A", name)
+
+	var rowCount int
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM %s.users
+		WHERE id = $1
+	`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&rowCount))
+	require.Equal(t, 1, rowCount)
 }
 
 func TestPushSessions_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
@@ -103,7 +240,7 @@ func TestPushSessions_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "push-update-after-insert-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -160,8 +297,8 @@ func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t 
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "push-delete-cascade-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
-			{Schema: schemaName, Table: "posts"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -249,7 +386,7 @@ func TestPushSessions_AlreadyCommittedReturnsSameCommittedBundle(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "push-replay-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users"},
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -291,11 +428,13 @@ func TestPushSessions_AllowsSelfReferentialInsert(t *testing.T) {
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.categories (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			parent_id UUID,
 			name TEXT NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id),
 			CONSTRAINT categories_parent_id_fkey
-				FOREIGN KEY (parent_id) REFERENCES %s.categories(id)
+				FOREIGN KEY (_sync_scope_id, parent_id) REFERENCES %s.categories(_sync_scope_id, id)
 				DEFERRABLE INITIALLY IMMEDIATE
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
@@ -304,7 +443,7 @@ func TestPushSessions_AllowsSelfReferentialInsert(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "push-self-ref-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "categories"},
+			{Schema: schemaName, Table: "categories", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -342,23 +481,27 @@ func TestPushSessions_AllowsTwoTableCycleInsert(t *testing.T) {
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.alpha (
-			id UUID PRIMARY KEY,
-			beta_id UUID NOT NULL
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			beta_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
 		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.beta (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			alpha_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id),
 			CONSTRAINT beta_alpha_id_fkey
-				FOREIGN KEY (alpha_id) REFERENCES %s.alpha(id)
+				FOREIGN KEY (_sync_scope_id, alpha_id) REFERENCES %s.alpha(_sync_scope_id, id)
 				DEFERRABLE INITIALLY IMMEDIATE
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		ALTER TABLE %s.alpha
 		ADD CONSTRAINT alpha_beta_id_fkey
-			FOREIGN KEY (beta_id) REFERENCES %s.beta(id)
+			FOREIGN KEY (_sync_scope_id, beta_id) REFERENCES %s.beta(_sync_scope_id, id)
 			DEFERRABLE INITIALLY IMMEDIATE
 	`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
@@ -367,8 +510,8 @@ func TestPushSessions_AllowsTwoTableCycleInsert(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "push-two-cycle-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "alpha"},
-			{Schema: schemaName, Table: "beta"},
+			{Schema: schemaName, Table: "alpha", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "beta", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
@@ -420,36 +563,42 @@ func TestPushSessions_AllowsThreeTableCycleInsert(t *testing.T) {
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.alpha (
-			id UUID PRIMARY KEY,
-			beta_id UUID NOT NULL
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			beta_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
 		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.beta (
-			id UUID PRIMARY KEY,
-			gamma_id UUID NOT NULL
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
+			gamma_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id)
 		)`, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s.gamma (
-			id UUID PRIMARY KEY,
+			_sync_scope_id TEXT NOT NULL,
+			id UUID NOT NULL,
 			alpha_id UUID NOT NULL,
+			PRIMARY KEY (_sync_scope_id, id),
 			CONSTRAINT gamma_alpha_id_fkey
-				FOREIGN KEY (alpha_id) REFERENCES %s.alpha(id)
+				FOREIGN KEY (_sync_scope_id, alpha_id) REFERENCES %s.alpha(_sync_scope_id, id)
 				DEFERRABLE INITIALLY IMMEDIATE
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		ALTER TABLE %s.alpha
 		ADD CONSTRAINT alpha_beta_id_fkey
-			FOREIGN KEY (beta_id) REFERENCES %s.beta(id)
+			FOREIGN KEY (_sync_scope_id, beta_id) REFERENCES %s.beta(_sync_scope_id, id)
 			DEFERRABLE INITIALLY IMMEDIATE
 	`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, fmt.Sprintf(`
 		ALTER TABLE %s.beta
 		ADD CONSTRAINT beta_gamma_id_fkey
-			FOREIGN KEY (gamma_id) REFERENCES %s.gamma(id)
+			FOREIGN KEY (_sync_scope_id, gamma_id) REFERENCES %s.gamma(_sync_scope_id, id)
 			DEFERRABLE INITIALLY IMMEDIATE
 	`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
@@ -458,9 +607,9 @@ func TestPushSessions_AllowsThreeTableCycleInsert(t *testing.T) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "push-three-cycle-test",
 		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "alpha"},
-			{Schema: schemaName, Table: "beta"},
-			{Schema: schemaName, Table: "gamma"},
+			{Schema: schemaName, Table: "alpha", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "beta", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "gamma", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 

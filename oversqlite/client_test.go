@@ -148,6 +148,27 @@ func TestBootstrap_PersistsConfiguredSchemaIdentity(t *testing.T) {
 	require.Equal(t, "business", schemaName)
 }
 
+func TestNewClient_RejectsUnsupportedIntegerSyncKeyColumn(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+		{TableName: "users", SyncKeyColumns: []string{"id"}},
+	}))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "supports only TEXT keys and UUID-backed BLOB keys")
+}
+
 func TestBootstrap_DifferentSourceClearsLocalStateAndRequiresRebuild(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `

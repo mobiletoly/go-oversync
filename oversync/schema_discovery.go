@@ -68,6 +68,7 @@ func NewSchemaDiscovery(pool *pgxpool.Pool, logger *slog.Logger) *SchemaDiscover
 func (sd *SchemaDiscovery) DiscoverSchemaWithDependencyOverrides(
 	ctx context.Context,
 	registeredTables map[string]bool,
+	registeredTableInfo map[string]registeredTableRuntimeInfo,
 	dependencyOverrides map[string][]string,
 ) (*DiscoveredSchema, error) {
 	// Step 1: Get all foreign key constraints for registered tables
@@ -78,7 +79,7 @@ func (sd *SchemaDiscovery) DiscoverSchemaWithDependencyOverrides(
 	if err := validateRegisteredForeignKeyClosure(fkConstraints, registeredTables); err != nil {
 		return nil, err
 	}
-	if err := validateSupportedForeignKeyConstraints(fkConstraints, registeredTables); err != nil {
+	if err := validateSupportedForeignKeyConstraints(fkConstraints, registeredTables, registeredTableInfo); err != nil {
 		return nil, err
 	}
 
@@ -156,7 +157,11 @@ func validateRegisteredForeignKeyClosure(fkConstraints []ForeignKeyConstraint, r
 	return unsupportedSchemaf("registered tables are not FK-closed: %s", strings.Join(details, "; "))
 }
 
-func validateSupportedForeignKeyConstraints(fkConstraints []ForeignKeyConstraint, registeredTables map[string]bool) error {
+func validateSupportedForeignKeyConstraints(
+	fkConstraints []ForeignKeyConstraint,
+	registeredTables map[string]bool,
+	registeredTableInfo map[string]registeredTableRuntimeInfo,
+) error {
 	if len(fkConstraints) == 0 || len(registeredTables) == 0 {
 		return nil
 	}
@@ -206,18 +211,40 @@ func validateSupportedForeignKeyConstraints(fkConstraints []ForeignKeyConstraint
 		groups[groupKey] = append(groups[groupKey], fk)
 	}
 
-	var composite []string
+	var invalidScopeScoped []string
 	for groupKey, group := range groups {
-		if len(group) <= 1 {
+		sort.Slice(group, func(i, j int) bool {
+			return group[i].Ordinal < group[j].Ordinal
+		})
+
+		if len(group) == 1 {
+			parentKey := key(group[0].RefSchema, group[0].RefTable)
+			if !registeredTables[parentKey] {
+				continue
+			}
+			invalidScopeScoped = append(invalidScopeScoped, fmt.Sprintf("%s.%s -> %s (%s)", groupKey.childSchema, groupKey.childTable, parentKey, groupKey.constraint))
 			continue
 		}
 
 		parentKey := key(group[0].RefSchema, group[0].RefTable)
-		composite = append(composite, fmt.Sprintf("%s.%s -> %s (%s)", groupKey.childSchema, groupKey.childTable, parentKey, groupKey.constraint))
+		if !registeredTables[parentKey] {
+			continue
+		}
+
+		parentInfo, ok := registeredTableInfo[parentKey]
+		if !ok {
+			return unsupportedSchemaf("registered schema metadata missing parent sync key info for %s", parentKey)
+		}
+		if len(group) != 2 ||
+			group[0].ColumnName != syncScopeColumnName ||
+			group[0].RefColumn != syncScopeColumnName ||
+			group[1].RefColumn != parentInfo.syncKeyColumn {
+			invalidScopeScoped = append(invalidScopeScoped, fmt.Sprintf("%s.%s -> %s (%s)", groupKey.childSchema, groupKey.childTable, parentKey, groupKey.constraint))
+		}
 	}
-	if len(composite) > 0 {
-		sort.Strings(composite)
-		return unsupportedSchemaf("registered schema contains unsupported composite FK constraints: %s", strings.Join(composite, "; "))
+	if len(invalidScopeScoped) > 0 {
+		sort.Strings(invalidScopeScoped)
+		return unsupportedSchemaf("registered schema contains unsupported registered FK constraints; registered child FKs must be scope-inclusive and reference (_sync_scope_id, parent_sync_key): %s", strings.Join(invalidScopeScoped, "; "))
 	}
 
 	return nil

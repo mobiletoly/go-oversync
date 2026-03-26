@@ -446,6 +446,65 @@ func TestPushPending_RepeatedLocalEditsCollapseIntoOneDirtyRowAndAdvanceBundleSt
 	require.Equal(t, int64(1), lastBundleSeq)
 }
 
+func TestPushPending_TextSyncKeyRoundTripsThroughPush(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "docs", SyncKeyColumnName: "doc_id"}}, `
+		CREATE TABLE docs (
+			doc_id TEXT PRIMARY KEY,
+			body TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO docs (doc_id, body) VALUES (?, ?)`, "doc-1", "Hello text key")
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+
+	require.NoError(t, client.PushPending(ctx))
+	require.Len(t, server.chunkRequests, 1)
+	require.Len(t, server.chunkRequests[0].Rows, 1)
+	require.Equal(t, oversync.SyncKey{"doc_id": "doc-1"}, server.chunkRequests[0].Rows[0].Key)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(server.chunkRequests[0].Rows[0].Payload, &payload))
+	require.Equal(t, "doc-1", payload["doc_id"])
+	require.Equal(t, "Hello text key", payload["body"])
+
+	keyJSONBytes, err := json.Marshal(map[string]any{"doc_id": "doc-1"})
+	require.NoError(t, err)
+	var rowVersion int64
+	var deleted int
+	require.NoError(t, db.QueryRow(`
+		SELECT row_version, deleted
+		FROM _sync_row_state
+		WHERE schema_name = 'main' AND table_name = 'docs' AND key_json = ?
+	`, string(keyJSONBytes)).Scan(&rowVersion, &deleted))
+	require.Equal(t, int64(1), rowVersion)
+	require.Equal(t, 0, deleted)
+}
+
+func TestPushPending_RejectsNonUUIDBlobSyncKey(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id BLOB PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (x'0102', ?, ?)`, "Blob", "blob@example.com")
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+
+	err = client.PushPending(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid blob UUID pk")
+}
+
 func TestCollectDirtyRowsForPushInTx_LocalInsertBuildsInsertFromDirtyPayload(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
