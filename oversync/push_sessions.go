@@ -14,6 +14,13 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+func nullableUUIDString(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
+}
+
 type PushSessionInvalidError struct {
 	Message string
 }
@@ -89,16 +96,17 @@ type committedBundleMeta struct {
 }
 
 type pushSessionState struct {
-	PushID          string
-	UserID          string
-	SourceID        string
-	SourceBundleID  int64
-	PlannedRowCount int64
-	Status          string
-	BundleSeq       int64
-	RowCount        int64
-	BundleHash      string
-	ExpiresAt       time.Time
+	PushID           string
+	UserID           string
+	SourceID         string
+	SourceBundleID   int64
+	PlannedRowCount  int64
+	InitializationID string
+	Status           string
+	BundleSeq        int64
+	RowCount         int64
+	BundleHash       string
+	ExpiresAt        time.Time
 }
 
 func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *PushSessionCreateRequest) (_ *PushSessionCreateResponse, err error) {
@@ -125,6 +133,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 	if req.PlannedRowCount <= 0 {
 		return nil, &PushSessionInvalidError{Message: "planned_row_count must be > 0"}
 	}
+	req.InitializationID = strings.TrimSpace(req.InitializationID)
 
 	conn, releaseConn, err := s.acquireUserUploadConn(ctx, actor.UserID)
 	if err != nil {
@@ -133,57 +142,96 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 	defer releaseConn()
 
 	var resp *PushSessionCreateResponse
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		if err := s.configureUploadTx(ctx, tx); err != nil {
-			return err
-		}
-		if err := cleanupExpiredPushSessionsQuerier(ctx, tx); err != nil {
-			return err
-		}
+	err = runRetryableTx(ctx, 3, 25*time.Millisecond, func() error {
+		resp = nil
+		return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+			if err := s.configureUploadTx(ctx, tx); err != nil {
+				return err
+			}
+			if err := cleanupExpiredPushSessionsQuerier(ctx, tx); err != nil {
+				return err
+			}
+			if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
+				return err
+			}
+			scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
+			if err != nil {
+				return err
+			}
+			scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
+			if err != nil {
+				return err
+			}
 
-		meta, err := loadAppliedPushMetadata(ctx, tx, actor.UserID, req.SourceID, req.SourceBundleID)
-		if err != nil {
-			return err
-		}
-		if meta != nil {
+			initializationID := ""
+			switch scopeState.State {
+			case scopeStateUninitialized:
+				if req.InitializationID != "" {
+					return &InitializationExpiredError{Message: "initialization lease is no longer active"}
+				}
+				return &ScopeUninitializedError{UserID: actor.UserID}
+			case scopeStateInitializing:
+				if req.InitializationID == "" {
+					return &PushSessionInvalidError{Message: "initialization_id is required while the scope is initializing"}
+				}
+				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
+				leasedState, err := requireActiveInitializationLease(ctx, tx, actor.UserID, req.SourceID, req.InitializationID, refreshUntil)
+				if err != nil {
+					return err
+				}
+				initializationID = leasedState.InitializationID
+			case scopeStateInitialized:
+				if req.InitializationID != "" {
+					return &PushSessionInvalidError{Message: "initialization_id must be absent once the scope is initialized"}
+				}
+			default:
+				return fmt.Errorf("unexpected scope state %q", scopeState.State)
+			}
+
+			meta, err := loadAppliedPushMetadata(ctx, tx, actor.UserID, req.SourceID, req.SourceBundleID)
+			if err != nil {
+				return err
+			}
+			if meta != nil {
+				resp = &PushSessionCreateResponse{
+					Status:         "already_committed",
+					BundleSeq:      meta.BundleSeq,
+					SourceID:       meta.SourceID,
+					SourceBundleID: meta.SourceBundleID,
+					RowCount:       meta.RowCount,
+					BundleHash:     meta.BundleHash,
+				}
+				return nil
+			}
+
+			if _, err := tx.Exec(ctx, `
+				DELETE FROM sync.push_sessions
+				WHERE user_id = $1
+				  AND source_id = $2
+				  AND source_bundle_id = $3
+				  AND status = 'staging'
+			`, actor.UserID, req.SourceID, req.SourceBundleID); err != nil {
+				return fmt.Errorf("delete existing staging push session: %w", err)
+			}
+
+			pushID := uuid.NewString()
+			expiresAt := time.Now().UTC().Add(s.pushSessionTTL())
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO sync.push_sessions (
+					push_id, user_id, source_id, source_bundle_id, planned_row_count, initialization_id, status, expires_at
+				) VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, 'staging', $7)
+			`, pushID, actor.UserID, req.SourceID, req.SourceBundleID, req.PlannedRowCount, nullableUUIDString(initializationID), expiresAt); err != nil {
+				return fmt.Errorf("insert push session: %w", err)
+			}
+
 			resp = &PushSessionCreateResponse{
-				Status:         "already_committed",
-				BundleSeq:      meta.BundleSeq,
-				SourceID:       meta.SourceID,
-				SourceBundleID: meta.SourceBundleID,
-				RowCount:       meta.RowCount,
-				BundleHash:     meta.BundleHash,
+				PushID:                 pushID,
+				Status:                 "staging",
+				PlannedRowCount:        req.PlannedRowCount,
+				NextExpectedRowOrdinal: 0,
 			}
 			return nil
-		}
-
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM sync.push_sessions
-			WHERE user_id = $1
-			  AND source_id = $2
-			  AND source_bundle_id = $3
-			  AND status = 'staging'
-		`, actor.UserID, req.SourceID, req.SourceBundleID); err != nil {
-			return fmt.Errorf("delete existing staging push session: %w", err)
-		}
-
-		pushID := uuid.NewString()
-		expiresAt := time.Now().UTC().Add(s.pushSessionTTL())
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO sync.push_sessions (
-				push_id, user_id, source_id, source_bundle_id, planned_row_count, status, expires_at
-			) VALUES ($1::uuid, $2, $3, $4, $5, 'staging', $6)
-		`, pushID, actor.UserID, req.SourceID, req.SourceBundleID, req.PlannedRowCount, expiresAt); err != nil {
-			return fmt.Errorf("insert push session: %w", err)
-		}
-
-		resp = &PushSessionCreateResponse{
-			PushID:                 pushID,
-			Status:                 "staging",
-			PlannedRowCount:        req.PlannedRowCount,
-			NextExpectedRowOrdinal: 0,
-		}
-		return nil
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -229,76 +277,85 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 	defer releaseConn()
 
 	var resp *PushSessionChunkResponse
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		if err := s.configureUploadTx(ctx, tx); err != nil {
-			return err
-		}
-		session, err := loadPushSessionForUpdate(ctx, tx, pushID)
-		if err != nil {
-			return err
-		}
-		if session.UserID != actor.UserID {
-			return &PushSessionForbiddenError{PushID: pushID}
-		}
-		if time.Now().UTC().After(session.ExpiresAt) {
-			return &PushSessionExpiredError{PushID: pushID}
-		}
-		if session.Status != "staging" {
-			return &PushChunkInvalidError{Message: fmt.Sprintf("push session %s is already committed", pushID)}
-		}
+	err = runRetryableTx(ctx, 3, 25*time.Millisecond, func() error {
+		resp = nil
+		return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+			if err := s.configureUploadTx(ctx, tx); err != nil {
+				return err
+			}
+			session, err := loadPushSessionForUpdate(ctx, tx, pushID)
+			if err != nil {
+				return err
+			}
+			if session.UserID != actor.UserID {
+				return &PushSessionForbiddenError{PushID: pushID}
+			}
+			if time.Now().UTC().After(session.ExpiresAt) {
+				return &PushSessionExpiredError{PushID: pushID}
+			}
+			if session.Status != "staging" {
+				return &PushChunkInvalidError{Message: fmt.Sprintf("push session %s is already committed", pushID)}
+			}
+			if session.InitializationID != "" {
+				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
+				if _, err := requireActiveInitializationLease(ctx, tx, actor.UserID, session.SourceID, session.InitializationID, refreshUntil); err != nil {
+					return err
+				}
+			}
 
-		var nextExpected int64
-		if err := tx.QueryRow(ctx, `
+			var nextExpected int64
+			if err := tx.QueryRow(ctx, `
 			SELECT COALESCE(COUNT(*), 0)
 			FROM sync.push_session_rows
 			WHERE push_id = $1::uuid
 		`, pushID).Scan(&nextExpected); err != nil {
-			return fmt.Errorf("count push session rows: %w", err)
-		}
-		if req.StartRowOrdinal != nextExpected {
-			return &PushChunkOutOfOrderError{PushID: pushID, Expected: nextExpected, Actual: req.StartRowOrdinal}
-		}
-		if req.StartRowOrdinal+int64(len(preparedRows)) > session.PlannedRowCount {
-			return &PushChunkInvalidError{Message: "chunk exceeds planned_row_count"}
-		}
-
-		rowsData := make([][]any, 0, len(preparedRows))
-		for idx, row := range preparedRows {
-			rowOrdinal := req.StartRowOrdinal + int64(idx)
-			var payload any
-			if row.op != OpDelete {
-				payload = string(row.payload)
+				return fmt.Errorf("count push session rows: %w", err)
 			}
-			rowsData = append(rowsData, []any{
-				pushID,
-				rowOrdinal,
-				row.schema,
-				row.table,
-				row.keyJSON,
-				row.op,
-				row.baseRowVersion,
-				payload,
-			})
-		}
-		if _, err := tx.CopyFrom(ctx,
-			pgx.Identifier{"sync", "push_session_rows"},
-			[]string{"push_id", "row_ordinal", "schema_name", "table_name", "key_json", "op", "base_row_version", "payload"},
-			pgx.CopyFromRows(rowsData),
-		); err != nil {
-			return fmt.Errorf("insert push session rows: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `
+			if req.StartRowOrdinal != nextExpected {
+				return &PushChunkOutOfOrderError{PushID: pushID, Expected: nextExpected, Actual: req.StartRowOrdinal}
+			}
+			if req.StartRowOrdinal+int64(len(preparedRows)) > session.PlannedRowCount {
+				return &PushChunkInvalidError{Message: "chunk exceeds planned_row_count"}
+			}
+
+			rowsData := make([][]any, 0, len(preparedRows))
+			for idx, row := range preparedRows {
+				rowOrdinal := req.StartRowOrdinal + int64(idx)
+				var payload any
+				if row.op != OpDelete {
+					payload = string(row.payload)
+				}
+				rowsData = append(rowsData, []any{
+					pushID,
+					rowOrdinal,
+					row.schema,
+					row.table,
+					row.keyJSON,
+					row.op,
+					row.baseRowVersion,
+					payload,
+				})
+			}
+			if _, err := tx.CopyFrom(ctx,
+				pgx.Identifier{"sync", "push_session_rows"},
+				[]string{"push_id", "row_ordinal", "schema_name", "table_name", "key_json", "op", "base_row_version", "payload"},
+				pgx.CopyFromRows(rowsData),
+			); err != nil {
+				return fmt.Errorf("insert push session rows: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
 			UPDATE sync.push_sessions
 			SET expires_at = $2
 			WHERE push_id = $1::uuid
 		`, pushID, time.Now().UTC().Add(s.pushSessionTTL())); err != nil {
-			return fmt.Errorf("refresh push session expiry: %w", err)
-		}
-		resp = &PushSessionChunkResponse{
-			PushID:                 pushID,
-			NextExpectedRowOrdinal: req.StartRowOrdinal + int64(len(preparedRows)),
-		}
-		return nil
+				return fmt.Errorf("refresh push session expiry: %w", err)
+			}
+			resp = &PushSessionChunkResponse{
+				PushID:                 pushID,
+				NextExpectedRowOrdinal: req.StartRowOrdinal + int64(len(preparedRows)),
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -323,99 +380,111 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 	defer releaseConn()
 
 	var resp *PushSessionCommitResponse
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		if err := s.configureUploadTx(ctx, tx); err != nil {
-			return err
-		}
-		session, err := loadPushSessionForUpdate(ctx, tx, pushID)
-		if err != nil {
-			return err
-		}
-		if session.UserID != actor.UserID {
-			return &PushSessionForbiddenError{PushID: pushID}
-		}
-		if time.Now().UTC().After(session.ExpiresAt) {
-			return &PushSessionExpiredError{PushID: pushID}
-		}
-		if session.Status == "committed" {
-			resp = &PushSessionCommitResponse{
-				BundleSeq:      session.BundleSeq,
+	err = runRetryableTx(ctx, 3, 25*time.Millisecond, func() error {
+		resp = nil
+		return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+			if err := s.configureUploadTx(ctx, tx); err != nil {
+				return err
+			}
+			session, err := loadPushSessionForUpdate(ctx, tx, pushID)
+			if err != nil {
+				return err
+			}
+			if session.UserID != actor.UserID {
+				return &PushSessionForbiddenError{PushID: pushID}
+			}
+			if time.Now().UTC().After(session.ExpiresAt) {
+				return &PushSessionExpiredError{PushID: pushID}
+			}
+			if session.Status == "committed" {
+				resp = &PushSessionCommitResponse{
+					BundleSeq:      session.BundleSeq,
+					SourceID:       session.SourceID,
+					SourceBundleID: session.SourceBundleID,
+					RowCount:       session.RowCount,
+					BundleHash:     session.BundleHash,
+				}
+				return nil
+			}
+
+			rows, err := s.loadPushSessionPreparedRows(ctx, tx, pushID)
+			if err != nil {
+				return err
+			}
+			if int64(len(rows)) != session.PlannedRowCount {
+				return &PushCommitInvalidError{Message: fmt.Sprintf("staged row count %d does not match planned_row_count %d", len(rows), session.PlannedRowCount)}
+			}
+
+			seenTargets := make(map[string]struct{}, len(rows))
+			for idx, row := range rows {
+				if row.inputOrder != idx {
+					return &PushCommitInvalidError{Message: fmt.Sprintf("staged rows are not contiguous at row_ordinal %d", idx)}
+				}
+				targetKey := row.schema + "\x00" + row.table + "\x00" + row.keyJSON
+				if _, exists := seenTargets[targetKey]; exists {
+					return &PushCommitInvalidError{Message: fmt.Sprintf("duplicate target row in staged push session: %s.%s %s", row.schema, row.table, row.keyString)}
+				}
+				seenTargets[targetKey] = struct{}{}
+			}
+
+			if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
+				return fmt.Errorf("defer push constraints: %w", err)
+			}
+			if session.InitializationID != "" {
+				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
+				if _, err := requireActiveInitializationLease(ctx, tx, actor.UserID, session.SourceID, session.InitializationID, refreshUntil); err != nil {
+					return err
+				}
+				if err := ensureUserStateBaselineWithExec(ctx, tx, actor.UserID); err != nil {
+					return err
+				}
+			} else {
+				if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_user_id', $1, true)`, actor.UserID); err != nil {
+				return fmt.Errorf("set push bundle user_id: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_id', $1, true)`, session.SourceID); err != nil {
+				return fmt.Errorf("set push bundle source_id: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_bundle_id', $1, true)`, fmt.Sprintf("%d", session.SourceBundleID)); err != nil {
+				return fmt.Errorf("set push bundle source_bundle_id: %w", err)
+			}
+
+			rowStates, err := loadRowStateSnapshots(ctx, tx, actor.UserID, rows)
+			if err != nil {
+				return err
+			}
+			for i, row := range rows {
+				var state *rowStateSnapshot
+				if rowStates[i].found {
+					state = &rowStates[i].rowStateSnapshot
+				}
+				if err := s.validatePushRowConflict(ctx, tx, actor.UserID, row, state); err != nil {
+					return err
+				}
+			}
+
+			for _, group := range batchPreparedPushRows(rows) {
+				if err := applyPreparedPushRowBatch(ctx, tx, actor.UserID, group); err != nil {
+					return err
+				}
+			}
+
+			bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, BundleSource{
 				SourceID:       session.SourceID,
 				SourceBundleID: session.SourceBundleID,
-				RowCount:       session.RowCount,
-				BundleHash:     session.BundleHash,
-			}
-			return nil
-		}
-
-		rows, err := s.loadPushSessionPreparedRows(ctx, tx, pushID)
-		if err != nil {
-			return err
-		}
-		if int64(len(rows)) != session.PlannedRowCount {
-			return &PushCommitInvalidError{Message: fmt.Sprintf("staged row count %d does not match planned_row_count %d", len(rows), session.PlannedRowCount)}
-		}
-
-		seenTargets := make(map[string]struct{}, len(rows))
-		for idx, row := range rows {
-			if row.inputOrder != idx {
-				return &PushCommitInvalidError{Message: fmt.Sprintf("staged rows are not contiguous at row_ordinal %d", idx)}
-			}
-			targetKey := row.schema + "\x00" + row.table + "\x00" + row.keyJSON
-			if _, exists := seenTargets[targetKey]; exists {
-				return &PushCommitInvalidError{Message: fmt.Sprintf("duplicate target row in staged push session: %s.%s %s", row.schema, row.table, row.keyString)}
-			}
-			seenTargets[targetKey] = struct{}{}
-		}
-
-		if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
-			return fmt.Errorf("defer push constraints: %w", err)
-		}
-		if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_user_id', $1, true)`, actor.UserID); err != nil {
-			return fmt.Errorf("set push bundle user_id: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_id', $1, true)`, session.SourceID); err != nil {
-			return fmt.Errorf("set push bundle source_id: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_bundle_id', $1, true)`, fmt.Sprintf("%d", session.SourceBundleID)); err != nil {
-			return fmt.Errorf("set push bundle source_bundle_id: %w", err)
-		}
-
-		rowStates, err := loadRowStateSnapshots(ctx, tx, actor.UserID, rows)
-		if err != nil {
-			return err
-		}
-		for i, row := range rows {
-			var state *rowStateSnapshot
-			if rowStates[i].found {
-				state = &rowStates[i].rowStateSnapshot
-			}
-			if err := s.validatePushRowConflict(ctx, tx, actor.UserID, row, state); err != nil {
+			})
+			if err != nil {
 				return err
 			}
-		}
-
-		for _, group := range batchPreparedPushRows(rows) {
-			if err := applyPreparedPushRowBatch(ctx, tx, actor.UserID, group); err != nil {
-				return err
+			if bundle == nil {
+				return &PushCommitInvalidError{Message: "push session produced no captured business-table effects"}
 			}
-		}
 
-		bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, BundleSource{
-			SourceID:       session.SourceID,
-			SourceBundleID: session.SourceBundleID,
-		})
-		if err != nil {
-			return err
-		}
-		if bundle == nil {
-			return &PushCommitInvalidError{Message: "push session produced no captured business-table effects"}
-		}
-
-		if _, err := tx.Exec(ctx, `
+			if _, err := tx.Exec(ctx, `
 			INSERT INTO sync.applied_pushes (
 				user_id, source_id, source_bundle_id, bundle_seq, row_count, bundle_hash, committed_at, recorded_at
 			) VALUES ($1, $2, $3, $4, $5, $6, now(), now())
@@ -426,10 +495,10 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 				committed_at = EXCLUDED.committed_at,
 				recorded_at = EXCLUDED.recorded_at
 		`, actor.UserID, session.SourceID, session.SourceBundleID, bundle.BundleSeq, bundle.RowCount, bundle.BundleHash); err != nil {
-			return fmt.Errorf("record applied push replay key: %w", err)
-		}
+				return fmt.Errorf("record applied push replay key: %w", err)
+			}
 
-		if _, err := tx.Exec(ctx, `
+			if _, err := tx.Exec(ctx, `
 			UPDATE sync.push_sessions
 			SET status = 'committed',
 				bundle_seq = $2,
@@ -437,17 +506,23 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 				bundle_hash = $4
 			WHERE push_id = $1::uuid
 		`, pushID, bundle.BundleSeq, bundle.RowCount, bundle.BundleHash); err != nil {
-			return fmt.Errorf("mark push session committed: %w", err)
-		}
+				return fmt.Errorf("mark push session committed: %w", err)
+			}
+			if session.InitializationID != "" {
+				if err := transitionScopeToInitialized(ctx, tx, actor.UserID, session.SourceID); err != nil {
+					return err
+				}
+			}
 
-		resp = &PushSessionCommitResponse{
-			BundleSeq:      bundle.BundleSeq,
-			SourceID:       bundle.SourceID,
-			SourceBundleID: bundle.SourceBundleID,
-			RowCount:       bundle.RowCount,
-			BundleHash:     bundle.BundleHash,
-		}
-		return nil
+			resp = &PushSessionCommitResponse{
+				BundleSeq:      bundle.BundleSeq,
+				SourceID:       bundle.SourceID,
+				SourceBundleID: bundle.SourceBundleID,
+				RowCount:       bundle.RowCount,
+				BundleHash:     bundle.BundleHash,
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -605,6 +680,7 @@ func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*p
 			source_id,
 			source_bundle_id,
 			planned_row_count,
+			COALESCE(initialization_id::text, ''),
 			status,
 			COALESCE(bundle_seq, 0),
 			COALESCE(row_count, 0),
@@ -619,6 +695,7 @@ func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*p
 		&session.SourceID,
 		&session.SourceBundleID,
 		&session.PlannedRowCount,
+		&session.InitializationID,
 		&session.Status,
 		&session.BundleSeq,
 		&session.RowCount,

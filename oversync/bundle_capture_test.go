@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 )
 
@@ -82,6 +83,7 @@ func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
 	rowID := uuid.New()
 	actor := Actor{UserID: userID}
 	source := BundleSource{SourceID: "server-app", SourceBundleID: 1}
+	mustInitializeEmptyScope(t, ctx, svc, userID, source.SourceID)
 
 	err := svc.WithinSyncBundle(ctx, actor, source, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -170,6 +172,7 @@ func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 
 	userID := "bundle-rollback-user-" + suffix
 	rowID := uuid.New()
+	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
 
 	err := svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -207,6 +210,40 @@ func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 	require.Zero(t, stagedCount)
 }
 
+func TestWithinSyncBundle_DoesNotRetryCallbackOnRetryableTransactionError(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "bundle_single_attempt_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "bundle-single-attempt-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "bundle-single-attempt-user-" + suffix
+	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+
+	attempts := 0
+	err := svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
+		attempts++
+		return &pgconn.PgError{Code: "40001", Message: "synthetic serialization failure"}
+	})
+	require.Error(t, err)
+	require.Equal(t, 1, attempts)
+
+	var bundleCount int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_id = $1`, userID).Scan(&bundleCount))
+	require.Zero(t, bundleCount)
+}
+
 func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
@@ -229,6 +266,7 @@ func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 	userID := "bundle-cascade-user-" + suffix
 	userRowID := uuid.New()
 	postRowID := uuid.New()
+	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
 
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -338,6 +376,7 @@ func TestWithinSyncBundle_CapturesCascadeUpdates(t *testing.T) {
 	parentID := uuid.New()
 	newParentID := uuid.New()
 	childID := uuid.New()
+	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
 
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -487,6 +526,7 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 
 	userID := "bundle-trigger-write-user-" + suffix
 	rowID := uuid.New()
+	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
 
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -550,6 +590,7 @@ func TestWithinSyncBundle_RejectsMismatchedOwnerOnInsert(t *testing.T) {
 	}, logger)
 
 	rowID := uuid.New()
+	mustInitializeEmptyScope(t, ctx, svc, "actor-a", "server-app")
 	err := svc.WithinSyncBundle(ctx, Actor{UserID: "actor-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (_sync_scope_id, id, name, email)
@@ -580,6 +621,8 @@ func TestWithinSyncBundle_RejectsCrossOwnerWriteByVisibleKeyAlone(t *testing.T) 
 	}, logger)
 
 	rowID := uuid.New()
+	mustInitializeEmptyScope(t, ctx, svc, "owner-a", "server-app")
+	mustInitializeEmptyScope(t, ctx, svc, "owner-b", "server-app")
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: "owner-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
@@ -629,6 +672,7 @@ func TestWithinSyncBundle_RejectsOwnerMutationOnUpdate(t *testing.T) {
 	}, logger)
 
 	rowID := uuid.New()
+	mustInitializeEmptyScope(t, ctx, svc, "owner-a", "server-app")
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: "owner-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)

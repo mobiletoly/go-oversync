@@ -2,10 +2,10 @@ package oversqlite
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -25,6 +25,12 @@ func (e *DirtyStateRejectedError) Error() string {
 }
 
 func (c *Client) pullToStableLocked(ctx context.Context) error {
+	if err := c.ensureConnectedSessionLocked(ctx, "PullToStable()"); err != nil {
+		return err
+	}
+	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
+		return err
+	}
 	rebuildRequired, err := c.rebuildRequired(ctx)
 	if err != nil {
 		return err
@@ -100,34 +106,21 @@ func (c *Client) sendPullRequest(ctx context.Context, afterBundleSeq int64, maxB
 		endpoint += "&target_bundle_seq=" + strconv.FormatInt(targetBundleSeq, 10)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create pull request: %w", err)
-	}
-	token, err := c.Token(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get JWT token: %w", err)
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.HTTP.Do(httpReq)
+	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "pull_request", http.MethodGet, endpoint, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to send pull request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusConflict {
+	if statusCode != http.StatusOK {
+		if statusCode == http.StatusConflict {
 			var errorResp oversync.ErrorResponse
 			if json.Unmarshal(body, &errorResp) == nil && errorResp.Error == "history_pruned" {
 				return nil, &HistoryPrunedError{
-					Status:  resp.StatusCode,
+					Status:  statusCode,
 					Message: errorResp.Message,
 				}
 			}
 		}
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("server returned status %d: %s", statusCode, string(body))
 	}
 
 	var pullResp oversync.PullResponse
@@ -205,6 +198,9 @@ func (c *Client) lastSeenBundleSeq(ctx context.Context) (int64, error) {
 		FROM _sync_client_state
 		WHERE user_id = ?
 	`, c.UserID).Scan(&seq); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, &ConnectRequiredError{Operation: "LastBundleSeqSeen()/PullToStable()"}
+		}
 		return 0, fmt.Errorf("failed to read last_bundle_seq_seen: %w", err)
 	}
 	return seq, nil
@@ -212,10 +208,20 @@ func (c *Client) lastSeenBundleSeq(ctx context.Context) (int64, error) {
 
 // LastBundleSeqSeen exposes the durable pulled-bundle checkpoint for diagnostics.
 func (c *Client) LastBundleSeqSeen(ctx context.Context) (int64, error) {
+	if err := c.tryBeginSyncOperation(); err != nil {
+		return 0, err
+	}
+	defer c.writeMu.Unlock()
+	if err := c.ensureConnectedSessionLocked(ctx, "LastBundleSeqSeen()"); err != nil {
+		return 0, err
+	}
 	return c.lastSeenBundleSeq(ctx)
 }
 
 func (c *Client) hydrateLocked(ctx context.Context) error {
+	if err := c.ensureConnectedSessionLocked(ctx, "Hydrate()"); err != nil {
+		return err
+	}
 	pendingCount, err := c.pendingChangeCount(ctx)
 	if err != nil {
 		return err
@@ -245,6 +251,9 @@ func (c *Client) Recover(ctx context.Context) error {
 }
 
 func (c *Client) recoverLocked(ctx context.Context) error {
+	if err := c.ensureConnectedSessionLocked(ctx, "Recover()"); err != nil {
+		return err
+	}
 	pendingCount, err := c.pendingChangeCount(ctx)
 	if err != nil {
 		return err
@@ -263,6 +272,9 @@ func (c *Client) recoverLocked(ctx context.Context) error {
 }
 
 func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource bool) error {
+	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
+		return err
+	}
 	if err := c.setRebuildRequired(ctx, true); err != nil {
 		return err
 	}
@@ -302,25 +314,12 @@ func (c *Client) snapshotChunkRows() int {
 }
 
 func (c *Client) createSnapshotSession(ctx context.Context) (*oversync.SnapshotSession, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, buildSnapshotSessionCreateURL(c.BaseURL), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create snapshot session request: %w", err)
-	}
-	token, err := c.Token(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get JWT token: %w", err)
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.HTTP.Do(httpReq)
+	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "snapshot_session_create", http.MethodPost, buildSnapshotSessionCreateURL(c.BaseURL), nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to send snapshot session request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned status %d: %s", statusCode, decodeServerErrorBody(body))
 	}
 
 	var session oversync.SnapshotSession
@@ -335,25 +334,12 @@ func (c *Client) createSnapshotSession(ctx context.Context) (*oversync.SnapshotS
 }
 
 func (c *Client) fetchSnapshotChunk(ctx context.Context, snapshotID string, snapshotBundleSeq int64, afterRowOrdinal int64, maxRows int) (*oversync.SnapshotChunkResponse, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, buildSnapshotChunkURL(c.BaseURL, snapshotID, afterRowOrdinal, maxRows), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create snapshot chunk request: %w", err)
-	}
-	token, err := c.Token(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get JWT token: %w", err)
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.HTTP.Do(httpReq)
+	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "snapshot_chunk_fetch", http.MethodGet, buildSnapshotChunkURL(c.BaseURL, snapshotID, afterRowOrdinal, maxRows), nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to send snapshot chunk request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned status %d: %s", statusCode, decodeServerErrorBody(body))
 	}
 
 	var chunk oversync.SnapshotChunkResponse
@@ -497,20 +483,43 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	newSourceID := c.SourceID
 	if rotateSource {
 		newSourceID = uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `
+		result, err := tx.ExecContext(ctx, `
 			UPDATE _sync_client_state
 			SET source_id = ?, next_source_bundle_id = 1, last_bundle_seq_seen = ?, rebuild_required = 0
 			WHERE user_id = ?
-		`, newSourceID, session.SnapshotBundleSeq, c.UserID); err != nil {
+		`, newSourceID, session.SnapshotBundleSeq, c.UserID)
+		if err != nil {
 			return fmt.Errorf("failed to persist recovery client bundle state: %w", err)
 		}
-	} else {
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to inspect recovery client bundle update result: %w", err)
+		}
+		if rowsAffected != 1 {
+			return &ConnectRequiredError{Operation: "Recover()"}
+		}
 		if _, err := tx.ExecContext(ctx, `
+			UPDATE _sync_lifecycle_state
+			SET source_id = ?
+			WHERE singleton_key = 1
+		`, newSourceID); err != nil {
+			return fmt.Errorf("failed to persist recovery lifecycle source_id: %w", err)
+		}
+	} else {
+		result, err := tx.ExecContext(ctx, `
 			UPDATE _sync_client_state
 			SET last_bundle_seq_seen = ?, rebuild_required = 0
 			WHERE user_id = ?
-		`, session.SnapshotBundleSeq, c.UserID); err != nil {
+		`, session.SnapshotBundleSeq, c.UserID)
+		if err != nil {
 			return fmt.Errorf("failed to persist snapshot bundle checkpoint: %w", err)
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to inspect snapshot checkpoint update result: %w", err)
+		}
+		if rowsAffected != 1 {
+			return &ConnectRequiredError{Operation: "Hydrate()"}
 		}
 	}
 
@@ -697,14 +706,25 @@ func decodeServerErrorBody(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
+	resp, ok := decodeServerErrorResponse(body)
+	if !ok {
+		return string(body)
+	}
+	if strings.TrimSpace(resp.Message) != "" {
+		return fmt.Sprintf("%s: %s", resp.Error, resp.Message)
+	}
+	return resp.Error
+}
+
+func decodeServerErrorResponse(body []byte) (oversync.ErrorResponse, bool) {
+	if len(body) == 0 {
+		return oversync.ErrorResponse{}, false
+	}
 	var resp oversync.ErrorResponse
 	if err := json.Unmarshal(body, &resp); err == nil && strings.TrimSpace(resp.Error) != "" {
-		if strings.TrimSpace(resp.Message) != "" {
-			return fmt.Sprintf("%s: %s", resp.Error, resp.Message)
-		}
-		return resp.Error
+		return resp, true
 	}
-	return string(body)
+	return oversync.ErrorResponse{}, false
 }
 
 func buildPullURL(base string, afterBundleSeq int64, maxBundles int, targetBundleSeq int64) string {

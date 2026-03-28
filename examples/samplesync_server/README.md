@@ -2,12 +2,13 @@ Samplesync Server (PostgreSQL)
 
 This example runs a minimal bundle-based go-oversync server for the `samplesync-kmp` app.
 
-The server uses business tables as authoritative state and exposes only the supported bundle-based
-sync endpoints.
+The server uses business tables as authoritative state and exposes the supported lifecycle and
+bundle-based sync endpoints.
 
 Endpoints
 
 - `POST /dummy-signin`
+- `POST /sync/connect`
 - `POST /sync/push-sessions`
 - `POST /sync/push-sessions/{push_id}/chunks`
 - `POST /sync/push-sessions/{push_id}/commit`
@@ -44,3 +45,10 @@ Client settings
 
 - Base URL: `http://localhost:8080` (desktop/iOS) or `http://10.0.2.2:8080` (Android emulator)
 - Schema: `business`
+- Call `POST /sync/connect` after local `Open(sourceID)` to resolve
+  `remote_authoritative`, `initialize_local`, `initialize_empty`, or `retry_later`
+- Expect lifecycle-related sync failures:
+  - `scope_uninitialized`
+  - `scope_initializing`
+  - `initialization_stale`
+  - `initialization_expired`

@@ -150,6 +150,24 @@ func (s *SyncService) WithinSyncBundle(
 	defer releaseConn()
 
 	return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
+			return err
+		}
+		scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
+		if err != nil {
+			return err
+		}
+		scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
+		if err != nil {
+			return err
+		}
+		switch scopeState.State {
+		case scopeStateInitialized:
+		case scopeStateInitializing:
+			return &ScopeInitializingError{UserID: actor.UserID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
+		default:
+			return &ScopeUninitializedError{UserID: actor.UserID}
+		}
 		if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
 			return fmt.Errorf("defer bundle constraints: %w", err)
 		}

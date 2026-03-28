@@ -6,13 +6,15 @@ It tracks local dirty rows with triggers, freezes one outbound snapshot at a tim
 snapshot through push sessions, replays the authoritative committed bundle locally, pulls complete
 committed bundles, and rebuilds through chunked snapshot sessions for hydration or recovery.
 
-## Current model
+## Lifecycle model
 
 - Business tables are your application tables.
 - `_sync_dirty_rows` stores one coalesced dirty row per structured key.
 - `_sync_push_outbound` stores the frozen in-flight push snapshot.
 - `_sync_push_stage` stores authoritative committed rows before final local replay.
 - `_sync_row_state` stores the authoritative replicated row version seen by the client.
+- `_sync_managed_tables` stores the set of tables for which `oversqlite` has installed local
+  change-capture triggers.
 - `_sync_client_state` stores:
   - `source_id`
   - `schema_name`
@@ -20,6 +22,54 @@ committed bundles, and rebuilds through chunked snapshot sessions for hydration 
   - `last_bundle_seq_seen`
   - `apply_mode`
   - `rebuild_required`
+- `_sync_lifecycle_state` stores local-only lifecycle control state:
+  - persisted caller-owned `source_id`
+  - anonymous vs attached binding state
+  - pending transition / remote-replace recovery metadata
+  - initialization lease tracking
+
+Public lifecycle surface:
+
+- `Open(ctx, sourceID)` is local-only and runs on every app launch.
+- `Connect(ctx, userID)` resolves account attachment through `POST /sync/connect`.
+- `SignOut(ctx)` blocks if unsynced attached data exists and otherwise clears local synced state.
+- `SyncThenSignOut(ctx)` is a sync-first convenience wrapper.
+- `PendingSyncStatus(ctx)` distinguishes anonymous pending rows from sign-out-blocking attached rows.
+- `ResetForNewSource(ctx, sourceID)` is the explicit destructive source-rotation path.
+- `UninstallSync(ctx)` is the explicit full local teardown path for removing `oversqlite` metadata
+  tables and triggers from the SQLite database.
+
+`ConnectStatusRetryLater` is a normal retriable attachment outcome, not an auth failure. It means
+the server has not finished resolving first-connect authority yet.
+
+## Built-in transient retry
+
+`oversqlite` owns bounded retries for transient transport and temporary server-availability
+failures on sync I/O. If `Config.RetryPolicy` is left unset, the client uses a conservative
+built-in default:
+
+- `MaxAttempts: 3`
+- `InitialBackoff: 100ms`
+- `MaxBackoff: 1s`
+- `JitterFraction: 0.2`
+
+Internal retry covers:
+
+- `PushPending(ctx)`
+- `PullToStable(ctx)`
+- snapshot session creation and snapshot chunk fetches during `Hydrate(ctx)` / `Recover(ctx)`
+- transport-level reachability failures while `Connect(ctx, userID)` is calling `/sync/connect`
+
+Internal retry does not hide caller-visible lifecycle or protocol outcomes:
+
+- server `ConnectStatusRetryLater`
+- `401` / `403`
+- capability mismatch / old-server incompatibility
+- conflict / validation failures
+- `SignOut(ctx)`, `ResetForNewSource(ctx, sourceID)`, `UninstallSync(ctx)`
+
+Set `Config.RetryPolicy = &oversqlite.RetryPolicy{Enabled: false}` to disable the built-in retry
+layer explicitly.
 
 ## One-shot operations
 
@@ -31,6 +81,34 @@ committed bundles, and rebuilds through chunked snapshot sessions for hydration 
 - `Sync(ctx)` runs `PushPending(ctx)` and then `PullToStable(ctx)`.
 - `Hydrate(ctx)` rebuilds from `POST /sync/snapshot-sessions` plus chunk fetches.
 - `Recover(ctx)` resets managed state, rebuilds from chunked snapshot sessions, and rotates `source_id`.
+
+## Lifecycle Preconditions
+
+Require only `Open(ctx, sourceID)`:
+
+- `Open(ctx, sourceID)`
+- `PendingSyncStatus(ctx)`
+- `ResetForNewSource(ctx, sourceID)`
+- `UninstallSync(ctx)`
+
+Require successful `Open(ctx, sourceID)` and successful `Connect(ctx, userID)`:
+
+- `PushPending(ctx)`
+- `PullToStable(ctx)`
+- `Sync(ctx)`
+- `Hydrate(ctx)`
+- `Recover(ctx)`
+- `LastBundleSeqSeen(ctx)`
+- `SignOut(ctx)`
+- `SyncThenSignOut(ctx)`
+
+Typed precondition errors:
+
+- `OpenRequiredError`: returned when an operation needs `Open(ctx, sourceID)` first
+- `ConnectRequiredError`: returned when attached-state sync operations run before successful
+  `Connect(ctx, userID)`
+- `DestructiveTransitionInProgressError`: returned while destructive lifecycle transitions block
+  safe sync execution
 
 ## Quick start
 
@@ -50,16 +128,23 @@ tokenProvider := func(ctx context.Context) (string, error) {
     return "<jwt>", nil
 }
 
-client, err := oversqlite.NewClient(
-    db,
-    "http://localhost:8080",
-    "user-123",
-    "device-abc",
-    tokenProvider,
-    cfg,
-)
+client, err := oversqlite.NewClient(db, "http://localhost:8080", tokenProvider, cfg)
 if err != nil {
     log.Fatal(err)
+}
+defer client.Close()
+
+if err := client.Open(context.Background(), "device-abc"); err != nil {
+    log.Fatal(err)
+}
+
+connectResult, err := client.Connect(context.Background(), "user-123")
+if err != nil {
+    log.Fatal(err)
+}
+if connectResult.Status == oversqlite.ConnectStatusRetryLater {
+    log.Printf("connect pending, retry after %s", connectResult.RetryAfter)
+    return
 }
 
 if err := client.PushPending(context.Background()); err != nil {
@@ -68,7 +153,22 @@ if err := client.PushPending(context.Background()); err != nil {
 if err := client.PullToStable(context.Background()); err != nil {
     log.Printf("pull failed: %v", err)
 }
-```
+
+if err := client.SignOut(context.Background()); err != nil {
+    log.Printf("sign-out failed: %v", err)
+}
+
+// Full local teardown when you want to remove oversqlite from this database entirely.
+if err := client.UninstallSync(context.Background()); err != nil {
+    log.Printf("uninstall failed: %v", err)
+}
+``` 
+
+`UninstallSync(ctx)` is intentionally more destructive than `SignOut(ctx)` or
+`ResetForNewSource(ctx, sourceID)`. It drops sync-owned `_sync_*` metadata tables and the
+change-capture triggers installed on managed tables, but it does not delete your business tables.
+After a successful uninstall, create a new client if you want to install sync again on the same
+SQLite database.
 
 ## Important invariants
 
@@ -168,6 +268,7 @@ Typed errors:
 - `*oversqlite.PushConflictError`: structured conflict payload decoded from transport
 - `*oversqlite.InvalidConflictResolutionError`: resolver returned an invalid outcome for the conflict shape
 - `*oversqlite.PushConflictRetryExhaustedError`: automatic structured conflict retry hit the retry budget
+- `*oversqlite.RetryExhaustedError`: bounded transient retry was exhausted for a retry-covered sync operation
 
 ## Server requirements
 
@@ -183,6 +284,10 @@ The server must expose:
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
 - `GET /sync/capabilities`
+- `POST /sync/connect`
+
+The server must advertise `connect_lifecycle` in `GET /sync/capabilities`. If `/sync/connect` or
+that capability is missing, `Connect(ctx, userID)` fails closed with a typed incompatibility error.
 
 ## Testing
 

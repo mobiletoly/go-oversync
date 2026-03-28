@@ -73,14 +73,48 @@ func integrationTestDatabaseURL() string {
 
 func newExampleServer(t *testing.T, schema string) *exampleserver.TestServer {
 	t.Helper()
+	return newExampleServerWithConfig(t, schema, func(*exampleserver.ServerConfig) {})
+}
 
-	ts, err := exampleserver.NewTestServer(&exampleserver.ServerConfig{
+func newRetryingConfig(schema string, tables []oversqlite.SyncTable) *oversqlite.Config {
+	config := oversqlite.DefaultConfig(schema, tables)
+	config.RetryPolicy = &oversqlite.RetryPolicy{
+		Enabled:        true,
+		MaxAttempts:    3,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     2 * time.Millisecond,
+		JitterFraction: 0,
+	}
+	return config
+}
+
+func newNoRetryConfig(schema string, tables []oversqlite.SyncTable) *oversqlite.Config {
+	config := oversqlite.DefaultConfig(schema, tables)
+	config.RetryPolicy = &oversqlite.RetryPolicy{
+		Enabled: false,
+	}
+	return config
+}
+
+func newExampleServerWithConfig(
+	t *testing.T,
+	schema string,
+	configure func(*exampleserver.ServerConfig),
+) *exampleserver.TestServer {
+	t.Helper()
+
+	cfg := &exampleserver.ServerConfig{
 		DatabaseURL:    integrationTestDatabaseURL(),
 		JWTSecret:      "oversqlite-end-to-end-secret",
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn})),
 		AppName:        "oversqlite-end-to-end",
 		BusinessSchema: schema,
-	})
+	}
+	if configure != nil {
+		configure(cfg)
+	}
+
+	ts, err := exampleserver.NewTestServer(cfg)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -124,9 +158,46 @@ func newSQLiteClient(
 		return ts.GenerateToken(userID, client.SourceID, time.Hour)
 	}
 
-	client, err = oversqlite.NewClient(db, ts.URL(), userID, sourceID, tokenFn, config)
+	client, err = oversqlite.NewClient(db, ts.URL(), tokenFn, config)
 	require.NoError(t, err)
-	require.NoError(t, client.Bootstrap(context.Background(), false))
+	require.NoError(t, client.Open(context.Background(), sourceID))
+	connectResult, err := client.Connect(context.Background(), userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	t.Cleanup(func() { _ = db.Close() })
+	return client, db
+}
+
+func newSQLiteClientWithoutConnect(
+	t *testing.T,
+	ts *exampleserver.TestServer,
+	userID string,
+	sourceID string,
+	config *oversqlite.Config,
+	ddl ...string,
+) (*oversqlite.Client, *sql.DB) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	for _, stmt := range ddl {
+		_, err := db.Exec(stmt)
+		require.NoError(t, err)
+	}
+
+	var client *oversqlite.Client
+	tokenFn := func(ctx context.Context) (string, error) {
+		return ts.GenerateToken(userID, client.SourceID, time.Hour)
+	}
+
+	client, err = oversqlite.NewClient(db, ts.URL(), tokenFn, config)
+	require.NoError(t, err)
+	require.NoError(t, client.Open(context.Background(), sourceID))
 
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	t.Cleanup(func() { _ = db.Close() })

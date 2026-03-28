@@ -164,6 +164,40 @@ func loadCommittedBundleForUser(t *testing.T, ctx context.Context, svc *SyncServ
 	return bundle
 }
 
+func resolveConnectForPushSession(t *testing.T, ctx context.Context, svc *SyncService, actor Actor, hasLocalPendingRows bool) string {
+	t.Helper()
+
+	resp, err := svc.Connect(ctx, Actor{UserID: actor.UserID}, &ConnectRequest{
+		SourceID:            actor.SourceID,
+		HasLocalPendingRows: hasLocalPendingRows,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	switch resp.Resolution {
+	case "initialize_local":
+		require.NotEmpty(t, resp.InitializationID)
+		return resp.InitializationID
+	case "remote_authoritative", "initialize_empty":
+		return ""
+	default:
+		t.Fatalf("unexpected connect resolution %q", resp.Resolution)
+		return ""
+	}
+}
+
+func mustInitializeEmptyScope(t *testing.T, ctx context.Context, svc *SyncService, userID, sourceID string) {
+	t.Helper()
+
+	resp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
+		SourceID:            sourceID,
+		HasLocalPendingRows: false,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Contains(t, []string{"initialize_empty", "remote_authoritative"}, resp.Resolution)
+}
+
 func pushRowsViaSession(
 	t *testing.T,
 	ctx context.Context,
@@ -174,10 +208,12 @@ func pushRowsViaSession(
 ) (*Bundle, error) {
 	t.Helper()
 
+	initializationID := resolveConnectForPushSession(t, ctx, svc, actor, len(rows) > 0)
 	createResp, err := svc.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
-		SourceID:        actor.SourceID,
-		SourceBundleID:  sourceBundleID,
-		PlannedRowCount: int64(len(rows)),
+		SourceID:         actor.SourceID,
+		SourceBundleID:   sourceBundleID,
+		PlannedRowCount:  int64(len(rows)),
+		InitializationID: initializationID,
 	})
 	if err != nil {
 		return nil, err

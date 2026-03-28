@@ -59,13 +59,16 @@ func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor) (_
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := actor.validate(false); err != nil {
 		return nil, err
 	}
 
 	var resp *SnapshotSession
 	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
 		if err := cleanupExpiredSnapshotSessionsQuerier(ctx, tx); err != nil {
+			return err
+		}
+		if err := requireScopeInitializedQuerier(ctx, tx, actor.UserID); err != nil {
 			return err
 		}
 
@@ -154,7 +157,7 @@ func (s *SyncService) GetSnapshotChunk(ctx context.Context, actor Actor, snapsho
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := actor.validate(false); err != nil {
 		return nil, err
 	}
 	if snapshotID == "" {
@@ -263,7 +266,7 @@ func (s *SyncService) DeleteSnapshotSession(ctx context.Context, actor Actor, sn
 		return err
 	}
 	defer done()
-	if err := actor.validate(true); err != nil {
+	if err := actor.validate(false); err != nil {
 		return err
 	}
 	if snapshotID == "" {

@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,24 +24,28 @@ import (
 
 // ServerConfig holds configuration for the server
 type ServerConfig struct {
-	DatabaseURL    string
-	JWTSecret      string
-	Logger         *slog.Logger
-	AppName        string
-	BusinessSchema string
-	StageMetrics   oversync.StageMetricsRecorder
+	DatabaseURL                string
+	JWTSecret                  string
+	Logger                     *slog.Logger
+	AppName                    string
+	BusinessSchema             string
+	StageMetrics               oversync.StageMetricsRecorder
+	InitializationLeaseTTL     time.Duration
+	EnableEmptyFirstDeferral   bool
+	EmptyFirstDeferralDuration time.Duration
 }
 
 // ServerComponents holds the initialized server components
 type ServerComponents struct {
-	Pool           *pgxpool.Pool
-	SyncService    *oversync.SyncService
-	JWTAuth        *oversync.JWTAuth
-	Handler        http.Handler
-	Logger         *slog.Logger
-	BusinessSchema string
-	ctx            context.Context
-	cancel         context.CancelFunc
+	Pool            *pgxpool.Pool
+	SyncService     *oversync.SyncService
+	JWTAuth         *oversync.JWTAuth
+	Handler         http.Handler
+	Logger          *slog.Logger
+	BusinessSchema  string
+	FailureInjector *failureInjector
+	ctx             context.Context
+	cancel          context.CancelFunc
 }
 
 // TestServer represents a running test server instance
@@ -47,10 +54,45 @@ type TestServer struct {
 	HTTPServer *httptest.Server
 }
 
+type emptyFirstDeferralCandidate struct {
+	sourceID  string
+	expiresAt time.Time
+}
+
+type emptyFirstDeferralController struct {
+	mu         sync.Mutex
+	duration   time.Duration
+	candidates map[string]emptyFirstDeferralCandidate
+}
+
+const (
+	FailureEndpointConnect             = "connect"
+	FailureEndpointPushSessionCreate   = "push_session_create"
+	FailureEndpointPushSessionChunk    = "push_session_chunk"
+	FailureEndpointPushSessionCommit   = "push_session_commit"
+	FailureEndpointPull                = "pull"
+	FailureEndpointSnapshotCreate      = "snapshot_create"
+	FailureEndpointSnapshotChunk       = "snapshot_chunk"
+	FailureEndpointCapabilities        = "capabilities"
+	FailureEndpointCommittedBundleRows = "committed_bundle_rows"
+)
+
+type failureInjector struct {
+	mu    sync.Mutex
+	rules map[string]*failureRule
+}
+
+type failureRule struct {
+	statusCode int
+	remaining  int
+	body       []byte
+}
+
 // SetupServer initializes all server components (database, sync service, handlers)
 // This is the shared logic used by both main() and tests
 func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	injector := &failureInjector{rules: make(map[string]*failureRule)}
 
 	// Use default logger if not provided
 	logger := config.Logger
@@ -123,6 +165,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   appName,
 		StageMetrics:              config.StageMetrics,
+		InitializationLeaseTTL:    config.InitializationLeaseTTL,
 		RegisteredTables: []oversync.RegisteredTable{
 			{Schema: businessSchema, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: businessSchema, Table: "posts", SyncKeyColumns: []string{"id"}},
@@ -167,6 +210,14 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 
 	// Create sync handlers
 	syncHandlers := oversync.NewHTTPSyncHandlers(syncService, logger)
+	connectHandler := http.HandlerFunc(syncHandlers.HandleConnect)
+	if config.EnableEmptyFirstDeferral {
+		deferralDuration := config.EmptyFirstDeferralDuration
+		if deferralDuration <= 0 {
+			deferralDuration = time.Second
+		}
+		connectHandler = wrapConnectWithEmptyFirstDeferral(connectHandler, pool, deferralDuration)
+	}
 
 	// Create HTTP handler
 	mux := http.NewServeMux()
@@ -272,30 +323,170 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	})
 
 	// Register sync endpoints with enhanced logging
-	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreatePushSession)), logger))
-	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandlePushSessionChunk)), logger))
-	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCommitPushSession)), logger))
+	mux.Handle("POST /sync/connect", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointConnect, jwtAuth.Middleware(connectHandler)), logger))
+	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionCreate, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreatePushSession))), logger))
+	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionChunk, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandlePushSessionChunk))), logger))
+	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionCommit, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCommitPushSession))), logger))
 	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))
-	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows)), logger))
-	mux.Handle("GET /sync/pull", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointCommittedBundleRows, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows))), logger))
+	mux.Handle("GET /sync/pull", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPull, jwtAuth.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		syncHandlers.HandlePull(w, r)
 		logger.Info("🔥 PULL: Pull handler completed")
-	})), logger))
-	mux.Handle("POST /sync/snapshot-sessions", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession)), logger))
-	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk)), logger))
+	}))), logger))
+	mux.Handle("POST /sync/snapshot-sessions", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointSnapshotCreate, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession))), logger))
+	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointSnapshotChunk, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk))), logger))
 	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)), logger))
-	mux.Handle("GET /sync/capabilities", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCapabilities)), logger))
+	mux.Handle("GET /sync/capabilities", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointCapabilities, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCapabilities))), logger))
 
 	return &ServerComponents{
-		Pool:           pool,
-		SyncService:    syncService,
-		JWTAuth:        jwtAuth,
-		Handler:        BrowserTestCORSMiddleware(mux),
-		Logger:         logger,
-		BusinessSchema: businessSchema,
-		ctx:            ctx,
-		cancel:         cancel,
+		Pool:            pool,
+		SyncService:     syncService,
+		JWTAuth:         jwtAuth,
+		Handler:         BrowserTestCORSMiddleware(mux),
+		Logger:          logger,
+		BusinessSchema:  businessSchema,
+		FailureInjector: injector,
+		ctx:             ctx,
+		cancel:          cancel,
 	}, nil
+}
+
+func injectFailureMiddleware(injector *failureInjector, endpoint string, next http.Handler) http.Handler {
+	if injector == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if injector.maybeRespond(endpoint, w) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func wrapConnectWithEmptyFirstDeferral(next http.Handler, pool *pgxpool.Pool, duration time.Duration) http.HandlerFunc {
+	controller := &emptyFirstDeferralController{
+		duration:   duration,
+		candidates: make(map[string]emptyFirstDeferralCandidate),
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(oversync.ErrorResponse{Error: "invalid_request", Message: "failed to read connect request"})
+			return
+		}
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		var req oversync.ConnectRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		actor, ok := oversync.ActorFromContext(r.Context())
+		if !ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if req.HasLocalPendingRows {
+			controller.clear(actor.UserID)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		state, err := loadHarnessScopeState(r.Context(), pool, actor.UserID)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if state != "UNINITIALIZED" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		now := time.Now().UTC()
+		retryLater, expiresAt := controller.decide(actor.UserID, req.SourceID, now)
+		if retryLater {
+			writeEmptyFirstRetryLater(w, expiresAt, now)
+			return
+		}
+		controller.clear(actor.UserID)
+		next.ServeHTTP(w, r)
+	}
+}
+
+func loadHarnessScopeState(ctx context.Context, pool *pgxpool.Pool, userID string) (string, error) {
+	if pool == nil {
+		return "", fmt.Errorf("pool is required")
+	}
+	var state string
+	err := pool.QueryRow(ctx, `
+		SELECT state
+		FROM sync.scope_state
+		WHERE user_id = $1
+	`, userID).Scan(&state)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "UNINITIALIZED", nil
+		}
+		return "", err
+	}
+	return state, nil
+}
+
+func writeEmptyFirstRetryLater(w http.ResponseWriter, expiresAt time.Time, now time.Time) {
+	retryAfter := int(math.Ceil(expiresAt.Sub(now).Seconds()))
+	if retryAfter < 1 {
+		retryAfter = 1
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(&oversync.ConnectResponse{
+		Resolution:     "retry_later",
+		RetryAfterSec:  retryAfter,
+		LeaseExpiresAt: expiresAt.UTC().Format(time.RFC3339Nano),
+	})
+}
+
+func (c *emptyFirstDeferralController) clear(userID string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.candidates, userID)
+}
+
+func (c *emptyFirstDeferralController) decide(userID, sourceID string, now time.Time) (bool, time.Time) {
+	if c == nil {
+		return false, time.Time{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	candidate, ok := c.candidates[userID]
+	if !ok {
+		expiresAt := now.Add(c.duration)
+		c.candidates[userID] = emptyFirstDeferralCandidate{
+			sourceID:  sourceID,
+			expiresAt: expiresAt,
+		}
+		return true, expiresAt
+	}
+	if candidate.expiresAt.After(now) {
+		return true, candidate.expiresAt
+	}
+	if candidate.sourceID == sourceID {
+		delete(c.candidates, userID)
+		return false, time.Time{}
+	}
+	expiresAt := now.Add(c.duration)
+	c.candidates[userID] = emptyFirstDeferralCandidate{
+		sourceID:  sourceID,
+		expiresAt: expiresAt,
+	}
+	return true, expiresAt
 }
 
 func resetExampleDatabase(ctx context.Context, pool *pgxpool.Pool, syncService *oversync.SyncService, logger *slog.Logger, businessSchema string) error {
@@ -415,6 +606,25 @@ func (ts *TestServer) GenerateToken(userID, deviceID string, duration time.Durat
 	return ts.JWTAuth.GenerateToken(userID, deviceID, duration)
 }
 
+func (ts *TestServer) InjectFailure(endpoint string, statusCode, count int) {
+	if ts == nil || ts.FailureInjector == nil {
+		return
+	}
+	body, _ := json.Marshal(oversync.ErrorResponse{
+		Error:   "injected_failure",
+		Message: fmt.Sprintf("injected %s failure", endpoint),
+	})
+	ts.FailureInjector.set(endpoint, statusCode, count, body)
+}
+
+func (ts *TestServer) InjectJSONFailure(endpoint string, statusCode, count int, body any) {
+	if ts == nil || ts.FailureInjector == nil {
+		return
+	}
+	raw, _ := json.Marshal(body)
+	ts.FailureInjector.set(endpoint, statusCode, count, raw)
+}
+
 // LoggingMiddleware logs all HTTP requests with detailed information
 func LoggingMiddleware(enableLogging bool, next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -482,6 +692,44 @@ func LoggingMiddleware(enableLogging bool, next http.Handler, logger *slog.Logge
 
 		logger.Info("HTTP Response", "response", responseLog)
 	})
+}
+
+func (f *failureInjector) set(endpoint string, statusCode, count int, body []byte) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if count <= 0 {
+		delete(f.rules, endpoint)
+		return
+	}
+	f.rules[endpoint] = &failureRule{
+		statusCode: statusCode,
+		remaining:  count,
+		body:       append([]byte(nil), body...),
+	}
+}
+
+func (f *failureInjector) maybeRespond(endpoint string, w http.ResponseWriter) bool {
+	if f == nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	rule := f.rules[endpoint]
+	if rule == nil || rule.remaining <= 0 {
+		return false
+	}
+	rule.remaining--
+	if rule.remaining == 0 {
+		delete(f.rules, endpoint)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(rule.statusCode)
+	_, _ = w.Write(rule.body)
+	return true
 }
 
 // responseWriter wraps http.ResponseWriter to capture status code and body

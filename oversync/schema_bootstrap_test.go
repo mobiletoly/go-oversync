@@ -27,6 +27,7 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 
 	var (
 		userStateExists                  bool
+		scopeStateExists                 bool
 		bundleCaptureStageExists         bool
 		rowStateExists                   bool
 		bundleLogExists                  bool
@@ -45,6 +46,7 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		bundleRowsKeyIndexExists         bool
 		snapshotSessionsTTLIndexExists   bool
 		snapshotSessionRowsIndexExists   bool
+		scopeStateLeaseIndexExists       bool
 		ownerGuardFunctionExists         bool
 		captureFunctionExists            bool
 		snapshotLastAccessedColumnCount  int
@@ -55,6 +57,7 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT
 			to_regclass('sync.user_state') IS NOT NULL,
+			to_regclass('sync.scope_state') IS NOT NULL,
 			to_regclass('sync.bundle_capture_stage') IS NOT NULL,
 			to_regclass('sync.row_state') IS NOT NULL,
 			to_regclass('sync.bundle_log') IS NOT NULL,
@@ -73,10 +76,12 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 			to_regclass('sync.br_user_bundle_key_idx') IS NOT NULL,
 			to_regclass('sync.ss_expires_at_idx') IS NOT NULL,
 			to_regclass('sync.ssr_snapshot_row_ordinal_idx') IS NOT NULL,
+			to_regclass('sync.scope_state_lease_idx') IS NOT NULL,
 			to_regprocedure('sync.enforce_registered_row_owner()') IS NOT NULL,
 			to_regprocedure('sync.capture_registered_row_change()') IS NOT NULL
 	`).Scan(
 		&userStateExists,
+		&scopeStateExists,
 		&bundleCaptureStageExists,
 		&rowStateExists,
 		&bundleLogExists,
@@ -95,11 +100,13 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		&bundleRowsKeyIndexExists,
 		&snapshotSessionsTTLIndexExists,
 		&snapshotSessionRowsIndexExists,
+		&scopeStateLeaseIndexExists,
 		&ownerGuardFunctionExists,
 		&captureFunctionExists,
 	))
 
 	require.True(t, userStateExists)
+	require.True(t, scopeStateExists)
 	require.True(t, bundleCaptureStageExists)
 	require.True(t, rowStateExists)
 	require.True(t, bundleLogExists)
@@ -118,6 +125,7 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 	require.True(t, bundleRowsKeyIndexExists)
 	require.True(t, snapshotSessionsTTLIndexExists)
 	require.True(t, snapshotSessionRowsIndexExists)
+	require.True(t, scopeStateLeaseIndexExists)
 	require.True(t, ownerGuardFunctionExists)
 	require.True(t, captureFunctionExists)
 
@@ -134,10 +142,10 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		SELECT COUNT(*)
 		FROM information_schema.table_constraints
 		WHERE table_schema = 'sync'
-		  AND table_name IN ('user_state', 'bundle_capture_stage', 'row_state', 'bundle_log', 'bundle_rows', 'applied_pushes', 'snapshot_sessions', 'snapshot_session_rows')
+		  AND table_name IN ('user_state', 'scope_state', 'bundle_capture_stage', 'row_state', 'bundle_log', 'bundle_rows', 'applied_pushes', 'snapshot_sessions', 'snapshot_session_rows')
 		  AND constraint_type = 'PRIMARY KEY'
 	`).Scan(&primaryKeyCount))
-	require.Equal(t, 8, primaryKeyCount)
+	require.Equal(t, 9, primaryKeyCount)
 
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT c.conname)

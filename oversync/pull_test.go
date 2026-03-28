@@ -170,6 +170,7 @@ func TestGetStatus_ReportsRetentionAndHistoryPrunedVisibility(t *testing.T) {
 			retained_bundle_floor = EXCLUDED.retained_bundle_floor
 	`, userID, latestBundleSeq+1, retainedFloor)
 	require.NoError(t, err)
+	mustInitializeEmptyScope(t, ctx, svc, userID, "reader")
 
 	_, err = svc.ProcessPull(ctx, Actor{UserID: userID, SourceID: "reader"}, retainedFloor-1, 10, 0)
 	var prunedErr *HistoryPrunedError

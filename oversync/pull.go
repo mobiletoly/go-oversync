@@ -27,7 +27,7 @@ func (s *SyncService) ProcessPull(
 	defer func() {
 		s.observeStageErr(ctx, "pull", "total", totalStart, maxBundles, 0, err)
 	}()
-	if err := actor.validate(true); err != nil {
+	if err := actor.validate(false); err != nil {
 		return nil, err
 	}
 	if maxBundles <= 0 {
@@ -71,6 +71,9 @@ func (s *SyncService) processPullQuerier(
 	maxBundles int,
 	targetBundleSeq int64,
 ) (*PullResponse, error) {
+	if err := requireScopeInitializedQuerier(ctx, tx, userID); err != nil {
+		return nil, err
+	}
 	stageStart := s.stageStart()
 	if err := enforceRetainedBundleFloorQuerier(ctx, tx, userID, afterBundleSeq); err != nil {
 		s.observeStageErr(ctx, "pull", "retained_floor_check", stageStart, 1, 0, err)

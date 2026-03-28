@@ -64,6 +64,18 @@ func (s *Session) SignIn(userID, sourceID string) error {
 	return nil
 }
 
+// SetSourceID updates the source identity used for future token refreshes.
+// It keeps the session active, but clears the cached token so the next request
+// regenerates credentials for the new source.
+func (s *Session) SetSourceID(sourceID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sourceID = sourceID
+	s.token = ""
+	s.expiresAt = time.Time{}
+}
+
 // SignOut clears the current session
 func (s *Session) SignOut() {
 	s.mu.Lock()
@@ -102,31 +114,35 @@ func (s *Session) IsActive() bool {
 // GetToken returns the current JWT token
 func (s *Session) GetToken() (string, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	if !s.isActive {
+		s.mu.RUnlock()
+		return "", fmt.Errorf("no active session")
+	}
+	if time.Now().Add(5 * time.Minute).Before(s.expiresAt) {
+		token := s.token
+		s.mu.RUnlock()
+		return token, nil
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if !s.isActive {
 		return "", fmt.Errorf("no active session")
 	}
-
 	if time.Now().Add(5 * time.Minute).After(s.expiresAt) {
-		s.mu.RUnlock()
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		defer s.mu.RLock()
+		s.logger.Info("Refreshing token", "user_id", s.userID)
 
-		if time.Now().Add(5 * time.Minute).After(s.expiresAt) {
-			s.logger.Info("Refreshing token", "user_id", s.userID)
-
-			token, expiresAt, err := s.generateToken(s.userID, s.sourceID)
-			if err != nil {
-				return "", fmt.Errorf("failed to refresh token: %w", err)
-			}
-
-			s.token = token
-			s.expiresAt = expiresAt
-
-			s.logger.Info("Token refreshed", "expires_at", expiresAt.Format(time.RFC3339))
+		token, expiresAt, err := s.generateToken(s.userID, s.sourceID)
+		if err != nil {
+			return "", fmt.Errorf("failed to refresh token: %w", err)
 		}
+
+		s.token = token
+		s.expiresAt = expiresAt
+
+		s.logger.Info("Token refreshed", "expires_at", expiresAt.Format(time.RFC3339))
 	}
 
 	return s.token, nil

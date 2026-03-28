@@ -90,6 +90,7 @@ if err := svc.Bootstrap(ctx); err != nil {
 handlers := oversync.NewHTTPSyncHandlers(svc, logger)
 
 mux := http.NewServeMux()
+mux.Handle("POST /sync/connect", auth(http.HandlerFunc(handlers.HandleConnect)))
 mux.Handle("POST /sync/push-sessions", auth(http.HandlerFunc(handlers.HandleCreatePushSession)))
 mux.Handle("POST /sync/push-sessions/{push_id}/chunks", auth(http.HandlerFunc(handlers.HandlePushSessionChunk)))
 mux.Handle("POST /sync/push-sessions/{push_id}/commit", auth(http.HandlerFunc(handlers.HandleCommitPushSession)))
@@ -104,10 +105,11 @@ mux.HandleFunc("GET /health", handlers.HandleHealth)
 mux.HandleFunc("GET /status", handlers.HandleStatus)
 ```
 
-Your auth middleware must authenticate the request and inject
-`oversync.Actor{UserID, SourceID}` into request context before calling the sync handlers.
-The runtime derives `_sync_scope_id` from `Actor.UserID`; clients never send or receive
-`_sync_scope_id` in visible sync payloads.
+Your auth middleware must authenticate the request and inject `oversync.Actor` into request
+context before calling the sync handlers. `POST /sync/connect` requires `Actor.UserID`; push,
+pull, and snapshot flows continue to rely on both `Actor.UserID` and `Actor.SourceID`. The runtime
+derives `_sync_scope_id` from `Actor.UserID`; clients never send or receive `_sync_scope_id` in
+visible sync payloads.
 
 ## SQLite Client
 
@@ -117,17 +119,30 @@ cfg := oversqlite.DefaultConfig("business", []oversqlite.SyncTable{
     {TableName: "posts", SyncKeyColumnName: "id"},
 })
 
-client, err := oversqlite.NewClient(db, "http://localhost:8080", "user-123", "device-abc", tokenProvider, cfg)
+client, err := oversqlite.NewClient(db, "http://localhost:8080", tokenProvider, cfg)
 if err != nil {
     log.Fatal(err)
 }
 defer client.Close()
 
-if err := client.Bootstrap(ctx, true); err != nil {
+if err := client.Open(ctx, "device-abc"); err != nil {
     log.Fatal(err)
 }
 
+connectResult, err := client.Connect(ctx, "user-123")
+if err != nil {
+    log.Fatal(err)
+}
+if connectResult.Status == oversqlite.ConnectStatusRetryLater {
+    log.Printf("connect pending, retry after %s", connectResult.RetryAfter)
+    return
+}
+
 if err := client.Sync(ctx); err != nil {
+    log.Fatal(err)
+}
+
+if err := client.SignOut(ctx); err != nil {
     log.Fatal(err)
 }
 ```

@@ -15,6 +15,7 @@ const syncBootstrapLockKey int64 = 0x6f76657273796e63
 const scaleRedesignSchemaReadySQL = `
 SELECT
 	to_regclass('sync.user_state') IS NOT NULL
+	AND to_regclass('sync.scope_state') IS NOT NULL
 	AND to_regclass('sync.bundle_capture_stage') IS NOT NULL
 	AND to_regclass('sync.row_state') IS NOT NULL
 	AND to_regclass('sync.bundle_log') IS NOT NULL
@@ -34,12 +35,33 @@ SELECT
 	AND to_regclass('sync.br_user_bundle_key_idx') IS NOT NULL
 	AND to_regclass('sync.ss_expires_at_idx') IS NOT NULL
 	AND to_regclass('sync.ssr_snapshot_row_ordinal_idx') IS NOT NULL
+	AND to_regclass('sync.scope_state_lease_idx') IS NOT NULL
 	AND to_regprocedure('sync.enforce_registered_row_owner()') IS NOT NULL
 	AND to_regprocedure('sync.capture_registered_row_change()') IS NOT NULL
 `
 
+type schemaReadyQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func scaleRedesignSchemaReady(ctx context.Context, q schemaReadyQuerier) (bool, error) {
+	var ready bool
+	if err := q.QueryRow(ctx, scaleRedesignSchemaReadySQL).Scan(&ready); err != nil {
+		return false, fmt.Errorf("check sync schema readiness: %w", err)
+	}
+	return ready, nil
+}
+
 // initializeSchema creates the required sync tables if they don't exist
 func (s *SyncService) initializeSchema(ctx context.Context) error {
+	ready, err := scaleRedesignSchemaReady(ctx, s.pool)
+	if err != nil {
+		return err
+	}
+	if ready {
+		return s.discoverSchemaRelationships(ctx)
+	}
+
 	if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		return s.initializeSchemaInTx(ctx, tx)
 	}); err != nil {
@@ -59,6 +81,13 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, syncBootstrapLockKey); err != nil {
 		return fmt.Errorf("acquire sync bootstrap lock: %w", err)
 	}
+	ready, err := scaleRedesignSchemaReady(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if ready {
+		return nil
+	}
 
 	migrations := []string{
 		// Create dedicated sync schema
@@ -70,6 +99,35 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			next_bundle_seq BIGINT NOT NULL DEFAULT 1,
 			retained_bundle_floor BIGINT NOT NULL DEFAULT 0,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.scope_state (
+			user_id TEXT PRIMARY KEY,
+			state TEXT NOT NULL CHECK (state IN ('UNINITIALIZED', 'INITIALIZING', 'INITIALIZED')),
+			initializer_source_id TEXT,
+			initialization_id UUID,
+			lease_expires_at TIMESTAMPTZ,
+			initialized_at TIMESTAMPTZ,
+			initialized_by_source_id TEXT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			CONSTRAINT scope_state_fields_chk CHECK (
+				(
+					state = 'UNINITIALIZED'
+					AND initializer_source_id IS NULL
+					AND initialization_id IS NULL
+					AND lease_expires_at IS NULL
+				) OR (
+					state = 'INITIALIZING'
+					AND initializer_source_id IS NOT NULL
+					AND initialization_id IS NOT NULL
+					AND lease_expires_at IS NOT NULL
+				) OR (
+					state = 'INITIALIZED'
+					AND initializer_source_id IS NULL
+					AND initialization_id IS NULL
+					AND lease_expires_at IS NULL
+				)
+			)
 		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.row_state (
 			user_id TEXT NOT NULL,
@@ -140,6 +198,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 			source_id TEXT NOT NULL,
 			source_bundle_id BIGINT NOT NULL,
 			planned_row_count BIGINT NOT NULL,
+			initialization_id UUID,
 			status TEXT NOT NULL CHECK (status IN ('staging', 'committed')),
 			bundle_seq BIGINT,
 			row_count BIGINT,
@@ -396,6 +455,7 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 		`CREATE UNIQUE INDEX IF NOT EXISTS ap_user_bundle_seq_idx ON sync.applied_pushes(user_id, bundle_seq)`,
 		`CREATE INDEX IF NOT EXISTS ss_expires_at_idx ON sync.snapshot_sessions(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS ssr_snapshot_row_ordinal_idx ON sync.snapshot_session_rows(snapshot_id, row_ordinal)`,
+		`CREATE INDEX IF NOT EXISTS scope_state_lease_idx ON sync.scope_state(state, lease_expires_at)`,
 	}
 	for _, stmt := range bootstrapIndexes {
 		if _, err := tx.Exec(ctx, stmt); err != nil {

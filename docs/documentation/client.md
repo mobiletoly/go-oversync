@@ -8,6 +8,10 @@ permalink: /documentation/client/
 
 `oversqlite` is the SQLite client SDK for the current bundle-based contract.
 
+`NewClient(...)` is lifecycle-neutral. It installs the runtime and local sync metadata, but it does
+not attach a user and it does not validate or persist a `source_id`. Call `Open(ctx, sourceID)` on
+launch and `Connect(ctx, userID)` after sign-in.
+
 ## SQLite State
 
 - `_sync_dirty_rows`: one coalesced local dirty row per structured key
@@ -15,12 +19,24 @@ permalink: /documentation/client/
 - `_sync_push_outbound`: the frozen in-flight push snapshot
 - `_sync_push_stage`: authoritative committed rows staged before final replay
 - `_sync_row_state`: authoritative replicated row state for managed tables
+- `_sync_managed_tables`: registry of managed tables whose change-capture triggers were installed by
+  `oversqlite`
 - `_sync_client_state`: client-scoped state including `source_id`, `next_source_bundle_id`,
   `last_bundle_seq_seen`, `schema_name`, `apply_mode`, and `rebuild_required`
+- `_sync_lifecycle_state`: lifecycle control state including persisted caller-owned `source_id`,
+  anonymous vs attached binding state, and pending recovery/transition markers
 
 ## Operations
 
-- `Bootstrap(ctx, performHydration)`: ensures client metadata exists and optionally hydrates
+- `Open(ctx, sourceID)`: local-only startup step; validates/persists the caller-owned `source_id`
+  and captures pre-existing anonymous rows once
+- `Connect(ctx, userID)`: resolves first-account attachment through `POST /sync/connect`
+- `SignOut(ctx)`: blocks on unsynced attached data and otherwise clears synced local state
+- `SyncThenSignOut(ctx)`: sync-first sign-out convenience path
+- `PendingSyncStatus(ctx)`: reports whether pending sync rows exist and whether they block sign-out
+- `ResetForNewSource(ctx, sourceID)`: explicit destructive source-rotation path
+- `UninstallSync(ctx)`: explicit full local teardown that removes sync-owned metadata tables and
+  triggers without deleting business tables
 - `PushPending()`: freezes `_sync_dirty_rows` into `_sync_push_outbound`, uploads through push
   sessions, resolves valid structured `push_conflict` responses automatically, fetches
   authoritative committed rows into `_sync_push_stage`, and replays them locally
@@ -31,8 +47,68 @@ permalink: /documentation/client/
 - `Hydrate()`: rebuilds managed tables through chunked snapshot sessions
 - `Recover()`: destructive rebuild through chunked snapshot sessions, then rotates `source_id`
 
+## Lifecycle Preconditions
+
+Operations that require only `Open(ctx, sourceID)`:
+
+- `Open(ctx, sourceID)` itself
+- `PendingSyncStatus(ctx)`
+- `ResetForNewSource(ctx, sourceID)`
+- `UninstallSync(ctx)`
+
+Operations that require successful `Open(ctx, sourceID)` plus successful `Connect(ctx, userID)`:
+
+- `PushPending()`
+- `PullToStable()`
+- `Sync()`
+- `Hydrate()`
+- `Recover()`
+- `LastBundleSeqSeen(ctx)`
+- `SignOut(ctx)`
+- `SyncThenSignOut(ctx)`
+
+Typed lifecycle/state-precondition errors:
+
+- `OpenRequiredError`: returned when an operation requires `Open(ctx, sourceID)` first, including
+  `Connect(ctx, userID)` before open
+- `ConnectRequiredError`: returned when attached-state operations are called before successful
+  `Connect(ctx, userID)`
+- `DestructiveTransitionInProgressError`: returned while sign-out/source-reset state prevents sync
+  operations from running safely
+
+## Built-In Transient Retry
+
+If `Config.RetryPolicy` is unset, `oversqlite` enables a conservative built-in retry policy for
+transient transport and temporary server-availability failures:
+
+- `MaxAttempts: 3`
+- `InitialBackoff: 100ms`
+- `MaxBackoff: 1s`
+- `JitterFraction: 0.2`
+
+Covered internally:
+
+- `PushPending()`
+- `PullToStable()`
+- snapshot session creation and snapshot chunk fetches used by `Hydrate()` / `Recover()`
+- transport-level `/sync/connect` failures while `Connect(ctx, userID)` is reaching the server
+
+Not covered internally:
+
+- semantic `ConnectStatusRetryLater`
+- `401` / `403`
+- capability mismatch / old-server incompatibility
+- conflict / validation failures
+- `SignOut()`
+- `ResetForNewSource(ctx, sourceID)`
+- `UninstallSync()`
+
+Set `Config.RetryPolicy = &oversqlite.RetryPolicy{Enabled: false}` to disable built-in retry
+explicitly. When the retry budget is exhausted, the client returns `RetryExhaustedError`.
+
 ## Invariants
 
+- `ConnectStatusRetryLater` is a normal lifecycle result, not an auth failure
 - the client never applies part of a bundle
 - `last_bundle_seq_seen` advances only after durable bundle commit and represents the highest
   contiguous durably applied bundle
@@ -49,6 +125,9 @@ permalink: /documentation/client/
 - run exactly one client runtime against one SQLite database at a time
 - `Close()` releases client ownership of the SQLite database; it does not close the underlying
   `*sql.DB`
+- `UninstallSync()` is more destructive than `SignOut()` and `ResetForNewSource()`: it removes the
+  installed `oversqlite` footprint from the database and requires a new client instance before sync
+  can be reinstalled
 
 ## Timestamp Fields
 
@@ -92,6 +171,7 @@ Typed errors:
 - `PushConflictError`: structured transport/decode-layer push-conflict error
 - `InvalidConflictResolutionError`: resolver returned an outcome that is invalid for the conflict shape
 - `PushConflictRetryExhaustedError`: retry budget was exhausted and replayable dirty state remains
+- `RetryExhaustedError`: bounded transient retry was exhausted for a retry-covered sync operation
 
 Fail-closed behavior:
 

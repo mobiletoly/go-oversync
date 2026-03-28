@@ -67,7 +67,7 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 	}
 
 	// Create client
-	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, config)
+	client, err := NewClient(db, "http://localhost:8080", tokenFunc, config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestNewClient_RequiresExplicitPrimaryKeyConfig(t *testing.T) {
 		return "mock-token", nil
 	}
 
-	_, err = NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, config)
+	_, err = NewClient(db, "http://localhost:8080", tokenFunc, config)
 	if err == nil {
 		t.Fatal("expected client creation to fail when SyncKeyColumnName is omitted")
 	}
@@ -192,7 +192,7 @@ func TestNewClient_FailsWhenSyncKeyColumnDoesNotExist(t *testing.T) {
 		return "mock-token", nil
 	}
 
-	_, err = NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, config)
+	_, err = NewClient(db, "http://localhost:8080", tokenFunc, config)
 	if err == nil {
 		t.Fatal("expected client creation to fail when SyncKeyColumnName does not exist")
 	}
@@ -421,7 +421,7 @@ func TestNewClient_FailsWhenSyncKeyColumnUsesIntegerPrimaryKey(t *testing.T) {
 	tokenFunc := func(ctx context.Context) (string, error) {
 		return "mock-token", nil
 	}
-	_, err = NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+	_, err = NewClient(db, "http://localhost:8080", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "users", SyncKeyColumnName: "id"},
 	}))
 	if err == nil {
@@ -452,7 +452,7 @@ func TestNewClient_FailsWhenSyncKeyColumnUsesBigIntPrimaryKey(t *testing.T) {
 	tokenFunc := func(ctx context.Context) (string, error) {
 		return "mock-token", nil
 	}
-	_, err = NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+	_, err = NewClient(db, "http://localhost:8080", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "users", SyncKeyColumnName: "id"},
 	}))
 	if err == nil {

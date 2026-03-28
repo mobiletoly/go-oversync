@@ -26,6 +26,20 @@ type preparedUploadChange struct {
 	LocalPayload sql.NullString
 }
 
+func nextSyncLoopBackoffAfterError(err error, current, min, max time.Duration) time.Duration {
+	if IsLifecyclePreconditionError(err) {
+		return min
+	}
+	next := current * 2
+	if next < min {
+		return min
+	}
+	if next > max {
+		return max
+	}
+	return next
+}
+
 // uploaderLoop runs the push loop with backoff.
 func (c *Client) uploaderLoop(ctx context.Context) {
 	backoff := c.config.BackoffMin
@@ -42,11 +56,14 @@ func (c *Client) uploaderLoop(ctx context.Context) {
 		}
 
 		if err := c.PushPending(ctx); err != nil {
-			time.Sleep(backoff)
-			backoff *= 2
-			if backoff > c.config.BackoffMax {
-				backoff = c.config.BackoffMax
+			if IsLifecyclePreconditionError(err) {
+				c.logger.Warn("upload loop blocked by lifecycle state", "error", err)
+				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
+				time.Sleep(backoff)
+				continue
 			}
+			time.Sleep(backoff)
+			backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
 			continue
 		}
 
@@ -69,27 +86,33 @@ func (c *Client) downloaderLoop(ctx context.Context) {
 			continue
 		}
 
-		before, err := c.lastSeenBundleSeq(ctx)
+		before, err := c.LastBundleSeqSeen(ctx)
 		if err != nil {
-			time.Sleep(backoff)
-			backoff *= 2
-			if backoff > c.config.BackoffMax {
-				backoff = c.config.BackoffMax
+			if IsLifecyclePreconditionError(err) {
+				c.logger.Warn("download loop blocked by lifecycle state", "error", err)
+				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
+				time.Sleep(backoff)
+				continue
 			}
+			time.Sleep(backoff)
+			backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
 			continue
 		}
 
 		if err := c.PullToStable(ctx); err != nil {
-			time.Sleep(backoff)
-			backoff *= 2
-			if backoff > c.config.BackoffMax {
-				backoff = c.config.BackoffMax
+			if IsLifecyclePreconditionError(err) {
+				c.logger.Warn("download loop blocked by lifecycle state", "error", err)
+				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
+				time.Sleep(backoff)
+				continue
 			}
+			time.Sleep(backoff)
+			backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
 			continue
 		}
 
 		backoff = c.config.BackoffMin
-		after, seqErr := c.lastSeenBundleSeq(ctx)
+		after, seqErr := c.LastBundleSeqSeen(ctx)
 		if seqErr != nil || after == before {
 			time.Sleep(backoff)
 		}

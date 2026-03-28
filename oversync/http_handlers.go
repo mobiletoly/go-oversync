@@ -64,6 +64,26 @@ func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *htt
 			h.writeError(w, http.StatusBadRequest, "push_session_invalid", invalidErr.Error())
 			return
 		}
+		var uninitializedErr *ScopeUninitializedError
+		if errors.As(err, &uninitializedErr) {
+			h.writeError(w, http.StatusConflict, "scope_uninitialized", uninitializedErr.Error())
+			return
+		}
+		var initializingErr *ScopeInitializingError
+		if errors.As(err, &initializingErr) {
+			h.writeError(w, http.StatusConflict, "scope_initializing", initializingErr.Error())
+			return
+		}
+		var staleErr *InitializationStaleError
+		if errors.As(err, &staleErr) {
+			h.writeError(w, http.StatusConflict, "initialization_stale", staleErr.Error())
+			return
+		}
+		var expiredErr *InitializationExpiredError
+		if errors.As(err, &expiredErr) {
+			h.writeError(w, http.StatusGone, "initialization_expired", expiredErr.Error())
+			return
+		}
 		h.logger.Error("Failed to create push session", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
 		h.writeError(w, http.StatusInternalServerError, "push_session_create_failed", "Failed to create push session")
 		return
@@ -118,6 +138,16 @@ func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http
 		var expiredErr *PushSessionExpiredError
 		if errors.As(err, &expiredErr) {
 			h.writeError(w, http.StatusGone, "push_session_expired", expiredErr.Error())
+			return
+		}
+		var initExpiredErr *InitializationExpiredError
+		if errors.As(err, &initExpiredErr) {
+			h.writeError(w, http.StatusGone, "initialization_expired", initExpiredErr.Error())
+			return
+		}
+		var staleErr *InitializationStaleError
+		if errors.As(err, &staleErr) {
+			h.writeError(w, http.StatusConflict, "initialization_stale", staleErr.Error())
 			return
 		}
 		var forbiddenErr *PushSessionForbiddenError
@@ -175,6 +205,16 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 			h.writeError(w, http.StatusGone, "push_session_expired", expiredErr.Error())
 			return
 		}
+		var initExpiredErr *InitializationExpiredError
+		if errors.As(err, &initExpiredErr) {
+			h.writeError(w, http.StatusGone, "initialization_expired", initExpiredErr.Error())
+			return
+		}
+		var staleErr *InitializationStaleError
+		if errors.As(err, &staleErr) {
+			h.writeError(w, http.StatusConflict, "initialization_stale", staleErr.Error())
+			return
+		}
 		var forbiddenErr *PushSessionForbiddenError
 		if errors.As(err, &forbiddenErr) {
 			h.writeError(w, http.StatusForbidden, "push_session_forbidden", forbiddenErr.Error())
@@ -188,6 +228,46 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		h.logger.Error("Failed to encode push session commit response", "error", err, "user_id", actor.UserID, "push_id", pushID)
+	}
+}
+
+func (h *HTTPSyncHandlers) HandleConnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
+		return
+	}
+
+	actor, err := actorFromRequest(r)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+		return
+	}
+
+	var req ConnectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", "Failed to parse connect request")
+		return
+	}
+
+	response, err := h.service.Connect(r.Context(), actor, &req)
+	if err != nil {
+		if errors.Is(err, errServiceShuttingDown) {
+			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *ConnectInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "connect_invalid", invalidErr.Error())
+			return
+		}
+		h.logger.Error("Failed to resolve connect lifecycle", "error", err, "user_id", actor.UserID)
+		h.writeError(w, http.StatusInternalServerError, "connect_failed", "Failed to resolve connect lifecycle")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		h.logger.Error("Failed to encode connect response", "error", err, "user_id", actor.UserID)
 	}
 }
 
@@ -368,6 +448,16 @@ func (h *HTTPSyncHandlers) HandlePull(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, http.StatusConflict, "history_pruned", prunedErr.Error())
 			return
 		}
+		var uninitializedErr *ScopeUninitializedError
+		if errors.As(err, &uninitializedErr) {
+			h.writeError(w, http.StatusConflict, "scope_uninitialized", uninitializedErr.Error())
+			return
+		}
+		var initializingErr *ScopeInitializingError
+		if errors.As(err, &initializingErr) {
+			h.writeError(w, http.StatusConflict, "scope_initializing", initializingErr.Error())
+			return
+		}
 		h.logger.Error("Failed to process pull", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
 		h.writeError(w, http.StatusInternalServerError, "pull_failed", "Failed to process pull")
 		return
@@ -396,6 +486,16 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 	if err != nil {
 		if errors.Is(err, errServiceShuttingDown) {
 			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var uninitializedErr *ScopeUninitializedError
+		if errors.As(err, &uninitializedErr) {
+			h.writeError(w, http.StatusConflict, "scope_uninitialized", uninitializedErr.Error())
+			return
+		}
+		var initializingErr *ScopeInitializingError
+		if errors.As(err, &initializingErr) {
+			h.writeError(w, http.StatusConflict, "scope_initializing", initializingErr.Error())
 			return
 		}
 		h.logger.Error("Failed to create snapshot session", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)

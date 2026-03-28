@@ -43,11 +43,6 @@ func (s *SyncService) acquireUserUploadConn(ctx context.Context, userID string) 
 		return nil, nil, fmt.Errorf("acquire push connection: %w", err)
 	}
 
-	if err := ensureUserStateExistsWithExec(ctx, conn, userID); err != nil {
-		conn.Release()
-		return nil, nil, err
-	}
-
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, userID); err != nil {
 		conn.Release()
 		return nil, nil, fmt.Errorf("acquire user advisory lock: %w", err)

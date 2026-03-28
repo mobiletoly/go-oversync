@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/google/uuid"
 )
 
 type HistoryPrunedError struct {
@@ -73,6 +71,9 @@ func (c *Client) pendingPushOutboundCount(ctx context.Context) (int, error) {
 func (c *Client) rebuildRequired(ctx context.Context) (bool, error) {
 	var rebuildRequired int
 	if err := c.DB.QueryRowContext(ctx, `SELECT rebuild_required FROM _sync_client_state WHERE user_id = ?`, c.UserID).Scan(&rebuildRequired); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, &ConnectRequiredError{Operation: "sync operations"}
+		}
 		return false, fmt.Errorf("failed to read rebuild_required: %w", err)
 	}
 	return rebuildRequired == 1, nil
@@ -83,17 +84,38 @@ func (c *Client) setRebuildRequired(ctx context.Context, required bool) error {
 	if required {
 		value = 1
 	}
-	if _, err := c.DB.ExecContext(ctx, `UPDATE _sync_client_state SET rebuild_required = ? WHERE user_id = ?`, value, c.UserID); err != nil {
+	result, err := c.DB.ExecContext(ctx, `UPDATE _sync_client_state SET rebuild_required = ? WHERE user_id = ?`, value, c.UserID)
+	if err != nil {
 		return fmt.Errorf("failed to update rebuild_required: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to inspect rebuild_required update result: %w", err)
+	}
+	if rowsAffected != 1 {
+		return &ConnectRequiredError{Operation: "Hydrate()/Recover()"}
 	}
 	return nil
 }
 
 func (c *Client) clearManagedTablesInTx(ctx context.Context, tx *sql.Tx) error {
-	for _, syncTable := range c.config.Tables {
-		tableName := strings.ToLower(syncTable.TableName)
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM "%s"`, tableName)); err != nil {
-			return fmt.Errorf("failed to clear managed table %s: %w", tableName, err)
+	managedTables, err := c.loadManagedSyncTablesForUninstall(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, tableName := range managedTables {
+		tableName = strings.ToLower(strings.TrimSpace(tableName))
+		if tableName == "" {
+			continue
+		}
+		tableExists, err := sqliteTableExists(ctx, tx, tableName)
+		if err != nil {
+			return fmt.Errorf("failed to inspect managed table %s: %w", tableName, err)
+		}
+		if tableExists {
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM "%s"`, tableName)); err != nil {
+				return fmt.Errorf("failed to clear managed table %s: %w", tableName, err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_row_state WHERE schema_name = ? AND table_name = ?`, c.config.Schema, tableName); err != nil {
 			return fmt.Errorf("failed to clear structured row state for %s: %w", tableName, err)
@@ -122,110 +144,4 @@ func (c *Client) clearFullLocalSyncStateInTx(ctx context.Context, tx *sql.Tx) er
 		return fmt.Errorf("failed to clear snapshot staging during recovery: %w", err)
 	}
 	return nil
-}
-
-type persistedClientIdentity struct {
-	UserID     string
-	SourceID   string
-	SchemaName string
-}
-
-func (c *Client) ensureBootstrapStateLocked(ctx context.Context) (string, error) {
-	userID := strings.TrimSpace(c.UserID)
-	if userID == "" {
-		return "", fmt.Errorf("userID must be provided")
-	}
-
-	preferredSourceID := strings.TrimSpace(c.SourceID)
-	schemaName := strings.TrimSpace(c.config.Schema)
-
-	tx, err := c.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to begin bootstrap identity transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	rows, err := tx.QueryContext(ctx, `
-		SELECT user_id, source_id, schema_name
-		FROM _sync_client_state
-		ORDER BY user_id
-	`)
-	if err != nil {
-		return "", fmt.Errorf("failed to query bootstrap client identity: %w", err)
-	}
-	defer rows.Close()
-
-	identities := make([]persistedClientIdentity, 0)
-	for rows.Next() {
-		var identity persistedClientIdentity
-		if err := rows.Scan(&identity.UserID, &identity.SourceID, &identity.SchemaName); err != nil {
-			return "", fmt.Errorf("failed to scan bootstrap client identity: %w", err)
-		}
-		identities = append(identities, identity)
-	}
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("failed to iterate bootstrap client identity: %w", err)
-	}
-
-	if len(identities) == 0 {
-		sourceID := preferredSourceID
-		if sourceID == "" {
-			sourceID = uuid.NewString()
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO _sync_client_state (
-				user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode, rebuild_required
-			) VALUES (?, ?, ?, 1, 0, 0, 0)
-		`, userID, sourceID, schemaName); err != nil {
-			return "", fmt.Errorf("failed to insert initial bootstrap client state: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return "", fmt.Errorf("failed to commit initial bootstrap client state: %w", err)
-		}
-		return sourceID, nil
-	}
-
-	if len(identities) == 1 && identities[0].UserID == userID {
-		persisted := identities[0]
-		if schemaName != "" && strings.TrimSpace(persisted.SchemaName) != "" && strings.TrimSpace(persisted.SchemaName) != schemaName {
-			return "", fmt.Errorf("client state for user %s is bound to schema %s, not %s", userID, persisted.SchemaName, schemaName)
-		}
-		if preferredSourceID == "" || preferredSourceID == persisted.SourceID {
-			if schemaName != "" && strings.TrimSpace(persisted.SchemaName) == "" {
-				if _, err := tx.ExecContext(ctx, `
-					UPDATE _sync_client_state
-					SET schema_name = ?
-					WHERE user_id = ?
-				`, schemaName, userID); err != nil {
-					return "", fmt.Errorf("failed to persist client schema identity: %w", err)
-				}
-			}
-			if err := tx.Commit(); err != nil {
-				return "", fmt.Errorf("failed to commit bootstrap client identity: %w", err)
-			}
-			return persisted.SourceID, nil
-		}
-	}
-
-	sourceID := preferredSourceID
-	if sourceID == "" {
-		sourceID = uuid.NewString()
-	}
-	if err := c.clearFullLocalSyncStateInTx(ctx, tx); err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_client_state`); err != nil {
-		return "", fmt.Errorf("failed to clear persisted client identity during bootstrap reset: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO _sync_client_state (
-			user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode, rebuild_required
-		) VALUES (?, ?, ?, 1, 0, 0, 1)
-	`, userID, sourceID, schemaName); err != nil {
-		return "", fmt.Errorf("failed to persist reset bootstrap client identity: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return "", fmt.Errorf("failed to commit bootstrap identity reset: %w", err)
-	}
-	return sourceID, nil
 }

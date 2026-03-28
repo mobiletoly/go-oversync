@@ -135,6 +135,7 @@ type ServiceConfig struct {
 	DefaultRowsPerPushChunk int
 	MaxRowsPerPushChunk     int
 	PushSessionTTL          time.Duration
+	InitializationLeaseTTL  time.Duration
 	// Committed-bundle row fetch limits. Zero uses the runtime defaults.
 	DefaultRowsPerCommittedBundleChunk int
 	MaxRowsPerCommittedBundleChunk     int
@@ -275,15 +276,23 @@ func (s *SyncService) Bootstrap(ctx context.Context) error {
 	if s.pool == nil {
 		return fmt.Errorf("bootstrap requires a database pool")
 	}
-	if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.initializeSchemaInTx(ctx, tx); err != nil {
-			s.logger.Error("Failed to initialize database schema", "error", err)
+	ready, err := scaleRedesignSchemaReady(ctx, s.pool)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		if err := runRetryableTx(ctx, 3, 50*time.Millisecond, func() error {
+			return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+				if err := s.initializeSchemaInTx(ctx, tx); err != nil {
+					s.logger.Error("Failed to initialize database schema", "error", err)
+					return err
+				}
+				s.logger.Debug("Database schema initialized successfully")
+				return nil
+			})
+		}); err != nil {
 			return err
 		}
-		s.logger.Debug("Database schema initialized successfully")
-		return nil
-	}); err != nil {
-		return err
 	}
 
 	if err := s.normalizeAndValidateRegisteredSyncKeys(ctx); err != nil {
@@ -768,6 +777,8 @@ func (s *SyncService) GetCapabilities() CapabilitiesResponse {
 		"retained_floor_visibility":           true,
 		"retained_window_visibility":          true,
 		"history_pruned_visibility":           true,
+		"connect_lifecycle":                   true,
+		"scope_initialization_leases":         true,
 	}
 
 	tables := make([]string, 0, len(s.config.RegisteredTables))
@@ -808,6 +819,7 @@ func (s *SyncService) GetCapabilities() CapabilitiesResponse {
 			SnapshotSessionTTLSeconds:          int(s.snapshotSessionTTL().Seconds()),
 			MaxRowsPerSnapshotSession:          s.maxRowsPerSnapshotSession(),
 			MaxBytesPerSnapshotSession:         s.maxBytesPerSnapshotSession(),
+			InitializationLeaseTTLSeconds:      int(s.initializationLeaseTTL().Seconds()),
 		},
 	}
 }

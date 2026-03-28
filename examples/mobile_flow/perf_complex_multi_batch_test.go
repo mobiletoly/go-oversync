@@ -110,7 +110,11 @@ func TestPerfComplexMultiBatchParallel(t *testing.T) {
 	perfDatabaseURL, cleanupDatabase := createIsolatedPerfDatabase(t, ctx, databaseURL)
 	defer cleanupDatabase()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	logWriter := io.Writer(io.Discard)
+	if envBool("OVERSYNC_PERF_LOG", false) {
+		logWriter = os.Stdout
+	}
+	logger := slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	stageMetrics := newStageMetricsCollector()
 
 	testServer, err := serverpkg.NewTestServer(&serverpkg.ServerConfig{

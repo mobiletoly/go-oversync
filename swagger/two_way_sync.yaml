@@ -41,6 +41,47 @@ paths:
               schema:
                 $ref: '#/components/schemas/StatusResponse'
 
+  /sync/connect:
+    post:
+      summary: Resolve first-connect account attachment
+      description: |
+        Resolves whether the authenticated user's sync scope is already authoritative on the
+        server, whether this source may initialize it from local pending rows, whether the server
+        may initialize it empty, or whether the client should retry later because another
+        initializer currently owns the scope. `retry_later` is a normal lifecycle outcome, not an
+        authentication failure.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectRequest'
+      responses:
+        '200':
+          description: Connect lifecycle resolved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectResponse'
+        '400':
+          description: Invalid connect request (`connect_invalid`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Authentication required
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Server error
+
   /sync/push-sessions:
     post:
       summary: Create or restart chunked push session
@@ -65,13 +106,31 @@ paths:
               schema:
                 $ref: '#/components/schemas/PushSessionCreateResponse'
         '400':
-          description: Invalid push-session request
+          description: Invalid push-session request (`push_session_invalid`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Scope not ready for this push create (`scope_uninitialized`, `scope_initializing`, or `initialization_stale`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Initialization lease expired before push create (`initialization_expired`)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Authentication required
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: Server error
 
@@ -111,7 +170,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Out-of-order chunk upload
+          description: Out-of-order chunk upload or stale initialization lease (`push_chunk_out_of_order` or `initialization_stale`)
           content:
             application/json:
               schema:
@@ -131,7 +190,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '410':
-          description: Push session expired
+          description: Push session expired or initialization lease expired (`push_session_expired` or `initialization_expired`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
           content:
             application/json:
               schema:
@@ -182,13 +247,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Whole-bundle conflict rejection
+          description: Whole-bundle conflict rejection or stale initialization lease (`push_conflict` or `initialization_stale`)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PushConflictResponse'
+                oneOf:
+                  - $ref: '#/components/schemas/PushConflictResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
         '410':
-          description: Push session expired
+          description: Push session expired or initialization lease expired (`push_session_expired` or `initialization_expired`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
           content:
             application/json:
               schema:
@@ -211,6 +284,12 @@ paths:
       responses:
         '204':
           description: Push session deleted successfully
+        '400':
+          description: Invalid delete request (`push_chunk_invalid`, for example when the push session is already committed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Authentication required
         '403':
@@ -227,6 +306,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '410':
           description: Push session expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
           content:
             application/json:
               schema:
@@ -292,6 +377,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: Server error
 
@@ -347,7 +438,13 @@ paths:
         '401':
           description: Authentication required
         '409':
-          description: Requested checkpoint is older than the retained bundle floor
+          description: Requested checkpoint is older than the retained bundle floor, or the scope is not initialized (`history_pruned`, `scope_uninitialized`, or `scope_initializing`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
           content:
             application/json:
               schema:
@@ -369,8 +466,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SnapshotSession'
+        '409':
+          description: Scope is not initialized enough for snapshot creation (`scope_uninitialized` or `scope_initializing`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Authentication required
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: Server error
 
@@ -437,6 +546,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: Server error
     delete:
@@ -453,6 +568,12 @@ paths:
       responses:
         '204':
           description: Snapshot session deleted successfully
+        '400':
+          description: Invalid snapshot-session delete request (`snapshot_chunk_invalid`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Authentication required
         '403':
@@ -463,6 +584,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Snapshot session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service unavailable during graceful shutdown (`service_unavailable`)
           content:
             application/json:
               schema:
@@ -579,6 +706,39 @@ components:
           type: integer
           format: int64
           minimum: 1
+        initialization_id:
+          type: string
+          description: Required when this push session is seeding an uninitialized scope under an active initialization lease.
+
+    ConnectRequest:
+      type: object
+      required: [source_id, has_local_pending_rows]
+      properties:
+        source_id:
+          type: string
+          description: Caller-owned per-install or per-device source identity.
+        has_local_pending_rows:
+          type: boolean
+          description: Whether this client captured anonymous local rows that could seed an uninitialized scope.
+
+    ConnectResponse:
+      type: object
+      required: [resolution]
+      properties:
+        resolution:
+          type: string
+          enum: [remote_authoritative, initialize_local, initialize_empty, retry_later]
+        initialization_id:
+          type: string
+          description: Exclusive initialization lease token to carry through the first seed push when `resolution = initialize_local`.
+        lease_expires_at:
+          type: string
+          format: date-time
+          description: Lease expiry for `initialize_local` and `retry_later` responses when the server currently tracks an initializer.
+        retry_after_seconds:
+          type: integer
+          minimum: 1
+          description: Suggested retry backoff when `resolution = retry_later`.
 
     PushSessionCreateResponse:
       oneOf:
@@ -798,6 +958,17 @@ components:
         snapshot_session_ttl_seconds:
           type: integer
           description: Server-side time-to-live for frozen snapshot sessions before expiry cleanup.
+        max_rows_per_snapshot_session:
+          type: integer
+          format: int64
+          description: Maximum total row count the server will allow when materializing one frozen snapshot session.
+        max_bytes_per_snapshot_session:
+          type: integer
+          format: int64
+          description: Maximum total payload size in bytes the server will allow when materializing one frozen snapshot session.
+        initialization_lease_ttl_seconds:
+          type: integer
+          description: Server-side lease duration for exclusive first-initializer rights.
 
     RegisteredTableSpec:
       type: object
@@ -840,6 +1011,7 @@ components:
             committed_bundle_row_fetch: true
             bundle_pull: true
             snapshot_chunking: true
+            connect_lifecycle: true
             history_pruned_errors: true
             registered_write_rejection_enforced: true
             accepted_push_replay_visibility: true
