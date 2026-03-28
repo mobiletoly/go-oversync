@@ -7,6 +7,7 @@ This example shows a bundle-based go-oversync server built with the standard Go 
 - `POST /dummy-signin`
 - `POST /test/reset`
 - `POST /test/retention-floor`
+- `POST /sync/connect`
 - `POST /sync/push-sessions`
 - `POST /sync/push-sessions/{push_id}/chunks`
 - `POST /sync/push-sessions/{push_id}/commit`
@@ -49,6 +50,25 @@ curl -X POST http://localhost:8080/dummy-signin \
   -d '{"user":"demo-user","password":"anything","device":"device-123"}'
 ```
 
+## Example connect lifecycle
+
+```bash
+curl -X POST http://localhost:8080/sync/connect \
+  -H "Authorization: Bearer <jwt-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_id": "device-123",
+    "has_local_pending_rows": false
+  }'
+```
+
+Possible `resolution` values:
+
+- `remote_authoritative`
+- `initialize_local`
+- `initialize_empty`
+- `retry_later`
+
 ## Reset local example database
 
 ```bash
@@ -70,6 +90,9 @@ curl -X POST http://localhost:8080/test/retention-floor \
 This is a test helper for forcing the `history_pruned` path and snapshot recovery flows.
 
 ## Example push session flow
+
+If `POST /sync/connect` returned `initialize_local`, include the returned `initialization_id` in the
+create request below. If the scope is already initialized, omit `initialization_id`.
 
 ```bash
 PUSH_ID=$(curl -s -X POST http://localhost:8080/sync/push-sessions \
@@ -118,3 +141,10 @@ curl -H "Authorization: Bearer <jwt-token>" \
 If incremental pull falls behind the retained bundle floor, the server returns `history_pruned`.
 Clients then create a frozen snapshot session with `POST /sync/snapshot-sessions` and fetch
 chunks from `GET /sync/snapshot-sessions/{snapshot_id}` until the rebuild is complete.
+
+Lifecycle-specific failure codes to expect on the sync endpoints:
+
+- `scope_uninitialized`
+- `scope_initializing`
+- `initialization_stale`
+- `initialization_expired`

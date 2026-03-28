@@ -84,10 +84,12 @@ func (f *pushSessionFixture) userRow(id uuid.UUID, name string) PushRequestRow {
 func (f *pushSessionFixture) createSession(t *testing.T, ctx context.Context, sourceBundleID, plannedRowCount int64) *PushSessionCreateResponse {
 	t.Helper()
 
+	initializationID := resolveConnectForPushSession(t, ctx, f.svc, f.writer, plannedRowCount > 0)
 	resp, err := f.svc.CreatePushSession(ctx, f.writer, &PushSessionCreateRequest{
-		SourceID:        f.writer.SourceID,
-		SourceBundleID:  sourceBundleID,
-		PlannedRowCount: plannedRowCount,
+		SourceID:         f.writer.SourceID,
+		SourceBundleID:   sourceBundleID,
+		PlannedRowCount:  plannedRowCount,
+		InitializationID: initializationID,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -268,9 +270,9 @@ func TestPushSessions_StagedRowsRemainInvisibleUntilCommit(t *testing.T) {
 	require.Equal(t, 0, fixture.businessUserCount(t, ctx))
 
 	pullBeforeCommit, err := fixture.svc.ProcessPull(ctx, fixture.reader, 0, 10, 0)
-	require.NoError(t, err)
-	require.Empty(t, pullBeforeCommit.Bundles)
-	require.Equal(t, int64(0), pullBeforeCommit.StableBundleSeq)
+	require.Nil(t, pullBeforeCommit)
+	var initializingErr *ScopeInitializingError
+	require.ErrorAs(t, err, &initializingErr)
 
 	commit := fixture.commitSession(t, ctx, session.PushID)
 	require.Equal(t, int64(1), commit.RowCount)
@@ -631,6 +633,7 @@ func TestPushSessions_AcceptedPushReplaySurvivesNormalHistoryPruning(t *testing.
 func TestPushSessions_ConcurrentSessionCreationLeavesOneActiveStagingSession(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	initializationID := resolveConnectForPushSession(t, ctx, fixture.svc, fixture.writer, true)
 
 	lockConn, err := fixture.pool.Acquire(ctx)
 	require.NoError(t, err)
@@ -657,9 +660,10 @@ func TestPushSessions_ConcurrentSessionCreationLeavesOneActiveStagingSession(t *
 	runCreate := func() {
 		defer wg.Done()
 		resp, err := fixture.svc.CreatePushSession(ctx, fixture.writer, &PushSessionCreateRequest{
-			SourceID:        fixture.writer.SourceID,
-			SourceBundleID:  1,
-			PlannedRowCount: 1,
+			SourceID:         fixture.writer.SourceID,
+			SourceBundleID:   1,
+			PlannedRowCount:  1,
+			InitializationID: initializationID,
 		})
 		results <- createResult{resp: resp, err: err}
 	}
@@ -892,6 +896,10 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{maxRowsPerPushChunk: 1})
 	handlers := NewHTTPSyncHandlers(fixture.svc, slog.Default())
 	foreignActor := Actor{UserID: "other-user-" + uuid.NewString(), SourceID: "other-source"}
+
+	bootstrapSession := fixture.createSession(t, ctx, 100, 1)
+	fixture.uploadChunk(t, ctx, bootstrapSession.PushID, 0, fixture.userRow(uuid.New(), "Bootstrap"))
+	fixture.commitSession(t, ctx, bootstrapSession.PushID)
 
 	validSession := fixture.createSession(t, ctx, 1, 1)
 	outOfOrderSession := fixture.createSession(t, ctx, 2, 1)

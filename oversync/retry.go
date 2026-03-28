@@ -39,3 +39,28 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 		return ctx.Err()
 	}
 }
+
+func runRetryableTx(ctx context.Context, attempts int, baseDelay time.Duration, fn func() error) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	if baseDelay <= 0 {
+		baseDelay = 25 * time.Millisecond
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryablePGTxError(err) || attempt == attempts-1 {
+			return err
+		}
+		if err := sleepWithContext(ctx, time.Duration(attempt+1)*baseDelay); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}

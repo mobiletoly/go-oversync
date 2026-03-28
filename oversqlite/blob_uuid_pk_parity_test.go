@@ -55,10 +55,9 @@ func TestApplyBundleRowAuthoritativelyInTx_BlobUUIDPK_ServerSendsUUIDString(t *t
 	})
 	tokenFunc := func(ctx context.Context) (string, error) { return "mock-token", nil }
 
-	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, config)
+	client, err := NewClient(db, "http://localhost:8080", tokenFunc, config)
 	require.NoError(t, err)
-
-	require.NoError(t, client.Bootstrap(context.Background(), false))
+	attachTestClient(t, client, "test-user", "test-source")
 
 	_, err = db.Exec(`UPDATE _sync_client_state SET apply_mode = 1 WHERE user_id = ?`, client.UserID)
 	require.NoError(t, err)
@@ -191,14 +190,14 @@ func TestApplyBundleRowAuthoritativelyInTx_UpsertPreservesChildrenForBlobPKTable
 	`)
 	require.NoError(t, err)
 
-	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-source", func(context.Context) (string, error) {
+	client, err := NewClient(db, "http://localhost:8080", func(context.Context) (string, error) {
 		return "mock-token", nil
 	}, DefaultConfig("business", []SyncTable{
 		{TableName: "files", SyncKeyColumnName: "id"},
 		{TableName: "file_reviews", SyncKeyColumnName: "id"},
 	}))
 	require.NoError(t, err)
-	require.NoError(t, client.Bootstrap(context.Background(), false))
+	attachTestClient(t, client, "test-user", "test-source")
 
 	_, err = db.Exec(`UPDATE _sync_client_state SET apply_mode = 1 WHERE user_id = ?`, client.UserID)
 	require.NoError(t, err)
@@ -284,13 +283,13 @@ func TestApplyBundleRowAuthoritativelyInTx_RejectsNonCanonicalWireEncodingsForBl
 	`)
 	require.NoError(t, err)
 
-	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-source", func(context.Context) (string, error) {
+	client, err := NewClient(db, "http://localhost:8080", func(context.Context) (string, error) {
 		return "mock-token", nil
 	}, DefaultConfig("business", []SyncTable{
 		{TableName: "files", SyncKeyColumnName: "id"},
 	}))
 	require.NoError(t, err)
-	require.NoError(t, client.Bootstrap(context.Background(), false))
+	attachTestClient(t, client, "test-user", "test-source")
 
 	_, err = db.Exec(`UPDATE _sync_client_state SET apply_mode = 1 WHERE user_id = ?`, client.UserID)
 	require.NoError(t, err)

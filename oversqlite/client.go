@@ -45,14 +45,16 @@ type Client struct {
 	closed     uint32
 
 	// Pause switches (atomic): allow callers to suspend sync activity deterministically
-	uploadPaused         int32
-	downloadPaused       int32
-	snapshotStats        snapshotTransferStats
-	pushStats            pushTransferStats
-	beforePushFreezeHook func(context.Context) error
-	beforePushCommitHook func(context.Context) error
-	beforePushReplayHook func(context.Context) error
-	dbOwnershipKey       string
+	uploadPaused            int32
+	downloadPaused          int32
+	snapshotStats           snapshotTransferStats
+	pushStats               pushTransferStats
+	beforePushFreezeHook    func(context.Context) error
+	beforePushCommitHook    func(context.Context) error
+	beforePushReplayHook    func(context.Context) error
+	dbOwnershipKey          string
+	pendingInitializationID string
+	sessionConnected        bool
 }
 
 // DatabaseAlreadyOwnedError indicates that another oversqlite client already owns the same SQLite DB.
@@ -111,6 +113,17 @@ type PushTransferStats struct {
 	SessionsCreated           int64
 	ChunksUploaded            int64
 	CommittedBundleChunksRead int64
+}
+
+var syncMetadataTableNames = []string{
+	"_sync_client_state",
+	"_sync_lifecycle_state",
+	"_sync_row_state",
+	"_sync_dirty_rows",
+	"_sync_snapshot_stage",
+	"_sync_push_outbound",
+	"_sync_push_stage",
+	"_sync_managed_tables",
 }
 
 func (c *Client) tryBeginSyncOperation() error {
@@ -216,6 +229,15 @@ func releaseClientDBOwnership(key string) {
 	delete(activeClientDBOwnership.owners, key)
 }
 
+func (c *Client) markClosedAndReleaseOwnershipLocked() {
+	if c == nil {
+		return
+	}
+	atomic.StoreUint32(&c.closed, 1)
+	releaseClientDBOwnership(c.dbOwnershipKey)
+	c.dbOwnershipKey = ""
+}
+
 // SyncTable represents a table configuration for synchronization
 type SyncTable struct {
 	TableName         string   // Table name (e.g., "users", "posts")
@@ -232,6 +254,7 @@ type Config struct {
 	SnapshotChunkRows int           // e.g., 1000
 	BackoffMin        time.Duration // 1s
 	BackoffMax        time.Duration // 60s
+	RetryPolicy       *RetryPolicy  // nil => conservative built-in retry policy; explicit disabled policy turns retries off
 }
 
 // DefaultConfig returns a default configuration for the specified tables.
@@ -322,9 +345,9 @@ func (c *Client) SetBeforePushCommitHook(hook func(context.Context) error) {
 	c.beforePushCommitHook = hook
 }
 
-// NewClient creates a new SQLite sync client with the specified configuration
-// Automatically creates triggers for all tables specified in the config
-func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx context.Context) (string, error), config *Config) (client *Client, err error) {
+// NewClient creates a new lifecycle-neutral SQLite sync client with the specified configuration.
+// Automatically creates triggers for all tables specified in the config.
+func NewClient(db *sql.DB, baseURL string, tok func(ctx context.Context) (string, error), config *Config) (client *Client, err error) {
 	if db == nil {
 		return nil, fmt.Errorf("db cannot be nil")
 	}
@@ -364,8 +387,8 @@ func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx contex
 		DB:             db,
 		BaseURL:        baseURL,
 		Token:          tok,
-		SourceID:       sourceID,
-		UserID:         userID,
+		SourceID:       "",
+		UserID:         "",
 		Resolver:       &ServerWinsResolver{},
 		HTTP:           &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
 		config:         config,
@@ -383,6 +406,9 @@ func NewClient(db *sql.DB, baseURL, userID, sourceID string, tok func(ctx contex
 		if err := createTriggersForTableWithInfo(db, config.Schema, syncTable, validatedTables.tableInfoByKey[tableName]); err != nil {
 			return nil, fmt.Errorf("failed to create triggers for table %s: %w", syncTable.TableName, err)
 		}
+	}
+	if err := client.recordManagedSyncTables(); err != nil {
+		return nil, err
 	}
 
 	releaseOwnershipOnError = false
@@ -402,9 +428,28 @@ func (c *Client) Close() error {
 	if atomic.LoadUint32(&c.closed) == 1 {
 		return nil
 	}
-	atomic.StoreUint32(&c.closed, 1)
-	releaseClientDBOwnership(c.dbOwnershipKey)
-	c.dbOwnershipKey = ""
+	c.markClosedAndReleaseOwnershipLocked()
+	return nil
+}
+
+func (c *Client) recordManagedSyncTables() error {
+	if c == nil || c.DB == nil || c.config == nil {
+		return nil
+	}
+	schemaName := strings.TrimSpace(c.config.Schema)
+	for _, syncTable := range c.config.Tables {
+		tableName := strings.ToLower(strings.TrimSpace(syncTable.TableName))
+		if tableName == "" {
+			continue
+		}
+		if _, err := c.DB.Exec(`
+			INSERT INTO _sync_managed_tables (schema_name, table_name)
+			VALUES (?, ?)
+			ON CONFLICT(schema_name, table_name) DO NOTHING
+		`, schemaName, tableName); err != nil {
+			return fmt.Errorf("failed to record managed sync table %s: %w", tableName, err)
+		}
+	}
 	return nil
 }
 
@@ -787,6 +832,23 @@ func initializeDatabase(db *sql.DB) error {
 			PRIMARY KEY (user_id)
 		)`,
 
+		`CREATE TABLE IF NOT EXISTS _sync_lifecycle_state (
+			singleton_key            INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
+			source_id                TEXT NOT NULL DEFAULT '',
+			binding_state            TEXT NOT NULL DEFAULT 'anonymous',
+			binding_scope            TEXT NOT NULL DEFAULT '',
+			pending_transition_kind  TEXT NOT NULL DEFAULT 'none',
+			pending_target_scope     TEXT NOT NULL DEFAULT '',
+			pending_target_source_id TEXT NOT NULL DEFAULT '',
+			pending_staged_snapshot_id TEXT NOT NULL DEFAULT '',
+			pending_snapshot_bundle_seq INTEGER NOT NULL DEFAULT 0,
+			pending_snapshot_row_count INTEGER NOT NULL DEFAULT 0,
+			pending_apply_cursor     INTEGER NOT NULL DEFAULT 0,
+			pending_initialization_id TEXT NOT NULL DEFAULT '',
+			preexisting_capture_done INTEGER NOT NULL DEFAULT 0,
+			runtime_bypass_active    INTEGER NOT NULL DEFAULT 0
+		)`,
+
 		`CREATE TABLE IF NOT EXISTS _sync_row_state (
 			schema_name TEXT NOT NULL,
 			table_name  TEXT NOT NULL,
@@ -843,6 +905,12 @@ func initializeDatabase(db *sql.DB) error {
 			payload      TEXT,
 			PRIMARY KEY (bundle_seq, row_ordinal)
 		)`,
+
+		`CREATE TABLE IF NOT EXISTS _sync_managed_tables (
+			schema_name TEXT NOT NULL,
+			table_name  TEXT NOT NULL,
+			PRIMARY KEY (schema_name, table_name)
+		)`,
 	}
 
 	for _, table := range tables {
@@ -853,6 +921,28 @@ func initializeDatabase(db *sql.DB) error {
 
 	if _, err := db.Exec(`ALTER TABLE _sync_client_state ADD COLUMN rebuild_required INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("failed to add rebuild_required column: %w", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO _sync_lifecycle_state (
+			singleton_key, source_id, binding_state, binding_scope, pending_transition_kind, pending_target_scope, pending_target_source_id, pending_staged_snapshot_id, pending_snapshot_bundle_seq, pending_snapshot_row_count, pending_apply_cursor, pending_initialization_id, preexisting_capture_done, runtime_bypass_active
+		) VALUES (1, '', 'anonymous', '', 'none', '', '', '', 0, 0, 0, '', 0, 0)
+		ON CONFLICT(singleton_key) DO NOTHING
+	`); err != nil {
+		return fmt.Errorf("failed to initialize lifecycle state row: %w", err)
+	}
+	lifecycleColumnStatements := []string{
+		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_target_scope TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_target_source_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_staged_snapshot_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_snapshot_bundle_seq INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_snapshot_row_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_apply_cursor INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE _sync_lifecycle_state ADD COLUMN runtime_bypass_active INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range lifecycleColumnStatements {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("failed to evolve lifecycle state table: %w", err)
+		}
 	}
 
 	// Reset apply_mode to 0 in case the app crashed while apply_mode was set to 1
@@ -902,6 +992,9 @@ func (c *Client) Sync(ctx context.Context) error {
 		return err
 	}
 	defer c.writeMu.Unlock()
+	if err := c.ensureConnectedSessionLocked(ctx, "Sync()"); err != nil {
+		return err
+	}
 	if atomic.LoadInt32(&c.uploadPaused) == 0 {
 		if err := c.pushPendingLocked(ctx, 0); err != nil {
 			return err
@@ -912,30 +1005,6 @@ func (c *Client) Sync(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
-}
-
-// Bootstrap performs initial setup for a new or restored client
-// This includes creating client info and optionally performing hydration
-func (c *Client) Bootstrap(ctx context.Context, performHydration bool) error {
-	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
-	}
-	defer c.writeMu.Unlock()
-
-	sourceID, err := c.ensureBootstrapStateLocked(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to ensure client bootstrap state: %w", err)
-	}
-	c.SourceID = sourceID
-
-	if performHydration {
-		if atomic.LoadInt32(&c.downloadPaused) == 1 {
-			return nil
-		}
-		return c.hydrateLocked(ctx)
-	}
-
 	return nil
 }
 

@@ -177,7 +177,7 @@ func TestBlobSerializeRow(t *testing.T) {
 	}
 
 	// Create client
-	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-source", tokenFunc, config)
+	client, err := NewClient(db, "http://localhost:8080", tokenFunc, config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}

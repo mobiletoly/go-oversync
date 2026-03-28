@@ -452,6 +452,7 @@ func cleanupServerDatabase(ctx context.Context, cfg *config.Config) error {
 			sync.applied_pushes,
 			sync.bundle_rows,
 			sync.bundle_log,
+			sync.scope_state,
 			sync.row_state,
 			sync.user_state
 		RESTART IDENTITY CASCADE

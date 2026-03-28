@@ -158,12 +158,15 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 	require.NoError(t, clientB.Close())
 
 	restartedConfig := oversqlite.DefaultConfig(schema, syncTables("users"))
-	restarted, err := oversqlite.NewClient(dbB, server.URL(), userID, clientB.SourceID, func(context.Context) (string, error) {
+	restarted, err := oversqlite.NewClient(dbB, server.URL(), func(context.Context) (string, error) {
 		return server.GenerateToken(userID, clientB.SourceID, time.Hour)
 	}, restartedConfig)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, restarted.Close()) }()
-	require.NoError(t, restarted.Bootstrap(ctx, false))
+	require.NoError(t, restarted.Open(ctx, clientB.SourceID))
+	restartedConnect, err := restarted.Connect(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.ConnectStatusConnected, restartedConnect.Status)
 	require.NoError(t, restarted.PullToStable(ctx))
 
 	var nameA, nameB string
@@ -202,10 +205,13 @@ func TestEndToEnd_ExampleServerSchemaTimestampParity(t *testing.T) {
 	tokenFn := func(ctx context.Context) (string, error) {
 		return server.GenerateToken(userID, client.SourceID, time.Hour)
 	}
-	client, err = oversqlite.NewClient(db, server.URL(), userID, "device-a", tokenFn, oversqlite.DefaultConfig(schema, syncTables("users", "posts")))
+	client, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users", "posts")))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	require.NoError(t, client.Bootstrap(ctx, false))
+	require.NoError(t, client.Open(ctx, "device-a"))
+	connectResult, err := client.Connect(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
 
 	userRowID := uuid.NewString()
 	postRowID := uuid.NewString()
@@ -233,7 +239,7 @@ func TestEndToEnd_PushSessionCreateTransportRetryLeavesClientRecoverable(t *test
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-user-" + uuid.NewString()
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", newNoRetryConfig(schema, syncTables("users")), usersDDL)
 	clientB, _ := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
 	rowUserID := uuid.NewString()
@@ -389,7 +395,7 @@ func TestEndToEnd_PullRetryPruneFallbackAndRecover(t *testing.T) {
 
 	userID := "e2e-user-" + uuid.NewString()
 	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", newNoRetryConfig(schema, syncTables("users")), usersDDL)
 
 	insertUser := func(id, name string) {
 		_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, id, name, strings.ToLower(name)+"@example.com")

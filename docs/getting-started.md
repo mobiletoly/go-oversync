@@ -180,6 +180,7 @@ func main() {
     handlers := oversync.NewHTTPSyncHandlers(svc, logger)
 
     mux := http.NewServeMux()
+    mux.Handle("POST /sync/connect", yourAuthMiddleware(http.HandlerFunc(handlers.HandleConnect)))
     mux.Handle("POST /sync/push-sessions", yourAuthMiddleware(http.HandlerFunc(handlers.HandleCreatePushSession)))
     mux.Handle("POST /sync/push-sessions/{push_id}/chunks", yourAuthMiddleware(http.HandlerFunc(handlers.HandlePushSessionChunk)))
     mux.Handle("POST /sync/push-sessions/{push_id}/commit", yourAuthMiddleware(http.HandlerFunc(handlers.HandleCommitPushSession)))
@@ -259,8 +260,6 @@ func main() {
     client, err := oversqlite.NewClient(
         db,
         "http://localhost:8080",
-        "user-123",
-        "device-abc",
         tokenProvider,
         cfg,
     )
@@ -269,8 +268,17 @@ func main() {
     }
     defer client.Close()
 
-    if err := client.Bootstrap(ctx, true); err != nil {
+    if err := client.Open(ctx, "device-abc"); err != nil {
         log.Fatal(err)
+    }
+
+    connectResult, err := client.Connect(ctx, "user-123")
+    if err != nil {
+        log.Fatal(err)
+    }
+    if connectResult.Status == oversqlite.ConnectStatusRetryLater {
+        log.Printf("connect pending, retry after %s", connectResult.RetryAfter)
+        return
     }
 }
 ```
@@ -293,6 +301,10 @@ if err := client.PullToStable(ctx); err != nil {
 if err := client.Sync(ctx); err != nil {
     log.Fatal(err)
 }
+
+if err := client.SignOut(ctx); err != nil {
+    log.Fatal(err)
+}
 ```
 
 Recovery operations:
@@ -309,13 +321,17 @@ if err := client.Recover(ctx); err != nil {
 
 Behavior to expect:
 
+- `Connect()` resolves first-account lifecycle through `POST /sync/connect`.
 - `PushPending()` freezes one outbound snapshot, uploads it through push sessions, fetches the
   committed authoritative rows, and replays them locally.
+- `Connect()` may return `retry_later` as a normal retriable lifecycle outcome before the client
+  becomes attached.
 - `PullToStable()` drains complete bundles until the frozen `stable_bundle_seq` is reached.
 - `PullToStable()` rebuilds automatically through snapshot sessions if the server returns
   `history_pruned`.
 - `Hydrate()` rebuilds through chunked snapshot sessions.
 - `Recover()` rebuilds through chunked snapshot sessions and rotates `source_id`.
+- `SignOut()` clears synced local cache/state after a successful attached sign-out.
 
 ## Important Client Rules
 
@@ -330,6 +346,7 @@ Behavior to expect:
 
 The server exposes:
 
+- `POST /sync/connect`
 - `POST /sync/push-sessions`
 - `POST /sync/push-sessions/{push_id}/chunks`
 - `POST /sync/push-sessions/{push_id}/commit`
@@ -342,6 +359,13 @@ The server exposes:
 - `GET /sync/capabilities`
 - `GET /health`
 - `GET /status`
+
+Lifecycle-specific sync failures to expect on the HTTP surface:
+
+- `scope_uninitialized`
+- `scope_initializing`
+- `initialization_stale`
+- `initialization_expired`
 
 ## Binary Payload Contract
 

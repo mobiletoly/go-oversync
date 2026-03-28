@@ -484,6 +484,7 @@ func TestSnapshotSessions_CreateEmptySnapshot(t *testing.T) {
 	}, logger)
 
 	reader := Actor{UserID: "snapshot-empty-user-" + suffix, SourceID: "reader"}
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
 	session, err := svc.CreateSnapshotSession(ctx, reader)
 	require.NoError(t, err)
 	require.Zero(t, session.RowCount)

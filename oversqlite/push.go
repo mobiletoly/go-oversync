@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -82,6 +81,12 @@ func atomicLoadPaused(v *int32) bool {
 }
 
 func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) error {
+	if err := c.ensureConnectedSessionLocked(ctx, "PushPending()"); err != nil {
+		return err
+	}
+	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
+		return err
+	}
 	rebuildRequired, err := c.rebuildRequired(ctx)
 	if err != nil {
 		return err
@@ -102,7 +107,16 @@ func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) 
 		return err
 	}
 
-	committed, err := c.commitPushOutboundSnapshot(ctx, snapshot)
+	committed, err := withRetryValue(ctx, c.normalizedRetryPolicy(), "push_pending", func() (*committedPushBundle, error) {
+		committed, err := c.commitPushOutboundSnapshot(ctx, snapshot)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.fetchCommittedPushBundle(ctx, committed); err != nil {
+			return nil, err
+		}
+		return committed, nil
+	})
 	if err != nil {
 		var conflictErr *PushConflictError
 		if errors.As(err, &conflictErr) {
@@ -124,9 +138,6 @@ func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) 
 			}
 			return nil
 		}
-		return err
-	}
-	if err := c.fetchCommittedPushBundle(ctx, committed); err != nil {
 		return err
 	}
 	if err := c.runBeforePushReplayHook(ctx); err != nil {
@@ -239,6 +250,10 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 	}
 	switch sessionResp.Status {
 	case "already_committed":
+		c.pendingInitializationID = ""
+		if err := c.clearPersistedPendingInitializationID(ctx); err != nil {
+			return nil, err
+		}
 		return committedPushBundleFromCreateResponse(sessionResp)
 	case "staging":
 	default:
@@ -249,7 +264,12 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 	if pushID == "" {
 		return nil, fmt.Errorf("push session response missing push_id")
 	}
-	defer c.deletePushSessionBestEffort(context.Background(), pushID)
+	cleanupPushSession := true
+	defer func() {
+		if cleanupPushSession {
+			c.deletePushSessionBestEffort(context.Background(), pushID)
+		}
+	}()
 
 	chunkSize := c.pushChunkRows()
 	for start := 0; start < len(snapshot.Rows); start += chunkSize {
@@ -279,6 +299,11 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 	}
 	commitResp, err := c.commitPushSession(ctx, pushID)
 	if err != nil {
+		return nil, err
+	}
+	cleanupPushSession = false
+	c.pendingInitializationID = ""
+	if err := c.clearPersistedPendingInitializationID(ctx); err != nil {
 		return nil, err
 	}
 	return committedPushBundleFromCommitResponse(commitResp)
@@ -836,8 +861,16 @@ func (c *Client) setBundleApplyModeInTx(ctx context.Context, tx *sql.Tx, enabled
 	if enabled {
 		value = 1
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE _sync_client_state SET apply_mode = ? WHERE user_id = ?`, value, c.UserID); err != nil {
+	result, err := tx.ExecContext(ctx, `UPDATE _sync_client_state SET apply_mode = ? WHERE user_id = ?`, value, c.UserID)
+	if err != nil {
 		return fmt.Errorf("failed to update _sync_client_state apply_mode: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to inspect _sync_client_state apply_mode update result: %w", err)
+	}
+	if rowsAffected != 1 {
+		return &ConnectRequiredError{Operation: "authoritative state application"}
 	}
 	return nil
 }
@@ -1046,37 +1079,31 @@ func (c *Client) committedBundleChunkRows() int {
 
 func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedRowCount int64) (*oversync.PushSessionCreateResponse, error) {
 	reqBody, err := json.Marshal(&oversync.PushSessionCreateRequest{
-		SourceID:        c.SourceID,
-		SourceBundleID:  sourceBundleID,
-		PlannedRowCount: plannedRowCount,
+		SourceID:         c.SourceID,
+		SourceBundleID:   sourceBundleID,
+		PlannedRowCount:  plannedRowCount,
+		InitializationID: c.pendingInitializationID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal push session request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, buildPushSessionCreateURL(c.BaseURL), strings.NewReader(string(reqBody)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create push session request: %w", err)
-	}
-	token, err := c.Token(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get JWT token: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.HTTP.Do(httpReq)
+	body, statusCode, err := c.doAuthenticatedRequest(ctx, http.MethodPost, buildPushSessionCreateURL(c.BaseURL), reqBody, "application/json")
 	if err != nil {
 		return nil, fmt.Errorf("failed to send push session request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		if conflictErr := decodePushConflictError(resp.StatusCode, body); conflictErr != nil {
+	if statusCode != http.StatusOK {
+		if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, statusCode, body); handled {
+			return nil, initErr
+		}
+		if conflictErr := decodePushConflictError(statusCode, body); conflictErr != nil {
 			return nil, conflictErr
 		}
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
+		return nil, &retryHTTPError{
+			Operation:  "push_session_create",
+			StatusCode: statusCode,
+			Message:    decodeServerErrorBody(body),
+		}
 	}
 
 	var session oversync.PushSessionCreateResponse
@@ -1098,29 +1125,22 @@ func (c *Client) uploadPushChunk(ctx context.Context, pushID string, req *oversy
 		return nil, fmt.Errorf("failed to marshal push chunk request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, buildPushSessionChunkURL(c.BaseURL, pushID), strings.NewReader(string(reqBody)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create push chunk request: %w", err)
-	}
-	token, err := c.Token(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get JWT token: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.HTTP.Do(httpReq)
+	body, statusCode, err := c.doAuthenticatedRequest(ctx, http.MethodPost, buildPushSessionChunkURL(c.BaseURL, pushID), reqBody, "application/json")
 	if err != nil {
 		return nil, fmt.Errorf("failed to send push chunk request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		if conflictErr := decodePushConflictError(resp.StatusCode, body); conflictErr != nil {
+	if statusCode != http.StatusOK {
+		if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, statusCode, body); handled {
+			return nil, initErr
+		}
+		if conflictErr := decodePushConflictError(statusCode, body); conflictErr != nil {
 			return nil, conflictErr
 		}
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
+		return nil, &retryHTTPError{
+			Operation:  "push_chunk_upload",
+			StatusCode: statusCode,
+			Message:    decodeServerErrorBody(body),
+		}
 	}
 
 	var chunkResp oversync.PushSessionChunkResponse
@@ -1135,28 +1155,22 @@ func (c *Client) uploadPushChunk(ctx context.Context, pushID string, req *oversy
 }
 
 func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversync.PushSessionCommitResponse, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, buildPushSessionCommitURL(c.BaseURL, pushID), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create push commit request: %w", err)
-	}
-	token, err := c.Token(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get JWT token: %w", err)
-	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.HTTP.Do(httpReq)
+	body, statusCode, err := c.doAuthenticatedRequest(ctx, http.MethodPost, buildPushSessionCommitURL(c.BaseURL, pushID), nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to send push commit request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		if conflictErr := decodePushConflictError(resp.StatusCode, body); conflictErr != nil {
+	if statusCode != http.StatusOK {
+		if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, statusCode, body); handled {
+			return nil, initErr
+		}
+		if conflictErr := decodePushConflictError(statusCode, body); conflictErr != nil {
 			return nil, conflictErr
 		}
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
+		return nil, &retryHTTPError{
+			Operation:  "push_session_commit",
+			StatusCode: statusCode,
+			Message:    decodeServerErrorBody(body),
+		}
 	}
 
 	var commitResp oversync.PushSessionCommitResponse
@@ -1169,26 +1183,33 @@ func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversyn
 	return &commitResp, nil
 }
 
-func (c *Client) fetchCommittedBundleChunk(ctx context.Context, bundleSeq int64, afterRowOrdinal *int64, maxRows int) (*oversync.CommittedBundleRowsResponse, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, buildCommittedBundleRowsURL(c.BaseURL, bundleSeq, afterRowOrdinal, maxRows), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create committed bundle chunk request: %w", err)
+func (c *Client) handleInitializationLeaseErrorLocked(ctx context.Context, statusCode int, body []byte) (error, bool) {
+	resp, ok := decodeServerErrorResponse(body)
+	if !ok {
+		return nil, false
 	}
-	token, err := c.Token(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get JWT token: %w", err)
+	switch resp.Error {
+	case "initialization_expired", "initialization_stale":
+	default:
+		return nil, false
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
+	if err := c.clearStalePendingInitializationStateLocked(ctx); err != nil {
+		return fmt.Errorf("failed to clear stale initialization state after %s: %w", resp.Error, err), true
+	}
+	return fmt.Errorf("server returned status %d: %s; reconnect required", statusCode, decodeServerErrorBody(body)), true
+}
 
-	resp, err := c.HTTP.Do(httpReq)
+func (c *Client) fetchCommittedBundleChunk(ctx context.Context, bundleSeq int64, afterRowOrdinal *int64, maxRows int) (*oversync.CommittedBundleRowsResponse, error) {
+	body, statusCode, err := c.doAuthenticatedRequest(ctx, http.MethodGet, buildCommittedBundleRowsURL(c.BaseURL, bundleSeq, afterRowOrdinal, maxRows), nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to send committed bundle chunk request: %w", err)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, decodeServerErrorBody(body))
+	if statusCode != http.StatusOK {
+		return nil, &retryHTTPError{
+			Operation:  "committed_bundle_chunk_fetch",
+			StatusCode: statusCode,
+			Message:    decodeServerErrorBody(body),
+		}
 	}
 
 	var chunk oversync.CommittedBundleRowsResponse

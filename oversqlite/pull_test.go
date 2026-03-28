@@ -56,6 +56,11 @@ func TestPullToStable_AppliesMultipleBundlesToFrozenCeiling(t *testing.T) {
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
+	`, `
+		CREATE TABLE legacy_docs (
+			id TEXT PRIMARY KEY,
+			body TEXT NOT NULL
+		)
 	`)
 
 	requests := 0
@@ -136,6 +141,87 @@ func TestPullToStable_AppliesMultipleBundlesToFrozenCeiling(t *testing.T) {
 	var lastBundleSeq int64
 	require.NoError(t, db.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&lastBundleSeq))
 	require.Equal(t, int64(3), lastBundleSeq)
+}
+
+func TestPullToStable_RetriesTransientFailureAndSucceeds(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`, `
+		CREATE TABLE legacy_docs (
+			id TEXT PRIMARY KEY,
+			body TEXT NOT NULL
+		)
+	`)
+
+	requests := 0
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/sync/pull", r.URL.Path)
+		requests++
+		if requests == 1 {
+			return errorJSONResponse(http.StatusServiceUnavailable, oversync.ErrorResponse{
+				Error:   "temporarily_unavailable",
+				Message: "retry me",
+			}), nil
+		}
+		return jsonResponse(oversync.PullResponse{
+			StableBundleSeq: 1,
+			HasMore:         false,
+			Bundles: []oversync.Bundle{{
+				BundleSeq:      1,
+				SourceID:       "peer-a",
+				SourceBundleID: 11,
+				Rows: []oversync.BundleRow{{
+					Schema:     "main",
+					Table:      "users",
+					Key:        mustBundleKey("user-1"),
+					Op:         oversync.OpInsert,
+					RowVersion: 1,
+					Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
+				}},
+			}},
+		}), nil
+	})}
+
+	require.NoError(t, client.PullToStable(ctx))
+	require.Equal(t, 2, requests)
+
+	var name string
+	require.NoError(t, db.QueryRow(`SELECT name FROM users WHERE id = ?`, "user-1").Scan(&name))
+	require.Equal(t, "Ada", name)
+}
+
+func TestPullToStable_RetryExhaustionReturnsTypedError(t *testing.T) {
+	ctx := context.Background()
+	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	requests := 0
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		require.Equal(t, "/sync/pull", r.URL.Path)
+		requests++
+		return errorJSONResponse(http.StatusServiceUnavailable, oversync.ErrorResponse{
+			Error:   "temporarily_unavailable",
+			Message: "retry me",
+		}), nil
+	})}
+
+	err := client.PullToStable(ctx)
+	var retryErr *RetryExhaustedError
+	require.ErrorAs(t, err, &retryErr)
+	require.Equal(t, "pull_request", retryErr.Operation)
+	require.Equal(t, 3, retryErr.Attempts)
+	require.Equal(t, 3, requests)
 }
 
 func TestPullToStable_AppliesTextSyncKeyBundleRows(t *testing.T) {
@@ -262,6 +348,42 @@ func TestPullHydrateAndRecover_RejectWhilePushOutboundReplayIsPending(t *testing
 			require.Equal(t, 0, requests)
 		})
 	}
+}
+
+func TestApplyStagedSnapshot_FailsClosedWhenAttachedStateIsMissing(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "local-1", "Local", "local@example.com")
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_snapshot_stage (
+			snapshot_id, row_ordinal, schema_name, table_name, key_json, row_version, payload
+		) VALUES ('snapshot-missing-state', 1, 'main', 'users', ?, 7, ?)
+	`, rowKeyJSON("remote-1"), `{"id":"remote-1","name":"Remote","email":"remote@example.com"}`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM _sync_client_state WHERE user_id = ?`, client.UserID)
+	require.NoError(t, err)
+
+	err = client.applyStagedSnapshotLocked(ctx, &oversync.SnapshotSession{
+		SnapshotID:        "snapshot-missing-state",
+		SnapshotBundleSeq: 7,
+		RowCount:          1,
+	}, false)
+	var connectErr *ConnectRequiredError
+	require.ErrorAs(t, err, &connectErr)
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, "local-1").Scan(&count))
+	require.Equal(t, 1, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, "remote-1").Scan(&count))
+	require.Equal(t, 0, count)
 }
 
 func TestPullToStable_FailedBundleApplyLeavesCheckpointUnchanged(t *testing.T) {
@@ -805,6 +927,11 @@ func TestRecover_RotatesSourceIDAndResetsBundleState(t *testing.T) {
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
 		)
+	`, `
+		CREATE TABLE legacy_docs (
+			id TEXT PRIMARY KEY,
+			body TEXT NOT NULL
+		)
 	`)
 
 	originalSourceID := client.SourceID
@@ -829,6 +956,19 @@ func TestRecover_RotatesSourceIDAndResetsBundleState(t *testing.T) {
 	`, rowKeyJSON("stale"), `{"id":"stale","name":"Snapshot","email":"snapshot@example.com"}`)
 	require.NoError(t, err)
 	_, err = db.Exec(`UPDATE _sync_client_state SET next_source_bundle_id = 5, last_bundle_seq_seen = 4 WHERE user_id = ?`, client.UserID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO legacy_docs (id, body) VALUES (?, ?)`, "legacy-1", "stale body")
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_managed_tables (schema_name, table_name)
+		VALUES ('main', 'legacy_docs')
+		ON CONFLICT(schema_name, table_name) DO NOTHING
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_row_state (schema_name, table_name, key_json, row_version, deleted)
+		VALUES ('main', 'legacy_docs', ?, 9, 0)
+	`, rowKeyJSON("legacy-1"))
 	require.NoError(t, err)
 
 	client.config.SnapshotChunkRows = 1
@@ -896,6 +1036,9 @@ func TestRecover_RotatesSourceIDAndResetsBundleState(t *testing.T) {
 		FROM _sync_client_state WHERE user_id = ?
 	`, client.UserID).Scan(&sourceID, &nextSourceBundleID, &lastBundleSeq, &rebuildRequired))
 	require.Equal(t, client.SourceID, sourceID)
+	var lifecycleSourceID string
+	require.NoError(t, db.QueryRow(`SELECT source_id FROM _sync_lifecycle_state WHERE singleton_key = 1`).Scan(&lifecycleSourceID))
+	require.Equal(t, client.SourceID, lifecycleSourceID)
 	require.Equal(t, int64(1), nextSourceBundleID)
 	require.Equal(t, int64(9), lastBundleSeq)
 	require.Equal(t, 0, rebuildRequired)
@@ -911,11 +1054,15 @@ func TestRecover_RotatesSourceIDAndResetsBundleState(t *testing.T) {
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_snapshot_stage`).Scan(&count))
 	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
+	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`
 		SELECT COUNT(*)
 		FROM _sync_row_state
 		WHERE schema_name = 'main' AND table_name = 'users' AND key_json = ?
 	`, rowKeyJSON("stale")).Scan(&count))
+	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_row_state WHERE table_name = 'legacy_docs'`).Scan(&count))
 	require.Equal(t, 0, count)
 }
 

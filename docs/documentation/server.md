@@ -20,6 +20,8 @@ Authoritative replication state:
 
 Transport/session state:
 
+- `sync.scope_state`: durable first-connect authority state (`UNINITIALIZED`, `INITIALIZING`,
+  `INITIALIZED`)
 - `sync.push_sessions`: active staged push sessions
 - `sync.push_session_rows`: staged rows for each push session
 - `sync.snapshot_sessions`: active frozen snapshot session metadata
@@ -27,6 +29,7 @@ Transport/session state:
 
 ## Write Path
 
+- clients resolve account attachment and first-connect authority with `POST /sync/connect`
 - clients create staged push sessions with `POST /sync/push-sessions`
 - clients upload ordered chunks with `POST /sync/push-sessions/{push_id}/chunks`
 - clients commit the staged push with `POST /sync/push-sessions/{push_id}/commit`
@@ -35,10 +38,32 @@ Transport/session state:
 - server-originated registered-table writes should run inside `WithinSyncBundle(...)`
 - registered-table writes are captured by bundle triggers and finalized atomically with the
   business-table transaction
+- `WithinSyncBundle(...)` does not auto-retry callback code on serialization/deadlock/lock-timeout
+  failures; if your application wants retry, it must wrap the call explicitly and keep the
+  callback transaction-safe
 
 One push session, one committed bundle, and one `WithinSyncBundle(...)` transaction belong to
 exactly one `user_id`. If application logic needs to affect multiple users, split that work into
 separate per-user transactions or bundles.
+
+## First-connect lifecycle
+
+`POST /sync/connect` resolves the client lifecycle without asking the app to choose between
+"upload local" and "replace local":
+
+- `remote_authoritative`: the scope was initialized previously, even if it is currently empty
+- `initialize_local`: this source won the exclusive initialization lease and may seed from local
+  pending rows
+- `initialize_empty`: the scope was uninitialized and the server established authoritative empty
+  state
+- `retry_later`: another initializer currently owns the lease, or the server is applying a bounded
+  empty-first deferral optimization
+
+`retry_later` is a normal connect outcome, not an auth failure. Clients should retry after the
+server-provided backoff.
+
+Once a scope reaches `INITIALIZED`, remote remains authoritative for this feature set until some
+future explicit reset feature exists.
 
 ## Registered Table DDL Requirements
 
@@ -71,6 +96,7 @@ registered schema is outside the supported envelope.
 - snapshot session creation may be bounded by optional row and byte caps in `ServiceConfig`
 - if a client checkpoint falls behind the retained bundle floor, the server returns
   `history_pruned`
+- pull and snapshot creation fail closed before the scope reaches `INITIALIZED`
 
 ## Auth Contract
 

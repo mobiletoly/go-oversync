@@ -20,6 +20,13 @@ import (
 
 func newBundleClient(t *testing.T, schema string, tables []SyncTable, ddl ...string) (*Client, *sql.DB) {
 	t.Helper()
+	config := DefaultConfig(schema, tables)
+	config.RetryPolicy = newTestRetryPolicy()
+	return newBundleClientWithConfig(t, config, ddl...)
+}
+
+func newBundleClientWithConfig(t *testing.T, config *Config, ddl ...string) (*Client, *sql.DB) {
+	t.Helper()
 
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
@@ -32,12 +39,12 @@ func newBundleClient(t *testing.T, schema string, tables []SyncTable, ddl ...str
 		require.NoError(t, err)
 	}
 
-	client, err := NewClient(db, "http://example.invalid", "bundle-user", "bundle-device", func(context.Context) (string, error) {
+	client, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
 		return "token", nil
-	}, DefaultConfig(schema, tables))
+	}, config)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	require.NoError(t, client.Bootstrap(context.Background(), false))
+	attachTestClient(t, client, "bundle-user", "bundle-device")
 	return client, db
 }
 
@@ -211,6 +218,7 @@ type mockPushSessionServer struct {
 	committedBySource map[int64]*mockCommittedBundle
 	committedBySeq    map[int64]*mockCommittedBundle
 	chunkRequests     []oversync.PushSessionChunkRequest
+	deletePushIDs     []string
 	commitHook        func(pushID string, session *mockPushSession) *http.Response
 }
 
@@ -321,6 +329,8 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 		}), nil
 
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/"):
+		pushID := strings.TrimPrefix(r.URL.Path, "/sync/push-sessions/")
+		s.deletePushIDs = append(s.deletePushIDs, pushID)
 		return jsonResponse(map[string]any{"status": "deleted"}), nil
 	}
 
@@ -444,6 +454,122 @@ func TestPushPending_RepeatedLocalEditsCollapseIntoOneDirtyRowAndAdvanceBundleSt
 	`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeq))
 	require.Equal(t, int64(2), nextSourceBundleID)
 	require.Equal(t, int64(1), lastBundleSeq)
+	require.Empty(t, server.deletePushIDs)
+}
+
+func TestPushPending_SuccessfulCommitDoesNotDeleteCommittedSession(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	server := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: server}
+
+	require.NoError(t, client.PushPending(ctx))
+	require.Empty(t, server.deletePushIDs)
+}
+
+func TestPushPending_RetriesTransientCreateSessionFailureAndSucceeds(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	base := newMockPushSessionServer(t)
+	var createRequests int
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
+			createRequests++
+			if createRequests == 1 {
+				return errorJSONResponse(http.StatusServiceUnavailable, oversync.ErrorResponse{
+					Error:   "temporarily_unavailable",
+					Message: "retry me",
+				}), nil
+			}
+		}
+		return base.RoundTrip(r)
+	})}
+
+	require.NoError(t, client.PushPending(ctx))
+	require.Equal(t, 2, createRequests)
+}
+
+func TestPushPending_DoesNotRetryUnauthorized(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	var createRequests int
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
+			createRequests++
+			return errorJSONResponse(http.StatusUnauthorized, oversync.ErrorResponse{
+				Error:   "unauthorized",
+				Message: "bad token",
+			}), nil
+		}
+		return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	})}
+
+	err = client.PushPending(ctx)
+	require.Error(t, err)
+	require.Equal(t, 1, createRequests)
+}
+
+func TestPushPending_RetryExhaustionReturnsTypedError(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	var createRequests int
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
+			createRequests++
+			return errorJSONResponse(http.StatusServiceUnavailable, oversync.ErrorResponse{
+				Error:   "temporarily_unavailable",
+				Message: "retry me",
+			}), nil
+		}
+		return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	})}
+
+	err = client.PushPending(ctx)
+	var retryErr *RetryExhaustedError
+	require.ErrorAs(t, err, &retryErr)
+	require.Equal(t, "push_pending", retryErr.Operation)
+	require.Equal(t, 3, retryErr.Attempts)
+	require.Equal(t, 3, createRequests)
 }
 
 func TestPushPending_TextSyncKeyRoundTripsThroughPush(t *testing.T) {
@@ -981,12 +1107,15 @@ func TestPushPending_ReplaysAcceptedBundleAfterCrashBeforeDurableApply(t *testin
 	require.NoError(t, client.fetchCommittedPushBundle(ctx, committed))
 	require.NoError(t, client.Close())
 
-	restarted, err := NewClient(db, "http://example.invalid", "bundle-user", client.SourceID, func(context.Context) (string, error) {
+	restarted, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
 		return "token", nil
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	restarted.HTTP = &http.Client{Transport: server}
-	require.NoError(t, restarted.Bootstrap(ctx, false))
+	require.NoError(t, restarted.Open(ctx, client.SourceID))
+	result, err := restarted.Connect(ctx, "bundle-user")
+	require.NoError(t, err)
+	require.Equal(t, ConnectStatusConnected, result.Status)
 	require.NoError(t, restarted.PushPending(ctx))
 	require.Equal(t, int64(0), restarted.PushTransferDiagnostics().SessionsCreated)
 	require.Equal(t, int64(0), restarted.PushTransferDiagnostics().ChunksUploaded)
@@ -1053,13 +1182,16 @@ func TestPushPending_ReuploadsFrozenOutboundSnapshotAfterCrashBeforeCommit(t *te
 	require.Equal(t, 0, dirtyCount)
 	require.NoError(t, client.Close())
 
-	restarted, err := NewClient(db, "http://example.invalid", "bundle-user", client.SourceID, func(context.Context) (string, error) {
+	restarted, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
 		return "token", nil
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	restarted.config.UploadLimit = 2
 	restarted.HTTP = &http.Client{Transport: server}
-	require.NoError(t, restarted.Bootstrap(ctx, false))
+	require.NoError(t, restarted.Open(ctx, client.SourceID))
+	result, err := restarted.Connect(ctx, "bundle-user")
+	require.NoError(t, err)
+	require.Equal(t, ConnectStatusConnected, result.Status)
 	require.NoError(t, restarted.PushPending(ctx))
 	require.Len(t, server.chunkRequests, 4)
 	require.Equal(t, int64(1), restarted.PushTransferDiagnostics().SessionsCreated)
@@ -1946,13 +2078,16 @@ func TestPushPending_RebasesSameKeyLocalIntentAfterRestartBeforeReplay(t *testin
 
 			require.NoError(t, client.Close())
 
-			restarted, err := NewClient(db, "http://example.invalid", "bundle-user", client.SourceID, func(context.Context) (string, error) {
+			restarted, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
 				return "token", nil
 			}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 			restarted.HTTP = &http.Client{Transport: server}
-			require.NoError(t, restarted.Bootstrap(ctx, false))
+			require.NoError(t, restarted.Open(ctx, client.SourceID))
+			result, err := restarted.Connect(ctx, "bundle-user")
+			require.NoError(t, err)
+			require.Equal(t, ConnectStatusConnected, result.Status)
 			require.NoError(t, restarted.PushPending(ctx))
 			require.Equal(t, int64(0), restarted.PushTransferDiagnostics().SessionsCreated)
 			require.Equal(t, int64(0), restarted.PushTransferDiagnostics().ChunksUploaded)

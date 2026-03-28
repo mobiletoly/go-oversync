@@ -3,9 +3,11 @@ package simulator
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,8 +108,6 @@ func (app *MobileApp) initializeDatabase() error {
 	client, err := oversqlite.NewClient(
 		db,
 		app.config.ServerURL,
-		app.config.UserID,
-		app.config.SourceID,
 		app.tokenFunc,
 		app.config.OversqliteConfig,
 	)
@@ -302,8 +302,14 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 	}
 	app.ui.SetBanner("Starting up...")
 
+	if err := app.client.Open(ctx, app.config.SourceID); err != nil {
+		app.logger.Error("Failed to open local oversqlite lifecycle", "error", err)
+		app.ui.SetBanner("Setup failed")
+		return fmt.Errorf("open lifecycle failed: %w", err)
+	}
+
 	// Try to restore session
-	if app.session.CanRestore() {
+	if app.session.CanRestore() && app.client != nil && app.client.UserID == app.session.GetUserID() {
 		if verboseLog {
 			app.logger.Info("Restoring previous session")
 		}
@@ -318,13 +324,10 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 			app.logger.Info("Session restored successfully", "user_id", app.session.GetUserID())
 		}
 
-		// Ensure the local oversqlite client is bootstrapped before starting background sync loops.
-		// Under high parallelism, background loops can tick before SignIn/Bootstrap runs and hit
-		// sql.ErrNoRows on _sync_client_state.
-		if err := app.client.Bootstrap(ctx, false); err != nil {
-			app.logger.Error("Failed to bootstrap client after session restore", "error", err)
+		if err := app.connectLifecycle(ctx, app.session.GetUserID()); err != nil {
+			app.logger.Error("Failed to connect oversqlite after session restore", "error", err)
 			app.ui.SetBanner("Setup failed")
-			return fmt.Errorf("bootstrap after restore failed: %w", err)
+			return fmt.Errorf("connect after restore failed: %w", err)
 		}
 
 		if err := app.sync.Start(ctx); err != nil {
@@ -363,10 +366,15 @@ func (app *MobileApp) OnSignIn(ctx context.Context, userID string) error {
 	if verboseLog {
 		app.ui.SetBanner("Setting up sync...")
 	}
-	if err := app.client.Bootstrap(ctx, false); err != nil {
-		app.logger.Error("Failed to bootstrap client", "error", err)
+	if err := app.client.Open(ctx, app.config.SourceID); err != nil {
+		app.logger.Error("Failed to open local oversqlite lifecycle", "error", err)
 		app.ui.SetBanner("Setup failed")
-		return fmt.Errorf("bootstrap failed: %w", err)
+		return fmt.Errorf("open lifecycle failed: %w", err)
+	}
+	if err := app.connectLifecycle(ctx, userID); err != nil {
+		app.logger.Error("Failed to connect oversqlite lifecycle", "error", err)
+		app.ui.SetBanner("Setup failed")
+		return fmt.Errorf("connect lifecycle failed: %w", err)
 	}
 
 	if err := app.sync.Start(ctx); err != nil {
@@ -394,6 +402,11 @@ func (app *MobileApp) OnSignOut(ctx context.Context) error {
 	app.logger.Info("👋 User signing out")
 
 	app.sync.Stop()
+	if app.client != nil {
+		if err := app.client.SignOut(ctx); err != nil {
+			return fmt.Errorf("sign out failed: %w", err)
+		}
+	}
 	app.session.SignOut()
 
 	app.ui.SetBanner("Offline mode. Sign in to sync.")
@@ -401,6 +414,43 @@ func (app *MobileApp) OnSignOut(ctx context.Context) error {
 
 	app.logger.Info("✅ User signed out successfully")
 	return nil
+}
+
+func (app *MobileApp) connectLifecycle(ctx context.Context, userID string) error {
+	const maxAttempts = 8
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		result, err := app.client.Connect(ctx, userID)
+		if err == nil {
+			switch result.Status {
+			case oversqlite.ConnectStatusConnected:
+				return nil
+			case oversqlite.ConnectStatusRetryLater:
+				waitFor := result.RetryAfter
+				if waitFor <= 0 {
+					waitFor = 250 * time.Millisecond
+				}
+				if verboseLog {
+					app.logger.Info("Connect retry requested", "attempt", attempt, "retry_after", waitFor)
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(waitFor):
+					continue
+				}
+			default:
+				return fmt.Errorf("unexpected connect status %q", result.Status)
+			}
+		}
+
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return err
+	}
+
+	return fmt.Errorf("connect lifecycle did not reach connected status after %d attempts", maxAttempts)
 }
 
 // CreateUser creates a new user record
@@ -746,10 +796,25 @@ func (app *MobileApp) Recover(ctx context.Context) error {
 		return fmt.Errorf("recovery rebuild failed: %w", err)
 	}
 
+	app.syncRotatedSourceIdentity(app.client.SourceID)
+
 	app.ui.SetBanner("Data recovered")
 	app.logger.Info("✅ Recovery rebuild completed successfully")
 
 	return nil
+}
+
+func (app *MobileApp) syncRotatedSourceIdentity(sourceID string) {
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return
+	}
+	if app.config != nil {
+		app.config.SourceID = sourceID
+	}
+	if app.session != nil {
+		app.session.SetSourceID(sourceID)
+	}
 }
 
 func (app *MobileApp) ResetSnapshotTransferDiagnostics() {

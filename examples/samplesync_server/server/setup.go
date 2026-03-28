@@ -158,6 +158,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		_ = json.NewEncoder(w).Encode(resp{Token: tok, ExpiresIn: 600, User: rr.User, Device: rr.Device})
 	})
 	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreatePushSession)), logger))
+	mux.Handle("POST /sync/connect", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleConnect)), logger))
 	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandlePushSessionChunk)), logger))
 	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCommitPushSession)), logger))
 	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))

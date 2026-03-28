@@ -1,10 +1,16 @@
 package oversqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"log/slog"
+	"net/http"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
@@ -23,6 +29,7 @@ func TestInitializeDatabase(t *testing.T) {
 	// Verify sync metadata tables were created
 	expectedTables := []string{
 		"_sync_client_state",
+		"_sync_lifecycle_state",
 		"_sync_row_state",
 		"_sync_dirty_rows",
 	}
@@ -119,7 +126,7 @@ func TestEnsureSourceID(t *testing.T) {
 	require.Equal(t, int64(0), lastBundleSeq)
 }
 
-func TestBootstrap_PersistsConfiguredSchemaIdentity(t *testing.T) {
+func TestConnect_PersistsConfiguredSchemaIdentity(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	defer db.Close()
@@ -133,14 +140,12 @@ func TestBootstrap_PersistsConfiguredSchemaIdentity(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	client, err := NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("business", []SyncTable{
+	client, err := NewClient(db, "http://localhost", tokenFunc, DefaultConfig("business", []SyncTable{
 		{TableName: "users", SyncKeyColumns: []string{"id"}},
 	}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-
-	err = client.Bootstrap(context.Background(), false)
-	require.NoError(t, err)
+	attachTestClient(t, client, "test-user", "test-source")
 
 	var schemaName string
 	err = db.QueryRow(`SELECT schema_name FROM _sync_client_state WHERE user_id = ?`, "test-user").Scan(&schemaName)
@@ -162,20 +167,25 @@ func TestNewClient_RejectsUnsupportedIntegerSyncKeyColumn(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "users", SyncKeyColumns: []string{"id"}},
 	}))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "supports only TEXT keys and UUID-backed BLOB keys")
 }
 
-func TestBootstrap_DifferentSourceClearsLocalStateAndRequiresRebuild(t *testing.T) {
+func TestResetForNewSource_ClearsLocalStateAndRequiresReconnect(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			email TEXT NOT NULL
+		)
+	`, `
+		CREATE TABLE legacy_docs (
+			id TEXT PRIMARY KEY,
+			body TEXT NOT NULL
 		)
 	`)
 
@@ -211,38 +221,45 @@ func TestBootstrap_DifferentSourceClearsLocalStateAndRequiresRebuild(t *testing.
 		WHERE user_id = ?
 	`, client.UserID)
 	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO legacy_docs (id, body) VALUES (?, ?)`, "legacy-1", "stale body")
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_managed_tables (schema_name, table_name)
+		VALUES ('main', 'legacy_docs')
+		ON CONFLICT(schema_name, table_name) DO NOTHING
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_row_state (schema_name, table_name, key_json, row_version, deleted)
+		VALUES ('main', 'legacy_docs', ?, 9, 0)
+	`, rowKeyJSON("legacy-1"))
+	require.NoError(t, err)
 	require.NoError(t, client.Close())
 
-	rebound, err := NewClient(db, "http://example.invalid", client.UserID, "replacement-device", func(context.Context) (string, error) {
+	rebound, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
 		return "token", nil
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rebound.Close()) })
-	require.NoError(t, rebound.Bootstrap(ctx, false))
+	require.NoError(t, rebound.Open(ctx, client.SourceID))
+	result, err := rebound.Connect(ctx, client.UserID)
+	require.NoError(t, err)
+	require.Equal(t, ConnectStatusConnected, result.Status)
+	require.NoError(t, rebound.ResetForNewSource(ctx, "replacement-device"))
 	require.Equal(t, "replacement-device", rebound.SourceID)
 
 	var (
-		sourceID           string
-		nextSourceBundleID int64
-		lastBundleSeqSeen  int64
-		applyMode          int
-		rebuildRequired    int
+		clientStateCount int
 	)
-	require.NoError(t, db.QueryRow(`
-		SELECT source_id, next_source_bundle_id, last_bundle_seq_seen, apply_mode, rebuild_required
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, rebound.UserID).Scan(&sourceID, &nextSourceBundleID, &lastBundleSeqSeen, &applyMode, &rebuildRequired))
-	require.Equal(t, rebound.SourceID, sourceID)
-	require.Equal(t, int64(1), nextSourceBundleID)
-	require.Equal(t, int64(0), lastBundleSeqSeen)
-	require.Equal(t, 0, applyMode)
-	require.Equal(t, 1, rebuildRequired)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_client_state`).Scan(&clientStateCount))
+	require.Equal(t, 0, clientStateCount)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_row_state`).Scan(&count))
+	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&count))
 	require.Equal(t, 0, count)
@@ -254,11 +271,49 @@ func TestBootstrap_DifferentSourceClearsLocalStateAndRequiresRebuild(t *testing.
 	require.Equal(t, 0, count)
 
 	err = rebound.PushPending(ctx)
-	var rebuildErr *RebuildRequiredError
-	require.ErrorAs(t, err, &rebuildErr)
+	var connectErr *ConnectRequiredError
+	require.ErrorAs(t, err, &connectErr)
 
 	err = rebound.PullToStable(ctx)
-	require.ErrorAs(t, err, &rebuildErr)
+	require.ErrorAs(t, err, &connectErr)
+}
+
+func TestSignOut_ClearsHistoricallyManagedTablesRemovedFromCurrentConfig(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`, `
+		CREATE TABLE legacy_docs (
+			id TEXT PRIMARY KEY,
+			body TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO legacy_docs (id, body) VALUES (?, ?)`, "legacy-1", "stale body")
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_managed_tables (schema_name, table_name)
+		VALUES ('main', 'legacy_docs')
+		ON CONFLICT(schema_name, table_name) DO NOTHING
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_row_state (schema_name, table_name, key_json, row_version, deleted)
+		VALUES ('main', 'legacy_docs', ?, 9, 0)
+	`, rowKeyJSON("legacy-1"))
+	require.NoError(t, err)
+
+	require.NoError(t, client.SignOut(ctx))
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
+	require.Equal(t, 0, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_row_state WHERE table_name = 'legacy_docs'`).Scan(&count))
+	require.Equal(t, 0, count)
 }
 
 func TestCreateTriggersForTable(t *testing.T) {
@@ -286,7 +341,7 @@ func TestCreateTriggersForTable(t *testing.T) {
 		{TableName: "test_table", SyncKeyColumns: []string{"id"}},
 	})
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, config)
+	_, err = NewClient(db, "http://localhost", tokenFunc, config)
 	require.NoError(t, err)
 
 	// Verify triggers were created
@@ -376,14 +431,14 @@ func TestNewClient(t *testing.T) {
 
 	// Create client
 	config := DefaultConfig("business", []SyncTable{})
-	client, err := NewClient(db, "http://localhost:8080", "test-user", "test-device", tokenFunc, config)
+	client, err := NewClient(db, "http://localhost:8080", tokenFunc, config)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	require.NotNil(t, client)
 	require.Equal(t, db, client.DB)
 	require.Equal(t, "http://localhost:8080", client.BaseURL)
-	require.Equal(t, "test-user", client.UserID)
-	require.Equal(t, "test-device", client.SourceID)
+	require.Empty(t, client.UserID)
+	require.Empty(t, client.SourceID)
 	require.NotNil(t, client.Token)
 	require.NotNil(t, client.Resolver)
 	require.NotNil(t, client.HTTP)
@@ -392,6 +447,178 @@ func TestNewClient(t *testing.T) {
 	token, err := client.Token(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "test-token", token)
+}
+
+func TestNewClient_ConnectRequiresOpenToEstablishSourceID(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	client, err := NewClient(db, "http://localhost", func(context.Context) (string, error) {
+		return "test-token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumns: []string{"id"}}}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+
+	_, err = client.Connect(context.Background(), "test-user")
+	var openErr *OpenRequiredError
+	require.ErrorAs(t, err, &openErr)
+	require.True(t, IsLifecyclePreconditionError(err))
+	require.Empty(t, client.SourceID)
+	require.Empty(t, client.UserID)
+}
+
+func TestOpenAndConnectEstablishRuntimeIdentity(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	client, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
+		return "test-token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+
+	require.NoError(t, client.Open(context.Background(), "device-a"))
+	require.Equal(t, "device-a", client.SourceID)
+	require.Empty(t, client.UserID)
+
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/capabilities":
+			return jsonResponse(map[string]any{
+				"features": map[string]bool{"connect_lifecycle": true},
+			}), nil
+		case "/sync/connect":
+			return jsonResponse(map[string]any{
+				"resolution": "initialize_empty",
+			}), nil
+		default:
+			return errorJSONResponse(404, map[string]string{"error": "not_found"}), nil
+		}
+	})}
+
+	result, err := client.Connect(context.Background(), "test-user")
+	require.NoError(t, err)
+	require.Equal(t, ConnectStatusConnected, result.Status)
+	require.Equal(t, "test-user", client.UserID)
+	require.Equal(t, "device-a", client.SourceID)
+}
+
+func TestOperationsRequireConnectAfterOpen(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+
+	client, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
+		return "test-token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	require.NoError(t, client.Open(context.Background(), "device-a"))
+
+	var requests int
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		return errorJSONResponse(http.StatusInternalServerError, map[string]string{"error": "unexpected_network"}), nil
+	})}
+
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "PushPending", run: func() error { return client.PushPending(context.Background()) }},
+		{name: "PullToStable", run: func() error { return client.PullToStable(context.Background()) }},
+		{name: "Sync", run: func() error { return client.Sync(context.Background()) }},
+		{name: "Hydrate", run: func() error { return client.Hydrate(context.Background()) }},
+		{name: "Recover", run: func() error { return client.Recover(context.Background()) }},
+	}
+
+	for _, tc := range operations {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.run()
+			var connectErr *ConnectRequiredError
+			require.ErrorAs(t, err, &connectErr)
+			require.True(t, IsLifecyclePreconditionError(err))
+		})
+	}
+
+	_, err = client.LastBundleSeqSeen(context.Background())
+	var connectErr *ConnectRequiredError
+	require.ErrorAs(t, err, &connectErr)
+	require.True(t, IsLifecyclePreconditionError(err))
+
+	require.Equal(t, 0, requests)
+}
+
+func TestLifecyclePreconditionErrorsResetSyncLoopBackoff(t *testing.T) {
+	min := 10 * time.Millisecond
+	max := 80 * time.Millisecond
+	require.Equal(t, min, nextSyncLoopBackoffAfterError(&OpenRequiredError{Operation: "Connect(userID)"}, 40*time.Millisecond, min, max))
+	require.Equal(t, min, nextSyncLoopBackoffAfterError(&ConnectRequiredError{Operation: "PushPending()"}, 40*time.Millisecond, min, max))
+	require.Equal(t, max, nextSyncLoopBackoffAfterError(context.DeadlineExceeded, 40*time.Millisecond, min, max))
+}
+
+func TestStartLoops_LogLifecycleMisuseWithoutTouchingNetwork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, client.SignOut(context.Background()))
+	require.NoError(t, client.Open(context.Background(), client.SourceID))
+
+	var requestCount atomic.Int64
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requestCount.Add(1)
+		return nil, context.DeadlineExceeded
+	})}
+	client.config.BackoffMin = time.Millisecond
+	client.config.BackoffMax = 2 * time.Millisecond
+
+	var logs bytes.Buffer
+	client.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	require.NoError(t, client.Start(ctx))
+	time.Sleep(12 * time.Millisecond)
+	cancel()
+	time.Sleep(5 * time.Millisecond)
+
+	require.Zero(t, requestCount.Load())
+	logOutput := logs.String()
+	require.Contains(t, logOutput, "upload loop blocked by lifecycle state")
+	require.Contains(t, logOutput, "download loop blocked by lifecycle state")
+	require.NotContains(t, strings.ToLower(logOutput), "deadline")
 }
 
 func TestNewClient_FailsWhenManagedTablesAreNotFKClosed(t *testing.T) {
@@ -416,7 +643,7 @@ func TestNewClient_FailsWhenManagedTablesAreNotFKClosed(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "posts", SyncKeyColumns: []string{"id"}},
 	}))
 	require.Error(t, err)
@@ -440,7 +667,7 @@ func TestNewClient_RejectsSecondActiveClientForSameSQLiteDB(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	client1, err := NewClient(db1, "http://localhost", "test-user", "test-source-a", tokenFunc, DefaultConfig("main", []SyncTable{
+	client1, err := NewClient(db1, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "users", SyncKeyColumns: []string{"id"}},
 	}))
 	require.NoError(t, err)
@@ -450,7 +677,7 @@ func TestNewClient_RejectsSecondActiveClientForSameSQLiteDB(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db2.Close() })
 
-	_, err = NewClient(db2, "http://localhost", "test-user", "test-source-b", tokenFunc, DefaultConfig("main", []SyncTable{
+	_, err = NewClient(db2, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "users", SyncKeyColumns: []string{"id"}},
 	}))
 	var ownedErr *DatabaseAlreadyOwnedError
@@ -474,7 +701,7 @@ func TestNewClient_AllowsSecondClientAfterClose(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	client1, err := NewClient(db1, "http://localhost", "test-user", "test-source-a", tokenFunc, DefaultConfig("main", []SyncTable{
+	client1, err := NewClient(db1, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "users", SyncKeyColumns: []string{"id"}},
 	}))
 	require.NoError(t, err)
@@ -484,7 +711,7 @@ func TestNewClient_AllowsSecondClientAfterClose(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db2.Close() })
 
-	client2, err := NewClient(db2, "http://localhost", "test-user", "test-source-b", tokenFunc, DefaultConfig("main", []SyncTable{
+	client2, err := NewClient(db2, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "users", SyncKeyColumns: []string{"id"}},
 	}))
 	require.NoError(t, err)
@@ -513,7 +740,7 @@ func TestNewClient_FailsWhenExistingSyncStateUsesDifferentSchema(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("business", []SyncTable{
+	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("business", []SyncTable{
 		{TableName: "users", SyncKeyColumns: []string{"id"}},
 	}))
 	require.Error(t, err)
@@ -536,7 +763,7 @@ func TestNewClient_AllowsSelfReferencingManagedTable(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	client, err := NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+	client, err := NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "categories", SyncKeyColumns: []string{"id"}},
 	}))
 	require.NoError(t, err)
@@ -558,7 +785,7 @@ func TestNewClient_FailsWhenTableNameIsSchemaQualified(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("business", []SyncTable{
+	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("business", []SyncTable{
 		{TableName: "main.users", SyncKeyColumns: []string{"id"}},
 	}))
 	require.Error(t, err)
@@ -580,7 +807,7 @@ func TestNewClient_FailsWhenCompositeSyncKeyColumnsConfigured(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "pairs", SyncKeyColumns: []string{"left_id", "right_id"}},
 	}))
 	require.Error(t, err)
@@ -613,7 +840,7 @@ func TestNewClient_FailsWhenManagedTablesContainCompositeFK(t *testing.T) {
 	require.NoError(t, err)
 
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", "test-user", "test-source", tokenFunc, DefaultConfig("main", []SyncTable{
+	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
 		{TableName: "parents", SyncKeyColumns: []string{"id"}},
 		{TableName: "children", SyncKeyColumns: []string{"id"}},
 	}))

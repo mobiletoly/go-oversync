@@ -15,6 +15,46 @@ keys use canonical dashed lowercase UUID strings. Hidden server ownership column
 `_sync_scope_id` never appear in client-visible payloads, conflicts, committed bundle rows, or
 snapshot rows.
 
+## POST `/sync/connect`
+
+Resolve the first-connect lifecycle for the authenticated `(user_id, source_id)`.
+
+Request:
+
+```json
+{
+  "source_id": "device-1",
+  "has_local_pending_rows": true
+}
+```
+
+Response:
+
+```json
+{
+  "resolution": "initialize_local",
+  "initialization_id": "6df0d8dd-a84b-43b6-bbca-8de70432922a",
+  "lease_expires_at": "2026-03-22T12:00:00Z"
+}
+```
+
+Possible `resolution` values:
+
+- `remote_authoritative`
+- `initialize_local`
+- `initialize_empty`
+- `retry_later`
+
+Failure contract:
+
+- `400 connect_invalid`
+
+Notes:
+
+- `retry_later` is a normal lifecycle outcome, not an auth failure
+- the caller must carry `initialization_id` into the first seed push only when the response is
+  `initialize_local`
+
 ## POST `/sync/push-sessions`
 
 Create one staging push session for a logical dirty-set bundle.
@@ -47,6 +87,14 @@ Notes:
 - repeating the same tuple after the server has already committed returns
   `status = "already_committed"` plus the committed bundle metadata
 - session creation is serialized by `(user_id, source_id, source_bundle_id)`
+
+Create failure contract:
+
+- `400 push_session_invalid`
+- `409 scope_uninitialized`
+- `409 scope_initializing`
+- `409 initialization_stale`
+- `410 initialization_expired`
 
 ## POST `/sync/push-sessions/{push_id}/chunks`
 
@@ -89,7 +137,9 @@ Failure contract:
 - `403 push_session_forbidden`
 - `404 push_session_not_found`
 - `409 push_chunk_out_of_order`
+- `409 initialization_stale`
 - `410 push_session_expired`
+- `410 initialization_expired`
 
 ## POST `/sync/push-sessions/{push_id}/commit`
 
@@ -113,7 +163,9 @@ Failure contract:
 - `403 push_session_forbidden`
 - `404 push_session_not_found`
 - `409 push_conflict`
+- `409 initialization_stale`
 - `410 push_session_expired`
+- `410 initialization_expired`
 
 Push conflict response:
 
@@ -230,6 +282,13 @@ Notes:
 - if the provided checkpoint is older than the retained bundle floor, the server returns HTTP `409`
   with `error=history_pruned`
 
+Failure contract:
+
+- `400 pull_invalid`
+- `409 history_pruned`
+- `409 scope_uninitialized`
+- `409 scope_initializing`
+
 ## POST `/sync/snapshot-sessions`
 
 Create one frozen snapshot session for hydration or destructive recovery.
@@ -245,6 +304,11 @@ Response:
   "expires_at": "2026-03-22T12:00:00Z"
 }
 ```
+
+Failure contract:
+
+- `409 scope_uninitialized`
+- `409 scope_initializing`
 
 ## GET `/sync/snapshot-sessions/{snapshot_id}`
 
@@ -296,6 +360,7 @@ Important feature flags:
 
 - `bundle_push`
 - `bundle_pull`
+- `connect_lifecycle`
 - `push_session_chunking`
 - `committed_bundle_row_fetch`
 - `snapshot_chunking`

@@ -42,9 +42,10 @@ type PushRequestRow struct {
 }
 
 type PushSessionCreateRequest struct {
-	SourceID        string `json:"source_id"`
-	SourceBundleID  int64  `json:"source_bundle_id"`
-	PlannedRowCount int64  `json:"planned_row_count"`
+	SourceID         string `json:"source_id"`
+	SourceBundleID   int64  `json:"source_bundle_id"`
+	PlannedRowCount  int64  `json:"planned_row_count"`
+	InitializationID string `json:"initialization_id,omitempty"`
 }
 
 type PushSessionCreateResponse struct {
@@ -57,6 +58,18 @@ type PushSessionCreateResponse struct {
 	SourceBundleID         int64  `json:"source_bundle_id,omitempty"`
 	RowCount               int64  `json:"row_count,omitempty"`
 	BundleHash             string `json:"bundle_hash,omitempty"`
+}
+
+type ConnectRequest struct {
+	SourceID            string `json:"source_id"`
+	HasLocalPendingRows bool   `json:"has_local_pending_rows"`
+}
+
+type ConnectResponse struct {
+	Resolution       string `json:"resolution"`
+	InitializationID string `json:"initialization_id,omitempty"`
+	LeaseExpiresAt   string `json:"lease_expires_at,omitempty"`
+	RetryAfterSec    int    `json:"retry_after_seconds,omitempty"`
 }
 
 type PushSessionChunkRequest struct {
@@ -152,6 +165,7 @@ type BundleCapabilitiesLimits struct {
 	SnapshotSessionTTLSeconds          int   `json:"snapshot_session_ttl_seconds,omitempty"`
 	MaxRowsPerSnapshotSession          int64 `json:"max_rows_per_snapshot_session,omitempty"`
 	MaxBytesPerSnapshotSession         int64 `json:"max_bytes_per_snapshot_session,omitempty"`
+	InitializationLeaseTTLSeconds      int   `json:"initialization_lease_ttl_seconds,omitempty"`
 }
 
 // RegisteredTableSpec describes one registered sync table in the newer contract surface.
