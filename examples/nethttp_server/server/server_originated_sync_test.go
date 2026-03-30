@@ -25,8 +25,9 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 	defer ts.Close()
 
 	ctx := context.Background()
-	userID := "e2e-server-originated-user"
-	deviceID := "device-e2e-a"
+	suffix := uuid.NewString()
+	userID := "e2e-server-originated-user-" + suffix
+	deviceID := "device-e2e-a-" + suffix
 
 	token, err := ts.GenerateToken(userID, deviceID, time.Hour)
 	require.NoError(t, err)
@@ -109,7 +110,14 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 		FROM _sync_client_state
 		WHERE user_id = ?
 	`, userID).Scan(&lastBundleSeqSeen))
-	require.Equal(t, int64(1), lastBundleSeqSeen)
+
+	var latestBundleSeq int64
+	require.NoError(t, ts.Pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(bundle_seq), 0)
+		FROM sync.bundle_log
+		WHERE user_id = $1
+	`, userID).Scan(&latestBundleSeq))
+	require.Equal(t, latestBundleSeq, lastBundleSeqSeen)
 
 	var rowCount int
 	require.NoError(t, ts.Pool.QueryRow(ctx, `
