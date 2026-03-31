@@ -87,7 +87,7 @@ func (s *BundleFKAtomicityScenario) Setup(ctx context.Context) error {
 	s.device3App = device3App
 
 	for idx, app := range []*MobileApp{s.app, s.device2App, s.device3App} {
-		if err := app.OnLaunch(ctx); err != nil {
+		if err := app.onLaunch(ctx); err != nil {
 			return fmt.Errorf("failed to launch device %d app: %w", idx+1, err)
 		}
 	}
@@ -106,7 +106,7 @@ func (s *BundleFKAtomicityScenario) createDeviceApp(deviceID, deviceName string)
 		DownloadLimit: 100,
 	}
 
-	app, err := NewMobileApp(&MobileAppConfig{
+	app, err := newMobileApp(&mobileAppConfig{
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           s.userID,
@@ -128,7 +128,7 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 	logger.Info("🎯 Executing bundle/FK atomicity scenario")
 
 	for idx, app := range []*MobileApp{s.app, s.device2App, s.device3App} {
-		if err := app.SignIn(ctx, s.userID); err != nil {
+		if err := app.signIn(ctx, s.userID); err != nil {
 			return fmt.Errorf("failed to sign in device %d: %w", idx+1, err)
 		}
 		app.sync.Stop()
@@ -145,7 +145,7 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 		return err
 	}
 
-	pendingBeforePush, err := s.app.GetPendingChangesCount(ctx)
+	pendingBeforePush, err := s.app.pendingChangesCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read pending count before seed push: %w", err)
 	}
@@ -153,11 +153,11 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("expected at least 6 pending rows before seed push, got %d", pendingBeforePush)
 	}
 
-	if err := s.app.PushPending(ctx); err != nil {
+	if err := s.app.pushPending(ctx); err != nil {
 		return fmt.Errorf("failed to push seed bundle: %w", err)
 	}
 
-	pendingAfterPush, err := s.app.GetPendingChangesCount(ctx)
+	pendingAfterPush, err := s.app.pendingChangesCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read pending count after seed push: %w", err)
 	}
@@ -165,7 +165,7 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("seed push left %d pending rows", pendingAfterPush)
 	}
 
-	s.seedBundleSeq, err = s.app.GetLastServerSeqSeen(ctx)
+	s.seedBundleSeq, err = s.app.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read seed bundle seq: %w", err)
 	}
@@ -173,10 +173,10 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("expected positive seed bundle seq, got %d", s.seedBundleSeq)
 	}
 
-	if err := s.device2App.Hydrate(ctx); err != nil {
+	if err := s.device2App.rebuildKeepSource(ctx); err != nil {
 		return fmt.Errorf("failed to hydrate device 2: %w", err)
 	}
-	if err := s.device3App.Hydrate(ctx); err != nil {
+	if err := s.device3App.rebuildKeepSource(ctx); err != nil {
 		return fmt.Errorf("failed to hydrate device 3: %w", err)
 	}
 
@@ -187,7 +187,7 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("device 3 seed state mismatch: %w", err)
 	}
 
-	device2SeqBeforeDirtyPull, err := s.device2App.GetLastServerSeqSeen(ctx)
+	device2SeqBeforeDirtyPull, err := s.device2App.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read device 2 checkpoint before dirty pull: %w", err)
 	}
@@ -199,13 +199,13 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("failed to create local dirty category update on device 2: %w", err)
 	}
 
-	pullErr := s.device2App.GetClient().PullToStable(ctx)
+	_, pullErr := s.device2App.currentClient().PullToStable(ctx)
 	var dirtyErr *oversqlite.DirtyStateRejectedError
 	if pullErr == nil || !errors.As(pullErr, &dirtyErr) {
 		return fmt.Errorf("expected dirty-state rejection on device 2 pull, got: %v", pullErr)
 	}
 
-	device2SeqAfterDirtyPull, err := s.device2App.GetLastServerSeqSeen(ctx)
+	device2SeqAfterDirtyPull, err := s.device2App.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read device 2 checkpoint after dirty pull: %w", err)
 	}
@@ -216,11 +216,11 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 	if err := s.deleteSupportedFKGraph(ctx); err != nil {
 		return err
 	}
-	if err := s.app.PushPending(ctx); err != nil {
+	if err := s.app.pushPending(ctx); err != nil {
 		return fmt.Errorf("failed to push supported FK graph delete bundle: %w", err)
 	}
 
-	s.deleteBundleSeq, err = s.app.GetLastServerSeqSeen(ctx)
+	s.deleteBundleSeq, err = s.app.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read delete bundle seq: %w", err)
 	}
@@ -228,7 +228,7 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("expected delete bundle seq > seed bundle seq, got seed=%d delete=%d", s.seedBundleSeq, s.deleteBundleSeq)
 	}
 
-	applied, nextAfter, err := s.device3App.PullToStable(ctx)
+	applied, nextAfter, err := s.device3App.pullToStable(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to pull cascade delete bundle on device 3: %w", err)
 	}
@@ -243,7 +243,7 @@ func (s *BundleFKAtomicityScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("device 3 delete state mismatch: %w", err)
 	}
 
-	device3SeqAfterDelete, err := s.device3App.GetLastServerSeqSeen(ctx)
+	device3SeqAfterDelete, err := s.device3App.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read device 3 checkpoint after cascade delete: %w", err)
 	}
@@ -354,7 +354,7 @@ func (s *BundleFKAtomicityScenario) Cleanup(ctx context.Context) error {
 		if app == nil {
 			continue
 		}
-		if err := app.Close(); err != nil {
+		if err := app.close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -365,10 +365,10 @@ func (s *BundleFKAtomicityScenario) Cleanup(ctx context.Context) error {
 }
 
 func (s *BundleFKAtomicityScenario) seedSupportedFKGraph(ctx context.Context) error {
-	if err := s.app.CreateUserWithID(ctx, s.userRowID, "Ada", "ada@example.com"); err != nil {
+	if err := s.app.createUserWithID(ctx, s.userRowID, "Ada", "ada@example.com"); err != nil {
 		return fmt.Errorf("failed to create seed user: %w", err)
 	}
-	if err := s.app.CreatePostWithID(ctx, s.postRowID, s.userRowID, "Hello", "Seed post"); err != nil {
+	if err := s.app.createPostWithID(ctx, s.postRowID, s.userRowID, "Hello", "Seed post"); err != nil {
 		return fmt.Errorf("failed to create seed post: %w", err)
 	}
 	if _, err := s.app.db.ExecContext(ctx, `

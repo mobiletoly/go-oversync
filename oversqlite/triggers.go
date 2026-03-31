@@ -17,6 +17,21 @@ var triggerSQLTemplates = []struct {
 	tmpl   *template.Template
 }{
 	{
+		name:   "guard_insert",
+		suffix: "bi_guard",
+		tmpl:   template.Must(template.New("guard_insert").Parse(guardInsertTriggerTemplate)),
+	},
+	{
+		name:   "guard_update",
+		suffix: "bu_guard",
+		tmpl:   template.Must(template.New("guard_update").Parse(guardUpdateTriggerTemplate)),
+	},
+	{
+		name:   "guard_delete",
+		suffix: "bd_guard",
+		tmpl:   template.Must(template.New("guard_delete").Parse(guardDeleteTriggerTemplate)),
+	},
+	{
 		name:   "insert",
 		suffix: "ai",
 		tmpl:   template.Must(template.New("insert").Parse(insertTriggerTemplate)),
@@ -45,10 +60,36 @@ type TriggerData struct {
 	PKExprOld  string
 }
 
+const transitionPendingTriggerError = "SYNC_TRANSITION_PENDING"
+
+const guardInsertTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_bi_guard
+BEFORE INSERT ON {{.TableName}}
+WHEN COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+	AND COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) != 1
+BEGIN
+	SELECT RAISE(ABORT, '` + transitionPendingTriggerError + `');
+END`
+
+const guardUpdateTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_bu_guard
+BEFORE UPDATE ON {{.TableName}}
+WHEN COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+	AND COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) != 1
+BEGIN
+	SELECT RAISE(ABORT, '` + transitionPendingTriggerError + `');
+END`
+
+const guardDeleteTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_bd_guard
+BEFORE DELETE ON {{.TableName}}
+WHEN COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+	AND COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) != 1
+BEGIN
+	SELECT RAISE(ABORT, '` + transitionPendingTriggerError + `');
+END`
+
 // Template for INSERT trigger
 const insertTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_ai
 AFTER INSERT ON {{.TableName}}
-WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
+WHEN COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) = 0
 BEGIN
 	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
 	VALUES (
@@ -84,7 +125,7 @@ END`
 // Template for UPDATE trigger
 const updateTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_au
 AFTER UPDATE ON {{.TableName}}
-WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
+WHEN COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) = 0
 BEGIN
 	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
 	SELECT
@@ -143,7 +184,7 @@ END`
 // Template for DELETE trigger
 const deleteTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_ad
 AFTER DELETE ON {{.TableName}}
-WHEN COALESCE((SELECT apply_mode FROM _sync_client_state LIMIT 1), 0) = 0
+WHEN COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) = 0
 BEGIN
 	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
 	VALUES (

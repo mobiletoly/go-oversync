@@ -166,20 +166,21 @@ func (u *Uploader) Run(ctx context.Context) {
 
 // runOnce performs one upload cycle
 func (u *Uploader) runOnce(ctx context.Context) {
-	if !u.app.GetUI().IsOnline() {
+	if !u.app.currentUI().IsOnline() {
 		return
 	}
 
-	if !u.app.GetSession().IsActive() {
+	if !u.app.currentSession().IsActive() {
 		return
 	}
-	client := u.app.GetClient()
+	client := u.app.currentClient()
 	if client == nil {
 		u.logger.Error("No oversqlite client available")
 		return
 	}
 
-	if err := client.PushPending(ctx); err != nil {
+	report, err := client.PushPending(ctx)
+	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
@@ -188,12 +189,15 @@ func (u *Uploader) runOnce(ctx context.Context) {
 		}
 		u.logger.Error("Upload failed", "error", err)
 		if isAuthError(err) {
-			u.app.GetUI().SetBanner("Session expired. Sign in.")
+			u.app.currentUI().SetBanner("Session expired. Sign in.")
 		}
 		return
 	}
+	if report.Outcome == oversqlite.PushOutcomeSkippedPaused {
+		return
+	}
 
-	u.app.GetUI().SetBanner("All changes saved")
+	u.app.currentUI().SetBanner("All changes saved")
 }
 
 // TriggerWake wakes up the uploader
@@ -242,20 +246,20 @@ func (d *Downloader) Run(ctx context.Context) {
 
 // runOnce performs one download cycle
 func (d *Downloader) runOnce(ctx context.Context) {
-	if !d.app.GetUI().IsOnline() {
+	if !d.app.currentUI().IsOnline() {
 		return
 	}
 
-	if !d.app.GetSession().IsActive() {
+	if !d.app.currentSession().IsActive() {
 		return
 	}
-	client := d.app.GetClient()
+	client := d.app.currentClient()
 	if client == nil {
 		d.logger.Error("No oversqlite client available")
 		return
 	}
 
-	err := client.PullToStable(ctx)
+	report, err := client.PullToStable(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
@@ -265,12 +269,15 @@ func (d *Downloader) runOnce(ctx context.Context) {
 		}
 		d.logger.Error("Download failed", "error", err)
 		if isAuthError(err) {
-			d.app.GetUI().SetBanner("Session expired. Sign in.")
+			d.app.currentUI().SetBanner("Session expired. Sign in.")
 		}
 		return
 	}
+	if report.Outcome == oversqlite.RemoteSyncOutcomeSkippedPaused {
+		return
+	}
 
-	d.app.GetUI().SetBanner("All changes saved")
+	d.app.currentUI().SetBanner("All changes saved")
 }
 
 // TriggerWake wakes up the downloader

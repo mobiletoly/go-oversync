@@ -147,7 +147,7 @@ func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 	s.simulator.currentApp = s.app // enable sqlite path reporting for parallel runs
 
 	// Launch the app
-	if err := s.app.OnLaunch(ctx); err != nil {
+	if err := s.app.onLaunch(ctx); err != nil {
 		return fmt.Errorf("failed to launch app: %w", err)
 	}
 
@@ -188,7 +188,7 @@ func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePre
 	}
 
 	// Create mobile app config
-	appConfig := &MobileAppConfig{
+	appConfig := &mobileAppConfig{
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           config.UserID,
@@ -201,7 +201,7 @@ func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePre
 	}
 
 	// Create mobile app
-	app, err := NewMobileApp(appConfig)
+	app, err := newMobileApp(appConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create mobile app: %w", err)
 	}
@@ -222,7 +222,7 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	if verboseLog {
 		logger.Info("👤 Signing in user to initialize sync system")
 	}
-	err := s.app.SignIn(ctx, s.config.UserID)
+	err := s.app.signIn(ctx, s.config.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to sign in user: %w", err)
 	}
@@ -290,12 +290,8 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 		logger.Info("📱 Uploading FK-challenging data to server")
 	}
 
-	// Ensure apply_mode=0 before reading pending (safety against interrupted flows)
-	if err := s.app.ResetApplyMode(ctx); err != nil {
-		logger.Warn("Failed to reset apply_mode to 0 before pending check (phone)", "error", err)
-	}
 	// Check pending changes before upload
-	pendingCount, err := s.app.GetPendingChangesCount(ctx)
+	pendingCount, err := s.app.pendingChangesCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get pending changes count: %w", err)
 	}
@@ -308,7 +304,7 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 		logger.Info("🚀 Starting bundle push for the full local dirty set")
 	}
 
-	if client := s.app.GetClient(); client != nil {
+	if client := s.app.currentClient(); client != nil {
 		client.ResumeUploads()
 		// Keep downloads paused; not needed for this phase
 		if verboseLog {
@@ -323,7 +319,7 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	}
 
 	// Check pending changes after upload
-	pendingCountAfter, err := s.app.GetPendingChangesCount(ctx)
+	pendingCountAfter, err := s.app.pendingChangesCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get pending changes count after upload: %w", err)
 	}
@@ -332,7 +328,7 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	}
 
 	// Step 5: Test download sync with "phone" source ID (should get 0 records)
-	if client := s.app.GetClient(); client != nil {
+	if client := s.app.currentClient(); client != nil {
 		client.ResumeDownloads()
 		if verboseLog {
 			logger.Info("▶️ Resumed phone client downloads for verification")
@@ -411,7 +407,7 @@ func (s *ComplexMultiBatchScenario) testDownloadWithPhoneSourceID(ctx context.Co
 	}
 
 	// Perform download sync - should get 0 records since we uploaded from this phone
-	applied, nextAfter, err := s.app.PullToStable(ctx)
+	applied, nextAfter, err := s.app.pullToStable(ctx)
 	if err != nil {
 		logger.Warn("❌ Download with phone source ID failed", "error", err.Error())
 		return fmt.Errorf("download sync with phone source ID failed: %w", err)
@@ -477,7 +473,7 @@ func (s *ComplexMultiBatchScenario) createLaptopApp(ctx context.Context, logger 
 	}
 
 	// Sign in the laptop app
-	err = laptopApp.SignIn(ctx, appConfig.UserID)
+	err = laptopApp.signIn(ctx, appConfig.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to sign in laptop app: %w", err)
 	}
@@ -507,12 +503,12 @@ func (s *ComplexMultiBatchScenario) performMultiBatchDownload(ctx context.Contex
 		logger.Info("📊 Initial laptop database state", "users", initialUserCount, "posts", initialPostCount)
 	}
 
-	s.laptopApp.ResetSnapshotTransferDiagnostics()
-	if err := s.laptopApp.Hydrate(ctx); err != nil {
+	s.laptopApp.resetSnapshotTransferDiagnostics()
+	if err := s.laptopApp.rebuildKeepSource(ctx); err != nil {
 		logger.Warn("❌ Hydrate failed", "error", err.Error())
 		return fmt.Errorf("failed to hydrate laptop from chunked snapshot: %w", err)
 	}
-	snapshotStats := s.laptopApp.SnapshotTransferDiagnostics()
+	snapshotStats := s.laptopApp.snapshotTransferDiagnostics()
 	if snapshotStats.ChunksFetched <= 1 {
 		return fmt.Errorf("expected laptop hydrate to fetch more than one snapshot chunk, got %d", snapshotStats.ChunksFetched)
 	}
@@ -563,14 +559,14 @@ func (s *ComplexMultiBatchScenario) performMultiBatchUpload(ctx context.Context,
 // performMultiBatchUploadForApp performs explicit upload rounds for any app until dirty state clears.
 func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Context, logger *slog.Logger, app *MobileApp, deviceName string) error {
 	// For deterministic behavior, pause downloads during explicit upload rounds
-	if client := app.GetClient(); client != nil {
+	if client := app.currentClient(); client != nil {
 		client.PauseDownloads()
 	}
 
 	uploadRound := 1
 	for {
 		// Check pending changes before this upload round
-		pendingBefore, err := app.GetPendingChangesCount(ctx)
+		pendingBefore, err := app.pendingChangesCount(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to get pending changes count before upload round %d: %w", uploadRound, err)
 		}
@@ -592,14 +588,14 @@ func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Co
 		}
 
 		// Push the current dirty set and inspect the response.
-		err = app.PushPending(ctx)
+		err = app.pushPending(ctx)
 		if err != nil {
 			logger.Warn("❌ Upload round failed", "device", deviceName, "round", uploadRound, "error", err.Error())
 			return fmt.Errorf("failed to upload changes in round %d: %w", uploadRound, err)
 		}
 
 		// Check pending changes after this upload round
-		pendingAfter, err := app.GetPendingChangesCount(ctx)
+		pendingAfter, err := app.pendingChangesCount(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to get pending changes count after upload round %d: %w", uploadRound, err)
 		}
@@ -617,19 +613,19 @@ func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Co
 		uploadRound++
 	}
 	// Resume downloads after explicit upload completes
-	if client := app.GetClient(); client != nil {
+	if client := app.currentClient(); client != nil {
 		client.ResumeDownloads()
 	}
 
 	// Simulator-only verification guards
-	if err := app.DebugVerifyPendingCleared(ctx); err != nil {
+	if err := app.debugVerifyPendingCleared(ctx); err != nil {
 		logger.Warn("Post-upload pending verification failed", "device", deviceName, "error", err.Error())
 	} else {
 		if verboseLog {
 			logger.Info("✅ Pending queue cleared after upload", "device", deviceName)
 		}
 	}
-	if err := app.DebugVerifyBusinessFKIntegrity(ctx); err != nil {
+	if err := app.debugVerifyBusinessFKIntegrity(ctx); err != nil {
 		logger.Warn("Business FK integrity check failed", "device", deviceName, "error", err.Error())
 	} else {
 		if verboseLog {
@@ -641,7 +637,7 @@ func (s *ComplexMultiBatchScenario) performMultiBatchUploadForApp(ctx context.Co
 
 // getDataCounts gets the current user and post counts in a database (DRY helper)
 func (s *ComplexMultiBatchScenario) getDataCounts(app *MobileApp) (int, int, error) {
-	db := app.GetDatabase()
+	db := app.database()
 
 	var userCount, postCount int
 	err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&userCount)
@@ -742,17 +738,13 @@ func (s *ComplexMultiBatchScenario) createDeferredFKData(ctx context.Context, lo
 	userIDs := make([]string, spec.userCount)
 	postIDs := make([]string, totalPosts)
 
-	app.StopSync()
-	app.PauseSync()
+	app.stopSync()
+	app.pauseSync()
 	if verboseLog {
 		logger.Info("⏸️ Paused client sync during offline creation", "device", spec.label)
 	}
 
-	if err := app.ResetApplyMode(ctx); err != nil {
-		logger.Warn("Failed to reset apply_mode to 0 before creation", "device", spec.label, "error", err)
-	}
-
-	db := app.GetDatabase()
+	db := app.database()
 	_, _ = db.Exec("ROLLBACK")
 	if verboseLog {
 		logger.Info("⏱️ About to begin creation transaction", "device", spec.label)
@@ -783,7 +775,7 @@ func (s *ComplexMultiBatchScenario) createDeferredFKData(ctx context.Context, lo
 			globalPostNum := spec.postNumberBase + postIndex + 1
 			title, content := spec.buildPost(globalPostNum, userOrdinal)
 
-			if err := app.CreatePostTx(tx, postID, userID, title, content); err != nil {
+			if err := app.createPostTx(tx, postID, userID, title, content); err != nil {
 				return nil, nil, fmt.Errorf("failed to create post %d on %s: %w", globalPostNum, spec.label, err)
 			}
 
@@ -796,7 +788,7 @@ func (s *ComplexMultiBatchScenario) createDeferredFKData(ctx context.Context, lo
 		}
 
 		name, email := spec.buildUser(userOrdinal)
-		if err := app.CreateUserTx(tx, userID, name, email); err != nil {
+		if err := app.createUserTx(tx, userID, name, email); err != nil {
 			return nil, nil, fmt.Errorf("failed to create user %d on %s: %w", userOrdinal, spec.label, err)
 		}
 		userIDs[userGroup] = userID
@@ -946,7 +938,7 @@ func (s *ComplexMultiBatchScenario) applyMixedCRUDOnLaptop(ctx context.Context, 
 }
 
 func (s *ComplexMultiBatchScenario) applyUserUpdate(app *MobileApp, userID, name, email string) error {
-	if err := app.UpdateUser(userID, name, email); err != nil {
+	if err := app.updateUser(userID, name, email); err != nil {
 		return fmt.Errorf("failed to update user %s: %w", userID, err)
 	}
 	s.testData.ExpectedUsers[userID] = expectedUserState{Name: name, Email: email, Exists: true}
@@ -954,7 +946,7 @@ func (s *ComplexMultiBatchScenario) applyUserUpdate(app *MobileApp, userID, name
 }
 
 func (s *ComplexMultiBatchScenario) applyPostUpdate(app *MobileApp, postID, title, content string) error {
-	if err := app.UpdatePost(postID, title, content); err != nil {
+	if err := app.updatePost(postID, title, content); err != nil {
 		return fmt.Errorf("failed to update post %s: %w", postID, err)
 	}
 	state := s.testData.ExpectedPosts[postID]
@@ -966,7 +958,7 @@ func (s *ComplexMultiBatchScenario) applyPostUpdate(app *MobileApp, postID, titl
 }
 
 func (s *ComplexMultiBatchScenario) applyPostDelete(app *MobileApp, postID string) error {
-	if err := app.DeletePost(postID); err != nil {
+	if err := app.deletePost(postID); err != nil {
 		return fmt.Errorf("failed to delete post %s: %w", postID, err)
 	}
 	state := s.testData.ExpectedPosts[postID]
@@ -976,7 +968,7 @@ func (s *ComplexMultiBatchScenario) applyPostDelete(app *MobileApp, postID strin
 }
 
 func (s *ComplexMultiBatchScenario) applyUserDelete(ctx context.Context, app *MobileApp, userID string) error {
-	if err := app.DeleteUserWithContext(ctx, userID); err != nil {
+	if err := app.deleteUserWithContext(ctx, userID); err != nil {
 		return fmt.Errorf("failed to delete user %s: %w", userID, err)
 	}
 	state := s.testData.ExpectedUsers[userID]
@@ -996,7 +988,7 @@ func (s *ComplexMultiBatchScenario) rebalancePendingForDeferredFKGroups(ctx cont
 		return nil
 	}
 
-	db := app.GetDatabase()
+	db := app.database()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin pending rebalance tx for %s: %w", label, err)
@@ -1094,13 +1086,8 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 		logger.Info("🎯 Expected: Upload rounds continue only if retries are needed, not to drain artificial batch limits")
 	}
 
-	// Ensure apply_mode=0 before reading pending (safety against interrupted flows)
-	if err := s.laptopApp.ResetApplyMode(ctx); err != nil {
-		logger.Warn("Failed to reset apply_mode to 0 before pending check", "error", err)
-	}
-
 	// Check pending changes before upload
-	pendingBefore, err := s.laptopApp.GetPendingChangesCount(ctx)
+	pendingBefore, err := s.laptopApp.pendingChangesCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get pending changes count before upload: %w", err)
 	}
@@ -1118,7 +1105,7 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 	}
 
 	// Resume uploads now that creation is complete and pending has been verified
-	if client := s.laptopApp.GetClient(); client != nil {
+	if client := s.laptopApp.currentClient(); client != nil {
 		client.ResumeUploads()
 		// Keep downloads paused to avoid noisy interference; download verification happens later explicitly
 		if verboseLog {
@@ -1126,13 +1113,13 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 		}
 	}
 
-	s.laptopApp.ResetPushTransferDiagnostics()
+	s.laptopApp.resetPushTransferDiagnostics()
 	if err := s.verifyChunkedPushRestartRecovery(ctx, logger); err != nil {
 		return fmt.Errorf("failed chunked push restart recovery verification: %w", err)
 	}
 
 	// Verify all changes uploaded
-	pendingAfter, err := s.laptopApp.GetPendingChangesCount(ctx)
+	pendingAfter, err := s.laptopApp.pendingChangesCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get pending changes count after upload: %w", err)
 	}
@@ -1142,7 +1129,7 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 	}
 
 	// Capture the durable bundle checkpoint after laptop uploads.
-	s.stableBundleSeq, err = s.laptopApp.GetLastServerSeqSeen(ctx)
+	s.stableBundleSeq, err = s.laptopApp.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get stable bundle seq after upload: %w", err)
 	}
@@ -1152,9 +1139,9 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 		logger.Info("📊 Upload summary",
 			"remaining_pending", pendingAfter,
 			"stable_bundle_seq", s.stableBundleSeq,
-			"push_sessions", s.laptopApp.PushTransferDiagnostics().SessionsCreated,
-			"push_chunks", s.laptopApp.PushTransferDiagnostics().ChunksUploaded,
-			"committed_bundle_chunks", s.laptopApp.PushTransferDiagnostics().CommittedBundleChunksRead,
+			"push_sessions", s.laptopApp.pushTransferDiagnostics().SessionsCreated,
+			"push_chunks", s.laptopApp.pushTransferDiagnostics().ChunksUploaded,
+			"committed_bundle_chunks", s.laptopApp.pushTransferDiagnostics().CommittedBundleChunksRead,
 			"expected_final_users", s.expectedUserCount(),
 			"expected_final_posts", s.expectedPostCount())
 	}
@@ -1166,7 +1153,7 @@ func (s *ComplexMultiBatchScenario) verifyChunkedPushRestartRecovery(ctx context
 	const preCommitCrashMessage = "simulated crash after chunk upload before push commit"
 	const replayCrashMessage = "simulated crash after committed bundle fetch before local replay"
 
-	client := s.laptopApp.GetClient()
+	client := s.laptopApp.currentClient()
 	if client == nil {
 		return fmt.Errorf("laptop client not initialized")
 	}
@@ -1174,12 +1161,12 @@ func (s *ComplexMultiBatchScenario) verifyChunkedPushRestartRecovery(ctx context
 		return fmt.Errorf(preCommitCrashMessage)
 	})
 
-	err := client.PushPending(ctx)
+	_, err := client.PushPending(ctx)
 	if err == nil || !strings.Contains(err.Error(), preCommitCrashMessage) {
 		return fmt.Errorf("expected simulated pre-commit crash, got %v", err)
 	}
 
-	pushStatsBeforeCommitRestart := s.laptopApp.PushTransferDiagnostics()
+	pushStatsBeforeCommitRestart := s.laptopApp.pushTransferDiagnostics()
 	if pushStatsBeforeCommitRestart.ChunksUploaded <= 1 {
 		return fmt.Errorf("expected laptop push to upload more than one chunk before pre-commit restart, got %d", pushStatsBeforeCommitRestart.ChunksUploaded)
 	}
@@ -1216,21 +1203,21 @@ func (s *ComplexMultiBatchScenario) verifyChunkedPushRestartRecovery(ctx context
 	}
 	s.laptopApp = restartedLaptop
 
-	client = s.laptopApp.GetClient()
+	client = s.laptopApp.currentClient()
 	if client == nil {
 		return fmt.Errorf("restarted laptop client not initialized")
 	}
 	client.ResumeUploads()
-	s.laptopApp.ResetPushTransferDiagnostics()
+	s.laptopApp.resetPushTransferDiagnostics()
 	client.SetBeforePushReplayHook(func(context.Context) error {
 		return fmt.Errorf(replayCrashMessage)
 	})
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	if err == nil || !strings.Contains(err.Error(), replayCrashMessage) {
 		return fmt.Errorf("expected simulated pre-replay crash after pre-commit restart, got %v", err)
 	}
 
-	pushStatsBeforeReplayRestart := s.laptopApp.PushTransferDiagnostics()
+	pushStatsBeforeReplayRestart := s.laptopApp.pushTransferDiagnostics()
 	if pushStatsBeforeReplayRestart.SessionsCreated != 1 {
 		return fmt.Errorf("expected one fresh push session after pre-commit restart, got %d", pushStatsBeforeReplayRestart.SessionsCreated)
 	}
@@ -1270,10 +1257,10 @@ func (s *ComplexMultiBatchScenario) verifyChunkedPushRestartRecovery(ctx context
 		return err
 	}
 	s.laptopApp = restartedLaptop
-	if client = s.laptopApp.GetClient(); client != nil {
+	if client = s.laptopApp.currentClient(); client != nil {
 		client.ResumeUploads()
 	}
-	s.laptopApp.ResetPushTransferDiagnostics()
+	s.laptopApp.resetPushTransferDiagnostics()
 	if err := s.performMultiBatchUploadForApp(ctx, logger, s.laptopApp, "laptop-restart-replay"); err != nil {
 		return fmt.Errorf("failed to replay committed laptop push after restart: %w", err)
 	}
@@ -1291,26 +1278,26 @@ func (s *ComplexMultiBatchScenario) verifyChunkedPushRestartRecovery(ctx context
 		return err
 	}
 	s.laptopApp = postCommitRestart
-	lastSeen, err := s.laptopApp.GetLastServerSeqSeen(ctx)
+	lastSeen, err := s.laptopApp.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to load laptop checkpoint after post-commit restart: %w", err)
 	}
 	if lastSeen <= 0 {
 		return fmt.Errorf("expected durable bundle checkpoint after post-commit restart, got %d", lastSeen)
 	}
-	if _, _, err := s.laptopApp.PullToStable(ctx); err != nil {
+	if _, _, err := s.laptopApp.pullToStable(ctx); err != nil {
 		return fmt.Errorf("post-commit restart pull failed: %w", err)
 	}
 	return nil
 }
 
 func (s *ComplexMultiBatchScenario) getPushRecoveryStateCounts(ctx context.Context, app *MobileApp) (outboundCount int, stagedCount int, dirtyCount int, err error) {
-	db := app.GetDatabase()
+	db := app.database()
 	if db == nil {
 		return 0, 0, 0, fmt.Errorf("database not initialized")
 	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount); err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to count _sync_push_outbound rows: %w", err)
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to count _sync_outbox_rows rows: %w", err)
 	}
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount); err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to count _sync_push_stage rows: %w", err)
@@ -1329,18 +1316,18 @@ func (s *ComplexMultiBatchScenario) restartApp(ctx context.Context, app *MobileA
 	app.config.PreserveDB = true
 	cfg := *app.config
 	cfg.PreserveDB = originalPreserveDB
-	if err := app.Close(); err != nil {
+	if err := app.close(); err != nil {
 		return nil, fmt.Errorf("failed to close %s app for restart: %w", label, err)
 	}
-	restarted, err := NewMobileApp(&cfg)
+	restarted, err := newMobileApp(&cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to recreate %s app after restart: %w", label, err)
 	}
-	if err := restarted.OnLaunch(ctx); err != nil {
+	if err := restarted.onLaunch(ctx); err != nil {
 		return nil, fmt.Errorf("failed to relaunch %s app after restart: %w", label, err)
 	}
-	restarted.StopSync()
-	restarted.PauseSync()
+	restarted.stopSync()
+	restarted.pauseSync()
 	return restarted, nil
 }
 
@@ -1352,7 +1339,7 @@ func (s *ComplexMultiBatchScenario) stage3DownloadVerificationLaptop(ctx context
 		logger.Info("📊 Expected result: laptop durable checkpoint already equals the Stage 2 stable bundle")
 	}
 
-	lastSeen, err := s.laptopApp.GetLastServerSeqSeen(ctx)
+	lastSeen, err := s.laptopApp.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get laptop stable checkpoint: %w", err)
 	}
@@ -1374,7 +1361,7 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 		logger.Info("🏁 STAGE 4: Download Verification - Phone (Should Get All New Records)")
 	}
 
-	if client := s.app.GetClient(); client != nil {
+	if client := s.app.currentClient(); client != nil {
 		client.ResumeDownloads()
 		if verboseLog {
 			logger.Info("▶️ Ensured phone client downloads are resumed for Stage 4")
@@ -1438,15 +1425,15 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 		return fmt.Errorf("failed to advance retained bundle floor for prune fallback: %w", err)
 	}
 
-	s.app.ResetSnapshotTransferDiagnostics()
+	s.app.resetSnapshotTransferDiagnostics()
 	if verboseLog {
 		logger.Info("📥 Starting bundle pull to the stable upload checkpoint with forced prune fallback", "stable_bundle_seq", s.stableBundleSeq, "snapshot_chunk_rows", snapshotChunkRows)
 	}
-	totalApplied, lastAfter, err := s.app.PullToStable(ctx)
+	totalApplied, lastAfter, err := s.app.pullToStable(ctx)
 	if err != nil {
 		return fmt.Errorf("bundle pull to stable checkpoint failed: %w", err)
 	}
-	snapshotStats := s.app.SnapshotTransferDiagnostics()
+	snapshotStats := s.app.snapshotTransferDiagnostics()
 	if snapshotStats.ChunksFetched <= 1 {
 		return fmt.Errorf("expected phone prune fallback to fetch more than one snapshot chunk, got %d", snapshotStats.ChunksFetched)
 	}
@@ -1463,7 +1450,7 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 		return fmt.Errorf("final count mismatch after bundle pull: expected users=%d posts=%d, got users=%d posts=%d",
 			targetTotalUsers, targetTotalPosts, usersAfter, postsAfter)
 	}
-	lastSeen, err := s.app.GetLastServerSeqSeen(ctx)
+	lastSeen, err := s.app.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get phone stable checkpoint after prune fallback: %w", err)
 	}
@@ -1568,19 +1555,19 @@ func (s *ComplexMultiBatchScenario) expectedReviewCount() int {
 }
 
 func (s *ComplexMultiBatchScenario) verifyExpectedBusinessState(app *MobileApp, logger *slog.Logger, device string) error {
-	actualUsers, err := s.loadActualUsers(app.GetDatabase())
+	actualUsers, err := s.loadActualUsers(app.database())
 	if err != nil {
 		return fmt.Errorf("failed to load users on %s: %w", device, err)
 	}
-	actualPosts, err := s.loadActualPosts(app.GetDatabase())
+	actualPosts, err := s.loadActualPosts(app.database())
 	if err != nil {
 		return fmt.Errorf("failed to load posts on %s: %w", device, err)
 	}
-	actualFiles, err := s.loadActualFiles(app.GetDatabase())
+	actualFiles, err := s.loadActualFiles(app.database())
 	if err != nil {
 		return fmt.Errorf("failed to load files on %s: %w", device, err)
 	}
-	actualReviews, err := s.loadActualReviews(app.GetDatabase())
+	actualReviews, err := s.loadActualReviews(app.database())
 	if err != nil {
 		return fmt.Errorf("failed to load file reviews on %s: %w", device, err)
 	}
@@ -1894,11 +1881,11 @@ func (s *ComplexMultiBatchScenario) Cleanup(ctx context.Context) error {
 	var err1, err2 error
 
 	if s.app != nil {
-		err1 = s.app.Close()
+		err1 = s.app.close()
 	}
 
 	if s.laptopApp != nil {
-		err2 = s.laptopApp.Close()
+		err2 = s.laptopApp.close()
 	}
 
 	if err1 != nil {

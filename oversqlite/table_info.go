@@ -29,6 +29,7 @@ func (c *ColumnInfo) IsBlob() bool {
 	return strings.Contains(strings.ToLower(c.DeclaredType), "blob")
 }
 
+// IsBlobReferenceColumn reports whether the named column is treated as a UUID-backed BLOB reference.
 func (t *TableInfo) IsBlobReferenceColumn(columnName string) bool {
 	if t == nil {
 		return false
@@ -48,6 +49,7 @@ type TableInfo struct {
 	ForeignKeyColumnsLower map[string]bool
 }
 
+// ForeignKeyInfo describes one SQLite foreign-key constraint edge discovered for a managed table.
 type ForeignKeyInfo struct {
 	Seq      int
 	RefTable string

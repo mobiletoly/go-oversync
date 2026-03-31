@@ -89,7 +89,7 @@ func stageCommittedPushBundleRows(t *testing.T, db *sql.DB, bundleSeq int64, row
 func readApplyMode(t *testing.T, db *sql.DB, userID string) int {
 	t.Helper()
 	var applyMode int
-	require.NoError(t, db.QueryRow(`SELECT apply_mode FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&applyMode))
+	require.NoError(t, db.QueryRow(`SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1 AND ? IS NOT NULL`, userID).Scan(&applyMode))
 	return applyMode
 }
 
@@ -426,7 +426,7 @@ func TestPushPending_RepeatedLocalEditsCollapseIntoOneDirtyRowAndAdvanceBundleSt
 	server := newMockPushSessionServer(t)
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.Len(t, server.chunkRequests, 1)
 	require.Len(t, server.chunkRequests[0].Rows, 1)
 	require.Equal(t, oversync.OpInsert, server.chunkRequests[0].Rows[0].Op)
@@ -445,13 +445,7 @@ func TestPushPending_RepeatedLocalEditsCollapseIntoOneDirtyRowAndAdvanceBundleSt
 	require.Equal(t, int64(1), rowVersion)
 	require.Equal(t, 0, deleted)
 
-	var nextSourceBundleID int64
-	var lastBundleSeq int64
-	require.NoError(t, db.QueryRow(`
-		SELECT next_source_bundle_id, last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeq))
+	_, nextSourceBundleID, lastBundleSeq := requireBundleState(t, db)
 	require.Equal(t, int64(2), nextSourceBundleID)
 	require.Equal(t, int64(1), lastBundleSeq)
 	require.Empty(t, server.deletePushIDs)
@@ -473,7 +467,7 @@ func TestPushPending_SuccessfulCommitDoesNotDeleteCommittedSession(t *testing.T)
 	server := newMockPushSessionServer(t)
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.Empty(t, server.deletePushIDs)
 }
 
@@ -505,7 +499,7 @@ func TestPushPending_RetriesTransientCreateSessionFailureAndSucceeds(t *testing.
 		return base.RoundTrip(r)
 	})}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.Equal(t, 2, createRequests)
 }
 
@@ -534,7 +528,7 @@ func TestPushPending_DoesNotRetryUnauthorized(t *testing.T) {
 		return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 	})}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	require.Equal(t, 1, createRequests)
 }
@@ -564,7 +558,7 @@ func TestPushPending_RetryExhaustionReturnsTypedError(t *testing.T) {
 		return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 	})}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	var retryErr *RetryExhaustedError
 	require.ErrorAs(t, err, &retryErr)
 	require.Equal(t, "push_pending", retryErr.Operation)
@@ -587,7 +581,7 @@ func TestPushPending_TextSyncKeyRoundTripsThroughPush(t *testing.T) {
 	server := newMockPushSessionServer(t)
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.Len(t, server.chunkRequests, 1)
 	require.Len(t, server.chunkRequests[0].Rows, 1)
 	require.Equal(t, oversync.SyncKey{"doc_id": "doc-1"}, server.chunkRequests[0].Rows[0].Key)
@@ -626,7 +620,7 @@ func TestPushPending_RejectsNonUUIDBlobSyncKey(t *testing.T) {
 	server := newMockPushSessionServer(t)
 	client.HTTP = &http.Client{Transport: server}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invalid blob UUID pk")
 }
@@ -761,23 +755,18 @@ func TestPushPending_EmptyDirtyQueueIsNoOpBeforeOutboundStateIsCreated(t *testin
 		return nil, fmt.Errorf("unexpected network request: %s %s", r.Method, r.URL.Path)
 	})}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.Equal(t, 0, requests)
 
 	var dirtyCount, outboundCount, stageCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stageCount))
 	require.Equal(t, 0, dirtyCount)
 	require.Equal(t, 0, outboundCount)
 	require.Equal(t, 0, stageCount)
 
-	var nextSourceBundleID, lastBundleSeq int64
-	require.NoError(t, db.QueryRow(`
-		SELECT next_source_bundle_id, last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeq))
+	_, nextSourceBundleID, lastBundleSeq := requireBundleState(t, db)
 	require.Equal(t, int64(1), nextSourceBundleID)
 	require.Equal(t, int64(0), lastBundleSeq)
 }
@@ -805,7 +794,7 @@ func TestPushPending_DirtySetLargerThanOneChunkSucceeds(t *testing.T) {
 	server := newMockPushSessionServer(t)
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.Equal(t, int64(1), client.PushTransferDiagnostics().SessionsCreated)
 	require.Equal(t, int64(3), client.PushTransferDiagnostics().ChunksUploaded)
 	require.Len(t, server.chunkRequests, 3)
@@ -815,18 +804,13 @@ func TestPushPending_DirtySetLargerThanOneChunkSucceeds(t *testing.T) {
 
 	var dirtyCount, outboundCount, stageCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stageCount))
 	require.Equal(t, 0, dirtyCount)
 	require.Equal(t, 0, outboundCount)
 	require.Equal(t, 0, stageCount)
 
-	var nextSourceBundleID, lastBundleSeq int64
-	require.NoError(t, db.QueryRow(`
-		SELECT next_source_bundle_id, last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeq))
+	_, nextSourceBundleID, lastBundleSeq := requireBundleState(t, db)
 	require.Equal(t, int64(2), nextSourceBundleID)
 	require.Equal(t, int64(1), lastBundleSeq)
 }
@@ -848,14 +832,14 @@ func TestPushPending_RealColumnReplayDoesNotRequeueEquivalentValue(t *testing.T)
 	_, err := db.Exec(`INSERT INTO users (id, name, score) VALUES (?, ?, ?)`, "local-user", "Local Bob", 6.57111473696007)
 	require.NoError(t, err)
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 
 	var dirtyCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
 	require.Equal(t, 0, dirtyCount)
 
 	var outboundCount int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.Equal(t, 0, outboundCount)
 }
 
@@ -889,7 +873,7 @@ func TestPushPending_OrdersUpsertsParentFirstAndDeletesChildFirst(t *testing.T) 
 	server := newMockPushSessionServer(t)
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.Len(t, server.chunkRequests, 1)
 	require.Len(t, server.chunkRequests[0].Rows, 2)
 	require.Equal(t, "users", server.chunkRequests[0].Rows[0].Table)
@@ -897,7 +881,7 @@ func TestPushPending_OrdersUpsertsParentFirstAndDeletesChildFirst(t *testing.T) 
 
 	_, err = db.Exec(`DELETE FROM users WHERE id = ?`, userID)
 	require.NoError(t, err)
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.Len(t, server.chunkRequests, 2)
 	require.Len(t, server.chunkRequests[1].Rows, 2)
 	require.Equal(t, oversync.OpDelete, server.chunkRequests[1].Rows[0].Op)
@@ -928,18 +912,18 @@ func TestPushPending_ConflictLeavesDirtyRowsIntact(t *testing.T) {
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "409")
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = 'users'`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound WHERE table_name = 'users'`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows WHERE table_name = 'users'`).Scan(&outboundCount))
 	require.Equal(t, 0, dirtyCount)
 	require.Equal(t, 1, outboundCount)
 
 	var nextSourceBundleID int64
-	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&nextSourceBundleID))
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, client.UserID).Scan(&nextSourceBundleID))
 	require.Equal(t, int64(1), nextSourceBundleID)
 }
 
@@ -968,18 +952,18 @@ func TestPushPending_RejectsInvalidCommitResponse(t *testing.T) {
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "bundle_hash")
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = 'users'`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound WHERE table_name = 'users'`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows WHERE table_name = 'users'`).Scan(&outboundCount))
 	require.Equal(t, 0, dirtyCount)
 	require.Equal(t, 1, outboundCount)
 
 	var nextSourceBundleID int64
-	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&nextSourceBundleID))
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, client.UserID).Scan(&nextSourceBundleID))
 	require.Equal(t, int64(1), nextSourceBundleID)
 }
 
@@ -1057,24 +1041,19 @@ func TestPushPending_FailsClosedOnCommittedReplayMetadataMismatch(t *testing.T) 
 			}
 			client.HTTP = &http.Client{Transport: server}
 
-			err = client.PushPending(ctx)
+			_, err = client.PushPending(ctx)
 			require.Error(t, err)
 			require.Contains(t, strings.ToLower(err.Error()), tc.errContains)
 
 			var dirtyCount, outboundCount, stagedCount int
 			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
 			require.Equal(t, 0, dirtyCount)
 			require.Equal(t, 1, outboundCount)
 			require.Equal(t, 0, stagedCount)
 
-			var nextSourceBundleID, lastBundleSeqSeen int64
-			require.NoError(t, db.QueryRow(`
-				SELECT next_source_bundle_id, last_bundle_seq_seen
-				FROM _sync_client_state
-				WHERE user_id = ?
-			`, client.UserID).Scan(&nextSourceBundleID, &lastBundleSeqSeen))
+			_, nextSourceBundleID, lastBundleSeqSeen := requireBundleState(t, db)
 			require.Equal(t, int64(1), nextSourceBundleID)
 			require.Equal(t, int64(0), lastBundleSeqSeen)
 		})
@@ -1112,11 +1091,11 @@ func TestPushPending_ReplaysAcceptedBundleAfterCrashBeforeDurableApply(t *testin
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	restarted.HTTP = &http.Client{Transport: server}
-	require.NoError(t, restarted.Open(ctx, client.SourceID))
-	result, err := restarted.Connect(ctx, "bundle-user")
+	mustOpen(t, restarted, ctx, client.SourceID)
+	result, err := restarted.Attach(ctx, "bundle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
-	require.NoError(t, restarted.PushPending(ctx))
+	require.Equal(t, AttachStatusConnected, result.Status)
+	mustPushPending(t, restarted, ctx)
 	require.Equal(t, int64(0), restarted.PushTransferDiagnostics().SessionsCreated)
 	require.Equal(t, int64(0), restarted.PushTransferDiagnostics().ChunksUploaded)
 	require.Equal(t, int64(1), restarted.PushTransferDiagnostics().CommittedBundleChunksRead)
@@ -1135,7 +1114,7 @@ func TestPushPending_ReplaysAcceptedBundleAfterCrashBeforeDurableApply(t *testin
 	require.Equal(t, int64(1), rowVersion)
 
 	var nextSourceBundleID int64
-	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, restarted.UserID).Scan(&nextSourceBundleID))
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, restarted.UserID).Scan(&nextSourceBundleID))
 	require.Equal(t, int64(2), nextSourceBundleID)
 }
 
@@ -1165,7 +1144,7 @@ func TestPushPending_ReuploadsFrozenOutboundSnapshotAfterCrashBeforeCommit(t *te
 		return fmt.Errorf("simulated crash before push commit")
 	})
 
-	err := client.PushPending(ctx)
+	_, err := client.PushPending(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "simulated crash before push commit")
 	require.Len(t, server.chunkRequests, 2)
@@ -1174,7 +1153,7 @@ func TestPushPending_ReuploadsFrozenOutboundSnapshotAfterCrashBeforeCommit(t *te
 	require.Equal(t, int64(0), client.PushTransferDiagnostics().CommittedBundleChunksRead)
 
 	var outboundCount, stagedCount, dirtyCount int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
 	require.Equal(t, 3, outboundCount)
@@ -1188,16 +1167,16 @@ func TestPushPending_ReuploadsFrozenOutboundSnapshotAfterCrashBeforeCommit(t *te
 	require.NoError(t, err)
 	restarted.config.UploadLimit = 2
 	restarted.HTTP = &http.Client{Transport: server}
-	require.NoError(t, restarted.Open(ctx, client.SourceID))
-	result, err := restarted.Connect(ctx, "bundle-user")
+	mustOpen(t, restarted, ctx, client.SourceID)
+	result, err := restarted.Attach(ctx, "bundle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
-	require.NoError(t, restarted.PushPending(ctx))
+	require.Equal(t, AttachStatusConnected, result.Status)
+	mustPushPending(t, restarted, ctx)
 	require.Len(t, server.chunkRequests, 4)
 	require.Equal(t, int64(1), restarted.PushTransferDiagnostics().SessionsCreated)
 	require.Equal(t, int64(2), restarted.PushTransferDiagnostics().ChunksUploaded)
 
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
 	require.Equal(t, 0, outboundCount)
@@ -1205,7 +1184,7 @@ func TestPushPending_ReuploadsFrozenOutboundSnapshotAfterCrashBeforeCommit(t *te
 	require.Equal(t, 0, dirtyCount)
 
 	var nextSourceBundleID int64
-	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, restarted.UserID).Scan(&nextSourceBundleID))
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, restarted.UserID).Scan(&nextSourceBundleID))
 	require.Equal(t, int64(2), nextSourceBundleID)
 }
 
@@ -1237,7 +1216,7 @@ func TestPushPending_MovesFrozenRowsIntoOutboundAtomically(t *testing.T) {
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.Equal(t, 2, dirtyCount)
 	require.Equal(t, 0, outboundCount)
 
@@ -1246,7 +1225,7 @@ func TestPushPending_MovesFrozenRowsIntoOutboundAtomically(t *testing.T) {
 	require.Len(t, snapshot.Rows, 2)
 
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.Equal(t, 0, dirtyCount)
 	require.Equal(t, 2, outboundCount)
 }
@@ -1273,13 +1252,13 @@ func TestPushPending_NewLocalWritesDuringUploadSurviveInDirtyRows(t *testing.T) 
 	})
 	client.HTTP = &http.Client{Transport: newMockPushSessionServer(t)}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "simulated crash before commit")
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.Equal(t, 1, dirtyCount)
 	require.Equal(t, 1, outboundCount)
 
@@ -1288,6 +1267,47 @@ func TestPushPending_NewLocalWritesDuringUploadSurviveInDirtyRows(t *testing.T) 
 	require.NoError(t, db.QueryRow(`SELECT key_json, op FROM _sync_dirty_rows`).Scan(&keyJSON, &op))
 	require.Equal(t, rowKeyJSON(newID), keyJSON)
 	require.Equal(t, oversync.OpInsert, op)
+}
+
+func TestPushPending_KeepsOnlyOneFrozenOutboxBundleDurably(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	for idx := 0; idx < 2; idx++ {
+		_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`,
+			uuid.NewString(),
+			fmt.Sprintf("User %d", idx),
+			fmt.Sprintf("user%d@example.com", idx),
+		)
+		require.NoError(t, err)
+	}
+
+	firstSnapshot, err := client.ensurePushOutboundSnapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, firstSnapshot.Rows, 2)
+
+	secondSnapshot, err := client.ensurePushOutboundSnapshot(ctx)
+	require.NoError(t, err)
+	require.Len(t, secondSnapshot.Rows, 2)
+	require.Equal(t, firstSnapshot.SourceBundleID, secondSnapshot.SourceBundleID)
+
+	var (
+		bundleRows        int
+		singletonRows     int
+		distinctBundleIDs int
+	)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&bundleRows))
+	require.Equal(t, 2, bundleRows)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_bundle WHERE state = 'prepared'`).Scan(&singletonRows))
+	require.Equal(t, 1, singletonRows)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(DISTINCT source_bundle_id) FROM _sync_outbox_rows`).Scan(&distinctBundleIDs))
+	require.Equal(t, 1, distinctBundleIDs)
 }
 
 func TestPushPending_NewLocalWritesDuringReplaySurviveInDirtyRows(t *testing.T) {
@@ -1312,11 +1332,11 @@ func TestPushPending_NewLocalWritesDuringReplaySurviveInDirtyRows(t *testing.T) 
 	})
 	client.HTTP = &http.Client{Transport: newMockPushSessionServer(t)}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 
 	var dirtyCount, outboundCount, stagedCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
 	require.Equal(t, 1, dirtyCount)
 	require.Equal(t, 0, outboundCount)
@@ -1423,11 +1443,72 @@ func TestPushPending_AuthoritativeReplayRollbackDoesNotLeakApplyMode(t *testing.
 
 	var dirtyCount, outboundCount, stagedCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
 	require.Equal(t, 0, dirtyCount)
 	require.Equal(t, 1, outboundCount)
 	require.Equal(t, 1, stagedCount)
+}
+
+func TestCompareCommittedBundleToCanonicalOutbox_IgnoresEquivalentRowOrder(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	rowA := uuid.NewString()
+	rowB := uuid.NewString()
+
+	_, err := db.Exec(`
+		UPDATE _sync_outbox_bundle
+		SET state = 'prepared', source_id = ?, source_bundle_id = 5, row_count = 2, canonical_request_hash = 'hash'
+		WHERE singleton_key = 1
+	`, client.SourceID)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_outbox_rows (
+			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
+		) VALUES
+			(5, 0, 'main', 'users', ?, ?, 'DELETE', 3, NULL, NULL),
+			(5, 1, 'main', 'users', ?, ?, 'DELETE', 4, NULL, NULL)
+	`, rowKeyJSON(rowA), rowKeyJSON(rowA), rowKeyJSON(rowB), rowKeyJSON(rowB))
+	require.NoError(t, err)
+
+	committedRows := []oversync.BundleRow{
+		{
+			Schema:     "main",
+			Table:      "users",
+			Key:        mustBundleKey(rowB),
+			Op:         oversync.OpDelete,
+			RowVersion: 5,
+		},
+		{
+			Schema:     "main",
+			Table:      "users",
+			Key:        mustBundleKey(rowA),
+			Op:         oversync.OpDelete,
+			RowVersion: 6,
+		},
+	}
+	stageCommittedPushBundleRows(t, db, 11, committedRows)
+
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+
+	err = client.compareCommittedBundleToCanonicalOutbox(ctx, tx, &committedPushBundle{
+		BundleSeq:        11,
+		SourceID:         client.SourceID,
+		SourceBundleID:   5,
+		RowCount:         2,
+		BundleHash:       mustBundleHash(t, committedRows),
+		AlreadyCommitted: true,
+	})
+	require.NoError(t, err)
 }
 
 func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T) {
@@ -1584,7 +1665,8 @@ func TestClient_RejectsOverlappingSyncOperations(t *testing.T) {
 
 	firstErr := make(chan error, 1)
 	go func() {
-		firstErr <- client.PushPending(ctx)
+		_, err := client.PushPending(ctx)
+		firstErr <- err
 	}()
 
 	<-entered
@@ -1596,31 +1678,36 @@ func TestClient_RejectsOverlappingSyncOperations(t *testing.T) {
 		{
 			name: "push rejects overlap",
 			op: func() error {
-				return client.PushPending(ctx)
+				_, err := client.PushPending(ctx)
+				return err
 			},
 		},
 		{
 			name: "pull rejects overlap",
 			op: func() error {
-				return client.PullToStable(ctx)
+				_, err := client.PullToStable(ctx)
+				return err
 			},
 		},
 		{
 			name: "hydrate rejects overlap",
 			op: func() error {
-				return client.Hydrate(ctx)
+				_, err := client.Rebuild(ctx, RebuildKeepSource, "")
+				return err
 			},
 		},
 		{
 			name: "recover rejects overlap",
 			op: func() error {
-				return client.Recover(ctx)
+				_, err := client.Rebuild(ctx, RebuildRotateSource, newTestSourceID())
+				return err
 			},
 		},
 		{
 			name: "sync rejects overlap",
 			op: func() error {
-				return client.Sync(ctx)
+				_, err := client.Sync(ctx)
+				return err
 			},
 		},
 	}
@@ -1919,7 +2006,7 @@ func TestPushPending_RebasesSameKeyLocalIntentMutatedDuringUpload(t *testing.T) 
 			server.commitHook = newFixedVersionCommitHook(t, server, committedRowVersion)
 			client.HTTP = &http.Client{Transport: server}
 
-			require.NoError(t, client.PushPending(ctx))
+			mustPushPending(t, client, ctx)
 			require.Len(t, server.chunkRequests, 1)
 			require.Len(t, server.chunkRequests[0].Rows, 1)
 			require.Equal(t, tc.expectedUploadOp, server.chunkRequests[0].Rows[0].Op)
@@ -2066,7 +2153,7 @@ func TestPushPending_RebasesSameKeyLocalIntentAfterRestartBeforeReplay(t *testin
 			server.commitHook = newFixedVersionCommitHook(t, server, committedRowVersion)
 			client.HTTP = &http.Client{Transport: server}
 
-			err := client.PushPending(ctx)
+			_, err := client.PushPending(ctx)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "simulated crash before replay")
 			require.Len(t, server.chunkRequests, 1)
@@ -2084,11 +2171,11 @@ func TestPushPending_RebasesSameKeyLocalIntentAfterRestartBeforeReplay(t *testin
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 			restarted.HTTP = &http.Client{Transport: server}
-			require.NoError(t, restarted.Open(ctx, client.SourceID))
-			result, err := restarted.Connect(ctx, "bundle-user")
+			mustOpen(t, restarted, ctx, client.SourceID)
+			result, err := restarted.Attach(ctx, "bundle-user")
 			require.NoError(t, err)
-			require.Equal(t, ConnectStatusConnected, result.Status)
-			require.NoError(t, restarted.PushPending(ctx))
+			require.Equal(t, AttachStatusConnected, result.Status)
+			mustPushPending(t, restarted, ctx)
 			require.Equal(t, int64(0), restarted.PushTransferDiagnostics().SessionsCreated)
 			require.Equal(t, int64(0), restarted.PushTransferDiagnostics().ChunksUploaded)
 			require.Equal(t, int64(1), restarted.PushTransferDiagnostics().CommittedBundleChunksRead)

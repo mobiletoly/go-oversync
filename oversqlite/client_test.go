@@ -28,8 +28,12 @@ func TestInitializeDatabase(t *testing.T) {
 
 	// Verify sync metadata tables were created
 	expectedTables := []string{
-		"_sync_client_state",
-		"_sync_lifecycle_state",
+		"_sync_source_state",
+		"_sync_attachment_state",
+		"_sync_operation_state",
+		"_sync_apply_state",
+		"_sync_outbox_bundle",
+		"_sync_outbox_rows",
 		"_sync_row_state",
 		"_sync_dirty_rows",
 	}
@@ -60,19 +64,15 @@ func TestInitializeDatabase_ResetsStuckApplyModeAfterCrash(t *testing.T) {
 	defer db.Close()
 
 	_, err = db.Exec(`
-		CREATE TABLE _sync_client_state (
-			user_id TEXT NOT NULL PRIMARY KEY,
-			source_id TEXT NOT NULL,
-			schema_name TEXT NOT NULL DEFAULT '',
-			next_source_bundle_id INTEGER NOT NULL DEFAULT 1,
-			last_bundle_seq_seen INTEGER NOT NULL DEFAULT 0,
+		CREATE TABLE _sync_apply_state (
+			singleton_key INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
 			apply_mode INTEGER NOT NULL DEFAULT 0
 		)
 	`)
 	require.NoError(t, err)
 	_, err = db.Exec(`
-		INSERT INTO _sync_client_state(user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode)
-		VALUES ('u', 'd', 'business', 1, 0, 1)
+		INSERT INTO _sync_apply_state(singleton_key, apply_mode)
+		VALUES (1, 1)
 	`)
 	require.NoError(t, err)
 
@@ -80,50 +80,70 @@ func TestInitializeDatabase_ResetsStuckApplyModeAfterCrash(t *testing.T) {
 	require.NoError(t, err)
 
 	var applyMode int
-	err = db.QueryRow(`SELECT COALESCE(MAX(apply_mode), 0) FROM _sync_client_state`).Scan(&applyMode)
+	err = db.QueryRow(`SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1`).Scan(&applyMode)
 	require.NoError(t, err)
 	require.Equal(t, 0, applyMode)
 }
 
-func TestEnsureSourceID(t *testing.T) {
+func TestInitializeDatabase_PreservesUnknownSyncPrefixedTables(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE _sync_audit_log (
+			id INTEGER PRIMARY KEY,
+			event TEXT NOT NULL
+		)
+	`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO _sync_audit_log (id, event) VALUES (1, 'keep-me')`)
+	require.NoError(t, err)
+
+	require.NoError(t, initializeDatabase(db))
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sync_audit_log'`).Scan(&count))
+	require.Equal(t, 1, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_audit_log`).Scan(&count))
+	require.Equal(t, 1, count)
+
+	var event string
+	require.NoError(t, db.QueryRow(`SELECT event FROM _sync_audit_log WHERE id = 1`).Scan(&event))
+	require.Equal(t, "keep-me", event)
+}
+
+func TestOpen_PersistsCallerOwnedSourceState(t *testing.T) {
 	// Create in-memory SQLite database
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	defer db.Close()
 
-	// Initialize database (for this test only)
-	err = initializeDatabase(db)
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL
+		)
+	`)
 	require.NoError(t, err)
 
-	userID := "test-user"
-
-	// Test first call generates a source ID
-	sourceID1, err := EnsureSourceID(db, userID)
+	client, err := NewClient(db, "http://localhost", func(context.Context) (string, error) {
+		return "token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumns: []string{"id"}}}))
 	require.NoError(t, err)
-	require.NotEmpty(t, sourceID1)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
-	// Test second call returns the same source ID
-	sourceID2, err := EnsureSourceID(db, userID)
-	require.NoError(t, err)
-	require.Equal(t, sourceID1, sourceID2)
+	mustOpen(t, client, context.Background(), "device-a")
 
-	// Test different user gets different source ID
-	differentUserID := "different-user"
-	sourceID3, err := EnsureSourceID(db, differentUserID)
-	require.NoError(t, err)
-	require.NotEqual(t, sourceID1, sourceID3)
-
-	// Verify client state was created correctly
 	var storedSourceID string
-	var nextBundleID, lastBundleSeq int64
+	var nextBundleID int64
 	err = db.QueryRow(`
-		SELECT source_id, next_source_bundle_id, last_bundle_seq_seen
-		FROM _sync_client_state WHERE user_id = ?
-	`, userID).Scan(&storedSourceID, &nextBundleID, &lastBundleSeq)
+		SELECT source_id, next_source_bundle_id
+		FROM _sync_source_state WHERE source_id = ?
+	`, "device-a").Scan(&storedSourceID, &nextBundleID)
 	require.NoError(t, err)
-	require.Equal(t, sourceID1, storedSourceID)
+	require.Equal(t, "device-a", storedSourceID)
 	require.Equal(t, int64(1), nextBundleID)
-	require.Equal(t, int64(0), lastBundleSeq)
 }
 
 func TestConnect_PersistsConfiguredSchemaIdentity(t *testing.T) {
@@ -148,7 +168,7 @@ func TestConnect_PersistsConfiguredSchemaIdentity(t *testing.T) {
 	attachTestClient(t, client, "test-user", "test-source")
 
 	var schemaName string
-	err = db.QueryRow(`SELECT schema_name FROM _sync_client_state WHERE user_id = ?`, "test-user").Scan(&schemaName)
+	err = db.QueryRow(`SELECT schema_name FROM _sync_attachment_state WHERE singleton_key = 1`).Scan(&schemaName)
 	require.NoError(t, err)
 	require.Equal(t, "business", schemaName)
 }
@@ -174,7 +194,7 @@ func TestNewClient_RejectsUnsupportedIntegerSyncKeyColumn(t *testing.T) {
 	require.Contains(t, err.Error(), "supports only TEXT keys and UUID-backed BLOB keys")
 }
 
-func TestResetForNewSource_ClearsLocalStateAndRequiresReconnect(t *testing.T) {
+func TestRotateSource_BlocksOnOutboxThenPreservesLocalRowsAndRequiresReattach(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -198,10 +218,16 @@ func TestResetForNewSource_ClearsLocalStateAndRequiresReconnect(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	_, err = db.Exec(`
-		INSERT INTO _sync_push_outbound (
-			source_bundle_id, row_ordinal, schema_name, table_name, key_json, op, base_row_version, payload
-		) VALUES (5, 0, 'main', 'users', ?, 'UPDATE', 7, ?)
-	`, rowKeyJSON("stale"), `{"id":"stale","name":"Stale","email":"stale@example.com"}`)
+		UPDATE _sync_outbox_bundle
+		SET state = 'prepared', source_id = ?, source_bundle_id = 5, row_count = 1, canonical_request_hash = 'hash'
+		WHERE singleton_key = 1
+	`, client.SourceID)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_outbox_rows (
+			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
+		) VALUES (5, 0, 'main', 'users', ?, ?, 'UPDATE', 7, ?, ?)
+	`, rowKeyJSON("stale"), rowKeyJSON("stale"), `{"id":"stale","name":"Stale","email":"stale@example.com"}`, `{"id":"stale","name":"Stale","email":"stale@example.com"}`)
 	require.NoError(t, err)
 	_, err = db.Exec(`
 		INSERT INTO _sync_push_stage (
@@ -216,10 +242,16 @@ func TestResetForNewSource_ClearsLocalStateAndRequiresReconnect(t *testing.T) {
 	`, rowKeyJSON("stale"), `{"id":"stale","name":"Snapshot","email":"snapshot@example.com"}`)
 	require.NoError(t, err)
 	_, err = db.Exec(`
-	UPDATE _sync_client_state
-		SET next_source_bundle_id = 5, last_bundle_seq_seen = 4, rebuild_required = 0
-		WHERE user_id = ?
-	`, client.UserID)
+		UPDATE _sync_source_state
+		SET next_source_bundle_id = 5
+		WHERE source_id = ?
+	`, client.SourceID)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		UPDATE _sync_attachment_state
+		SET last_bundle_seq_seen = 4, rebuild_required = 0
+		WHERE singleton_key = 1
+	`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO legacy_docs (id, body) VALUES (?, ?)`, "legacy-1", "stale body")
 	require.NoError(t, err)
@@ -241,44 +273,53 @@ func TestResetForNewSource_ClearsLocalStateAndRequiresReconnect(t *testing.T) {
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rebound.Close()) })
-	require.NoError(t, rebound.Open(ctx, client.SourceID))
-	result, err := rebound.Connect(ctx, client.UserID)
+	mustOpen(t, rebound, ctx, client.SourceID)
+	result, err := rebound.Attach(ctx, client.UserID)
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
-	require.NoError(t, rebound.ResetForNewSource(ctx, "replacement-device"))
+	require.Equal(t, AttachStatusConnected, result.Status)
+
+	_, err = rebound.RotateSource(ctx, "replacement-device")
+	require.EqualError(t, err, "cannot rotate source while 1 outbox rows are pending")
+
+	_, err = db.Exec(`DELETE FROM _sync_outbox_rows`)
+	require.NoError(t, err)
+	require.NoError(t, clearOutboxBundle(ctx, db))
+
+	mustRotateSource(t, rebound, ctx, "replacement-device")
 	require.Equal(t, "replacement-device", rebound.SourceID)
 
-	var (
-		clientStateCount int
-	)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_client_state`).Scan(&clientStateCount))
-	require.Equal(t, 0, clientStateCount)
+	var replacedBy string
+	require.NoError(t, db.QueryRow(`SELECT replaced_by_source_id FROM _sync_source_state WHERE source_id = ?`, client.SourceID).Scan(&replacedBy))
+	require.Equal(t, "replacement-device", replacedBy)
 
 	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
-	require.Equal(t, 0, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_row_state`).Scan(&count))
-	require.Equal(t, 0, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
-	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&count))
+	require.Equal(t, 1, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
+	require.Equal(t, 1, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_row_state`).Scan(&count))
+	require.Equal(t, 2, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
+	require.Equal(t, 1, count)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&count))
 	require.Equal(t, 0, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&count))
-	require.Equal(t, 0, count)
+	var outboxState string
+	require.NoError(t, db.QueryRow(`SELECT state FROM _sync_outbox_bundle WHERE singleton_key = 1`).Scan(&outboxState))
+	require.Equal(t, outboxStateNone, outboxState)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&count))
-	require.Equal(t, 0, count)
+	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_snapshot_stage`).Scan(&count))
-	require.Equal(t, 0, count)
+	require.Equal(t, 1, count)
 
-	err = rebound.PushPending(ctx)
-	var connectErr *ConnectRequiredError
+	_, err = rebound.PushPending(ctx)
+	var connectErr *AttachRequiredError
 	require.ErrorAs(t, err, &connectErr)
 
-	err = rebound.PullToStable(ctx)
+	_, err = rebound.PullToStable(ctx)
 	require.ErrorAs(t, err, &connectErr)
 }
 
-func TestSignOut_ClearsHistoricallyManagedTablesRemovedFromCurrentConfig(t *testing.T) {
+func TestDetach_ClearsHistoricallyManagedTablesRemovedFromCurrentConfig(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -307,7 +348,7 @@ func TestSignOut_ClearsHistoricallyManagedTablesRemovedFromCurrentConfig(t *test
 	`, rowKeyJSON("legacy-1"))
 	require.NoError(t, err)
 
-	require.NoError(t, client.SignOut(ctx))
+	mustDetach(t, client, ctx)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
@@ -341,11 +382,15 @@ func TestCreateTriggersForTable(t *testing.T) {
 		{TableName: "test_table", SyncKeyColumns: []string{"id"}},
 	})
 	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", tokenFunc, config)
+	client, err := NewClient(db, "http://localhost", tokenFunc, config)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
 	// Verify triggers were created
 	expectedTriggers := []string{
+		"trg_test_table_bi_guard",
+		"trg_test_table_bu_guard",
+		"trg_test_table_bd_guard",
 		"trg_test_table_ai",
 		"trg_test_table_au",
 		"trg_test_table_ad",
@@ -358,9 +403,7 @@ func TestCreateTriggersForTable(t *testing.T) {
 	}
 
 	// Test that triggers work by inserting data
-	userID := "test-user"
-	_, err = EnsureSourceID(db, userID)
-	require.NoError(t, err)
+	mustOpen(t, client, context.Background(), "device-a")
 
 	// Insert a record
 	_, err = db.Exec("INSERT INTO test_table (id, name, value) VALUES (?, ?, ?)", "test-1", "Test Record", 42)
@@ -449,7 +492,7 @@ func TestNewClient(t *testing.T) {
 	require.Equal(t, "test-token", token)
 }
 
-func TestNewClient_ConnectRequiresOpenToEstablishSourceID(t *testing.T) {
+func TestNewClient_AttachRequiresOpenToEstablishSourceID(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	defer db.Close()
@@ -468,7 +511,7 @@ func TestNewClient_ConnectRequiresOpenToEstablishSourceID(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
-	_, err = client.Connect(context.Background(), "test-user")
+	_, err = client.Attach(context.Background(), "test-user")
 	var openErr *OpenRequiredError
 	require.ErrorAs(t, err, &openErr)
 	require.True(t, IsLifecyclePreconditionError(err))
@@ -476,7 +519,7 @@ func TestNewClient_ConnectRequiresOpenToEstablishSourceID(t *testing.T) {
 	require.Empty(t, client.UserID)
 }
 
-func TestOpenAndConnectEstablishRuntimeIdentity(t *testing.T) {
+func TestOpenAndAttachEstablishRuntimeIdentity(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	defer db.Close()
@@ -495,7 +538,8 @@ func TestOpenAndConnectEstablishRuntimeIdentity(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	openResult := mustOpen(t, client, context.Background(), "device-a")
+	require.Equal(t, OpenStateReadyAnonymous, openResult.State)
 	require.Equal(t, "device-a", client.SourceID)
 	require.Empty(t, client.UserID)
 
@@ -514,14 +558,14 @@ func TestOpenAndConnectEstablishRuntimeIdentity(t *testing.T) {
 		}
 	})}
 
-	result, err := client.Connect(context.Background(), "test-user")
+	result, err := client.Attach(context.Background(), "test-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
+	require.Equal(t, AttachStatusConnected, result.Status)
 	require.Equal(t, "test-user", client.UserID)
 	require.Equal(t, "device-a", client.SourceID)
 }
 
-func TestOperationsRequireConnectAfterOpen(t *testing.T) {
+func TestOperationsRequireAttachAfterOpen(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	defer db.Close()
@@ -540,7 +584,7 @@ func TestOperationsRequireConnectAfterOpen(t *testing.T) {
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	mustOpen(t, client, context.Background(), "device-a")
 
 	var requests int
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -552,24 +596,27 @@ func TestOperationsRequireConnectAfterOpen(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{name: "PushPending", run: func() error { return client.PushPending(context.Background()) }},
-		{name: "PullToStable", run: func() error { return client.PullToStable(context.Background()) }},
-		{name: "Sync", run: func() error { return client.Sync(context.Background()) }},
-		{name: "Hydrate", run: func() error { return client.Hydrate(context.Background()) }},
-		{name: "Recover", run: func() error { return client.Recover(context.Background()) }},
+		{name: "PushPending", run: func() error { _, err := client.PushPending(context.Background()); return err }},
+		{name: "PullToStable", run: func() error { _, err := client.PullToStable(context.Background()); return err }},
+		{name: "Sync", run: func() error { _, err := client.Sync(context.Background()); return err }},
+		{name: "RebuildKeepSource", run: func() error { _, err := client.Rebuild(context.Background(), RebuildKeepSource, ""); return err }},
+		{name: "RebuildRotateSource", run: func() error {
+			_, err := client.Rebuild(context.Background(), RebuildRotateSource, newTestSourceID())
+			return err
+		}},
 	}
 
 	for _, tc := range operations {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.run()
-			var connectErr *ConnectRequiredError
+			var connectErr *AttachRequiredError
 			require.ErrorAs(t, err, &connectErr)
 			require.True(t, IsLifecyclePreconditionError(err))
 		})
 	}
 
 	_, err = client.LastBundleSeqSeen(context.Background())
-	var connectErr *ConnectRequiredError
+	var connectErr *AttachRequiredError
 	require.ErrorAs(t, err, &connectErr)
 	require.True(t, IsLifecyclePreconditionError(err))
 
@@ -579,8 +626,8 @@ func TestOperationsRequireConnectAfterOpen(t *testing.T) {
 func TestLifecyclePreconditionErrorsResetSyncLoopBackoff(t *testing.T) {
 	min := 10 * time.Millisecond
 	max := 80 * time.Millisecond
-	require.Equal(t, min, nextSyncLoopBackoffAfterError(&OpenRequiredError{Operation: "Connect(userID)"}, 40*time.Millisecond, min, max))
-	require.Equal(t, min, nextSyncLoopBackoffAfterError(&ConnectRequiredError{Operation: "PushPending()"}, 40*time.Millisecond, min, max))
+	require.Equal(t, min, nextSyncLoopBackoffAfterError(&OpenRequiredError{Operation: "Attach(userID)"}, 40*time.Millisecond, min, max))
+	require.Equal(t, min, nextSyncLoopBackoffAfterError(&AttachRequiredError{Operation: "PushPending()"}, 40*time.Millisecond, min, max))
 	require.Equal(t, max, nextSyncLoopBackoffAfterError(context.DeadlineExceeded, 40*time.Millisecond, min, max))
 }
 
@@ -595,8 +642,8 @@ func TestStartLoops_LogLifecycleMisuseWithoutTouchingNetwork(t *testing.T) {
 			email TEXT NOT NULL
 		)
 	`)
-	require.NoError(t, client.SignOut(context.Background()))
-	require.NoError(t, client.Open(context.Background(), client.SourceID))
+	mustDetach(t, client, context.Background())
+	mustOpen(t, client, context.Background(), client.SourceID)
 
 	var requestCount atomic.Int64
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -726,9 +773,16 @@ func TestNewClient_FailsWhenExistingSyncStateUsesDifferentSchema(t *testing.T) {
 	require.NoError(t, initializeDatabase(db))
 
 	_, err = db.Exec(`
-		INSERT INTO _sync_client_state (user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode)
-		VALUES (?, ?, ?, 1, 0, 0)
-	`, "test-user", "existing-source", "other_business")
+		UPDATE _sync_attachment_state
+		SET current_source_id = ?, schema_name = ?
+		WHERE singleton_key = 1
+	`, "existing-source", "other_business")
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_source_state(source_id, next_source_bundle_id)
+		VALUES (?, 1)
+		ON CONFLICT(source_id) DO NOTHING
+	`, "existing-source")
 	require.NoError(t, err)
 
 	_, err = db.Exec(`

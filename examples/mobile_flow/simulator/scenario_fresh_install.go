@@ -32,12 +32,12 @@ func (s *FreshInstallScenario) Execute(ctx context.Context) error {
 
 	// Phase 1: Offline usage (guest mode)
 	logger.Info("📱 Phase 1: Offline usage (guest mode)")
-	s.app.GetUI().SimulateNetworkChange(false) // Go offline
+	s.app.currentUI().SimulateNetworkChange(false) // Go offline
 
 	// Create some data while offline
 	userIDs := make([]string, 0, s.config.InitialRecords)
 	for i := 0; i < s.config.InitialRecords; i++ {
-		userID, err := s.app.CreateUser(
+		userID, err := s.app.createUser(
 			fmt.Sprintf("User %d", i+1),
 			fmt.Sprintf("user%d@example.com", i+1),
 		)
@@ -47,7 +47,7 @@ func (s *FreshInstallScenario) Execute(ctx context.Context) error {
 		userIDs = append(userIDs, userID)
 
 		// Create a post for this user
-		_, err = s.app.CreatePost(
+		_, err = s.app.createPost(
 			fmt.Sprintf("Post by User %d", i+1),
 			fmt.Sprintf("This is content from user %d created offline", i+1),
 			userID,
@@ -59,7 +59,7 @@ func (s *FreshInstallScenario) Execute(ctx context.Context) error {
 
 	// Perform some updates while offline
 	for i := 0; i < s.config.UpdateOperations && i < len(userIDs); i++ {
-		err := s.app.UpdateUser(
+		err := s.app.updateUser(
 			userIDs[i],
 			fmt.Sprintf("Updated User %d", i+1),
 			fmt.Sprintf("updated.user%d@example.com", i+1),
@@ -74,13 +74,13 @@ func (s *FreshInstallScenario) Execute(ctx context.Context) error {
 		userToDelete := userIDs[len(userIDs)-1-i]
 
 		// First delete posts by this user to avoid foreign key constraint
-		_, err := s.app.GetDatabase().Exec(`DELETE FROM posts WHERE author_id = ?`, userToDelete)
+		_, err := s.app.database().Exec(`DELETE FROM posts WHERE author_id = ?`, userToDelete)
 		if err != nil {
 			return fmt.Errorf("failed to delete posts for user: %w", err)
 		}
 
 		// Then delete the user
-		err = s.app.DeleteUser(userToDelete)
+		err = s.app.deleteUser(userToDelete)
 		if err != nil {
 			return fmt.Errorf("failed to delete user: %w", err)
 		}
@@ -95,18 +95,18 @@ func (s *FreshInstallScenario) Execute(ctx context.Context) error {
 	logger.Info("📱 Phase 2: Sign in and first sync")
 
 	// Go back online first
-	s.app.GetUI().SimulateNetworkChange(true)
+	s.app.currentUI().SimulateNetworkChange(true)
 
 	// Sign in (this will bootstrap the client)
-	if err := s.app.OnSignIn(ctx, s.config.UserID); err != nil {
+	if err := s.app.onSignIn(ctx, s.config.UserID); err != nil {
 		return fmt.Errorf("failed to sign in: %w", err)
 	}
 
 	// Use explicit sync calls here so the scenario remains deterministic even if
 	// the background downloader wakes up before the uploader.
-	s.app.StopSync()
+	s.app.stopSync()
 	logger.Info("⏳ Uploading initial dirty set explicitly...")
-	if err := s.app.PushPending(ctx); err != nil {
+	if err := s.app.pushPending(ctx); err != nil {
 		return fmt.Errorf("failed to push initial dirty set: %w", err)
 	}
 
@@ -116,7 +116,7 @@ func (s *FreshInstallScenario) Execute(ctx context.Context) error {
 	logger.Info("📱 Phase 3: Verify sync state")
 
 	// Check UI state
-	uiState := s.app.GetUI().GetUIState()
+	uiState := s.app.currentUI().GetUIState()
 	logger.Info("UI State",
 		"banner", uiState.Banner,
 		"pending", uiState.PendingBadge,

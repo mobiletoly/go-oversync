@@ -8,19 +8,24 @@ import (
 	"strings"
 )
 
+// HistoryPrunedError reports that pull history is no longer available and the client must rebuild from snapshot state.
 type HistoryPrunedError struct {
 	Status  int
 	Message string
 }
 
+// RebuildRequiredError reports that normal sync is blocked until the client completes Rebuild.
 type RebuildRequiredError struct{}
 
+// Error implements error.
 func (e *RebuildRequiredError) Error() string {
-	return "client rebuild is required; run Hydrate or Recover before syncing"
+	return "client rebuild is required; run Rebuild before syncing"
 }
 
+// SyncOperationInProgressError reports that another sync operation is already active for the client.
 type SyncOperationInProgressError struct{}
 
+// Error implements error.
 func (e *SyncOperationInProgressError) Error() string {
 	return "another sync operation is already in progress for this client"
 }
@@ -37,14 +42,17 @@ func IsExpectedSyncContention(err error) bool {
 	return errors.As(err, &inProgressErr)
 }
 
+// PendingPushReplayError reports that pull or rebuild is blocked by an unfinished frozen outbox bundle.
 type PendingPushReplayError struct {
 	OutboundCount int
 }
 
+// Error implements error.
 func (e *PendingPushReplayError) Error() string {
 	return fmt.Sprintf("cannot rebuild while %d staged push rows are pending authoritative replay", e.OutboundCount)
 }
 
+// Error implements error.
 func (e *HistoryPrunedError) Error() string {
 	if e.Message != "" {
 		return e.Message
@@ -62,40 +70,33 @@ func (c *Client) pendingChangeCount(ctx context.Context) (int, error) {
 
 func (c *Client) pendingPushOutboundCount(ctx context.Context) (int, error) {
 	var count int
-	if err := c.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&count); err != nil {
+	if err := c.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("failed to count staged outbound push rows: %w", err)
 	}
 	return count, nil
 }
 
 func (c *Client) rebuildRequired(ctx context.Context) (bool, error) {
-	var rebuildRequired int
-	if err := c.DB.QueryRowContext(ctx, `SELECT rebuild_required FROM _sync_client_state WHERE user_id = ?`, c.UserID).Scan(&rebuildRequired); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, &ConnectRequiredError{Operation: "sync operations"}
-		}
-		return false, fmt.Errorf("failed to read rebuild_required: %w", err)
+	attachment, err := loadAttachmentState(ctx, c.DB)
+	if err != nil {
+		return false, err
 	}
-	return rebuildRequired == 1, nil
+	if attachment.BindingState != attachmentBindingAttached || attachment.AttachedUserID != c.UserID {
+		return false, &AttachRequiredError{Operation: "sync operations"}
+	}
+	return attachment.RebuildRequired, nil
 }
 
 func (c *Client) setRebuildRequired(ctx context.Context, required bool) error {
-	value := 0
-	if required {
-		value = 1
-	}
-	result, err := c.DB.ExecContext(ctx, `UPDATE _sync_client_state SET rebuild_required = ? WHERE user_id = ?`, value, c.UserID)
+	attachment, err := loadAttachmentState(ctx, c.DB)
 	if err != nil {
-		return fmt.Errorf("failed to update rebuild_required: %w", err)
+		return err
 	}
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to inspect rebuild_required update result: %w", err)
+	if attachment.BindingState != attachmentBindingAttached || attachment.AttachedUserID != c.UserID {
+		return &AttachRequiredError{Operation: "Rebuild()"}
 	}
-	if rowsAffected != 1 {
-		return &ConnectRequiredError{Operation: "Hydrate()/Recover()"}
-	}
-	return nil
+	attachment.RebuildRequired = required
+	return persistAttachmentState(ctx, c.DB, attachment)
 }
 
 func (c *Client) clearManagedTablesInTx(ctx context.Context, tx *sql.Tx) error {
@@ -124,8 +125,11 @@ func (c *Client) clearManagedTablesInTx(ctx context.Context, tx *sql.Tx) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_dirty_rows`); err != nil {
 		return fmt.Errorf("failed to clear dirty row queue during recovery: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_push_outbound`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_outbox_rows`); err != nil {
 		return fmt.Errorf("failed to clear outbound push snapshot during recovery: %w", err)
+	}
+	if err := clearOutboxBundle(ctx, tx); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_push_stage`); err != nil {
 		return fmt.Errorf("failed to clear staged push bundle rows during recovery: %w", err)
@@ -134,14 +138,25 @@ func (c *Client) clearManagedTablesInTx(ctx context.Context, tx *sql.Tx) error {
 }
 
 func (c *Client) clearFullLocalSyncStateInTx(ctx context.Context, tx *sql.Tx) error {
-	if _, err := tx.ExecContext(ctx, `UPDATE _sync_client_state SET apply_mode = 1`); err != nil {
+	if err := setApplyMode(ctx, tx, true); err != nil {
 		return fmt.Errorf("failed to enable apply_mode before full local reset: %w", err)
 	}
+	restoreApplyMode := true
+	defer func() {
+		if !restoreApplyMode {
+			return
+		}
+		_ = setApplyMode(ctx, tx, false)
+	}()
 	if err := c.clearManagedTablesInTx(ctx, tx); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_snapshot_stage`); err != nil {
 		return fmt.Errorf("failed to clear snapshot staging during recovery: %w", err)
 	}
+	if err := setApplyMode(ctx, tx, false); err != nil {
+		return fmt.Errorf("failed to restore apply_mode after full local reset: %w", err)
+	}
+	restoreApplyMode = false
 	return nil
 }

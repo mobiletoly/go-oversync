@@ -92,10 +92,10 @@ func (s *ConflictsScenario) Setup(ctx context.Context) error {
 	}
 	s.device2App = device2App
 
-	if err := s.app.OnLaunch(ctx); err != nil {
+	if err := s.app.onLaunch(ctx); err != nil {
 		return fmt.Errorf("failed to launch device 1 app: %w", err)
 	}
-	if err := s.device2App.OnLaunch(ctx); err != nil {
+	if err := s.device2App.onLaunch(ctx); err != nil {
 		return fmt.Errorf("failed to launch device 2 app: %w", err)
 	}
 
@@ -117,7 +117,7 @@ func (s *ConflictsScenario) createDeviceApp(scenarioConfig *config.ScenarioConfi
 		BackoffMax:    2 * time.Second,
 	}
 
-	appConfig := &MobileAppConfig{
+	appConfig := &mobileAppConfig{
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           scenarioConfig.UserID,
@@ -128,7 +128,7 @@ func (s *ConflictsScenario) createDeviceApp(scenarioConfig *config.ScenarioConfi
 		PreserveDB:       simCfg.PreserveDB,
 		Logger:           s.simulator.GetLogger(),
 	}
-	return NewMobileApp(appConfig)
+	return newMobileApp(appConfig)
 }
 
 func (s *ConflictsScenario) seedConflictCaseIDs() {
@@ -208,18 +208,18 @@ func (s *ConflictsScenario) Execute(ctx context.Context) error {
 }
 
 func (s *ConflictsScenario) signInAndPauseSync(ctx context.Context) error {
-	if err := s.app.SignIn(ctx, s.userID); err != nil {
+	if err := s.app.signIn(ctx, s.userID); err != nil {
 		return fmt.Errorf("failed to sign in device 1: %w", err)
 	}
-	if err := s.device2App.SignIn(ctx, s.userID); err != nil {
+	if err := s.device2App.signIn(ctx, s.userID); err != nil {
 		return fmt.Errorf("failed to sign in device 2: %w", err)
 	}
-	s.app.StopSync()
-	s.device2App.StopSync()
-	if err := s.app.Hydrate(ctx); err != nil {
+	s.app.stopSync()
+	s.device2App.stopSync()
+	if err := s.app.rebuildKeepSource(ctx); err != nil {
 		return fmt.Errorf("failed to hydrate device 1: %w", err)
 	}
-	if err := s.device2App.Hydrate(ctx); err != nil {
+	if err := s.device2App.rebuildKeepSource(ctx); err != nil {
 		return fmt.Errorf("failed to hydrate device 2: %w", err)
 	}
 	return nil
@@ -228,23 +228,23 @@ func (s *ConflictsScenario) signInAndPauseSync(ctx context.Context) error {
 func (s *ConflictsScenario) seedBaselineDataset(ctx context.Context, logger *slog.Logger) error {
 	logger.Info("🌱 Seeding baseline conflict dataset")
 	for _, tc := range s.cases {
-		if err := s.app.CreateUserWithContext(ctx, tc.targetID, baselineName(tc.name), baselineEmail(tc.name)); err != nil {
+		if err := s.app.createUserWithContext(ctx, tc.targetID, baselineName(tc.name), baselineEmail(tc.name)); err != nil {
 			return fmt.Errorf("failed to create baseline target for %s: %w", tc.name, err)
 		}
 		for i, siblingID := range tc.siblingIDs {
-			if err := s.app.CreateUserWithContext(ctx, siblingID, siblingName(tc.name, i), siblingEmail(tc.name, i)); err != nil {
+			if err := s.app.createUserWithContext(ctx, siblingID, siblingName(tc.name, i), siblingEmail(tc.name, i)); err != nil {
 				return fmt.Errorf("failed to create baseline sibling %d for %s: %w", i, tc.name, err)
 			}
 		}
 	}
-	s.app.ResetPushTransferDiagnostics()
-	if err := s.app.PushPending(ctx); err != nil {
+	s.app.resetPushTransferDiagnostics()
+	if err := s.app.pushPending(ctx); err != nil {
 		return fmt.Errorf("failed to upload baseline dataset: %w", err)
 	}
-	if _, _, err := s.app.PullToStable(ctx); err != nil {
+	if _, _, err := s.app.pullToStable(ctx); err != nil {
 		return fmt.Errorf("failed to stabilize device 1 after baseline upload: %w", err)
 	}
-	if err := s.device2App.Hydrate(ctx); err != nil {
+	if err := s.device2App.rebuildKeepSource(ctx); err != nil {
 		return fmt.Errorf("failed to hydrate baseline dataset on device 2: %w", err)
 	}
 	return s.verifyConvergedState(ctx, logger, "baseline")
@@ -253,17 +253,17 @@ func (s *ConflictsScenario) seedBaselineDataset(ctx context.Context, logger *slo
 func (s *ConflictsScenario) runConflictCase(ctx context.Context, logger *slog.Logger, tc conflictCase) error {
 	logger.Info("⚔️ Running conflict case", "case", tc.name, "resolver", fmt.Sprintf("%T", tc.resolver))
 
-	s.device2App.GetClient().Resolver = tc.resolver
+	s.device2App.currentClient().Resolver = tc.resolver
 
 	serverEmail := emailForName(tc.serverName)
 	localEmail := emailForName(tc.localName)
 	if err := updateUserWithTimestamp(ctx, s.app.db, tc.targetID, tc.serverName, serverEmail, tc.serverUpdatedAt); err != nil {
 		return fmt.Errorf("failed to update authoritative row on device 1: %w", err)
 	}
-	if err := s.app.PushPending(ctx); err != nil {
+	if err := s.app.pushPending(ctx); err != nil {
 		return fmt.Errorf("failed to push authoritative update for %s: %w", tc.name, err)
 	}
-	if _, _, err := s.app.PullToStable(ctx); err != nil {
+	if _, _, err := s.app.pullToStable(ctx); err != nil {
 		return fmt.Errorf("failed to stabilize device 1 after authoritative update: %w", err)
 	}
 
@@ -285,18 +285,18 @@ func (s *ConflictsScenario) runConflictCase(ctx context.Context, logger *slog.Lo
 		}
 	}
 
-	s.device2App.ResetPushTransferDiagnostics()
-	if err := s.device2App.PushPending(ctx); err != nil {
+	s.device2App.resetPushTransferDiagnostics()
+	if err := s.device2App.pushPending(ctx); err != nil {
 		return fmt.Errorf("failed to push conflicting case %s: %w", tc.name, err)
 	}
-	if _, _, err := s.device2App.PullToStable(ctx); err != nil {
+	if _, _, err := s.device2App.pullToStable(ctx); err != nil {
 		return fmt.Errorf("failed to stabilize device 2 after conflict recovery for %s: %w", tc.name, err)
 	}
-	if _, _, err := s.app.PullToStable(ctx); err != nil {
+	if _, _, err := s.app.pullToStable(ctx); err != nil {
 		return fmt.Errorf("failed to pull recovered results to device 1 for %s: %w", tc.name, err)
 	}
 
-	pushStats := s.device2App.PushTransferDiagnostics()
+	pushStats := s.device2App.pushTransferDiagnostics()
 	if pushStats.SessionsCreated != 2 {
 		return fmt.Errorf("expected 2 push sessions for %s, got %d", tc.name, pushStats.SessionsCreated)
 	}
@@ -331,11 +331,11 @@ func (s *ConflictsScenario) runConflictCase(ctx context.Context, logger *slog.Lo
 }
 
 func (s *ConflictsScenario) verifyConvergedState(ctx context.Context, logger *slog.Logger, label string) error {
-	count1, err := s.app.GetUserCount(ctx)
+	count1, err := s.app.userCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to count users on device 1 for %s: %w", label, err)
 	}
-	count2, err := s.device2App.GetUserCount(ctx)
+	count2, err := s.device2App.userCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to count users on device 2 for %s: %w", label, err)
 	}
@@ -343,11 +343,11 @@ func (s *ConflictsScenario) verifyConvergedState(ctx context.Context, logger *sl
 		return fmt.Errorf("user count mismatch after %s: device1=%d device2=%d", label, count1, count2)
 	}
 
-	lastSeq1, err := s.app.GetLastServerSeqSeen(ctx)
+	lastSeq1, err := s.app.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read device 1 last bundle seq for %s: %w", label, err)
 	}
-	lastSeq2, err := s.device2App.GetLastServerSeqSeen(ctx)
+	lastSeq2, err := s.device2App.lastServerSeqSeen(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read device 2 last bundle seq for %s: %w", label, err)
 	}
@@ -377,7 +377,7 @@ func (s *ConflictsScenario) Verify(ctx context.Context, verifier *DatabaseVerifi
 func (s *ConflictsScenario) Cleanup(ctx context.Context) error {
 	var firstErr error
 	if s.device2App != nil {
-		if err := s.device2App.Close(); err != nil && firstErr == nil {
+		if err := s.device2App.close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("failed to close device 2 app: %w", err)
 		}
 		s.device2App = nil
@@ -494,7 +494,7 @@ func assertNoPendingPushRecoveryState(ctx context.Context, db *sql.DB) error {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount); err != nil {
 		return fmt.Errorf("failed to count dirty rows: %w", err)
 	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount); err != nil {
 		return fmt.Errorf("failed to count outbound rows: %w", err)
 	}
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount); err != nil {

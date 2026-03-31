@@ -6,8 +6,8 @@ import (
 	"fmt"
 )
 
-// DebugVerifyPendingCleared checks that the local dirty-row queue is empty.
-func (app *MobileApp) DebugVerifyPendingCleared(ctx context.Context) error {
+// debugVerifyPendingCleared checks that the local dirty-row queue is empty.
+func (app *MobileApp) debugVerifyPendingCleared(ctx context.Context) error {
 	if app.db == nil {
 		return fmt.Errorf("database not initialized")
 	}
@@ -21,9 +21,9 @@ func (app *MobileApp) DebugVerifyPendingCleared(ctx context.Context) error {
 	return nil
 }
 
-// DebugVerifyBusinessFKIntegrity verifies basic FK integrity for the typical demo schema (users/posts).
+// debugVerifyBusinessFKIntegrity verifies basic FK integrity for the typical demo schema (users/posts).
 // It is intended for simulator/testing only and is not used by the general-purpose library.
-func (app *MobileApp) DebugVerifyBusinessFKIntegrity(ctx context.Context) error {
+func (app *MobileApp) debugVerifyBusinessFKIntegrity(ctx context.Context) error {
 	if app.db == nil {
 		return fmt.Errorf("database not initialized")
 	}

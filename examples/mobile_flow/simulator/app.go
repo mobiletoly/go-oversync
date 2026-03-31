@@ -18,8 +18,8 @@ import (
 
 var verboseLog = false
 
-// MobileAppConfig holds configuration for a mobile app instance
-type MobileAppConfig struct {
+// mobileAppConfig holds configuration for a mobile app instance.
+type mobileAppConfig struct {
 	DatabaseFile     string
 	ServerURL        string
 	UserID           string
@@ -33,7 +33,7 @@ type MobileAppConfig struct {
 
 // MobileApp represents a simulated mobile application
 type MobileApp struct {
-	config *MobileAppConfig
+	config *mobileAppConfig
 	logger *slog.Logger
 
 	db     *sql.DB
@@ -57,7 +57,7 @@ type mobileAppStatements struct {
 	deletePost *sql.Stmt
 }
 
-func NewMobileApp(config *MobileAppConfig) (*MobileApp, error) {
+func newMobileApp(config *mobileAppConfig) (*MobileApp, error) {
 	logger := config.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -289,8 +289,8 @@ func (app *MobileApp) tokenFunc(ctx context.Context) (string, error) {
 	return token, nil
 }
 
-// OnLaunch simulates app launch lifecycle
-func (app *MobileApp) OnLaunch(ctx context.Context) error {
+// onLaunch simulates app launch lifecycle.
+func (app *MobileApp) onLaunch(ctx context.Context) error {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 
@@ -302,10 +302,14 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 	}
 	app.ui.SetBanner("Starting up...")
 
-	if err := app.client.Open(ctx, app.config.SourceID); err != nil {
+	openResult, err := app.client.Open(ctx, app.config.SourceID)
+	if err != nil {
 		app.logger.Error("Failed to open local oversqlite lifecycle", "error", err)
 		app.ui.SetBanner("Setup failed")
 		return fmt.Errorf("open lifecycle failed: %w", err)
+	}
+	if verboseLog {
+		app.logger.Info("Opened local oversqlite lifecycle", "state", openResult.State)
 	}
 
 	// Try to restore session
@@ -351,8 +355,8 @@ func (app *MobileApp) OnLaunch(ctx context.Context) error {
 	return nil
 }
 
-// OnSignIn simulates user sign-in
-func (app *MobileApp) OnSignIn(ctx context.Context, userID string) error {
+// onSignIn simulates user sign-in.
+func (app *MobileApp) onSignIn(ctx context.Context, userID string) error {
 	if verboseLog {
 		app.logger.Info("👤 User signing in", "user_id", userID)
 	}
@@ -366,10 +370,14 @@ func (app *MobileApp) OnSignIn(ctx context.Context, userID string) error {
 	if verboseLog {
 		app.ui.SetBanner("Setting up sync...")
 	}
-	if err := app.client.Open(ctx, app.config.SourceID); err != nil {
+	openResult, err := app.client.Open(ctx, app.config.SourceID)
+	if err != nil {
 		app.logger.Error("Failed to open local oversqlite lifecycle", "error", err)
 		app.ui.SetBanner("Setup failed")
 		return fmt.Errorf("open lifecycle failed: %w", err)
+	}
+	if verboseLog {
+		app.logger.Info("Opened local oversqlite lifecycle", "state", openResult.State)
 	}
 	if err := app.connectLifecycle(ctx, userID); err != nil {
 		app.logger.Error("Failed to connect oversqlite lifecycle", "error", err)
@@ -392,27 +400,31 @@ func (app *MobileApp) OnSignIn(ctx context.Context, userID string) error {
 	return nil
 }
 
-// SignIn is a convenience method that wraps OnSignIn
-func (app *MobileApp) SignIn(ctx context.Context, userID string) error {
-	return app.OnSignIn(ctx, userID)
+// signIn is a convenience method that wraps onSignIn.
+func (app *MobileApp) signIn(ctx context.Context, userID string) error {
+	return app.onSignIn(ctx, userID)
 }
 
-// OnSignOut simulates user sign-out
-func (app *MobileApp) OnSignOut(ctx context.Context) error {
-	app.logger.Info("👋 User signing out")
+// onDetach leaves the attached sync session while keeping offline local edits enabled.
+func (app *MobileApp) onDetach(ctx context.Context) error {
+	app.logger.Info("👋 Detaching sync session")
 
 	app.sync.Stop()
 	if app.client != nil {
-		if err := app.client.SignOut(ctx); err != nil {
-			return fmt.Errorf("sign out failed: %w", err)
+		detachResult, err := app.client.Detach(ctx)
+		if err != nil {
+			return fmt.Errorf("detach failed: %w", err)
+		}
+		if detachResult.Outcome == oversqlite.DetachOutcomeBlockedUnsyncedData {
+			return fmt.Errorf("detach blocked by %d pending sync rows", detachResult.PendingRowCount)
 		}
 	}
-	app.session.SignOut()
+	app.session.Detach()
 
 	app.ui.SetBanner("Offline mode. Sign in to sync.")
 	app.ui.SetPendingBadge(app.getPendingCount())
 
-	app.logger.Info("✅ User signed out successfully")
+	app.logger.Info("✅ Detached sync session successfully")
 	return nil
 }
 
@@ -420,12 +432,12 @@ func (app *MobileApp) connectLifecycle(ctx context.Context, userID string) error
 	const maxAttempts = 8
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		result, err := app.client.Connect(ctx, userID)
+		result, err := app.client.Attach(ctx, userID)
 		if err == nil {
 			switch result.Status {
-			case oversqlite.ConnectStatusConnected:
+			case oversqlite.AttachStatusConnected:
 				return nil
-			case oversqlite.ConnectStatusRetryLater:
+			case oversqlite.AttachStatusRetryLater:
 				waitFor := result.RetryAfter
 				if waitFor <= 0 {
 					waitFor = 250 * time.Millisecond
@@ -453,31 +465,23 @@ func (app *MobileApp) connectLifecycle(ctx context.Context, userID string) error
 	return fmt.Errorf("connect lifecycle did not reach connected status after %d attempts", maxAttempts)
 }
 
-// CreateUser creates a new user record
-func (app *MobileApp) CreateUser(name, email string) (string, error) {
+func (app *MobileApp) createUser(name, email string) (string, error) {
 	userID := uuid.New().String()
-	return app.createUserWithID(context.Background(), userID, name, email)
+	return app.insertUserWithID(context.Background(), userID, name, email)
 }
 
-// CreateUserWithContext creates a new user record with context and specified ID
-func (app *MobileApp) CreateUserWithContext(ctx context.Context, userID, name, email string) error {
-	_, err := app.createUserWithID(ctx, userID, name, email)
+func (app *MobileApp) createUserWithContext(ctx context.Context, userID, name, email string) error {
+	_, err := app.insertUserWithID(ctx, userID, name, email)
 	return err
 }
 
-// CreateUserWithID creates a new user record with specified ID
-func (app *MobileApp) CreateUserWithID(ctx context.Context, userID, name, email string) error {
-	_, err := app.createUserWithID(ctx, userID, name, email)
+func (app *MobileApp) createUserWithID(ctx context.Context, userID, name, email string) error {
+	_, err := app.insertUserWithID(ctx, userID, name, email)
 	return err
 }
 
-// CreateUserWithIDReturningID creates a new user record with specified ID and returns the ID
-func (app *MobileApp) CreateUserWithIDReturningID(userID, name, email string) (string, error) {
-	return app.createUserWithID(context.Background(), userID, name, email)
-}
-
-// createUserWithID is the internal implementation for creating users
-func (app *MobileApp) createUserWithID(ctx context.Context, userID, name, email string) (string, error) {
+// insertUserWithID is the internal implementation for creating users.
+func (app *MobileApp) insertUserWithID(ctx context.Context, userID, name, email string) (string, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err := app.stmts.createUser.ExecContext(ctx, userID, name, email, now, now)
@@ -492,8 +496,7 @@ func (app *MobileApp) createUserWithID(ctx context.Context, userID, name, email 
 	return userID, nil
 }
 
-// CreateUserTx inserts a user row within an existing transaction
-func (app *MobileApp) CreateUserTx(tx *sql.Tx, userID, name, email string) error {
+func (app *MobileApp) createUserTx(tx *sql.Tx, userID, name, email string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	stmt := tx.StmtContext(context.Background(), app.stmts.createUser)
 	defer stmt.Close()
@@ -504,20 +507,18 @@ func (app *MobileApp) CreateUserTx(tx *sql.Tx, userID, name, email string) error
 	return nil
 }
 
-// CreatePost creates a new post record
-func (app *MobileApp) CreatePost(title, content, authorID string) (string, error) {
+func (app *MobileApp) createPost(title, content, authorID string) (string, error) {
 	postID := uuid.New().String()
-	return app.createPostWithID(context.Background(), postID, authorID, title, content)
+	return app.insertPostWithID(context.Background(), postID, authorID, title, content)
 }
 
-// CreatePostWithID creates a new post record with specified ID and author
-func (app *MobileApp) CreatePostWithID(ctx context.Context, postID, authorID, title, content string) error {
-	_, err := app.createPostWithID(ctx, postID, authorID, title, content)
+func (app *MobileApp) createPostWithID(ctx context.Context, postID, authorID, title, content string) error {
+	_, err := app.insertPostWithID(ctx, postID, authorID, title, content)
 	return err
 }
 
-// createPostWithID is the internal implementation for creating posts
-func (app *MobileApp) createPostWithID(ctx context.Context, postID, authorID, title, content string) (string, error) {
+// insertPostWithID is the internal implementation for creating posts.
+func (app *MobileApp) insertPostWithID(ctx context.Context, postID, authorID, title, content string) (string, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err := app.stmts.createPost.ExecContext(ctx, postID, title, content, authorID, now, now)
@@ -532,8 +533,7 @@ func (app *MobileApp) createPostWithID(ctx context.Context, postID, authorID, ti
 	return postID, nil
 }
 
-// CreatePostTx inserts a post row within an existing transaction
-func (app *MobileApp) CreatePostTx(tx *sql.Tx, postID, authorID, title, content string) error {
+func (app *MobileApp) createPostTx(tx *sql.Tx, postID, authorID, title, content string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	stmt := tx.StmtContext(context.Background(), app.stmts.createPost)
 	defer stmt.Close()
@@ -544,8 +544,7 @@ func (app *MobileApp) CreatePostTx(tx *sql.Tx, postID, authorID, title, content 
 	return nil
 }
 
-// UpdateUser updates an existing user record
-func (app *MobileApp) UpdateUser(userID, name, email string) error {
+func (app *MobileApp) updateUser(userID, name, email string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err := app.stmts.updateUser.Exec(name, email, now, userID)
@@ -560,8 +559,7 @@ func (app *MobileApp) UpdateUser(userID, name, email string) error {
 	return nil
 }
 
-// UpdatePost updates an existing post record
-func (app *MobileApp) UpdatePost(postID, title, content string) error {
+func (app *MobileApp) updatePost(postID, title, content string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
 	_, err := app.stmts.updatePost.Exec(title, content, now, postID)
@@ -575,8 +573,7 @@ func (app *MobileApp) UpdatePost(postID, title, content string) error {
 	return nil
 }
 
-// DeletePost deletes a post record
-func (app *MobileApp) DeletePost(postID string) error {
+func (app *MobileApp) deletePost(postID string) error {
 	_, err := app.stmts.deletePost.Exec(postID)
 	if err != nil {
 		return fmt.Errorf("failed to delete post: %w", err)
@@ -588,8 +585,7 @@ func (app *MobileApp) DeletePost(postID string) error {
 	return nil
 }
 
-// DeleteUser deletes a user record
-func (app *MobileApp) DeleteUser(userID string) error {
+func (app *MobileApp) deleteUser(userID string) error {
 	_, err := app.stmts.deleteUser.Exec(userID)
 	if err != nil {
 		return fmt.Errorf("failed to delete user: %w", err)
@@ -601,8 +597,7 @@ func (app *MobileApp) DeleteUser(userID string) error {
 	return nil
 }
 
-// DeleteUserWithContext deletes a user record with context
-func (app *MobileApp) DeleteUserWithContext(ctx context.Context, userID string) error {
+func (app *MobileApp) deleteUserWithContext(ctx context.Context, userID string) error {
 	if app.db == nil {
 		return fmt.Errorf("database not initialized")
 	}
@@ -631,8 +626,7 @@ func (app *MobileApp) getPendingCount() int {
 	return count
 }
 
-// GetPendingChangesCount returns the number of locally dirty rows (public method).
-func (app *MobileApp) GetPendingChangesCount(ctx context.Context) (int, error) {
+func (app *MobileApp) pendingChangesCount(ctx context.Context) (int, error) {
 	if app.db == nil {
 		return 0, fmt.Errorf("database not initialized")
 	}
@@ -645,8 +639,8 @@ func (app *MobileApp) GetPendingChangesCount(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-// Close cleans up the mobile app
-func (app *MobileApp) Close() error {
+// close cleans up the mobile app.
+func (app *MobileApp) close() error {
 	app.mu.Lock()
 	defer app.mu.Unlock()
 
@@ -693,110 +687,97 @@ func (app *MobileApp) Close() error {
 	return nil
 }
 
-// GetDatabase returns the SQLite database connection
-func (app *MobileApp) GetDatabase() *sql.DB {
+func (app *MobileApp) database() *sql.DB {
 	return app.db
 }
 
-// GetClient returns the oversqlite client
-func (app *MobileApp) GetClient() *oversqlite.Client {
+func (app *MobileApp) currentClient() *oversqlite.Client {
 	return app.client
 }
 
-// GetSession returns the session manager
-func (app *MobileApp) GetSession() *Session {
+func (app *MobileApp) currentSession() *Session {
 	return app.session
 }
 
-// GetUI returns the UI simulator
-func (app *MobileApp) GetUI() *UISimulator {
+func (app *MobileApp) currentUI() *UISimulator {
 	return app.ui
 }
 
-// ResetApplyMode forces _sync_client_state.apply_mode back to 0 for this user.
-// This ensures local change-tracking triggers are active even if a previous
-// download transaction left apply_mode=1 due to an interrupted flow.
-func (app *MobileApp) ResetApplyMode(ctx context.Context) error {
-	if app.db == nil {
-		return fmt.Errorf("database not initialized")
-	}
-	_, err := app.db.ExecContext(ctx, `UPDATE _sync_client_state SET apply_mode = 0 WHERE user_id = ?`, app.config.UserID)
-	return err
-}
-
-// PauseSync pauses both uploads and downloads in the oversqlite client
-func (app *MobileApp) PauseSync() {
+func (app *MobileApp) pauseSync() {
 	if app.client != nil {
 		app.client.PauseUploads()
 		app.client.PauseDownloads()
 	}
 }
 
-// ResumeSync resumes both uploads and downloads in the oversqlite client
-func (app *MobileApp) ResumeSync() {
+func (app *MobileApp) resumeSync() {
 	if app.client != nil {
 		app.client.ResumeUploads()
 		app.client.ResumeDownloads()
 	}
 }
 
-// StopSync stops background sync loops (uploader/downloader)
-func (app *MobileApp) StopSync() {
+func (app *MobileApp) stopSync() {
 	if app.sync != nil {
 		app.sync.Stop()
 	}
 }
 
-// StartSync starts background sync loops
-func (app *MobileApp) StartSync(ctx context.Context) error {
+func (app *MobileApp) startSync(ctx context.Context) error {
 	if app.sync != nil {
 		return app.sync.Start(ctx)
 	}
 	return nil
 }
 
-// IsRunning returns whether the app is currently running
-func (app *MobileApp) IsRunning() bool {
-	app.mu.RLock()
-	defer app.mu.RUnlock()
-	return app.isRunning
-}
-
-// Hydrate rebuilds local state from the authoritative server snapshot using chunked snapshot sessions.
-func (app *MobileApp) Hydrate(ctx context.Context) error {
+// rebuildKeepSource rebuilds local state from the authoritative server snapshot without rotating source identity.
+func (app *MobileApp) rebuildKeepSource(ctx context.Context) error {
 	if app.client == nil {
 		return fmt.Errorf("no oversqlite client available")
 	}
 
-	app.logger.Info("🔄 Starting hydration")
+	app.logger.Info("🔄 Starting rebuild")
 	app.ui.SetBanner("Downloading data...")
 
-	if err := app.client.Hydrate(ctx); err != nil {
+	report, err := app.client.Rebuild(ctx, oversqlite.RebuildKeepSource, "")
+	if err != nil {
 		app.ui.SetBanner("Download failed")
-		return fmt.Errorf("hydration failed: %w", err)
+		return fmt.Errorf("rebuild failed: %w", err)
+	}
+	if verboseLog {
+		app.logger.Info("Rebuild completed", "outcome", report.Outcome, "restored", report.Restore != nil)
 	}
 
 	app.ui.SetBanner("Data downloaded")
-	app.logger.Info("✅ Hydration completed successfully")
+	app.logger.Info("✅ Rebuild completed successfully")
 
 	return nil
 }
 
-// Recover rebuilds local state from the authoritative server snapshot using chunked snapshot sessions and rotates source identity.
-func (app *MobileApp) Recover(ctx context.Context) error {
+// rebuildRotateSource rebuilds local state and rotates to an explicit replacement source ID.
+func (app *MobileApp) rebuildRotateSource(ctx context.Context, newSourceID string) error {
 	if app.client == nil {
 		return fmt.Errorf("no oversqlite client available")
+	}
+	newSourceID = strings.TrimSpace(newSourceID)
+	if newSourceID == "" {
+		return fmt.Errorf("newSourceID must be provided")
 	}
 
 	app.logger.Info("🔄 Starting recovery rebuild")
 	app.ui.SetBanner("Recovering data...")
 
-	if err := app.client.Recover(ctx); err != nil {
+	report, err := app.client.Rebuild(ctx, oversqlite.RebuildRotateSource, newSourceID)
+	if err != nil {
 		app.ui.SetBanner("Recovery failed")
 		return fmt.Errorf("recovery rebuild failed: %w", err)
 	}
 
-	app.syncRotatedSourceIdentity(app.client.SourceID)
+	if report.RotatedSourceID != "" {
+		app.syncRotatedSourceIdentity(report.RotatedSourceID)
+	} else {
+		app.syncRotatedSourceIdentity(newSourceID)
+	}
 
 	app.ui.SetBanner("Data recovered")
 	app.logger.Info("✅ Recovery rebuild completed successfully")
@@ -817,34 +798,34 @@ func (app *MobileApp) syncRotatedSourceIdentity(sourceID string) {
 	}
 }
 
-func (app *MobileApp) ResetSnapshotTransferDiagnostics() {
+func (app *MobileApp) resetSnapshotTransferDiagnostics() {
 	if app.client != nil {
 		app.client.ResetSnapshotTransferDiagnostics()
 	}
 }
 
-func (app *MobileApp) SnapshotTransferDiagnostics() oversqlite.SnapshotTransferStats {
+func (app *MobileApp) snapshotTransferDiagnostics() oversqlite.SnapshotTransferStats {
 	if app.client == nil {
 		return oversqlite.SnapshotTransferStats{}
 	}
 	return app.client.SnapshotTransferDiagnostics()
 }
 
-func (app *MobileApp) ResetPushTransferDiagnostics() {
+func (app *MobileApp) resetPushTransferDiagnostics() {
 	if app.client != nil {
 		app.client.ResetPushTransferDiagnostics()
 	}
 }
 
-func (app *MobileApp) PushTransferDiagnostics() oversqlite.PushTransferStats {
+func (app *MobileApp) pushTransferDiagnostics() oversqlite.PushTransferStats {
 	if app.client == nil {
 		return oversqlite.PushTransferStats{}
 	}
 	return app.client.PushTransferDiagnostics()
 }
 
-// PushPending uploads the full current dirty set and refreshes the local UI state.
-func (app *MobileApp) PushPending(ctx context.Context) error {
+// pushPending uploads the full current dirty set and refreshes the local UI state.
+func (app *MobileApp) pushPending(ctx context.Context) error {
 	if app.client == nil {
 		return fmt.Errorf("client not initialized")
 	}
@@ -855,8 +836,12 @@ func (app *MobileApp) PushPending(ctx context.Context) error {
 
 	var err error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		err = app.client.PushPending(ctx)
+		var report oversqlite.PushReport
+		report, err = app.client.PushPending(ctx)
 		if err == nil {
+			if verboseLog {
+				app.logger.Info("Upload finished", "outcome", report.Outcome)
+			}
 			break
 		}
 
@@ -877,9 +862,9 @@ func (app *MobileApp) PushPending(ctx context.Context) error {
 	return nil
 }
 
-// PullToStable performs one bundle-era pull session and returns the number of
+// pullToStable performs one bundle-era pull session and returns the number of
 // newly applied bundles along with the latest durable bundle checkpoint.
-func (app *MobileApp) PullToStable(ctx context.Context) (applied int, nextAfter int64, err error) {
+func (app *MobileApp) pullToStable(ctx context.Context) (applied int, nextAfter int64, err error) {
 	if app.client == nil {
 		return 0, 0, fmt.Errorf("client not initialized")
 	}
@@ -889,17 +874,20 @@ func (app *MobileApp) PullToStable(ctx context.Context) (applied int, nextAfter 
 	const retryDelay = 500 * time.Millisecond
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		before, err := app.GetLastServerSeqSeen(ctx)
+		before, err := app.lastServerSeqSeen(ctx)
 		if err != nil {
 			return 0, 0, err
 		}
-		err = app.client.PullToStable(ctx)
+		var report oversqlite.RemoteSyncReport
+		report, err = app.client.PullToStable(ctx)
 		if err == nil {
-			nextAfter, err = app.GetLastServerSeqSeen(ctx)
+			nextAfter, err = app.lastServerSeqSeen(ctx)
 			if err != nil {
 				return 0, 0, err
 			}
-			if nextAfter > before {
+			if report.Outcome == oversqlite.RemoteSyncOutcomeSkippedPaused {
+				applied = 0
+			} else if nextAfter > before {
 				applied = int(nextAfter - before)
 			} else {
 				applied = 0
@@ -929,20 +917,18 @@ func (app *MobileApp) GetDatabasePath() string {
 	return app.config.DatabaseFile
 }
 
-// GetLastServerSeqSeen returns the last committed bundle sequence seen by this client.
-func (app *MobileApp) GetLastServerSeqSeen(ctx context.Context) (int64, error) {
+func (app *MobileApp) lastServerSeqSeen(ctx context.Context) (int64, error) {
 	var lastSeq int64
 	err := app.db.QueryRowContext(ctx, `
-		SELECT last_bundle_seq_seen FROM _sync_client_state WHERE user_id = ?
-	`, app.config.UserID).Scan(&lastSeq)
+		SELECT last_bundle_seq_seen FROM _sync_attachment_state WHERE singleton_key = 1
+	`).Scan(&lastSeq)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get last bundle seq seen: %w", err)
 	}
 	return lastSeq, nil
 }
 
-// GetUserCount returns the number of users in the database
-func (app *MobileApp) GetUserCount(ctx context.Context) (int, error) {
+func (app *MobileApp) userCount(ctx context.Context) (int, error) {
 	if app.db == nil {
 		return 0, fmt.Errorf("database not initialized")
 	}
@@ -955,8 +941,7 @@ func (app *MobileApp) GetUserCount(ctx context.Context) (int, error) {
 	return count, nil
 }
 
-// HasUser checks if a user with the given ID exists in the database
-func (app *MobileApp) HasUser(ctx context.Context, userID string) (bool, error) {
+func (app *MobileApp) hasUser(ctx context.Context, userID string) (bool, error) {
 	if app.db == nil {
 		return false, fmt.Errorf("database not initialized")
 	}
@@ -967,19 +952,4 @@ func (app *MobileApp) HasUser(ctx context.Context, userID string) (bool, error) 
 		return false, fmt.Errorf("failed to check user existence: %w", err)
 	}
 	return count > 0, nil
-}
-
-// ResetSyncState resets the durable bundle checkpoint to force a fresh pull from bundle 0.
-func (app *MobileApp) ResetSyncState(ctx context.Context) error {
-	if app.db == nil {
-		return fmt.Errorf("database not initialized")
-	}
-
-	_, err := app.db.ExecContext(ctx, "UPDATE _sync_client_state SET last_bundle_seq_seen = 0 WHERE user_id = ?", app.config.UserID)
-	if err != nil {
-		return fmt.Errorf("failed to reset sync state: %w", err)
-	}
-
-	app.logger.Info("🔄 Reset sync state to download all changes", "user_id", app.config.UserID)
-	return nil
 }

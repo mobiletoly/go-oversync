@@ -59,7 +59,7 @@ func TestApplyBundleRowAuthoritativelyInTx_BlobUUIDPK_ServerSendsUUIDString(t *t
 	require.NoError(t, err)
 	attachTestClient(t, client, "test-user", "test-source")
 
-	_, err = db.Exec(`UPDATE _sync_client_state SET apply_mode = 1 WHERE user_id = ?`, client.UserID)
+	_, err = db.Exec(`UPDATE _sync_apply_state SET apply_mode = 1 WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID)
 	require.NoError(t, err)
 
 	fileID := uuid.New()
@@ -199,7 +199,7 @@ func TestApplyBundleRowAuthoritativelyInTx_UpsertPreservesChildrenForBlobPKTable
 	require.NoError(t, err)
 	attachTestClient(t, client, "test-user", "test-source")
 
-	_, err = db.Exec(`UPDATE _sync_client_state SET apply_mode = 1 WHERE user_id = ?`, client.UserID)
+	_, err = db.Exec(`UPDATE _sync_apply_state SET apply_mode = 1 WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID)
 	require.NoError(t, err)
 
 	fileID := uuid.New()
@@ -291,7 +291,7 @@ func TestApplyBundleRowAuthoritativelyInTx_RejectsNonCanonicalWireEncodingsForBl
 	require.NoError(t, err)
 	attachTestClient(t, client, "test-user", "test-source")
 
-	_, err = db.Exec(`UPDATE _sync_client_state SET apply_mode = 1 WHERE user_id = ?`, client.UserID)
+	_, err = db.Exec(`UPDATE _sync_apply_state SET apply_mode = 1 WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID)
 	require.NoError(t, err)
 
 	fileID := uuid.New()

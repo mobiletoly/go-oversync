@@ -133,7 +133,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Device Replacement",
 			Description:      "Simulates user switching to a new device",
 			UserID:           "user-device-replacement",
-			SourceID:         "device-replacement-002", // Different device ID
+			SourceID:         "device-replacement-001",
 			DeviceName:       "iPhone New",
 			OfflineMode:      false,
 			CleanDatabase:    true,

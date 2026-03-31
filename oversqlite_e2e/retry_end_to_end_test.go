@@ -19,9 +19,9 @@ func TestEndToEnd_PushPending_RetriesInjectedTransientFailure(t *testing.T) {
 	userID := "e2e-retry-push-user-" + uuid.NewString()
 	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", newRetryingConfig(schema, syncTables("users")), usersDDL)
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	rowID := uuid.NewString()
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Retry", "retry@example.com")
@@ -29,7 +29,7 @@ func TestEndToEnd_PushPending_RetriesInjectedTransientFailure(t *testing.T) {
 
 	server.InjectFailure(exampleserver.FailureEndpointPushSessionCreate, 503, 1)
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPendingE2E(t, client, ctx)
 
 	var count int
 	require.NoError(t, server.Pool.QueryRow(ctx, `
@@ -48,16 +48,16 @@ func TestEndToEnd_PushPending_RetryExhaustionReturnsTypedError(t *testing.T) {
 	userID := "e2e-retry-push-exhaust-user-" + uuid.NewString()
 	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", newRetryingConfig(schema, syncTables("users")), usersDDL)
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, uuid.NewString(), "Retry", "retry@example.com")
 	require.NoError(t, err)
 
 	server.InjectFailure(exampleserver.FailureEndpointPushSessionCreate, 503, 3)
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	var retryErr *oversqlite.RetryExhaustedError
 	require.ErrorAs(t, err, &retryErr)
 	require.Equal(t, "push_pending", retryErr.Operation)
@@ -73,21 +73,21 @@ func TestEndToEnd_PullToStable_RetriesInjectedTransientFailure(t *testing.T) {
 	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", config, usersDDL)
 	clientB, dbB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", config, usersDDL)
 
-	connectA, err := clientA.Connect(ctx, userID)
+	connectA, err := clientA.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectA.Status)
-	connectB, err := clientB.Connect(ctx, userID)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
+	connectB, err := clientB.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectB.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
 
 	rowID := uuid.NewString()
 	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Remote", "remote@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	server.InjectFailure(exampleserver.FailureEndpointPull, 503, 1)
 
-	require.NoError(t, clientB.PullToStable(ctx))
+	mustPullToStableE2E(t, clientB, ctx)
 
 	var count int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, rowID).Scan(&count))
@@ -104,20 +104,20 @@ func TestEndToEnd_PullToStable_RetryExhaustionReturnsTypedError(t *testing.T) {
 	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", config, usersDDL)
 	clientB, _ := newSQLiteClientWithoutConnect(t, server, userID, "device-b", config, usersDDL)
 
-	connectA, err := clientA.Connect(ctx, userID)
+	connectA, err := clientA.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectA.Status)
-	connectB, err := clientB.Connect(ctx, userID)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
+	connectB, err := clientB.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectB.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
 
 	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, uuid.NewString(), "Remote", "remote@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	server.InjectFailure(exampleserver.FailureEndpointPull, 503, 3)
 
-	err = clientB.PullToStable(ctx)
+	_, err = clientB.PullToStable(ctx)
 	var retryErr *oversqlite.RetryExhaustedError
 	require.ErrorAs(t, err, &retryErr)
 	require.Equal(t, "pull_request", retryErr.Operation)

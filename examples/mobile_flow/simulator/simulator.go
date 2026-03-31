@@ -100,7 +100,7 @@ func NewSimulatorWithUserConfigAndVerifier(cfg *config.Config, userID, sourceID 
 // Close cleans up simulator resources
 func (s *Simulator) Close() error {
 	if s.currentApp != nil {
-		s.currentApp.Close()
+		s.currentApp.close()
 	}
 
 	// Close verifier only if it was created by NewSimulator (not shared)
@@ -224,7 +224,7 @@ func (s *Simulator) CreateMobileApp(scenarioConfig *config.ScenarioConfig) (*Mob
 	}
 
 	// Create mobile app
-	app, err := NewMobileApp(&MobileAppConfig{
+	app, err := newMobileApp(&mobileAppConfig{
 		DatabaseFile:     dbFile,
 		ServerURL:        s.config.ServerURL,
 		UserID:           scenarioConfig.UserID,

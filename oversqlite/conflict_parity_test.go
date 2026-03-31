@@ -94,12 +94,7 @@ func structuredConflictResponse(row oversync.PushRequestRow, serverRowVersion in
 
 func requireClientBundleState(t *testing.T, db *sql.DB, userID string) (int64, int64) {
 	t.Helper()
-	var nextSourceBundleID, lastBundleSeqSeen int64
-	require.NoError(t, db.QueryRow(`
-		SELECT next_source_bundle_id, last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, userID).Scan(&nextSourceBundleID, &lastBundleSeqSeen))
+	_, nextSourceBundleID, lastBundleSeqSeen := requireBundleState(t, db)
 	return nextSourceBundleID, lastBundleSeqSeen
 }
 
@@ -165,7 +160,7 @@ func TestPushPending_StructuredConflictBuildsConflictContextFromOutboundSnapshot
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 	require.True(t, resolver.called)
 	require.Equal(t, "main", resolver.conflict.Schema)
 	require.Equal(t, "users", resolver.conflict.Table)
@@ -203,7 +198,7 @@ func TestPushPending_StructuredConflictServerWinsResolverRecoversToServerState(t
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 
 	name, email, exists := loadUserForKey(t, db, userID)
 	require.True(t, exists)
@@ -217,7 +212,7 @@ func TestPushPending_StructuredConflictServerWinsResolverRecoversToServerState(t
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.Equal(t, 0, dirtyCount)
 	require.Equal(t, 0, outboundCount)
 
@@ -257,14 +252,14 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 			})
 		}
 		var nextSourceBundleID int64
-		require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&nextSourceBundleID))
+		require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, client.UserID).Scan(&nextSourceBundleID))
 		require.Equal(t, int64(1), nextSourceBundleID)
 		require.Equal(t, int64(2), session.Rows[0].BaseRowVersion)
 		return successHook(pushID, session)
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 
 	name, _, exists := loadUserForKey(t, db, userID)
 	require.True(t, exists)
@@ -319,7 +314,7 @@ func TestPushPending_StructuredConflictKeepMergedRetriesMergedPayload(t *testing
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 
 	name, email, exists := loadUserForKey(t, db, userID)
 	require.True(t, exists)
@@ -396,7 +391,7 @@ func TestPushPending_StructuredConflictKeepMergedLatestUpdatedAtWins(t *testing.
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 
 	var name, email, updatedAt string
 	require.NoError(t, db.QueryRow(`
@@ -458,7 +453,7 @@ func TestPushPending_StructuredConflictPreservesSiblingRowsFromRejectedBundle(t 
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPending(t, client, ctx)
 
 	name, _, exists := loadUserForKey(t, db, conflictUserID)
 	require.True(t, exists)
@@ -500,7 +495,7 @@ func TestPushPending_StructuredConflictInvalidKeepMergedForDeleteRestoresReplaya
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	var invalidErr *InvalidConflictResolutionError
 	require.ErrorAs(t, err, &invalidErr)
@@ -513,7 +508,7 @@ func TestPushPending_StructuredConflictInvalidKeepMergedForDeleteRestoresReplaya
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.Equal(t, 1, dirtyCount)
 	require.Equal(t, 0, outboundCount)
 
@@ -544,7 +539,7 @@ func TestPushPending_StructuredConflictInvalidKeepLocalForDeletedAuthoritativeUp
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	var invalidErr *InvalidConflictResolutionError
 	require.ErrorAs(t, err, &invalidErr)
@@ -585,7 +580,7 @@ func TestPushPending_StructuredConflictInvalidKeepMergedForDeletedAuthoritativeU
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	var invalidErr *InvalidConflictResolutionError
 	require.ErrorAs(t, err, &invalidErr)
@@ -641,7 +636,7 @@ func TestPushPending_StructuredConflictRejectsInvalidMergedPayloadShape(t *testi
 			}
 			client.HTTP = &http.Client{Transport: server}
 
-			err = client.PushPending(ctx)
+			_, err = client.PushPending(ctx)
 			require.Error(t, err)
 			var invalidErr *InvalidConflictResolutionError
 			require.ErrorAs(t, err, &invalidErr)
@@ -676,7 +671,7 @@ func TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState
 	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
 		sourceBundleIDs = append(sourceBundleIDs, session.SourceBundleID)
 		var nextSourceBundleID int64
-		require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&nextSourceBundleID))
+		require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, client.UserID).Scan(&nextSourceBundleID))
 		require.Equal(t, int64(1), nextSourceBundleID)
 		return structuredConflictResponse(session.Rows[0], 2, false, map[string]any{
 			"id":    userID,
@@ -686,7 +681,7 @@ func TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState
 	}
 	client.HTTP = &http.Client{Transport: server}
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	var exhaustedErr *PushConflictRetryExhaustedError
 	require.ErrorAs(t, err, &exhaustedErr)
@@ -702,7 +697,7 @@ func TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.Equal(t, 1, dirtyCount)
 	require.Equal(t, 0, outboundCount)
 

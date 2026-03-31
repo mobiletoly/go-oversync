@@ -26,8 +26,8 @@ func TestEndToEnd_ConflictServerWinsResolverRecoversAutomatically(t *testing.T) 
 	conflictUserID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Ada", "ada@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -45,15 +45,14 @@ func TestEndToEnd_ConflictServerWinsResolverRecoversAutomatically(t *testing.T) 
 	_, err = dbB.Exec(`UPDATE users SET name = ? WHERE id = ?`, "Ada Local", conflictUserID)
 	require.NoError(t, err)
 
-	require.NoError(t, clientB.PushPending(ctx))
+	mustPushPendingE2E(t, clientB, ctx)
 
 	var localName string
 	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, conflictUserID).Scan(&localName))
 	require.Equal(t, "Ada Server", localName)
 
-	require.NoError(t, clientB.PullToStable(ctx))
-	var lastBundleSeq int64
-	require.NoError(t, dbB.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&lastBundleSeq))
+	mustPullToStableE2E(t, clientB, ctx)
+	lastBundleSeq := requireLastBundleSeqSeen(t, dbB)
 	require.Equal(t, int64(2), lastBundleSeq)
 }
 
@@ -71,12 +70,12 @@ func TestEndToEnd_ConflictClientWinsResolverStillConvergesWithUnseenPeerBundle(t
 	peerUserID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Grace", "grace@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 
 	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, peerUserID, "Peer", "peer@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -94,14 +93,13 @@ func TestEndToEnd_ConflictClientWinsResolverStillConvergesWithUnseenPeerBundle(t
 	_, err = dbB.Exec(`UPDATE users SET name = ? WHERE id = ?`, "Grace Client", conflictUserID)
 	require.NoError(t, err)
 
-	require.NoError(t, clientB.PushPending(ctx))
+	mustPushPendingE2E(t, clientB, ctx)
 
-	var lastBundleSeq int64
-	require.NoError(t, dbB.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&lastBundleSeq))
+	lastBundleSeq := requireLastBundleSeqSeen(t, dbB)
 	require.Equal(t, int64(1), lastBundleSeq)
 
-	require.NoError(t, clientB.PullToStable(ctx))
-	require.NoError(t, dbB.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&lastBundleSeq))
+	mustPullToStableE2E(t, clientB, ctx)
+	lastBundleSeq = requireLastBundleSeqSeen(t, dbB)
 	require.Equal(t, int64(4), lastBundleSeq)
 
 	var conflictName, peerName string
@@ -123,8 +121,8 @@ func TestEndToEnd_ConflictKeepMergedResolverRetriesMergedPayload(t *testing.T) {
 	conflictUserID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Ada", "ada@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -152,8 +150,8 @@ func TestEndToEnd_ConflictKeepMergedResolverRetriesMergedPayload(t *testing.T) {
 		"updated_at": updatedAt,
 	})}}
 
-	require.NoError(t, clientB.PushPending(ctx))
-	require.NoError(t, clientB.PullToStable(ctx))
+	mustPushPendingE2E(t, clientB, ctx)
+	mustPullToStableE2E(t, clientB, ctx)
 
 	var name, email string
 	require.NoError(t, dbB.QueryRow(`SELECT name, email FROM users WHERE id = ?`, conflictUserID).Scan(&name, &email))
@@ -174,8 +172,8 @@ func TestEndToEnd_ConflictKeepLocalResolverAutoRetriesAndWins(t *testing.T) {
 	conflictUserID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Linus", "linus@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -193,8 +191,8 @@ func TestEndToEnd_ConflictKeepLocalResolverAutoRetriesAndWins(t *testing.T) {
 	_, err = dbB.Exec(`UPDATE users SET name = ? WHERE id = ?`, "Linus Local", conflictUserID)
 	require.NoError(t, err)
 
-	require.NoError(t, clientB.PushPending(ctx))
-	require.NoError(t, clientB.PullToStable(ctx))
+	mustPushPendingE2E(t, clientB, ctx)
+	mustPullToStableE2E(t, clientB, ctx)
 
 	var name string
 	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, conflictUserID).Scan(&name))
@@ -214,8 +212,8 @@ func TestEndToEnd_ConflictRetryExhaustionLeavesReplayableDirtyState(t *testing.T
 	conflictUserID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Ada", "ada@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 
 	_, err = dbB.Exec(`UPDATE users SET name = ? WHERE id = ?`, "Ada Local", conflictUserID)
 	require.NoError(t, err)
@@ -241,7 +239,7 @@ func TestEndToEnd_ConflictRetryExhaustionLeavesReplayableDirtyState(t *testing.T
 		return baseTransport.RoundTrip(r)
 	})}
 
-	err = clientB.PushPending(ctx)
+	_, err = clientB.PushPending(ctx)
 	require.Error(t, err)
 	var exhaustedErr *oversqlite.PushConflictRetryExhaustedError
 	require.ErrorAs(t, err, &exhaustedErr)
@@ -249,7 +247,7 @@ func TestEndToEnd_ConflictRetryExhaustionLeavesReplayableDirtyState(t *testing.T
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.Equal(t, 1, dirtyCount)
 	require.Equal(t, 0, outboundCount)
 
@@ -259,12 +257,8 @@ func TestEndToEnd_ConflictRetryExhaustionLeavesReplayableDirtyState(t *testing.T
 	require.True(t, payload.Valid)
 	require.GreaterOrEqual(t, baseRowVersion, int64(2))
 
-	var nextSourceBundleID, lastBundleSeqSeen int64
-	require.NoError(t, dbB.QueryRow(`
-		SELECT next_source_bundle_id, last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, userID).Scan(&nextSourceBundleID, &lastBundleSeqSeen))
+	nextSourceBundleID := requireNextSourceBundleID(t, dbB)
+	lastBundleSeqSeen := requireLastBundleSeqSeen(t, dbB)
 	require.Equal(t, int64(1), nextSourceBundleID)
 	require.Equal(t, int64(1), lastBundleSeqSeen)
 	require.Equal(t, 3, commitAttempts)

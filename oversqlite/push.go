@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/mobiletoly/go-oversync/oversync"
 )
@@ -47,11 +48,12 @@ type pushOutboundSnapshot struct {
 }
 
 type committedPushBundle struct {
-	BundleSeq      int64
-	SourceID       string
-	SourceBundleID int64
-	RowCount       int64
-	BundleHash     string
+	BundleSeq        int64
+	SourceID         string
+	SourceBundleID   int64
+	RowCount         int64
+	BundleHash       string
+	AlreadyCommitted bool
 }
 
 type stagedPushBundleRow struct {
@@ -65,12 +67,10 @@ type stagedPushBundleRow struct {
 	Payload    sql.NullString
 }
 
-func (c *Client) PushPending(ctx context.Context) error {
-	if atomicLoadPaused(&c.uploadPaused) {
-		return nil
-	}
+// PushPending uploads the current frozen or freshly collected outbox and replays the authoritative committed bundle.
+func (c *Client) PushPending(ctx context.Context) (PushReport, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
+		return PushReport{}, err
 	}
 	defer c.writeMu.Unlock()
 	return c.pushPendingLocked(ctx, 0)
@@ -80,31 +80,48 @@ func atomicLoadPaused(v *int32) bool {
 	return v != nil && atomic.LoadInt32(v) == 1
 }
 
-func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) error {
+func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) (PushReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "PushPending()"); err != nil {
-		return err
+		return PushReport{}, err
 	}
 	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
-		return err
+		return PushReport{}, err
 	}
 	rebuildRequired, err := c.rebuildRequired(ctx)
 	if err != nil {
-		return err
+		return PushReport{}, err
 	}
 	if rebuildRequired {
-		return &RebuildRequiredError{}
+		return PushReport{}, &RebuildRequiredError{}
+	}
+	if atomicLoadPaused(&c.uploadPaused) {
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return PushReport{}, err
+		}
+		return PushReport{
+			Outcome: PushOutcomeSkippedPaused,
+			Status:  status,
+		}, nil
 	}
 
 	snapshot, err := c.ensurePushOutboundSnapshot(ctx)
 	if err != nil {
-		return err
+		return PushReport{}, err
 	}
 	if len(snapshot.Rows) == 0 {
-		return nil
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return PushReport{}, err
+		}
+		return PushReport{
+			Outcome: PushOutcomeNoChange,
+			Status:  status,
+		}, nil
 	}
 
 	if err := c.clearPushStage(ctx); err != nil {
-		return err
+		return PushReport{}, err
 	}
 
 	committed, err := withRetryValue(ctx, c.normalizedRetryPolicy(), "push_pending", func() (*committedPushBundle, error) {
@@ -121,29 +138,46 @@ func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) 
 		var conflictErr *PushConflictError
 		if errors.As(err, &conflictErr) {
 			if err := c.resolvePushConflict(ctx, snapshot, conflictErr); err != nil {
-				return err
+				return PushReport{}, err
 			}
 			remainingDirtyCount, err := c.pendingChangeCount(ctx)
 			if err != nil {
-				return err
+				return PushReport{}, err
 			}
 			if remainingDirtyCount > 0 {
 				if conflictRetryCount >= maxPushConflictAutoRetries {
-					return &PushConflictRetryExhaustedError{
+					return PushReport{}, &PushConflictRetryExhaustedError{
 						RetryCount:          maxPushConflictAutoRetries,
 						RemainingDirtyCount: remainingDirtyCount,
 					}
 				}
 				return c.pushPendingLocked(ctx, conflictRetryCount+1)
 			}
-			return nil
+			status, err := c.syncStatusLocked(ctx)
+			if err != nil {
+				return PushReport{}, err
+			}
+			return PushReport{
+				Outcome: PushOutcomeNoChange,
+				Status:  status,
+			}, nil
 		}
-		return err
+		return PushReport{}, err
 	}
 	if err := c.runBeforePushReplayHook(ctx); err != nil {
-		return err
+		return PushReport{}, err
 	}
-	return c.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed)
+	if err := c.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed); err != nil {
+		return PushReport{}, err
+	}
+	status, err := c.syncStatusLocked(ctx)
+	if err != nil {
+		return PushReport{}, err
+	}
+	return PushReport{
+		Outcome: PushOutcomeCommitted,
+		Status:  status,
+	}, nil
 }
 
 func (c *Client) ensurePushOutboundSnapshot(ctx context.Context) (*pushOutboundSnapshot, error) {
@@ -186,10 +220,18 @@ func (c *Client) loadPushOutboundSnapshot(ctx context.Context) (*pushOutboundSna
 	}
 	defer tx.Rollback()
 
+	outboxBundle, err := loadOutboxBundle(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if outboxBundle.State == outboxStateNone {
+		return nil, nil
+	}
+
 	rows, err := tx.QueryContext(ctx, `
-		SELECT source_bundle_id, schema_name, table_name, key_json, op, base_row_version, payload, row_ordinal
-		FROM _sync_push_outbound
-		ORDER BY source_bundle_id, row_ordinal
+		SELECT source_bundle_id, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, row_ordinal
+		FROM _sync_outbox_rows
+		ORDER BY row_ordinal
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query outbound push snapshot: %w", err)
@@ -201,12 +243,14 @@ func (c *Client) loadPushOutboundSnapshot(ctx context.Context) (*pushOutboundSna
 		var (
 			sourceBundleID int64
 			capture        dirtyRowCapture
+			wireKeyJSON    string
 		)
 		if err := rows.Scan(
 			&sourceBundleID,
 			&capture.SchemaName,
 			&capture.TableName,
 			&capture.KeyJSON,
+			&wireKeyJSON,
 			&capture.Op,
 			&capture.BaseRowVersion,
 			&capture.LocalPayload,
@@ -219,12 +263,13 @@ func (c *Client) loadPushOutboundSnapshot(ctx context.Context) (*pushOutboundSna
 		} else if snapshot.SourceBundleID != sourceBundleID {
 			return nil, fmt.Errorf("outbound push snapshot contains multiple source_bundle_id values (%d and %d)", snapshot.SourceBundleID, sourceBundleID)
 		}
-		localPK, wireKey, err := c.decodeDirtyKeyForPush(tx, capture.TableName, capture.KeyJSON)
+		capture.LocalPK, _, err = c.decodeDirtyKeyForPush(tx, capture.TableName, capture.KeyJSON)
 		if err != nil {
 			return nil, err
 		}
-		capture.LocalPK = localPK
-		capture.WireKey = wireKey
+		if err := json.Unmarshal([]byte(wireKeyJSON), &capture.WireKey); err != nil {
+			return nil, fmt.Errorf("failed to decode stored wire key for %s.%s: %w", capture.SchemaName, capture.TableName, err)
+		}
 		snapshot.Rows = append(snapshot.Rows, capture)
 	}
 	if err := rows.Err(); err != nil {
@@ -254,7 +299,15 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 		if err := c.clearPersistedPendingInitializationID(ctx); err != nil {
 			return nil, err
 		}
-		return committedPushBundleFromCreateResponse(sessionResp)
+		committed, err := committedPushBundleFromCreateResponse(sessionResp)
+		if err != nil {
+			return nil, err
+		}
+		committed.AlreadyCommitted = true
+		if err := c.persistCommittedRemoteOutboxState(ctx, committed); err != nil {
+			return nil, err
+		}
+		return committed, nil
 	case "staging":
 	default:
 		return nil, fmt.Errorf("unexpected push session status %q", sessionResp.Status)
@@ -306,7 +359,14 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 	if err := c.clearPersistedPendingInitializationID(ctx); err != nil {
 		return nil, err
 	}
-	return committedPushBundleFromCommitResponse(commitResp)
+	committed, err := committedPushBundleFromCommitResponse(commitResp)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.persistCommittedRemoteOutboxState(ctx, committed); err != nil {
+		return nil, err
+	}
+	return committed, nil
 }
 
 func (c *Client) buildPushRequestRows(rows []dirtyRowCapture) ([]oversync.PushRequestRow, error) {
@@ -373,6 +433,26 @@ func (c *Client) fetchCommittedPushBundle(ctx context.Context, committed *commit
 		return fmt.Errorf("staged committed bundle hash %s does not match expected %s", bundleHash, committed.BundleHash)
 	}
 	return nil
+}
+
+func (c *Client) persistCommittedRemoteOutboxState(ctx context.Context, committed *committedPushBundle) error {
+	if committed == nil {
+		return fmt.Errorf("committed push bundle metadata is required")
+	}
+	current, err := loadOutboxBundle(ctx, c.DB)
+	if err != nil {
+		return err
+	}
+	return persistOutboxBundle(ctx, c.DB, &outboxBundleRecord{
+		State:                outboxStateCommittedRemote,
+		SourceID:             committed.SourceID,
+		SourceBundleID:       committed.SourceBundleID,
+		CanonicalRequestHash: current.CanonicalRequestHash,
+		RowCount:             committed.RowCount,
+		InitializationID:     current.InitializationID,
+		RemoteBundleHash:     committed.BundleHash,
+		RemoteBundleSeq:      committed.BundleSeq,
+	})
 }
 
 func (c *Client) stageCommittedBundleChunk(ctx context.Context, chunk *oversync.CommittedBundleRowsResponse, afterRowOrdinal *int64) error {
@@ -558,6 +638,12 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 		}
 	}
 
+	if committed.AlreadyCommitted {
+		if err := c.compareCommittedBundleToCanonicalOutbox(ctx, tx, committed); err != nil {
+			return err
+		}
+	}
+
 	for _, row := range stagedRows {
 		bundleRow := oversync.BundleRow{
 			Schema:     row.SchemaName,
@@ -595,22 +681,24 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE _sync_client_state
-		SET last_bundle_seq_seen = CASE
-				WHEN last_bundle_seq_seen + 1 = ? THEN ?
-				ELSE last_bundle_seq_seen
-			END,
-			next_source_bundle_id = CASE
-				WHEN next_source_bundle_id <= ? THEN ?
-				ELSE next_source_bundle_id
-			END
-		WHERE user_id = ?
-	`, committed.BundleSeq, committed.BundleSeq, committed.SourceBundleID, committed.SourceBundleID+1, c.UserID); err != nil {
-		return fmt.Errorf("failed to update client bundle checkpoint after staged push replay: %w", err)
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_push_outbound WHERE source_bundle_id = ?`, committed.SourceBundleID); err != nil {
+	if committed.BundleSeq == attachment.LastBundleSeqSeen+1 {
+		attachment.LastBundleSeqSeen = committed.BundleSeq
+	}
+	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
+		return err
+	}
+	if err := updateSourceNextBundleID(ctx, tx, committed.SourceID, committed.SourceBundleID+1); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_outbox_rows WHERE source_bundle_id = ?`, committed.SourceBundleID); err != nil {
 		return fmt.Errorf("failed to clear outbound push snapshot for source_bundle_id %d: %w", committed.SourceBundleID, err)
+	}
+	if err := clearOutboxBundle(ctx, tx); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_push_stage WHERE bundle_seq = ?`, committed.BundleSeq); err != nil {
 		return fmt.Errorf("failed to clear staged committed bundle %d: %w", committed.BundleSeq, err)
@@ -658,13 +746,19 @@ func (c *Client) loadStagedPushBundleRowsInTx(ctx context.Context, tx *sql.Tx, b
 }
 
 func (c *Client) collectDirtyRowsForPushInTx(ctx context.Context, tx *sql.Tx) (sourceBundleID int64, baseBundleSeq int64, dirtyRows []dirtyRowCapture, noOps []string, err error) {
-	if err := tx.QueryRowContext(ctx, `
-		SELECT next_source_bundle_id, last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, c.UserID).Scan(&sourceBundleID, &baseBundleSeq); err != nil {
-		return 0, 0, nil, nil, fmt.Errorf("failed to load client bundle state: %w", err)
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return 0, 0, nil, nil, err
 	}
+	sourceState, err := loadSourceState(ctx, tx, attachment.CurrentSourceID)
+	if err != nil {
+		return 0, 0, nil, nil, err
+	}
+	if sourceState == nil {
+		return 0, 0, nil, nil, fmt.Errorf("missing source state for %s", attachment.CurrentSourceID)
+	}
+	sourceBundleID = sourceState.NextSourceBundleID
+	baseBundleSeq = attachment.LastBundleSeqSeen
 
 	rows, err := tx.QueryContext(ctx, `
 			SELECT
@@ -834,12 +928,38 @@ func (c *Client) freezePushOutboundSnapshotInTx(ctx context.Context, tx *sql.Tx)
 		return &pushOutboundSnapshot{}, nil
 	}
 
+	pushRequestRows, err := c.buildPushRequestRows(dirtyRows)
+	if err != nil {
+		return nil, err
+	}
+	canonicalRequestHash, err := computeCanonicalPushRequestHash(pushRequestRows)
+	if err != nil {
+		return nil, err
+	}
+	if err := persistOutboxBundle(ctx, tx, &outboxBundleRecord{
+		State:                outboxStatePrepared,
+		SourceID:             c.SourceID,
+		SourceBundleID:       sourceBundleID,
+		CanonicalRequestHash: canonicalRequestHash,
+		RowCount:             int64(len(dirtyRows)),
+		InitializationID:     c.pendingInitializationID,
+	}); err != nil {
+		return nil, err
+	}
 	for idx, row := range dirtyRows {
+		wireKeyJSON, err := json.Marshal(row.WireKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode wire key for frozen outbox row %d: %w", idx, err)
+		}
+		wirePayload := sql.NullString{}
+		if pushRequestRows[idx].Op != oversync.OpDelete {
+			wirePayload = sql.NullString{String: string(pushRequestRows[idx].Payload), Valid: true}
+		}
 		if _, err := stmtCache.ExecContext(ctx, `
-				INSERT INTO _sync_push_outbound (
-					source_bundle_id, row_ordinal, schema_name, table_name, key_json, op, base_row_version, payload
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			`, sourceBundleID, idx, row.SchemaName, row.TableName, row.KeyJSON, row.Op, row.BaseRowVersion, nullStringValue(row.LocalPayload)); err != nil {
+				INSERT INTO _sync_outbox_rows (
+					source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`, sourceBundleID, idx, row.SchemaName, row.TableName, row.KeyJSON, string(wireKeyJSON), row.Op, row.BaseRowVersion, nullStringValue(row.LocalPayload), nullStringValue(wirePayload)); err != nil {
 			return nil, fmt.Errorf("failed to freeze outbound push row %d for %s.%s: %w", idx, row.SchemaName, row.TableName, err)
 		}
 		if _, err := stmtCache.ExecContext(ctx, `
@@ -857,20 +977,8 @@ func (c *Client) freezePushOutboundSnapshotInTx(ctx context.Context, tx *sql.Tx)
 }
 
 func (c *Client) setBundleApplyModeInTx(ctx context.Context, tx *sql.Tx, enabled bool) error {
-	value := 0
-	if enabled {
-		value = 1
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE _sync_client_state SET apply_mode = ? WHERE user_id = ?`, value, c.UserID)
-	if err != nil {
-		return fmt.Errorf("failed to update _sync_client_state apply_mode: %w", err)
-	}
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to inspect _sync_client_state apply_mode update result: %w", err)
-	}
-	if rowsAffected != 1 {
-		return &ConnectRequiredError{Operation: "authoritative state application"}
+	if err := setApplyMode(ctx, tx, enabled); err != nil {
+		return fmt.Errorf("failed to update _sync_apply_state apply_mode: %w", err)
 	}
 	return nil
 }
@@ -1412,6 +1520,171 @@ func validateCommittedBundleRowsResponse(resp *oversync.CommittedBundleRowsRespo
 	return nil
 }
 
+func computeCanonicalPushRequestHash(rows []oversync.PushRequestRow) (string, error) {
+	raw, err := json.Marshal(rows)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal canonical push request rows: %w", err)
+	}
+	canonical, err := canonicalizeJSONBytes(raw)
+	if err != nil {
+		return "", fmt.Errorf("failed to canonicalize push request rows: %w", err)
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (c *Client) compareCommittedBundleToCanonicalOutbox(ctx context.Context, tx *sql.Tx, committed *committedPushBundle) error {
+	if committed == nil {
+		return fmt.Errorf("committed push bundle metadata is required")
+	}
+	type proofRow struct {
+		Ordinal     int64
+		Schema      string
+		Table       string
+		Op          string
+		WireKeyJSON string
+		WirePayload sql.NullString
+	}
+	outboxRows, err := tx.QueryContext(ctx, `
+		SELECT row_ordinal, schema_name, table_name, wire_key_json, op, wire_payload
+		FROM _sync_outbox_rows
+		WHERE source_bundle_id = ?
+		ORDER BY row_ordinal
+	`, committed.SourceBundleID)
+	if err != nil {
+		return fmt.Errorf("failed to query canonical outbox rows: %w", err)
+	}
+	defer outboxRows.Close()
+
+	stagedRows, err := tx.QueryContext(ctx, `
+		SELECT row_ordinal, schema_name, table_name, key_json, op, payload
+		FROM _sync_push_stage
+		WHERE bundle_seq = ?
+		ORDER BY row_ordinal
+	`, committed.BundleSeq)
+	if err != nil {
+		return fmt.Errorf("failed to query staged committed bundle rows for proof: %w", err)
+	}
+	defer stagedRows.Close()
+
+	var outboxProofRows []proofRow
+	for outboxRows.Next() {
+		var (
+			outOrdinal     int64
+			outSchema      string
+			outTable       string
+			outWireKeyJSON string
+			outOp          string
+			outWirePayload sql.NullString
+		)
+		if err := outboxRows.Scan(&outOrdinal, &outSchema, &outTable, &outWireKeyJSON, &outOp, &outWirePayload); err != nil {
+			return fmt.Errorf("failed to scan canonical outbox row for proof: %w", err)
+		}
+		outboxProofRows = append(outboxProofRows, proofRow{
+			Ordinal:     outOrdinal,
+			Schema:      outSchema,
+			Table:       outTable,
+			Op:          outOp,
+			WireKeyJSON: outWireKeyJSON,
+			WirePayload: outWirePayload,
+		})
+	}
+	if err := outboxRows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate canonical outbox rows for proof: %w", err)
+	}
+
+	var stagedProofRows []proofRow
+	for stagedRows.Next() {
+		var (
+			stagedOrdinal int64
+			stagedSchema  string
+			stagedTable   string
+			stagedKeyJSON string
+			stagedOp      string
+			stagedPayload sql.NullString
+		)
+		if err := stagedRows.Scan(&stagedOrdinal, &stagedSchema, &stagedTable, &stagedKeyJSON, &stagedOp, &stagedPayload); err != nil {
+			return fmt.Errorf("failed to scan staged committed bundle row for proof: %w", err)
+		}
+
+		localPK, wireKey, err := c.decodeDirtyKeyForPush(tx, stagedTable, stagedKeyJSON)
+		if err != nil {
+			return err
+		}
+		_ = localPK
+		stagedWireKeyJSONBytes, err := json.Marshal(wireKey)
+		if err != nil {
+			return fmt.Errorf("failed to encode staged committed bundle wire key for proof: %w", err)
+		}
+		stagedProofRows = append(stagedProofRows, proofRow{
+			Ordinal:     stagedOrdinal,
+			Schema:      stagedSchema,
+			Table:       stagedTable,
+			Op:          stagedOp,
+			WireKeyJSON: string(stagedWireKeyJSONBytes),
+			WirePayload: stagedPayload,
+		})
+	}
+	if err := stagedRows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate staged committed bundle rows for proof: %w", err)
+	}
+
+	if len(outboxProofRows) != len(stagedProofRows) {
+		return fmt.Errorf("committed bundle row count does not match canonical outbox row count")
+	}
+
+	sortProofRows := func(rows []proofRow) {
+		sort.SliceStable(rows, func(i, j int) bool {
+			if rows[i].Schema != rows[j].Schema {
+				return rows[i].Schema < rows[j].Schema
+			}
+			if rows[i].Table != rows[j].Table {
+				return rows[i].Table < rows[j].Table
+			}
+			if rows[i].Op != rows[j].Op {
+				return rows[i].Op < rows[j].Op
+			}
+			if rows[i].WireKeyJSON != rows[j].WireKeyJSON {
+				return rows[i].WireKeyJSON < rows[j].WireKeyJSON
+			}
+			if rows[i].WirePayload.Valid != rows[j].WirePayload.Valid {
+				return !rows[i].WirePayload.Valid
+			}
+			if rows[i].WirePayload.String != rows[j].WirePayload.String {
+				return rows[i].WirePayload.String < rows[j].WirePayload.String
+			}
+			return rows[i].Ordinal < rows[j].Ordinal
+		})
+	}
+	sortProofRows(outboxProofRows)
+	sortProofRows(stagedProofRows)
+
+	for idx := range outboxProofRows {
+		outRow := outboxProofRows[idx]
+		stagedRow := stagedProofRows[idx]
+		payloadsMatch := outRow.WirePayload.Valid == stagedRow.WirePayload.Valid
+		if payloadsMatch && outRow.WirePayload.Valid {
+			payloadsMatch, err = replayEquivalentJSON(outRow.WirePayload.String, stagedRow.WirePayload.String)
+			if err != nil {
+				return fmt.Errorf("failed to compare payloads for canonical outbox proof: %w", err)
+			}
+		}
+		if outRow.Schema != stagedRow.Schema ||
+			outRow.Table != stagedRow.Table ||
+			outRow.Op != stagedRow.Op ||
+			outRow.WireKeyJSON != stagedRow.WireKeyJSON ||
+			!payloadsMatch {
+			return fmt.Errorf(
+				"committed bundle does not match canonical outbox row %d: outbox=(ordinal=%d schema=%s table=%s op=%s key=%s payload=%q valid=%t) staged=(ordinal=%d schema=%s table=%s op=%s key=%s payload=%q valid=%t)",
+				idx,
+				outRow.Ordinal, outRow.Schema, outRow.Table, outRow.Op, outRow.WireKeyJSON, outRow.WirePayload.String, outRow.WirePayload.Valid,
+				stagedRow.Ordinal, stagedRow.Schema, stagedRow.Table, stagedRow.Op, stagedRow.WireKeyJSON, stagedRow.WirePayload.String, stagedRow.WirePayload.Valid,
+			)
+		}
+	}
+	return nil
+}
+
 func canonicalizeJSONBytes(raw []byte) ([]byte, error) {
 	var value any
 	if err := json.Unmarshal(raw, &value); err != nil {
@@ -1422,6 +1695,75 @@ func canonicalizeJSONBytes(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	return normalized, nil
+}
+
+func replayEquivalentJSON(leftRaw, rightRaw string) (bool, error) {
+	var left any
+	if err := json.Unmarshal([]byte(leftRaw), &left); err != nil {
+		return false, fmt.Errorf("failed to decode left replay JSON: %w", err)
+	}
+	var right any
+	if err := json.Unmarshal([]byte(rightRaw), &right); err != nil {
+		return false, fmt.Errorf("failed to decode right replay JSON: %w", err)
+	}
+	return replayEquivalentValue(left, right), nil
+}
+
+func replayEquivalentValue(left, right any) bool {
+	switch l := left.(type) {
+	case nil:
+		return right == nil
+	case bool:
+		r, ok := right.(bool)
+		return ok && l == r
+	case float64:
+		r, ok := right.(float64)
+		return ok && l == r
+	case string:
+		r, ok := right.(string)
+		if !ok {
+			return false
+		}
+		if li, lok := parseRFC3339Instant(l); lok {
+			if ri, rok := parseRFC3339Instant(r); rok {
+				return li.Equal(ri)
+			}
+		}
+		return l == r
+	case []any:
+		r, ok := right.([]any)
+		if !ok || len(l) != len(r) {
+			return false
+		}
+		for i := range l {
+			if !replayEquivalentValue(l[i], r[i]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		r, ok := right.(map[string]any)
+		if !ok || len(l) != len(r) {
+			return false
+		}
+		for key, lv := range l {
+			rv, ok := r[key]
+			if !ok || !replayEquivalentValue(lv, rv) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func parseRFC3339Instant(raw string) (time.Time, bool) {
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 func buildPushSessionCreateURL(base string) string {

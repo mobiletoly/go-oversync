@@ -66,7 +66,7 @@ The supported client/runtime contract includes structured `push_conflict` recove
   - keep local intent
   - keep merged full-row payload
 - Automatic structured recovery rewrites local row state, requeues surviving dirty intents,
-  clears `_sync_push_outbound`, and retries from a fresh outbound snapshot
+  clears `_sync_outbox_*`, and retries from a fresh outbound snapshot
 - Structured retries preserve the same logical `source_bundle_id`; `next_source_bundle_id` advances
   only after a successful committed replay
 - The retry budget is bounded to `2` automatic retries inside one `PushPending()`
@@ -98,9 +98,9 @@ The supported envelope is intentionally strict.
 - bootstrap fails when required FK deferrability is missing
 - pull/hydrate/recover fail while local dirty rows exist
 - malformed server responses are rejected without advancing durable checkpoints
-- invalid structured conflict resolutions clear `_sync_push_outbound` and restore replayable intents
+- invalid structured conflict resolutions clear `_sync_outbox_*` and restore replayable intents
   to `_sync_dirty_rows`
-- structured conflict retry exhaustion also clears `_sync_push_outbound` and leaves unresolved
+- structured conflict retry exhaustion also clears `_sync_outbox_*` and leaves unresolved
   intents replayable
 - generic non-conflict commit/replay failures still use the existing fail-closed recovery path
 

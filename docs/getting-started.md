@@ -73,7 +73,7 @@ CREATE TABLE business.posts (
 ## Core Terms
 
 - `user_id`: one isolated sync stream
-- `source_id`: one app installation or device identity
+- `current_source_id`: one app installation or device identity
 - `source_bundle_id`: per-device monotonically increasing push id
 - `bundle_seq`: server-side committed bundle sequence
 - `row_version`: authoritative row version used for optimistic concurrency
@@ -268,15 +268,17 @@ func main() {
     }
     defer client.Close()
 
-    if err := client.Open(ctx, "device-abc"); err != nil {
-        log.Fatal(err)
-    }
-
-    connectResult, err := client.Connect(ctx, "user-123")
+    openResult, err := client.Open(ctx, "device-abc")
     if err != nil {
         log.Fatal(err)
     }
-    if connectResult.Status == oversqlite.ConnectStatusRetryLater {
+    log.Printf("open state: %s", openResult.State)
+
+    connectResult, err := client.Attach(ctx, "user-123")
+    if err != nil {
+        log.Fatal(err)
+    }
+    if connectResult.Status == oversqlite.AttachStatusRetryLater {
         log.Printf("connect pending, retry after %s", connectResult.RetryAfter)
         return
     }
@@ -290,57 +292,78 @@ The supported high-level operations are:
 ```go
 ctx := context.Background()
 
-if err := client.PushPending(ctx); err != nil {
+pushReport, err := client.PushPending(ctx)
+if err != nil {
     log.Fatal(err)
 }
+log.Printf("push outcome: %s", pushReport.Outcome)
 
-if err := client.PullToStable(ctx); err != nil {
+pullReport, err := client.PullToStable(ctx)
+if err != nil {
     log.Fatal(err)
 }
+log.Printf("pull outcome: %s", pullReport.Outcome)
 
-if err := client.Sync(ctx); err != nil {
+syncReport, err := client.Sync(ctx)
+if err != nil {
     log.Fatal(err)
 }
+log.Printf("sync outcomes: push=%s remote=%s", syncReport.PushOutcome, syncReport.RemoteOutcome)
 
-if err := client.SignOut(ctx); err != nil {
+detachResult, err := client.Detach(ctx)
+if err != nil {
     log.Fatal(err)
+}
+if detachResult.Outcome == oversqlite.DetachOutcomeBlockedUnsyncedData {
+    log.Printf("detach blocked by %d pending rows", detachResult.PendingRowCount)
 }
 ```
 
-Recovery operations:
+Rebuild operations:
 
 ```go
-if err := client.Hydrate(ctx); err != nil {
+rebuildReport, err := client.Rebuild(ctx, oversqlite.RebuildKeepSource, "")
+if err != nil {
     log.Fatal(err)
 }
+log.Printf("rebuild outcome: %s", rebuildReport.Outcome)
 
-if err := client.Recover(ctx); err != nil {
+recoverReport, err := client.Rebuild(ctx, oversqlite.RebuildRotateSource, "device-rotated")
+if err != nil {
     log.Fatal(err)
 }
+log.Printf("recover outcome: %s rotated_source_id=%s", recoverReport.Outcome, recoverReport.RotatedSourceID)
 ```
 
 Behavior to expect:
 
-- `Connect()` resolves first-account lifecycle through `POST /sync/connect`.
+- `Attach()` resolves first-account lifecycle through `POST /sync/connect`.
+- `Open()`, `PushPending()`, `PullToStable()`, `Sync()`, `Detach()`, and `Rebuild()` now return
+  structured results in addition to `error`.
 - `PushPending()` freezes one outbound snapshot, uploads it through push sessions, fetches the
   committed authoritative rows, and replays them locally.
-- `Connect()` may return `retry_later` as a normal retriable lifecycle outcome before the client
+- `Attach()` may return `retry_later` as a normal retriable lifecycle outcome before the client
   becomes attached.
 - `PullToStable()` drains complete bundles until the frozen `stable_bundle_seq` is reached.
 - `PullToStable()` rebuilds automatically through snapshot sessions if the server returns
   `history_pruned`.
-- `Hydrate()` rebuilds through chunked snapshot sessions.
-- `Recover()` rebuilds through chunked snapshot sessions and rotates `source_id`.
-- `SignOut()` clears synced local cache/state after a successful attached sign-out.
+- `Rebuild(ctx, oversqlite.RebuildKeepSource, "")` rebuilds through chunked snapshot sessions without rotating source identity.
+- `Rebuild(ctx, oversqlite.RebuildRotateSource, newSourceID)` rebuilds through chunked snapshot sessions and rotates to the caller-provided source ID.
+- `Detach()` clears synced local cache/state after a successful attached detach, restores dirty-row
+  capture before returning, and reports blocked detach as a normal `DetachResult`.
+- local writes made after `Detach()` are captured immediately as anonymous pending rows and can be synced after a later `Attach()`.
+- Go intentionally does not expose reactive progress streams; inspect result structs for final
+  lifecycle and sync outcomes instead.
 
 ## Important Client Rules
 
 - every managed table must declare its sync key explicitly
 - managed tables must be FK-closed
-- `PullToStable()`, `Hydrate()`, and `Recover()` fail closed while `_sync_push_outbound` exists
-- `Sync()` fails closed while `_sync_client_state.rebuild_required = 1`
-- the durable read checkpoint is `_sync_client_state.last_bundle_seq_seen`
-- the next outgoing client bundle id is `_sync_client_state.next_source_bundle_id`
+- `PullToStable()`, `Rebuild(ctx, oversqlite.RebuildKeepSource, "")`, and `Rebuild(ctx, oversqlite.RebuildRotateSource, newSourceID)` fail closed while `_sync_outbox_*` exists
+- `Sync()` fails closed while `_sync_attachment_state.rebuild_required = 1`
+- the durable read checkpoint is `_sync_attachment_state.last_bundle_seq_seen`
+- the next outgoing client bundle id is `_sync_source_state.next_source_bundle_id`
+- sync-visible absolute timestamps should use RFC3339 or RFC3339Nano text with an explicit zone, for example `2026-03-24T18:02:00Z`
 
 ## Endpoints
 

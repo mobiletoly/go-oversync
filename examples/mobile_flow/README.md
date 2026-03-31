@@ -3,18 +3,22 @@
 `mobile_flow` is the end-to-end simulator for the current bundle-based contract. It runs realistic
 SQLite clients against the `nethttp_server` example.
 
-Some scenario names are fully implemented regression flows. Others are present in the CLI but are
-still scaffolds that log `not yet implemented`. This README distinguishes the two.
+Most scenario names are fully implemented regression flows. A smaller remainder is still present in
+the CLI as partial scaffolds. This README distinguishes the two.
 
 ## What It Proves
 
-- implemented scenarios exercise `PushPending`, `PullToStable`, `Hydrate`, and `Recover`
+- implemented scenarios exercise `PushPending`, `PullToStable`, `Rebuild(ctx, RebuildKeepSource, "")`, and `Rebuild(ctx, RebuildRotateSource, newSourceID)`
+- the simulator consumes rich `oversqlite` results instead of treating lifecycle/sync operations as
+  error-only calls
 - dirty local state blocks pull instead of being silently rebased
 - bundle checkpoints advance only after durable local apply
 - multi-chunk push upload and post-commit recovery paths work for implemented scenarios
 - supported FK graphs in the example schema converge across devices
 - canonical binary wire payloads survive end-to-end sync for `files` and `file_reviews`
 - server-originated writes and cascades are visible as committed bundle outcomes
+- after `Detach()`, offline local writes are still captured immediately and show up in the pending
+  badge before the next sign-in
 
 ## What It Does Not Prove
 
@@ -70,6 +74,10 @@ Useful flags:
   - routine push/pull behavior on an established client
 - `bundle-fk-atomicity`
   - self-reference, cycle, and cascade visibility under committed bundle semantics
+- `reinstall`
+  - reinstall-style rebuild on the same source identity
+- `device-replacement`
+  - replacement-device rebuild on a fresh source identity for the same user
 - `complex-multi-batch`
   - forces multi-chunk push upload with a low per-chunk `UploadLimit`, then checks pre-commit and
     post-commit restart recovery across scalar and BLOB-bearing tables
@@ -84,12 +92,10 @@ Useful flags:
 - `files-sync`
   - narrow BLOB-focused scenario for quick debugging of `files` / `file_reviews`
 
-## Scaffolded Scenario Names
+## Partially Scaffolded Scenario Names
 
-These names are accepted by the simulator today but are not implemented yet:
+These names are accepted by the simulator, but the implementations are not complete yet:
 
-- `reinstall`
-- `device-replacement`
 - `offline-online`
 - `user-switch`
 
@@ -97,6 +103,8 @@ These names are accepted by the simulator today but are not implemented yet:
 
 - `MobileApp`
   - wraps the local SQLite database, auth session, and `oversqlite.Client`
+  - branches intentionally on rich `Open`, `Attach`, `Detach`, `PushPending`, `PullToStable`, and
+    `Rebuild` results
 - `SyncManager`
   - runs periodic push and pull loops using the supported bundle APIs
 - `DatabaseVerifier`
@@ -108,15 +116,17 @@ These names are accepted by the simulator today but are not implemented yet:
 
 The simulator assumes the supported `oversqlite` metadata model:
 
-- `_sync_client_state`
+- `_sync_attachment_state`
 - `_sync_row_state`
 - `_sync_dirty_rows`
-- `_sync_push_outbound`
+- `_sync_outbox_*`
 - `_sync_push_stage`
 
 ## Troubleshooting
 
 - If pull fails while local dirty rows exist, that is expected fail-closed behavior.
+- If detach returns a blocked result, that is expected when attached pending sync state still
+  exists; the simulator keeps the session attached in that case.
 - If the server returns `history_pruned`, the client should rebuild through chunked snapshot sessions.
 - If a scenario fails, inspect the JSON report when you ran with `--output`, or the generated
   `test_reports/` file for parallel runs, before digging into PostgreSQL bundle metadata.

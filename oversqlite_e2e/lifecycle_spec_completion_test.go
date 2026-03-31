@@ -51,7 +51,7 @@ func TestEndToEnd_ConcurrentFirstInitializerRaceFollowThroughConvergesLoserViaRe
 
 	type connectResult struct {
 		sourceID string
-		result   oversqlite.ConnectResult
+		result   oversqlite.AttachResult
 		err      error
 	}
 
@@ -63,7 +63,7 @@ func TestEndToEnd_ConcurrentFirstInitializerRaceFollowThroughConvergesLoserViaRe
 		go func(sourceID string, state *clientState) {
 			defer wg.Done()
 			<-start
-			result, err := state.client.Connect(ctx, userID)
+			result, err := state.client.Attach(ctx, userID)
 			results <- connectResult{sourceID: sourceID, result: result, err: err}
 		}(sourceID, state)
 	}
@@ -79,10 +79,10 @@ func TestEndToEnd_ConcurrentFirstInitializerRaceFollowThroughConvergesLoserViaRe
 	for result := range results {
 		require.NoError(t, result.err)
 		switch {
-		case result.result.Status == oversqlite.ConnectStatusConnected && result.result.Outcome == oversqlite.ConnectOutcomeSeededLocal:
+		case result.result.Status == oversqlite.AttachStatusConnected && result.result.Outcome == oversqlite.AttachOutcomeSeededLocal:
 			require.Nil(t, winner)
 			winner = states[result.sourceID]
-		case result.result.Status == oversqlite.ConnectStatusRetryLater:
+		case result.result.Status == oversqlite.AttachStatusRetryLater:
 			require.Nil(t, loser)
 			loser = states[result.sourceID]
 		default:
@@ -92,12 +92,12 @@ func TestEndToEnd_ConcurrentFirstInitializerRaceFollowThroughConvergesLoserViaRe
 	require.NotNil(t, winner)
 	require.NotNil(t, loser)
 
-	require.NoError(t, winner.client.PushPending(ctx))
+	mustPushPendingE2E(t, winner.client, ctx)
 
-	loserReconnect, err := loser.client.Connect(ctx, userID)
+	loserReconnect, err := loser.client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, loserReconnect.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeUsedRemote, loserReconnect.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, loserReconnect.Status)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, loserReconnect.Outcome)
 
 	var (
 		winnerCount int

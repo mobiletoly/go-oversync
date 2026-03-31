@@ -63,13 +63,15 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 		require.NoError(t, client.Close())
 	}()
 
-	require.NoError(t, client.Open(ctx, deviceID))
-
-	connectResult, err := client.Connect(ctx, userID)
+	_, err = client.Open(ctx, deviceID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
 
-	require.NoError(t, client.PullToStable(ctx))
+	connectResult, err := client.Attach(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
+
+	_, err = client.PullToStable(ctx)
+	require.NoError(t, err)
 
 	rowID := uuid.New()
 	err = ts.SyncService.WithinSyncBundle(
@@ -86,7 +88,8 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	require.NoError(t, client.PullToStable(ctx))
+	_, err = client.PullToStable(ctx)
+	require.NoError(t, err)
 
 	var (
 		name      string
@@ -107,9 +110,9 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 	var lastBundleSeqSeen int64
 	require.NoError(t, db.QueryRow(`
 		SELECT last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, userID).Scan(&lastBundleSeqSeen))
+		FROM _sync_attachment_state
+		WHERE singleton_key = 1
+	`).Scan(&lastBundleSeqSeen))
 
 	var latestBundleSeq int64
 	require.NoError(t, ts.Pool.QueryRow(ctx, `

@@ -55,6 +55,7 @@ type Resolver interface {
 // ServerWinsResolver accepts authoritative server state.
 type ServerWinsResolver struct{}
 
+// Resolve selects the authoritative server state for a structured conflict.
 func (r *ServerWinsResolver) Resolve(conflict ConflictContext) MergeResult {
 	return AcceptServer{}
 }
@@ -62,6 +63,7 @@ func (r *ServerWinsResolver) Resolve(conflict ConflictContext) MergeResult {
 // ClientWinsResolver retries the latest local intent when valid for the conflict shape.
 type ClientWinsResolver struct{}
 
+// Resolve retries the latest local intent when the conflict shape allows it.
 func (r *ClientWinsResolver) Resolve(conflict ConflictContext) MergeResult {
 	return KeepLocal{}
 }
@@ -69,6 +71,7 @@ func (r *ClientWinsResolver) Resolve(conflict ConflictContext) MergeResult {
 // DefaultResolver preserves the prior exported default-resolver name with server-wins behavior.
 type DefaultResolver struct{}
 
+// Resolve preserves the historical default behavior of resolving conflicts as server-wins.
 func (r *DefaultResolver) Resolve(conflict ConflictContext) MergeResult {
 	return AcceptServer{}
 }
@@ -80,6 +83,7 @@ type PushConflictError struct {
 	Response oversync.PushConflictResponse
 }
 
+// Error implements error.
 func (e *PushConflictError) Error() string {
 	if e == nil {
 		return "push conflict"
@@ -87,6 +91,7 @@ func (e *PushConflictError) Error() string {
 	return fmt.Sprintf("push commit conflict: HTTP %d - %s", e.Status, decodeServerErrorBody([]byte(e.RawBody)))
 }
 
+// Conflict returns the structured conflict details when available.
 func (e *PushConflictError) Conflict() *oversync.PushConflictDetails {
 	if e == nil {
 		return nil
@@ -101,6 +106,7 @@ type InvalidConflictResolutionError struct {
 	Message  string
 }
 
+// Error implements error.
 func (e *InvalidConflictResolutionError) Error() string {
 	if e == nil || strings.TrimSpace(e.Message) == "" {
 		return "invalid conflict resolution"
@@ -114,6 +120,7 @@ type PushConflictRetryExhaustedError struct {
 	RemainingDirtyCount int
 }
 
+// Error implements error.
 func (e *PushConflictRetryExhaustedError) Error() string {
 	if e == nil {
 		return "push conflict auto-retry exhausted"

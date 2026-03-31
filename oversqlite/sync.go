@@ -55,7 +55,7 @@ func (c *Client) uploaderLoop(ctx context.Context) {
 			continue
 		}
 
-		if err := c.PushPending(ctx); err != nil {
+		if _, err := c.PushPending(ctx); err != nil {
 			if IsLifecyclePreconditionError(err) {
 				c.logger.Warn("upload loop blocked by lifecycle state", "error", err)
 				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
@@ -99,7 +99,7 @@ func (c *Client) downloaderLoop(ctx context.Context) {
 			continue
 		}
 
-		if err := c.PullToStable(ctx); err != nil {
+		if _, err := c.PullToStable(ctx); err != nil {
 			if IsLifecyclePreconditionError(err) {
 				c.logger.Warn("download loop blocked by lifecycle state", "error", err)
 				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)

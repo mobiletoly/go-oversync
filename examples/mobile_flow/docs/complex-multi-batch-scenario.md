@@ -36,7 +36,7 @@ graph.
 ### Stable rebuild
 
 After the server has accepted the data, a rebuilt client should reach the same final state through
-`Hydrate()` and one consistent chunked snapshot rebuild.
+`Rebuild(ctx, RebuildKeepSource, "")` and one consistent chunked snapshot rebuild.
 
 ### Stale follower recovery
 
@@ -69,7 +69,7 @@ multi-device run:
 - a stale follower catches up through prune-triggered rebuild after the writer used a low per-chunk
   `UploadLimit`
 - The final business-table state is correct on the server.
-- A rebuilt client reaches the same final state with `Hydrate()`.
+- A rebuilt client reaches the same final state with `Rebuild(ctx, RebuildKeepSource, "")`.
 - `files` and `file_reviews` converge with the same guarantees as the scalar tables.
 
 ## Signals To Inspect
@@ -77,8 +77,8 @@ multi-device run:
 ### On the client
 
 - `_sync_dirty_rows` drops to zero after successful authoritative replay
-- `_sync_client_state.next_source_bundle_id` advances
-- `_sync_client_state.last_bundle_seq_seen` reaches the expected stable bundle sequence
+- `_sync_source_state.next_source_bundle_id` advances
+- `_sync_attachment_state.last_bundle_seq_seen` reaches the expected stable bundle sequence
 
 ### On the server
 

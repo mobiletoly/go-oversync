@@ -90,10 +90,10 @@ func (s *MultiDeviceComplexScenario) Setup(ctx context.Context) error {
 	s.device2App = app2
 	s.simulator.currentApp = s.app // enable sqlite path reporting for parallel runs
 
-	if err := s.app.OnLaunch(ctx); err != nil {
+	if err := s.app.onLaunch(ctx); err != nil {
 		return err
 	}
-	if err := s.device2App.OnLaunch(ctx); err != nil {
+	if err := s.device2App.onLaunch(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -109,7 +109,7 @@ func (s *MultiDeviceComplexScenario) createDeviceApp(scenarioConfig *config.Scen
 		UploadLimit:   100,
 		DownloadLimit: 100,
 	}
-	appCfg := &MobileAppConfig{
+	appCfg := &mobileAppConfig{
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           scenarioConfig.UserID,
@@ -120,7 +120,7 @@ func (s *MultiDeviceComplexScenario) createDeviceApp(scenarioConfig *config.Scen
 		PreserveDB:       simCfg.PreserveDB,
 		Logger:           s.simulator.GetLogger(),
 	}
-	return NewMobileApp(appCfg)
+	return newMobileApp(appCfg)
 }
 
 func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
@@ -128,28 +128,28 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	log.Info("🎯 Starting Multi-Device Complex Scenario (SAME user)")
 
 	// Sign in both + hydrate
-	if err := s.app.SignIn(ctx, s.userID); err != nil {
+	if err := s.app.signIn(ctx, s.userID); err != nil {
 		return err
 	}
-	if err := s.device2App.SignIn(ctx, s.userID); err != nil {
+	if err := s.device2App.signIn(ctx, s.userID); err != nil {
 		return err
 	}
-	if err := s.app.Hydrate(ctx); err != nil {
+	if err := s.app.rebuildKeepSource(ctx); err != nil {
 		return err
 	}
-	if err := s.device2App.Hydrate(ctx); err != nil {
+	if err := s.device2App.rebuildKeepSource(ctx); err != nil {
 		return err
 	}
 
 	// D1 adds A1,A2,A3
 	s.A1, s.A2, s.A3 = uuid.New().String(), uuid.New().String(), uuid.New().String()
-	if err := s.app.CreateUserWithContext(ctx, s.A1, "A1", "a1@example.com"); err != nil {
+	if err := s.app.createUserWithContext(ctx, s.A1, "A1", "a1@example.com"); err != nil {
 		return err
 	}
-	if err := s.app.CreateUserWithContext(ctx, s.A2, "A2", "a2@example.com"); err != nil {
+	if err := s.app.createUserWithContext(ctx, s.A2, "A2", "a2@example.com"); err != nil {
 		return err
 	}
-	if err := s.app.CreateUserWithContext(ctx, s.A3, "A3", "a3@example.com"); err != nil {
+	if err := s.app.createUserWithContext(ctx, s.A3, "A3", "a3@example.com"); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
@@ -158,10 +158,10 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 
 	// D2 adds B1,B2
 	s.B1, s.B2 = uuid.New().String(), uuid.New().String()
-	if err := s.device2App.CreateUserWithContext(ctx, s.B1, "B1", "b1@example.com"); err != nil {
+	if err := s.device2App.createUserWithContext(ctx, s.B1, "B1", "b1@example.com"); err != nil {
 		return err
 	}
-	if err := s.device2App.CreateUserWithContext(ctx, s.B2, "B2", "b2@example.com"); err != nil {
+	if err := s.device2App.createUserWithContext(ctx, s.B2, "B2", "b2@example.com"); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
@@ -169,7 +169,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	}
 
 	// D1 updates A2
-	if err := s.app.UpdateUser(s.A2, "A2-upd", "a2u@example.com"); err != nil {
+	if err := s.app.updateUser(s.A2, "A2-upd", "a2u@example.com"); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
@@ -177,7 +177,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	}
 
 	// D2 deletes A1
-	if err := s.device2App.DeleteUserWithContext(ctx, s.A1); err != nil {
+	if err := s.device2App.deleteUserWithContext(ctx, s.A1); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
@@ -186,7 +186,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 
 	// D1 adds B3
 	s.B3 = uuid.New().String()
-	if err := s.app.CreateUserWithContext(ctx, s.B3, "B3", "b3@example.com"); err != nil {
+	if err := s.app.createUserWithContext(ctx, s.B3, "B3", "b3@example.com"); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
@@ -194,7 +194,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	}
 
 	// D2 updates B2
-	if err := s.device2App.UpdateUser(s.B2, "B2-upd", "b2u@example.com"); err != nil {
+	if err := s.device2App.updateUser(s.B2, "B2-upd", "b2u@example.com"); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
@@ -202,7 +202,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	}
 
 	// D1 deletes A3
-	if err := s.app.DeleteUserWithContext(ctx, s.A3); err != nil {
+	if err := s.app.deleteUserWithContext(ctx, s.A3); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
@@ -210,7 +210,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	}
 
 	// D1 re-adds A3
-	if err := s.app.CreateUserWithContext(ctx, s.A3, "A3-re", "a3re@example.com"); err != nil {
+	if err := s.app.createUserWithContext(ctx, s.A3, "A3-re", "a3re@example.com"); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
@@ -218,7 +218,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	}
 
 	// D1 updates A3
-	if err := s.app.UpdateUser(s.A3, "A3-re-upd", "a3reu@example.com"); err != nil {
+	if err := s.app.updateUser(s.A3, "A3-re-upd", "a3reu@example.com"); err != nil {
 		return err
 	}
 	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
@@ -234,10 +234,10 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 	}
 
 	// Debug dump right before verify if mismatch
-	if cnt1, _ := s.app.GetUserCount(ctx); cnt1 != 5 {
+	if cnt1, _ := s.app.userCount(ctx); cnt1 != 5 {
 		debugDumpUsers(s.app, "Device 1", log)
 	}
-	if cnt2, _ := s.device2App.GetUserCount(ctx); cnt2 != 5 {
+	if cnt2, _ := s.device2App.userCount(ctx); cnt2 != 5 {
 		debugDumpUsers(s.device2App, "Device 2", log)
 	}
 
@@ -250,7 +250,7 @@ func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
 }
 
 func (s *MultiDeviceComplexScenario) fullSyncUploadThenPull(ctx context.Context, app *MobileApp) error {
-	if err := app.PushPending(ctx); err != nil {
+	if err := app.pushPending(ctx); err != nil {
 		return err
 	}
 	_, _, err := s.pullToStable(ctx, app)
@@ -258,7 +258,7 @@ func (s *MultiDeviceComplexScenario) fullSyncUploadThenPull(ctx context.Context,
 }
 
 func (s *MultiDeviceComplexScenario) pullToStable(ctx context.Context, app *MobileApp) (total int, last int64, err error) {
-	return app.PullToStable(ctx)
+	return app.pullToStable(ctx)
 }
 
 func (s *MultiDeviceComplexScenario) verifyFinalState(ctx context.Context, logger *slog.Logger) error {
@@ -289,7 +289,7 @@ func (s *MultiDeviceComplexScenario) verifyFinalState(ctx context.Context, logge
 }
 
 func (s *MultiDeviceComplexScenario) checkCountsAndPresence(ctx context.Context, app *MobileApp, present, missing []string, expectedCount int) error {
-	cnt, err := app.GetUserCount(ctx)
+	cnt, err := app.userCount(ctx)
 	if err != nil {
 		return err
 	}
@@ -297,7 +297,7 @@ func (s *MultiDeviceComplexScenario) checkCountsAndPresence(ctx context.Context,
 		return fmt.Errorf("expected %d users, got %d", expectedCount, cnt)
 	}
 	for _, id := range present {
-		ok, err := app.HasUser(ctx, id)
+		ok, err := app.hasUser(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -306,7 +306,7 @@ func (s *MultiDeviceComplexScenario) checkCountsAndPresence(ctx context.Context,
 		}
 	}
 	for _, id := range missing {
-		ok, err := app.HasUser(ctx, id)
+		ok, err := app.hasUser(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -343,10 +343,10 @@ func debugDumpUsers(app *MobileApp, label string, logger *slog.Logger) {
 
 func (s *MultiDeviceComplexScenario) Cleanup(ctx context.Context) error {
 	if s.app != nil {
-		_ = s.app.Close()
+		_ = s.app.close()
 	}
 	if s.device2App != nil {
-		_ = s.device2App.Close()
+		_ = s.device2App.close()
 	}
 	return nil
 }

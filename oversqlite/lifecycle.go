@@ -13,56 +13,55 @@ import (
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
-type ConnectStatus string
+// AttachStatus describes the high-level result of Attach.
+type AttachStatus string
 
 const (
-	ConnectStatusConnected  ConnectStatus = "connected"
-	ConnectStatusRetryLater ConnectStatus = "retry_later"
+	AttachStatusConnected  AttachStatus = "connected"
+	AttachStatusRetryLater AttachStatus = "retry_later"
 )
 
-type ConnectOutcome string
+// AttachOutcome describes how Attach reached a connected state.
+type AttachOutcome string
 
 const (
-	ConnectOutcomeResumedAttached ConnectOutcome = "resumed_attached_state"
-	ConnectOutcomeUsedRemote      ConnectOutcome = "used_remote_state"
-	ConnectOutcomeSeededLocal     ConnectOutcome = "seeded_from_local"
-	ConnectOutcomeStartedEmpty    ConnectOutcome = "started_empty"
+	AttachOutcomeResumedAttached AttachOutcome = "resumed_attached_state"
+	AttachOutcomeUsedRemote      AttachOutcome = "used_remote_state"
+	AttachOutcomeSeededLocal     AttachOutcome = "seeded_from_local"
+	AttachOutcomeStartedEmpty    AttachOutcome = "started_empty"
 )
 
-type ConnectResult struct {
-	Status     ConnectStatus
-	Outcome    ConnectOutcome
+// AttachResult reports the lifecycle result of Attach.
+type AttachResult struct {
+	Status     AttachStatus
+	Outcome    AttachOutcome
 	RetryAfter time.Duration
+	SyncStatus SyncStatus
+	Restore    *RestoreSummary
 }
 
+// PendingSyncStatus summarizes whether local durable sync state exists and whether it blocks Detach.
 type PendingSyncStatus struct {
 	HasPendingSyncData bool
-	PendingRowCount    int
-	BlocksSignOut      bool
+	PendingRowCount    int64
+	BlocksDetach       bool
 }
 
-type SignOutBlockedError struct {
-	PendingRowCount int
-}
-
-func (e *SignOutBlockedError) Error() string {
-	return fmt.Sprintf("cannot sign out while %d attached sync rows are pending upload", e.PendingRowCount)
-}
-
-func (c *Client) Open(ctx context.Context, sourceID string) error {
+// Open validates or persists the caller-owned source ID and restores local lifecycle state.
+func (c *Client) Open(ctx context.Context, sourceID string) (OpenResult, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
+		return OpenResult{}, err
 	}
 	defer c.writeMu.Unlock()
 
 	sourceID = strings.TrimSpace(sourceID)
 	if sourceID == "" {
-		return fmt.Errorf("sourceID must be provided")
+		return OpenResult{}, fmt.Errorf("sourceID must be provided")
 	}
 	state, err := c.openLocked(ctx, sourceID)
 	var pendingRemoteReplaceErr *RemoteReplacePendingError
 	if err != nil && !errors.As(err, &pendingRemoteReplaceErr) {
-		return err
+		return OpenResult{}, err
 	}
 	c.SourceID = state.SourceID
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) != "" {
@@ -71,129 +70,175 @@ func (c *Client) Open(ctx context.Context, sourceID string) error {
 		c.UserID = ""
 	}
 	c.pendingInitializationID = state.PendingInitializationID
-	return err
+	c.sessionConnected = false
+	return openResultFromLifecycleState(state), nil
 }
 
-func (c *Client) Connect(ctx context.Context, userID string) (ConnectResult, error) {
+// Attach resolves account attachment through the server connect lifecycle.
+func (c *Client) Attach(ctx context.Context, userID string) (AttachResult, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return ConnectResult{}, err
+		return AttachResult{}, err
 	}
 	defer c.writeMu.Unlock()
 	return c.connectLocked(ctx, userID)
 }
 
-func (c *Client) connectLocked(ctx context.Context, userID string) (ConnectResult, error) {
+func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
-		return ConnectResult{}, fmt.Errorf("userID must be provided")
+		return AttachResult{}, fmt.Errorf("userID must be provided")
 	}
 	if strings.TrimSpace(c.SourceID) == "" {
-		return ConnectResult{}, &OpenRequiredError{Operation: "Connect(userID)"}
+		return AttachResult{}, &OpenRequiredError{Operation: "Attach(userID)"}
 	}
 
 	state, err := c.openLocked(ctx, c.SourceID)
 	var pendingRemoteReplaceErr *RemoteReplacePendingError
 	if err != nil && !errors.As(err, &pendingRemoteReplaceErr) {
-		return ConnectResult{}, err
+		return AttachResult{}, err
 	}
 	c.SourceID = state.SourceID
 
 	if state.PendingTransitionKind == lifecycleTransitionRemote {
-		if strings.TrimSpace(state.PendingTargetScope) != userID || strings.TrimSpace(state.PendingTargetSourceID) != c.SourceID {
-			return ConnectResult{}, &ConnectLocalStateConflictError{
-				Reason: fmt.Sprintf("pending remote_replace belongs to scope %q on source %q", state.PendingTargetScope, state.PendingTargetSourceID),
+		if strings.TrimSpace(state.PendingTargetScope) != userID || strings.TrimSpace(state.SourceID) != c.SourceID {
+			return AttachResult{}, &AttachLocalStateConflictError{
+				Reason: fmt.Sprintf("pending remote_replace belongs to scope %q on source %q", state.PendingTargetScope, state.SourceID),
 			}
 		}
 		c.UserID = userID
-		if err := c.finalizeRemoteReplaceLocked(ctx, state); err != nil {
-			return ConnectResult{}, err
+		restore, err := c.finalizeRemoteReplaceLocked(ctx, state)
+		if err != nil {
+			return AttachResult{}, err
 		}
 		c.pendingInitializationID = ""
 		if err := c.persistConnectedLifecycleState(ctx, userID, ""); err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
 		c.sessionConnected = true
-		return ConnectResult{Status: ConnectStatusConnected, Outcome: ConnectOutcomeUsedRemote}, nil
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return AttachResult{}, err
+		}
+		return AttachResult{
+			Status:     AttachStatusConnected,
+			Outcome:    AttachOutcomeUsedRemote,
+			SyncStatus: status,
+			Restore:    restore,
+		}, nil
 	}
 
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) == userID && state.PendingTransitionKind == lifecycleTransitionNone {
 		hasAttachedState, err := c.hasAttachedClientStateLocked(ctx, userID, c.SourceID)
 		if err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
 		if hasAttachedState {
 			c.UserID = userID
 			c.pendingInitializationID = state.PendingInitializationID
 			c.sessionConnected = true
-			return ConnectResult{Status: ConnectStatusConnected, Outcome: ConnectOutcomeResumedAttached}, nil
+			status, err := c.syncStatusLocked(ctx)
+			if err != nil {
+				return AttachResult{}, err
+			}
+			return AttachResult{
+				Status:     AttachStatusConnected,
+				Outcome:    AttachOutcomeResumedAttached,
+				SyncStatus: status,
+			}, nil
 		}
 	}
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) != "" && strings.TrimSpace(state.BindingScope) != userID {
-		return ConnectResult{}, &ConnectBindingConflictError{
+		return AttachResult{}, &AttachBindingConflictError{
 			AttachedUserID:  state.BindingScope,
 			RequestedUserID: userID,
 		}
 	}
 	if err := c.verifyConnectLifecycleSupported(ctx); err != nil {
-		return ConnectResult{}, err
+		return AttachResult{}, err
 	}
 
 	hasPendingRows, err := c.pendingChangeCount(ctx)
 	if err != nil {
-		return ConnectResult{}, err
+		return AttachResult{}, err
 	}
 	resp, err := c.connectRequest(ctx, userID, c.SourceID, hasPendingRows > 0)
 	if err != nil {
-		return ConnectResult{}, err
+		return AttachResult{}, err
 	}
 
 	switch resp.Resolution {
 	case "retry_later":
 		retryAfter := time.Duration(resp.RetryAfterSec) * time.Second
 		c.sessionConnected = false
-		return ConnectResult{Status: ConnectStatusRetryLater, RetryAfter: retryAfter}, nil
+		return AttachResult{Status: AttachStatusRetryLater, RetryAfter: retryAfter}, nil
 	case "initialize_empty":
 		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.SourceID); err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
 		c.pendingInitializationID = ""
 		if err := c.persistConnectedLifecycleState(ctx, userID, ""); err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
 		c.UserID = userID
 		c.sessionConnected = true
-		return ConnectResult{Status: ConnectStatusConnected, Outcome: ConnectOutcomeStartedEmpty}, nil
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return AttachResult{}, err
+		}
+		return AttachResult{
+			Status:     AttachStatusConnected,
+			Outcome:    AttachOutcomeStartedEmpty,
+			SyncStatus: status,
+		}, nil
 	case "initialize_local":
 		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.SourceID); err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
 		c.pendingInitializationID = resp.InitializationID
 		if err := c.persistConnectedLifecycleState(ctx, userID, resp.InitializationID); err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
 		c.UserID = userID
 		c.sessionConnected = true
-		return ConnectResult{Status: ConnectStatusConnected, Outcome: ConnectOutcomeSeededLocal}, nil
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return AttachResult{}, err
+		}
+		return AttachResult{
+			Status:     AttachStatusConnected,
+			Outcome:    AttachOutcomeSeededLocal,
+			SyncStatus: status,
+		}, nil
 	case "remote_authoritative":
 		c.UserID = userID
 		if err := c.beginRemoteReplaceLocked(ctx, userID, c.SourceID); err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
 		state, err = c.loadLifecycleState(ctx)
 		if err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
-		if err := c.finalizeRemoteReplaceLocked(ctx, state); err != nil {
-			return ConnectResult{}, err
+		restore, err := c.finalizeRemoteReplaceLocked(ctx, state)
+		if err != nil {
+			return AttachResult{}, err
 		}
 		c.pendingInitializationID = ""
 		if err := c.persistConnectedLifecycleState(ctx, userID, ""); err != nil {
-			return ConnectResult{}, err
+			return AttachResult{}, err
 		}
 		c.sessionConnected = true
-		return ConnectResult{Status: ConnectStatusConnected, Outcome: ConnectOutcomeUsedRemote}, nil
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return AttachResult{}, err
+		}
+		return AttachResult{
+			Status:     AttachStatusConnected,
+			Outcome:    AttachOutcomeUsedRemote,
+			SyncStatus: status,
+			Restore:    restore,
+		}, nil
 	default:
-		return ConnectResult{}, fmt.Errorf("unexpected connect resolution %q", resp.Resolution)
+		return AttachResult{}, fmt.Errorf("unexpected connect resolution %q", resp.Resolution)
 	}
 }
 
@@ -206,13 +251,10 @@ func (c *Client) clearStalePendingInitializationStateLocked(ctx context.Context)
 	state.BindingScope = ""
 	state.PendingTransitionKind = lifecycleTransitionNone
 	state.PendingTargetScope = ""
-	state.PendingTargetSourceID = ""
 	state.PendingStagedSnapshotID = ""
 	state.PendingSnapshotBundleSeq = 0
 	state.PendingSnapshotRowCount = 0
-	state.PendingApplyCursor = 0
 	state.PendingInitializationID = ""
-	state.RuntimeBypassActive = false
 	if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
 		return err
 	}
@@ -222,57 +264,109 @@ func (c *Client) clearStalePendingInitializationStateLocked(ctx context.Context)
 	return nil
 }
 
-func (c *Client) SignOut(ctx context.Context) error {
+// Detach clears attached synced state after verifying that no attached durable sync state remains.
+func (c *Client) Detach(ctx context.Context) (DetachResult, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
+		return DetachResult{}, err
 	}
 	defer c.writeMu.Unlock()
 
 	status, err := c.pendingSyncStatusLocked(ctx)
 	if err != nil {
-		return err
+		return DetachResult{}, err
 	}
-	if status.BlocksSignOut {
-		return &SignOutBlockedError{PendingRowCount: status.PendingRowCount}
-	}
-	if err := c.armDestructiveTransition(ctx, lifecycleTransitionSignOut, ""); err != nil {
-		return err
+	if status.BlocksDetach {
+		return DetachResult{
+			Outcome:         DetachOutcomeBlockedUnsyncedData,
+			PendingRowCount: status.PendingRowCount,
+		}, nil
 	}
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin sign-out transaction: %w", err)
+		return DetachResult{}, fmt.Errorf("failed to begin detach transaction: %w", err)
 	}
 	defer tx.Rollback()
 
 	if err := c.clearFullLocalSyncStateInTx(ctx, tx); err != nil {
-		return err
+		return DetachResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_client_state`); err != nil {
-		return fmt.Errorf("failed to clear per-scope client state during sign-out: %w", err)
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return DetachResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE _sync_lifecycle_state
-		SET binding_state = ?, binding_scope = ?, pending_transition_kind = ?, pending_target_scope = ?, pending_target_source_id = ?, pending_staged_snapshot_id = ?, pending_snapshot_bundle_seq = 0, pending_snapshot_row_count = 0, pending_apply_cursor = 0, pending_initialization_id = ?, preexisting_capture_done = 0, runtime_bypass_active = 0
-		WHERE singleton_key = 1
-	`, lifecycleBindingAnonymous, "", lifecycleTransitionNone, "", "", "", ""); err != nil {
-		return fmt.Errorf("failed to persist anonymous lifecycle state during sign-out: %w", err)
+	attachment.BindingState = attachmentBindingAnonymous
+	attachment.AttachedUserID = ""
+	attachment.PendingInitializationID = ""
+	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
+		return DetachResult{}, err
+	}
+	if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
+		return DetachResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit sign-out transaction: %w", err)
+		return DetachResult{}, fmt.Errorf("failed to commit detach transaction: %w", err)
 	}
 	c.pendingInitializationID = ""
 	c.UserID = ""
 	c.sessionConnected = false
-	return nil
+	return DetachResult{Outcome: DetachOutcomeDetached, PendingRowCount: 0}, nil
 }
 
-func (c *Client) SyncThenSignOut(ctx context.Context) error {
-	if err := c.Sync(ctx); err != nil {
-		return err
+// SyncThenDetach runs a bounded best-effort Sync followed by Detach.
+func (c *Client) SyncThenDetach(ctx context.Context) (SyncThenDetachResult, error) {
+	const maxAttempts = 3
+	var (
+		previousPending int64 = 1<<63 - 1
+		lastSync        SyncReport
+	)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		syncReport, err := c.Sync(ctx)
+		if err != nil {
+			return SyncThenDetachResult{}, err
+		}
+		lastSync = syncReport
+		detachResult, err := c.Detach(ctx)
+		if err != nil {
+			return SyncThenDetachResult{}, err
+		}
+		if detachResult.Outcome == DetachOutcomeDetached {
+			return SyncThenDetachResult{
+				LastSync:                 syncReport,
+				Detach:                   detachResult,
+				SyncRounds:               attempt + 1,
+				RemainingPendingRowCount: 0,
+			}, nil
+		}
+		pending, err := c.PendingSyncStatus(ctx)
+		if err != nil {
+			return SyncThenDetachResult{}, err
+		}
+		if pending.PendingRowCount >= previousPending {
+			return SyncThenDetachResult{
+				LastSync:                 syncReport,
+				Detach:                   detachResult,
+				SyncRounds:               attempt + 1,
+				RemainingPendingRowCount: pending.PendingRowCount,
+			}, nil
+		}
+		previousPending = pending.PendingRowCount
 	}
-	return c.SignOut(ctx)
+	pending, err := c.PendingSyncStatus(ctx)
+	if err != nil {
+		return SyncThenDetachResult{}, err
+	}
+	return SyncThenDetachResult{
+		LastSync: lastSync,
+		Detach: DetachResult{
+			Outcome:         DetachOutcomeBlockedUnsyncedData,
+			PendingRowCount: pending.PendingRowCount,
+		},
+		SyncRounds:               maxAttempts,
+		RemainingPendingRowCount: pending.PendingRowCount,
+	}, nil
 }
 
+// PendingSyncStatus reports pending local sync state and whether it blocks Detach.
 func (c *Client) PendingSyncStatus(ctx context.Context) (PendingSyncStatus, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
 		return PendingSyncStatus{}, err
@@ -295,56 +389,90 @@ func (c *Client) pendingSyncStatusLocked(ctx context.Context) (PendingSyncStatus
 	if err != nil {
 		return PendingSyncStatus{}, err
 	}
+	if strings.TrimSpace(state.PendingInitializationID) != "" {
+		total++
+	}
 	return PendingSyncStatus{
 		HasPendingSyncData: total > 0,
-		PendingRowCount:    total,
-		BlocksSignOut:      state.BindingState == lifecycleBindingAttached && total > 0,
+		PendingRowCount:    int64(total),
+		BlocksDetach:       state.BindingState == lifecycleBindingAttached && total > 0,
 	}, nil
 }
 
-func (c *Client) ResetForNewSource(ctx context.Context, sourceID string) error {
+// SyncStatus reports authority state, pending state, and the last durable bundle checkpoint for the currently connected scope.
+func (c *Client) SyncStatus(ctx context.Context) (SyncStatus, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
+		return SyncStatus{}, err
+	}
+	defer c.writeMu.Unlock()
+	return c.syncStatusLocked(ctx)
+}
+
+// RotateSource switches the client to a caller-provided source ID without minting one internally.
+func (c *Client) RotateSource(ctx context.Context, sourceID string) (SourceRotationResult, error) {
+	if err := c.tryBeginSyncOperation(); err != nil {
+		return SourceRotationResult{}, err
 	}
 	defer c.writeMu.Unlock()
 
 	sourceID = strings.TrimSpace(sourceID)
 	if sourceID == "" {
-		return fmt.Errorf("sourceID must be provided")
+		return SourceRotationResult{}, fmt.Errorf("sourceID must be provided")
 	}
 
-	if err := c.armDestructiveTransition(ctx, lifecycleTransitionSourceReset, sourceID); err != nil {
-		return err
+	outboxCount, err := c.pendingPushOutboundCount(ctx)
+	if err != nil {
+		return SourceRotationResult{}, err
+	}
+	if outboxCount > 0 {
+		return SourceRotationResult{}, fmt.Errorf("cannot rotate source while %d outbox rows are pending", outboxCount)
+	}
+	state, err := c.loadLifecycleState(ctx)
+	if err != nil {
+		return SourceRotationResult{}, err
+	}
+	if strings.TrimSpace(state.PendingInitializationID) != "" {
+		return SourceRotationResult{}, fmt.Errorf("cannot rotate source while initialization is pending")
+	}
+	if state.PendingTransitionKind != lifecycleTransitionNone {
+		return SourceRotationResult{}, fmt.Errorf("cannot rotate source while lifecycle operation %q is pending", state.PendingTransitionKind)
 	}
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin source reset transaction: %w", err)
+		return SourceRotationResult{}, fmt.Errorf("failed to begin source reset transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	if err := c.clearFullLocalSyncStateInTx(ctx, tx); err != nil {
-		return err
+	if err := ensureSourceState(ctx, tx, sourceID); err != nil {
+		return SourceRotationResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_client_state`); err != nil {
-		return fmt.Errorf("failed to clear client state during source reset: %w", err)
+	if strings.TrimSpace(c.SourceID) != "" && c.SourceID != sourceID {
+		if err := markSourceReplaced(ctx, tx, c.SourceID, sourceID); err != nil {
+			return SourceRotationResult{}, err
+		}
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE _sync_lifecycle_state
-		SET source_id = ?, binding_state = ?, binding_scope = ?, pending_transition_kind = ?, pending_target_scope = ?, pending_target_source_id = ?, pending_staged_snapshot_id = ?, pending_snapshot_bundle_seq = 0, pending_snapshot_row_count = 0, pending_apply_cursor = 0, pending_initialization_id = ?, preexisting_capture_done = 0, runtime_bypass_active = 0
-		WHERE singleton_key = 1
-	`, sourceID, lifecycleBindingAnonymous, "", lifecycleTransitionNone, "", "", "", ""); err != nil {
-		return fmt.Errorf("failed to persist source reset lifecycle state: %w", err)
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return SourceRotationResult{}, err
+	}
+	attachment.CurrentSourceID = sourceID
+	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
+		return SourceRotationResult{}, err
+	}
+	if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
+		return SourceRotationResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit source reset: %w", err)
+		return SourceRotationResult{}, fmt.Errorf("failed to commit source reset: %w", err)
 	}
 	c.SourceID = sourceID
 	c.pendingInitializationID = ""
 	c.UserID = ""
 	c.sessionConnected = false
-	return nil
+	return SourceRotationResult{SourceID: sourceID}, nil
 }
 
+// UninstallSync removes oversqlite-owned metadata tables and managed-table triggers from the database.
 func (c *Client) UninstallSync(ctx context.Context) error {
 	if err := c.tryBeginSyncOperation(); err != nil {
 		return err
@@ -455,6 +583,12 @@ func dropManagedTriggersForTableInTx(ctx context.Context, tx *sql.Tx, tableName 
 			return fmt.Errorf("failed to drop sync trigger %s: %w", triggerName, err)
 		}
 	}
+	for _, suffix := range []string{"bi_guard", "bu_guard", "bd_guard"} {
+		triggerName := fmt.Sprintf("trg_%s_%s", tableName, suffix)
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DROP TRIGGER IF EXISTS %s", quoteIdent(triggerName))); err != nil {
+			return fmt.Errorf("failed to drop sync trigger %s: %w", triggerName, err)
+		}
+	}
 	return nil
 }
 
@@ -472,7 +606,7 @@ func (c *Client) connectRequest(ctx context.Context, userID, sourceID string, ha
 		return nil, fmt.Errorf("failed to send connect request: %w", err)
 	}
 	if statusCode == http.StatusNotFound || statusCode == http.StatusMethodNotAllowed || statusCode == http.StatusNotImplemented {
-		return nil, &ConnectLifecycleUnsupportedError{Reason: "missing /sync/connect endpoint"}
+		return nil, &AttachLifecycleUnsupportedError{Reason: "missing /sync/connect endpoint"}
 	}
 	if statusCode != http.StatusOK {
 		return nil, fmt.Errorf("server returned status %d: %s", statusCode, decodeServerErrorBody(body))
@@ -486,14 +620,24 @@ func (c *Client) connectRequest(ctx context.Context, userID, sourceID string, ha
 }
 
 func (c *Client) persistConnectedLifecycleState(ctx context.Context, userID, initializationID string) error {
-	if _, err := c.DB.ExecContext(ctx, `
-		UPDATE _sync_lifecycle_state
-		SET source_id = ?, binding_state = ?, binding_scope = ?, pending_transition_kind = ?, pending_target_scope = ?, pending_target_source_id = ?, pending_staged_snapshot_id = ?, pending_snapshot_bundle_seq = 0, pending_snapshot_row_count = 0, pending_apply_cursor = 0, pending_initialization_id = ?, preexisting_capture_done = 1, runtime_bypass_active = 0
-		WHERE singleton_key = 1
-	`, c.SourceID, lifecycleBindingAttached, userID, lifecycleTransitionNone, "", "", "", initializationID); err != nil {
-		return fmt.Errorf("failed to persist attached lifecycle state: %w", err)
+	attachment, err := loadAttachmentState(ctx, c.DB)
+	if err != nil {
+		return err
 	}
-	return nil
+	attachment.CurrentSourceID = c.SourceID
+	attachment.BindingState = attachmentBindingAttached
+	attachment.AttachedUserID = userID
+	attachment.PendingInitializationID = initializationID
+	if strings.TrimSpace(attachment.SchemaName) == "" {
+		attachment.SchemaName = c.config.Schema
+	}
+	if err := ensureSourceState(ctx, c.DB, c.SourceID); err != nil {
+		return err
+	}
+	if err := persistAttachmentState(ctx, c.DB, attachment); err != nil {
+		return err
+	}
+	return persistOperationState(ctx, c.DB, &operationStateRecord{Kind: operationKindNone})
 }
 
 func (c *Client) beginRemoteReplaceLocked(ctx context.Context, userID, sourceID string) error {
@@ -505,42 +649,42 @@ func (c *Client) beginRemoteReplaceLocked(ctx context.Context, userID, sourceID 
 	state.BindingScope = ""
 	state.PendingTransitionKind = lifecycleTransitionRemote
 	state.PendingTargetScope = userID
-	state.PendingTargetSourceID = sourceID
 	state.PendingStagedSnapshotID = ""
 	state.PendingSnapshotBundleSeq = 0
 	state.PendingSnapshotRowCount = 0
-	state.PendingApplyCursor = 0
 	state.PendingInitializationID = ""
-	state.RuntimeBypassActive = false
-	if _, err := c.DB.ExecContext(ctx, `DELETE FROM _sync_client_state`); err != nil {
-		return fmt.Errorf("failed to clear attached client metadata before remote_replace: %w", err)
-	}
 	if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *Client) finalizeRemoteReplaceLocked(ctx context.Context, state *lifecycleState) error {
+func (c *Client) finalizeRemoteReplaceLocked(ctx context.Context, state *lifecycleState) (*RestoreSummary, error) {
 	if state == nil {
-		return fmt.Errorf("remote_replace lifecycle state is required")
+		return nil, fmt.Errorf("remote_replace lifecycle state is required")
 	}
 	if state.PendingTransitionKind != lifecycleTransitionRemote {
-		return fmt.Errorf("cannot finalize lifecycle transition %q as remote_replace", state.PendingTransitionKind)
+		return nil, fmt.Errorf("cannot finalize lifecycle transition %q as remote_replace", state.PendingTransitionKind)
 	}
 	refreshedState, err := c.ensureRemoteReplaceSnapshotStagedLocked(ctx, state)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := c.prepareAttachedClientStateForRemoteReplace(ctx, refreshedState.PendingTargetScope, refreshedState.PendingTargetSourceID); err != nil {
-		return err
+	if err := c.prepareAttachedClientStateForRemoteReplace(ctx, refreshedState.PendingTargetScope, refreshedState.SourceID); err != nil {
+		return nil, err
 	}
 	session := &oversync.SnapshotSession{
 		SnapshotID:        refreshedState.PendingStagedSnapshotID,
 		SnapshotBundleSeq: refreshedState.PendingSnapshotBundleSeq,
 		RowCount:          refreshedState.PendingSnapshotRowCount,
 	}
-	return c.applyStagedSnapshotLocked(ctx, session, false)
+	if err := c.applyStagedSnapshotLocked(ctx, session, false, ""); err != nil {
+		return nil, err
+	}
+	return &RestoreSummary{
+		BundleSeq: session.SnapshotBundleSeq,
+		RowCount:  session.RowCount,
+	}, nil
 }
 
 func (c *Client) ensureRemoteReplaceSnapshotStagedLocked(ctx context.Context, state *lifecycleState) (*lifecycleState, error) {
@@ -606,15 +750,31 @@ func (c *Client) prepareAttachedClientStateForRemoteReplace(ctx context.Context,
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_client_state`); err != nil {
-		return fmt.Errorf("failed to clear attached client metadata during remote_replace attach: %w", err)
+	if err := ensureSourceState(ctx, tx, sourceID); err != nil {
+		return err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO _sync_client_state (
-			user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode, rebuild_required
-		) VALUES (?, ?, ?, 1, 0, 0, 0)
-	`, userID, sourceID, c.config.Schema); err != nil {
-		return fmt.Errorf("failed to create attached client metadata during remote_replace attach: %w", err)
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	attachment.CurrentSourceID = sourceID
+	attachment.BindingState = attachmentBindingAttached
+	attachment.AttachedUserID = userID
+	attachment.SchemaName = c.config.Schema
+	attachment.LastBundleSeqSeen = 0
+	attachment.RebuildRequired = false
+	attachment.PendingInitializationID = ""
+	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
+		return err
+	}
+	if err := persistOperationState(ctx, tx, &operationStateRecord{
+		Kind:              operationKindRemoteReplace,
+		TargetUserID:      userID,
+		StagedSnapshotID:  "",
+		SnapshotBundleSeq: 0,
+		SnapshotRowCount:  0,
+	}); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit remote_replace attach transaction: %w", err)
@@ -634,65 +794,6 @@ func (c *Client) countSnapshotStageRows(ctx context.Context, snapshotID string) 
 	return count, nil
 }
 
-func (c *Client) persistLifecycleStateInTxless(ctx context.Context, state *lifecycleState) error {
-	if state == nil {
-		return fmt.Errorf("lifecycle state is required")
-	}
-	captureDone := 0
-	if state.PreexistingCaptureDone {
-		captureDone = 1
-	}
-	runtimeBypass := 0
-	if state.RuntimeBypassActive {
-		runtimeBypass = 1
-	}
-	if _, err := c.DB.ExecContext(ctx, `
-		UPDATE _sync_lifecycle_state
-		SET source_id = ?,
-			binding_state = ?,
-			binding_scope = ?,
-			pending_transition_kind = ?,
-			pending_target_scope = ?,
-			pending_target_source_id = ?,
-			pending_staged_snapshot_id = ?,
-			pending_snapshot_bundle_seq = ?,
-			pending_snapshot_row_count = ?,
-			pending_apply_cursor = ?,
-			pending_initialization_id = ?,
-			preexisting_capture_done = ?,
-			runtime_bypass_active = ?
-		WHERE singleton_key = 1
-	`, state.SourceID, state.BindingState, state.BindingScope, state.PendingTransitionKind, state.PendingTargetScope, state.PendingTargetSourceID, state.PendingStagedSnapshotID, state.PendingSnapshotBundleSeq, state.PendingSnapshotRowCount, state.PendingApplyCursor, state.PendingInitializationID, captureDone, runtimeBypass); err != nil {
-		return fmt.Errorf("failed to persist lifecycle state: %w", err)
-	}
-	return nil
-}
-
 func (c *Client) armDestructiveTransition(ctx context.Context, transitionKind, pendingTargetSourceID string) error {
-	tx, err := c.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin destructive transition arm transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	state, err := c.loadLifecycleStateInTx(ctx, tx)
-	if err != nil {
-		return err
-	}
-	state.PendingTransitionKind = transitionKind
-	state.PendingTargetScope = ""
-	state.PendingTargetSourceID = strings.TrimSpace(pendingTargetSourceID)
-	state.PendingStagedSnapshotID = ""
-	state.PendingSnapshotBundleSeq = 0
-	state.PendingSnapshotRowCount = 0
-	state.PendingApplyCursor = 0
-	state.PendingInitializationID = ""
-	state.RuntimeBypassActive = true
-	if err := c.persistLifecycleStateInTx(ctx, tx, state); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit destructive transition arm transaction: %w", err)
-	}
 	return nil
 }

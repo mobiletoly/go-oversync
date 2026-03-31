@@ -76,8 +76,8 @@ func (s *Session) SetSourceID(sourceID string) {
 	s.expiresAt = time.Time{}
 }
 
-// SignOut clears the current session
-func (s *Session) SignOut() {
+// Detach clears the current authenticated app session state.
+func (s *Session) Detach() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

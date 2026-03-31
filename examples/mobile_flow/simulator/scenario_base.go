@@ -51,7 +51,7 @@ func (bs *BaseScenario) Setup(ctx context.Context) error {
 	bs.app = app
 
 	// Launch the app
-	if err := bs.app.OnLaunch(ctx); err != nil {
+	if err := bs.app.onLaunch(ctx); err != nil {
 		return fmt.Errorf("failed to launch app: %w", err)
 	}
 
@@ -61,7 +61,7 @@ func (bs *BaseScenario) Setup(ctx context.Context) error {
 // Cleanup performs common cleanup for scenarios
 func (bs *BaseScenario) Cleanup(ctx context.Context) error {
 	if bs.app != nil {
-		if err := bs.app.Close(); err != nil {
+		if err := bs.app.close(); err != nil {
 			return fmt.Errorf("failed to close app: %w", err)
 		}
 	}

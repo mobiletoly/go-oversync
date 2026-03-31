@@ -48,7 +48,7 @@ func (r *staticResolver) Resolve(conflict ConflictContext) MergeResult {
 	return r.result
 }
 
-func attachTestClient(t *testing.T, client *Client, userID, sourceID string) ConnectResult {
+func attachTestClient(t *testing.T, client *Client, userID, sourceID string) AttachResult {
 	t.Helper()
 
 	prevHTTP := client.HTTP
@@ -68,10 +68,10 @@ func attachTestClient(t *testing.T, client *Client, userID, sourceID string) Con
 		client.HTTP = prevHTTP
 	})
 
-	require.NoError(t, client.Open(context.Background(), sourceID))
-	result, err := client.Connect(context.Background(), userID)
+	mustOpen(t, client, context.Background(), sourceID)
+	result, err := client.Attach(context.Background(), userID)
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
+	require.Equal(t, AttachStatusConnected, result.Status)
 	return result
 }
 

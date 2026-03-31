@@ -2,7 +2,6 @@ package oversqlite
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,52 +11,63 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/google/uuid"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
+// DirtyStateRejectedError reports that pull or rebuild was rejected because local dirty rows still exist.
 type DirtyStateRejectedError struct {
 	DirtyCount int
 }
 
+// Error implements error.
 func (e *DirtyStateRejectedError) Error() string {
 	return fmt.Sprintf("cannot pull while %d local dirty rows exist", e.DirtyCount)
 }
 
-func (c *Client) pullToStableLocked(ctx context.Context) error {
+func (c *Client) pullToStableLocked(ctx context.Context) (RemoteSyncReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "PullToStable()"); err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	rebuildRequired, err := c.rebuildRequired(ctx)
 	if err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	if rebuildRequired {
-		return &RebuildRequiredError{}
+		return RemoteSyncReport{}, &RebuildRequiredError{}
 	}
 	outboundCount, err := c.pendingPushOutboundCount(ctx)
 	if err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	if outboundCount > 0 {
-		return &PendingPushReplayError{OutboundCount: outboundCount}
+		return RemoteSyncReport{}, &PendingPushReplayError{OutboundCount: outboundCount}
 	}
 
 	pendingCount, err := c.pendingChangeCount(ctx)
 	if err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	if pendingCount > 0 {
 		c.logger.Warn("pull rejected due to local dirty state", "dirty_rows", pendingCount)
-		return &DirtyStateRejectedError{DirtyCount: pendingCount}
+		return RemoteSyncReport{}, &DirtyStateRejectedError{DirtyCount: pendingCount}
+	}
+	if atomic.LoadInt32(&c.downloadPaused) == 1 {
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return RemoteSyncReport{}, err
+		}
+		return RemoteSyncReport{
+			Outcome: RemoteSyncOutcomeSkippedPaused,
+			Status:  status,
+		}, nil
 	}
 
 	afterBundleSeq, err := c.lastSeenBundleSeq(ctx)
 	if err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	maxBundles := c.config.DownloadLimit
 	if maxBundles <= 0 {
@@ -65,37 +75,50 @@ func (c *Client) pullToStableLocked(ctx context.Context) error {
 	}
 
 	targetBundleSeq := int64(0)
+	appliedBundles := false
 	for {
 		resp, err := c.sendPullRequest(ctx, afterBundleSeq, maxBundles, targetBundleSeq)
 		if err != nil {
 			var prunedErr *HistoryPrunedError
 			if errors.As(err, &prunedErr) {
 				c.logger.Info("pull history pruned; rebuilding from chunked snapshot", "message", prunedErr.Message)
-				return c.hydrateLocked(ctx)
+				return c.rebuildKeepSourceLocked(ctx)
 			}
-			return err
+			return RemoteSyncReport{}, err
 		}
 		if targetBundleSeq == 0 {
 			targetBundleSeq = resp.StableBundleSeq
 		} else if resp.StableBundleSeq != targetBundleSeq {
-			return fmt.Errorf("pull response stable bundle seq changed from %d to %d", targetBundleSeq, resp.StableBundleSeq)
+			return RemoteSyncReport{}, fmt.Errorf("pull response stable bundle seq changed from %d to %d", targetBundleSeq, resp.StableBundleSeq)
 		}
 
 		for _, bundle := range resp.Bundles {
 			if err := c.applyPulledBundleLocked(ctx, &bundle); err != nil {
-				return err
+				return RemoteSyncReport{}, err
 			}
+			appliedBundles = true
 			afterBundleSeq = bundle.BundleSeq
 		}
 
 		if afterBundleSeq >= resp.StableBundleSeq {
-			return nil
+			status, err := c.syncStatusLocked(ctx)
+			if err != nil {
+				return RemoteSyncReport{}, err
+			}
+			outcome := RemoteSyncOutcomeAlreadyAtTarget
+			if appliedBundles {
+				outcome = RemoteSyncOutcomeAppliedIncremental
+			}
+			return RemoteSyncReport{
+				Outcome: outcome,
+				Status:  status,
+			}, nil
 		}
 		if !resp.HasMore && len(resp.Bundles) == 0 {
-			return fmt.Errorf("pull ended before reaching stable bundle seq %d", resp.StableBundleSeq)
+			return RemoteSyncReport{}, fmt.Errorf("pull ended before reaching stable bundle seq %d", resp.StableBundleSeq)
 		}
 		if !resp.HasMore && afterBundleSeq < resp.StableBundleSeq {
-			return fmt.Errorf("pull ended early at bundle seq %d before stable bundle seq %d", afterBundleSeq, resp.StableBundleSeq)
+			return RemoteSyncReport{}, fmt.Errorf("pull ended early at bundle seq %d before stable bundle seq %d", afterBundleSeq, resp.StableBundleSeq)
 		}
 	}
 }
@@ -172,14 +195,14 @@ func (c *Client) applyPulledBundleLocked(ctx context.Context, bundle *oversync.B
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE _sync_client_state
-		SET last_bundle_seq_seen = CASE
-				WHEN last_bundle_seq_seen < ? THEN ?
-				ELSE last_bundle_seq_seen
-			END
-		WHERE user_id = ?
-	`, bundle.BundleSeq, bundle.BundleSeq, c.UserID); err != nil {
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if attachment.LastBundleSeqSeen < bundle.BundleSeq {
+		attachment.LastBundleSeqSeen = bundle.BundleSeq
+	}
+	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
 		return fmt.Errorf("failed to advance pulled bundle checkpoint: %w", err)
 	}
 	if err := c.setBundleApplyModeInTx(ctx, tx, false); err != nil {
@@ -192,18 +215,14 @@ func (c *Client) applyPulledBundleLocked(ctx context.Context, bundle *oversync.B
 }
 
 func (c *Client) lastSeenBundleSeq(ctx context.Context) (int64, error) {
-	var seq int64
-	if err := c.DB.QueryRowContext(ctx, `
-		SELECT last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, c.UserID).Scan(&seq); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, &ConnectRequiredError{Operation: "LastBundleSeqSeen()/PullToStable()"}
-		}
-		return 0, fmt.Errorf("failed to read last_bundle_seq_seen: %w", err)
+	attachment, err := loadAttachmentState(ctx, c.DB)
+	if err != nil {
+		return 0, err
 	}
-	return seq, nil
+	if attachment.BindingState != attachmentBindingAttached || attachment.AttachedUserID != c.UserID {
+		return 0, &AttachRequiredError{Operation: "LastBundleSeqSeen()/PullToStable()"}
+	}
+	return attachment.LastBundleSeqSeen, nil
 }
 
 // LastBundleSeqSeen exposes the durable pulled-bundle checkpoint for diagnostics.
@@ -218,8 +237,25 @@ func (c *Client) LastBundleSeqSeen(ctx context.Context) (int64, error) {
 	return c.lastSeenBundleSeq(ctx)
 }
 
-func (c *Client) hydrateLocked(ctx context.Context) error {
-	if err := c.ensureConnectedSessionLocked(ctx, "Hydrate()"); err != nil {
+func (c *Client) rebuildKeepSourceLocked(ctx context.Context) (RemoteSyncReport, error) {
+	if err := c.ensureRebuildPreconditionsLocked(ctx); err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if atomic.LoadInt32(&c.downloadPaused) == 1 {
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return RemoteSyncReport{}, err
+		}
+		return RemoteSyncReport{
+			Outcome: RemoteSyncOutcomeSkippedPaused,
+			Status:  status,
+		}, nil
+	}
+	return c.rebuildFromSnapshotLocked(ctx, false, "")
+}
+
+func (c *Client) ensureRebuildPreconditionsLocked(ctx context.Context) error {
+	if err := c.ensureConnectedSessionLocked(ctx, "Rebuild()"); err != nil {
 		return err
 	}
 	pendingCount, err := c.pendingChangeCount(ctx)
@@ -236,55 +272,30 @@ func (c *Client) hydrateLocked(ctx context.Context) error {
 	if outboundCount > 0 {
 		return &PendingPushReplayError{OutboundCount: outboundCount}
 	}
-	return c.rebuildFromSnapshotLocked(ctx, false)
-}
-
-func (c *Client) Recover(ctx context.Context) error {
-	if atomicLoadPaused(&c.downloadPaused) {
-		return nil
-	}
-	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
-	}
-	defer c.writeMu.Unlock()
-	return c.recoverLocked(ctx)
-}
-
-func (c *Client) recoverLocked(ctx context.Context) error {
-	if err := c.ensureConnectedSessionLocked(ctx, "Recover()"); err != nil {
-		return err
-	}
-	pendingCount, err := c.pendingChangeCount(ctx)
-	if err != nil {
-		return err
-	}
-	if pendingCount > 0 {
-		return &DirtyStateRejectedError{DirtyCount: pendingCount}
-	}
-	outboundCount, err := c.pendingPushOutboundCount(ctx)
-	if err != nil {
-		return err
-	}
-	if outboundCount > 0 {
-		return &PendingPushReplayError{OutboundCount: outboundCount}
-	}
-	return c.rebuildFromSnapshotLocked(ctx, true)
-}
-
-func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource bool) error {
 	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
 		return err
 	}
-	if err := c.setRebuildRequired(ctx, true); err != nil {
+	state, err := c.loadLifecycleState(ctx)
+	if err != nil {
 		return err
 	}
+	if state.PendingTransitionKind != lifecycleTransitionNone {
+		return fmt.Errorf("cannot rebuild while lifecycle operation %q is pending", state.PendingTransitionKind)
+	}
+	return nil
+}
+
+func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource bool, newSourceID string) (RemoteSyncReport, error) {
+	if err := c.setRebuildRequired(ctx, true); err != nil {
+		return RemoteSyncReport{}, err
+	}
 	if err := c.clearSnapshotStage(ctx); err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 
 	session, err := c.createSnapshotSession(ctx)
 	if err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	defer c.deleteSnapshotSessionBestEffort(context.Background(), session.SnapshotID)
 
@@ -292,10 +303,10 @@ func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource boo
 	for {
 		chunk, err := c.fetchSnapshotChunk(ctx, session.SnapshotID, session.SnapshotBundleSeq, afterRowOrdinal, c.snapshotChunkRows())
 		if err != nil {
-			return err
+			return RemoteSyncReport{}, err
 		}
 		if err := c.stageSnapshotChunk(ctx, chunk, afterRowOrdinal); err != nil {
-			return err
+			return RemoteSyncReport{}, err
 		}
 		if !chunk.HasMore {
 			break
@@ -303,7 +314,26 @@ func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource boo
 		afterRowOrdinal = chunk.NextRowOrdinal
 	}
 
-	return c.applyStagedSnapshotLocked(ctx, session, rotateSource)
+	if err := c.applyStagedSnapshotLocked(ctx, session, rotateSource, newSourceID); err != nil {
+		return RemoteSyncReport{}, err
+	}
+	status, err := c.syncStatusLocked(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
+	rotatedSourceID := ""
+	if rotateSource {
+		rotatedSourceID = strings.TrimSpace(newSourceID)
+	}
+	return RemoteSyncReport{
+		Outcome: RemoteSyncOutcomeAppliedSnapshot,
+		Status:  status,
+		Restore: &RestoreSummary{
+			BundleSeq: session.SnapshotBundleSeq,
+			RowCount:  session.RowCount,
+		},
+		RotatedSourceID: rotatedSourceID,
+	}, nil
 }
 
 func (c *Client) snapshotChunkRows() int {
@@ -413,7 +443,7 @@ func (c *Client) stageSnapshotChunk(ctx context.Context, chunk *oversync.Snapsho
 	return nil
 }
 
-func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversync.SnapshotSession, rotateSource bool) error {
+func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversync.SnapshotSession, rotateSource bool, newSourceID string) error {
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin staged snapshot apply transaction: %w", err)
@@ -424,6 +454,13 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
 		return fmt.Errorf("failed to defer foreign keys for staged snapshot apply: %w", err)
+	}
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if attachment.BindingState != attachmentBindingAttached || strings.TrimSpace(attachment.AttachedUserID) == "" {
+		return &AttachRequiredError{Operation: "Rebuild()"}
 	}
 	if err := c.setBundleApplyModeInTx(ctx, tx, true); err != nil {
 		return err
@@ -480,47 +517,26 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 		return fmt.Errorf("staged snapshot row count %d does not match expected row_count %d", stagedRowCount, session.RowCount)
 	}
 
-	newSourceID := c.SourceID
+	targetSourceID := c.SourceID
 	if rotateSource {
-		newSourceID = uuid.NewString()
-		result, err := tx.ExecContext(ctx, `
-			UPDATE _sync_client_state
-			SET source_id = ?, next_source_bundle_id = 1, last_bundle_seq_seen = ?, rebuild_required = 0
-			WHERE user_id = ?
-		`, newSourceID, session.SnapshotBundleSeq, c.UserID)
-		if err != nil {
-			return fmt.Errorf("failed to persist recovery client bundle state: %w", err)
+		targetSourceID = strings.TrimSpace(newSourceID)
+		if targetSourceID == "" {
+			return fmt.Errorf("newSourceID must be provided for rotated rebuild")
 		}
-		rowsAffected, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("failed to inspect recovery client bundle update result: %w", err)
+		if err := ensureSourceState(ctx, tx, targetSourceID); err != nil {
+			return err
 		}
-		if rowsAffected != 1 {
-			return &ConnectRequiredError{Operation: "Recover()"}
+		if strings.TrimSpace(c.SourceID) != "" && c.SourceID != targetSourceID {
+			if err := markSourceReplaced(ctx, tx, c.SourceID, targetSourceID); err != nil {
+				return err
+			}
 		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE _sync_lifecycle_state
-			SET source_id = ?
-			WHERE singleton_key = 1
-		`, newSourceID); err != nil {
-			return fmt.Errorf("failed to persist recovery lifecycle source_id: %w", err)
-		}
-	} else {
-		result, err := tx.ExecContext(ctx, `
-			UPDATE _sync_client_state
-			SET last_bundle_seq_seen = ?, rebuild_required = 0
-			WHERE user_id = ?
-		`, session.SnapshotBundleSeq, c.UserID)
-		if err != nil {
-			return fmt.Errorf("failed to persist snapshot bundle checkpoint: %w", err)
-		}
-		rowsAffected, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("failed to inspect snapshot checkpoint update result: %w", err)
-		}
-		if rowsAffected != 1 {
-			return &ConnectRequiredError{Operation: "Hydrate()"}
-		}
+	}
+	attachment.CurrentSourceID = targetSourceID
+	attachment.LastBundleSeqSeen = session.SnapshotBundleSeq
+	attachment.RebuildRequired = false
+	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
+		return fmt.Errorf("failed to persist snapshot bundle checkpoint: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_snapshot_stage WHERE snapshot_id = ?`, session.SnapshotID); err != nil {
@@ -533,7 +549,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 		return fmt.Errorf("failed to commit staged snapshot apply: %w", err)
 	}
 	if rotateSource {
-		c.SourceID = newSourceID
+		c.SourceID = targetSourceID
 	}
 	return nil
 }

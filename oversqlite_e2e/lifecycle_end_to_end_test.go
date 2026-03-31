@@ -43,7 +43,7 @@ func TestEndToEnd_ConnectBeforeOpenReturnsTypedLifecycleError(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
-	_, err = client.Connect(ctx, userID)
+	_, err = client.Attach(ctx, userID)
 	var openErr *oversqlite.OpenRequiredError
 	require.ErrorAs(t, err, &openErr)
 	require.True(t, oversqlite.IsLifecyclePreconditionError(err))
@@ -67,23 +67,26 @@ func TestEndToEnd_SyncOperationsBeforeConnectReturnTypedLifecycleErrors(t *testi
 		name string
 		run  func() error
 	}{
-		{name: "PushPending", run: func() error { return client.PushPending(ctx) }},
-		{name: "PullToStable", run: func() error { return client.PullToStable(ctx) }},
-		{name: "Sync", run: func() error { return client.Sync(ctx) }},
-		{name: "Hydrate", run: func() error { return client.Hydrate(ctx) }},
-		{name: "Recover", run: func() error { return client.Recover(ctx) }},
+		{name: "PushPending", run: func() error { _, err := client.PushPending(ctx); return err }},
+		{name: "PullToStable", run: func() error { _, err := client.PullToStable(ctx); return err }},
+		{name: "Sync", run: func() error { _, err := client.Sync(ctx); return err }},
+		{name: "RebuildKeepSource", run: func() error { _, err := client.Rebuild(ctx, oversqlite.RebuildKeepSource, ""); return err }},
+		{name: "RebuildRotateSource", run: func() error {
+			_, err := client.Rebuild(ctx, oversqlite.RebuildRotateSource, newE2ESourceID())
+			return err
+		}},
 	}
 	for _, tc := range operations {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.run()
-			var connectErr *oversqlite.ConnectRequiredError
+			var connectErr *oversqlite.AttachRequiredError
 			require.ErrorAs(t, err, &connectErr)
 			require.True(t, oversqlite.IsLifecyclePreconditionError(err))
 		})
 	}
 
 	_, err := client.LastBundleSeqSeen(ctx)
-	var connectErr *oversqlite.ConnectRequiredError
+	var connectErr *oversqlite.AttachRequiredError
 	require.ErrorAs(t, err, &connectErr)
 	require.True(t, oversqlite.IsLifecyclePreconditionError(err))
 	require.Zero(t, requestCount.Load())
@@ -97,15 +100,15 @@ func TestEndToEnd_ConnectInitializeEmptyThenPushWorks(t *testing.T) {
 	userID := "e2e-connect-empty-user-" + uuid.NewString()
 	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeStartedEmpty, connectResult.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachOutcomeStartedEmpty, connectResult.Outcome)
 
 	rowID := uuid.NewString()
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Alpha", "alpha@example.com")
 	require.NoError(t, err)
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPendingE2E(t, client, ctx)
 
 	var count int
 	require.NoError(t, server.Pool.QueryRow(ctx, `
@@ -117,7 +120,7 @@ func TestEndToEnd_ConnectInitializeEmptyThenPushWorks(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
-func TestEndToEnd_ConnectRemoteAuthoritativeHydratesExistingRemote(t *testing.T) {
+func TestEndToEnd_ConnectRemoteAuthoritativeRebuildsExistingRemote(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_connect_remote_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -126,19 +129,19 @@ func TestEndToEnd_ConnectRemoteAuthoritativeHydratesExistingRemote(t *testing.T)
 	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 	clientB, dbB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectA, err := clientA.Connect(ctx, userID)
+	connectA, err := clientA.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectA.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
 
 	rowID := uuid.NewString()
 	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Remote", "remote@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
-	connectB, err := clientB.Connect(ctx, userID)
+	connectB, err := clientB.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectB.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeUsedRemote, connectB.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, connectB.Outcome)
 
 	var name string
 	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
@@ -154,24 +157,24 @@ func TestEndToEnd_ConnectRemoteAuthoritativeReplacesAnonymousLocalRows(t *testin
 	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 	clientB, dbB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectA, err := clientA.Connect(ctx, userID)
+	connectA, err := clientA.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectA.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
 
 	remoteRowID := uuid.NewString()
 	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, remoteRowID, "Remote", "remote@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	localOnlyID := uuid.NewString()
 	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, localOnlyID, "Local", "local@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientB.Open(ctx, "device-b"))
+	mustOpenE2E(t, clientB, ctx, "device-b")
 
-	connectB, err := clientB.Connect(ctx, userID)
+	connectB, err := clientB.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectB.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeUsedRemote, connectB.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, connectB.Outcome)
 
 	var count int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, localOnlyID).Scan(&count))
@@ -193,17 +196,17 @@ func TestEndToEnd_ConnectInitializeLocalThenSeedRemote(t *testing.T) {
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Seed", "seed@example.com")
 	require.NoError(t, err)
 
-	connectA, err := clientA.Connect(ctx, userID)
+	connectA, err := clientA.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectA.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeSeededLocal, connectA.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
+	require.Equal(t, oversqlite.AttachOutcomeSeededLocal, connectA.Outcome)
 
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
-	connectB, err := clientB.Connect(ctx, userID)
+	connectB, err := clientB.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectB.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeUsedRemote, connectB.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, connectB.Outcome)
 
 	var name string
 	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
@@ -219,27 +222,27 @@ func TestEndToEnd_ConnectRemoteAuthoritativeEmptyStillReplacesAnonymousLocalRows
 	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 	clientB, dbB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectA, err := clientA.Connect(ctx, userID)
+	connectA, err := clientA.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectA.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
 
 	remoteRowID := uuid.NewString()
 	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, remoteRowID, "Transient", "transient@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 	_, err = dbA.Exec(`DELETE FROM users WHERE id = ?`, remoteRowID)
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	localOnlyID := uuid.NewString()
 	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, localOnlyID, "Local", "local@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientB.Open(ctx, "device-b"))
+	mustOpenE2E(t, clientB, ctx, "device-b")
 
-	connectB, err := clientB.Connect(ctx, userID)
+	connectB, err := clientB.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectB.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeUsedRemote, connectB.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, connectB.Outcome)
 
 	var count int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
@@ -254,9 +257,9 @@ func TestEndToEnd_ConnectResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 	userID := "e2e-connect-resume-user-" + uuid.NewString()
 	dbClient, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectResult, err := dbClient.Connect(ctx, userID)
+	connectResult, err := dbClient.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 	require.NoError(t, dbClient.Close())
 
 	var restarted *oversqlite.Client
@@ -270,33 +273,33 @@ func TestEndToEnd_ConnectResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 	})}
 	t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 
-	require.NoError(t, restarted.Open(ctx, "device-a"))
+	mustOpenE2E(t, restarted, ctx, "device-a")
 
-	resumeResult, err := restarted.Connect(ctx, userID)
+	resumeResult, err := restarted.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, resumeResult.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeResumedAttached, resumeResult.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, resumeResult.Status)
+	require.Equal(t, oversqlite.AttachOutcomeResumedAttached, resumeResult.Outcome)
 }
 
-func TestEndToEnd_SignOutBlocksWithAttachedDirtyRows(t *testing.T) {
+func TestEndToEnd_DetachBlocksWithAttachedDirtyRows(t *testing.T) {
 	ctx := context.Background()
-	schema := "e2e_signout_blocked_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	schema := "e2e_detach_blocked_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 
-	userID := "e2e-signout-user-" + uuid.NewString()
+	userID := "e2e-detach-user-" + uuid.NewString()
 	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, uuid.NewString(), "Pending", "pending@example.com")
 	require.NoError(t, err)
 
-	err = client.SignOut(ctx)
-	var blockedErr *oversqlite.SignOutBlockedError
-	require.ErrorAs(t, err, &blockedErr)
-	require.Greater(t, blockedErr.PendingRowCount, 0)
+	detachResult, err := client.Detach(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.DetachOutcomeBlockedUnsyncedData, detachResult.Outcome)
+	require.Greater(t, detachResult.PendingRowCount, int64(0))
 }
 
 func TestEndToEnd_ConnectNetworkFailureLeavesAnonymousLocalStateIntact(t *testing.T) {
@@ -310,27 +313,27 @@ func TestEndToEnd_ConnectNetworkFailureLeavesAnonymousLocalStateIntact(t *testin
 	rowID := uuid.NewString()
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Offline", "offline@example.com")
 	require.NoError(t, err)
-	require.NoError(t, client.Open(ctx, "device-a"))
+	mustOpenE2E(t, client, ctx, "device-a")
 
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return nil, context.DeadlineExceeded
 	})}
 
-	_, err = client.Connect(ctx, userID)
+	_, err = client.Attach(ctx, userID)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, context.DeadlineExceeded))
 
 	status, err := client.PendingSyncStatus(ctx)
 	require.NoError(t, err)
 	require.True(t, status.HasPendingSyncData)
-	require.Equal(t, 1, status.PendingRowCount)
-	require.False(t, status.BlocksSignOut)
+	require.EqualValues(t, 1, status.PendingRowCount)
+	require.False(t, status.BlocksDetach)
 
 	client.HTTP = &http.Client{Timeout: 120 * time.Second}
-	result, err := client.Connect(ctx, userID)
+	result, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, result.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeSeededLocal, result.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, result.Status)
+	require.Equal(t, oversqlite.AttachOutcomeSeededLocal, result.Outcome)
 }
 
 func TestEndToEnd_ConnectRetryLaterSurfacesRetryAfterThenInitializeEmpty(t *testing.T) {
@@ -344,20 +347,20 @@ func TestEndToEnd_ConnectRetryLaterSurfacesRetryAfterThenInitializeEmpty(t *test
 	userID := "e2e-connect-retry-later-user-" + uuid.NewString()
 	client, _ := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	first, err := client.Connect(ctx, userID)
+	first, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusRetryLater, first.Status)
+	require.Equal(t, oversqlite.AttachStatusRetryLater, first.Status)
 	require.GreaterOrEqual(t, first.RetryAfter, time.Second)
 
 	time.Sleep(1300 * time.Millisecond)
 
-	second, err := client.Connect(ctx, userID)
+	second, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, second.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeStartedEmpty, second.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, second.Status)
+	require.Equal(t, oversqlite.AttachOutcomeStartedEmpty, second.Outcome)
 }
 
-func TestEndToEnd_SyncThenSignOutSuccessClearsAttachedLocalState(t *testing.T) {
+func TestEndToEnd_SyncThenDetachSuccessClearsAttachedLocalState(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_sync_then_signout_success_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -365,15 +368,16 @@ func TestEndToEnd_SyncThenSignOutSuccessClearsAttachedLocalState(t *testing.T) {
 	userID := "e2e-sync-then-signout-user-" + uuid.NewString()
 	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	rowID := uuid.NewString()
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Synced", "synced@example.com")
 	require.NoError(t, err)
 
-	require.NoError(t, client.SyncThenSignOut(ctx))
+	result := mustSyncThenDetachE2E(t, client, ctx)
+	require.True(t, result.IsSuccess())
 	require.Empty(t, client.UserID)
 
 	var remoteCount int
@@ -385,7 +389,7 @@ func TestEndToEnd_SyncThenSignOutSuccessClearsAttachedLocalState(t *testing.T) {
 	require.Equal(t, 0, localCount)
 }
 
-func TestEndToEnd_SyncThenSignOutFailureLeavesAttachedState(t *testing.T) {
+func TestEndToEnd_SyncThenDetachFailureLeavesAttachedState(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_sync_then_signout_failure_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -393,9 +397,9 @@ func TestEndToEnd_SyncThenSignOutFailureLeavesAttachedState(t *testing.T) {
 	userID := "e2e-sync-then-signout-failure-user-" + uuid.NewString()
 	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, uuid.NewString(), "Pending", "pending@example.com")
 	require.NoError(t, err)
@@ -404,12 +408,12 @@ func TestEndToEnd_SyncThenSignOutFailureLeavesAttachedState(t *testing.T) {
 		return nil, context.DeadlineExceeded
 	})}
 
-	err = client.SyncThenSignOut(ctx)
+	_, err = client.SyncThenDetach(ctx)
 	require.Error(t, err)
 	require.Equal(t, userID, client.UserID)
 }
 
-func TestEndToEnd_DifferentUserCanConnectAfterSuccessfulSignOut(t *testing.T) {
+func TestEndToEnd_DifferentUserCanConnectAfterSuccessfulDetach(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_connect_different_user_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -428,23 +432,89 @@ func TestEndToEnd_DifferentUserCanConnectAfterSuccessfulSignOut(t *testing.T) {
 	}
 	client, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
 	require.NoError(t, err)
-	require.NoError(t, client.Open(ctx, "device-a"))
+	mustOpenE2E(t, client, ctx, "device-a")
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	t.Cleanup(func() { _ = db.Close() })
 
-	first, err := client.Connect(ctx, currentUserID)
+	first, err := client.Attach(ctx, currentUserID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, first.Status)
-	require.NoError(t, client.SignOut(ctx))
+	require.Equal(t, oversqlite.AttachStatusConnected, first.Status)
+	detachResult := mustDetachE2E(t, client, ctx)
+	require.Equal(t, oversqlite.DetachOutcomeDetached, detachResult.Outcome)
 
 	currentUserID = "user-b-" + uuid.NewString()
-	second, err := client.Connect(ctx, currentUserID)
+	second, err := client.Attach(ctx, currentUserID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, second.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, second.Status)
 	require.Equal(t, currentUserID, client.UserID)
 }
 
-func TestEndToEnd_OpenSourceMismatchThenResetForNewSourceRecovers(t *testing.T) {
+func TestEndToEnd_SameUserSameSourceCanDetachAttachAndPushAgain(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_same_source_reattach_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newExampleServer(t, schema)
+
+	userID := "e2e-same-source-user-" + uuid.NewString()
+	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+
+	connectResult, err := client.Attach(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
+
+	rowOne := uuid.NewString()
+	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowOne, "First", "first@example.com")
+	require.NoError(t, err)
+	mustPushPendingE2E(t, client, ctx)
+	require.Equal(t, int64(2), requireNextSourceBundleID(t, db))
+
+	mustDetachE2E(t, client, ctx)
+	mustOpenE2E(t, client, ctx, "device-a")
+
+	connectResult, err = client.Attach(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
+	require.Equal(t, int64(2), requireNextSourceBundleID(t, db))
+
+	rowTwo := uuid.NewString()
+	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowTwo, "Second", "second@example.com")
+	require.NoError(t, err)
+	mustPushPendingE2E(t, client, ctx)
+
+	require.Equal(t, int64(3), requireNextSourceBundleID(t, db))
+
+	var remoteCount int
+	require.NoError(t, server.Pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.users WHERE id IN ($1, $2)`, pgx.Identifier{schema}.Sanitize()), rowOne, rowTwo).Scan(&remoteCount))
+	require.Equal(t, 2, remoteCount)
+}
+
+func TestEndToEnd_DetachedOfflineWritesSurviveReopenWithoutDuplicateCapture(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_detached_offline_writes_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newExampleServer(t, schema)
+
+	userID := "e2e-detached-offline-user-" + uuid.NewString()
+	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+
+	connectResult, err := client.Attach(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
+
+	mustDetachE2E(t, client, ctx)
+
+	rowID := uuid.NewString()
+	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Offline", "offline@example.com")
+	require.NoError(t, err)
+
+	var dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = 'users'`).Scan(&dirtyCount))
+	require.Equal(t, 1, dirtyCount)
+
+	mustOpenE2E(t, client, ctx, "device-a")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = 'users'`).Scan(&dirtyCount))
+	require.Equal(t, 1, dirtyCount)
+}
+
+func TestEndToEnd_OpenSourceMismatchThenRotateSourceRecovers(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_open_reset_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -452,14 +522,14 @@ func TestEndToEnd_OpenSourceMismatchThenResetForNewSourceRecovers(t *testing.T) 
 	userID := "e2e-open-reset-user-" + uuid.NewString()
 	client, _ := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	require.NoError(t, client.Open(ctx, "device-a"))
+	mustOpenE2E(t, client, ctx, "device-a")
 
-	err := client.Open(ctx, "device-b")
+	_, err := client.Open(ctx, "device-b")
 	var mismatchErr *oversqlite.SourceMismatchError
 	require.ErrorAs(t, err, &mismatchErr)
 
-	require.NoError(t, client.ResetForNewSource(ctx, "device-b"))
-	require.NoError(t, client.Open(ctx, "device-b"))
+	mustRotateSourceE2E(t, client, ctx, "device-b")
+	mustOpenE2E(t, client, ctx, "device-b")
 	require.Equal(t, "device-b", client.SourceID)
 }
 
@@ -471,14 +541,14 @@ func TestEndToEnd_UninstallSyncThenReinstallOpenAndConnectOnSameDatabase(t *test
 	userID := "e2e-uninstall-reinstall-user-" + uuid.NewString()
 	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	rowID := uuid.NewString()
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Remote", "remote@example.com")
 	require.NoError(t, err)
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPendingE2E(t, client, ctx)
 
 	require.NoError(t, client.UninstallSync(ctx))
 
@@ -493,12 +563,12 @@ func TestEndToEnd_UninstallSyncThenReinstallOpenAndConnectOnSameDatabase(t *test
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, reinstalled.Close()) })
 
-	require.NoError(t, reinstalled.Open(ctx, "device-a"))
+	mustOpenE2E(t, reinstalled, ctx, "device-a")
 
-	reconnectResult, err := reinstalled.Connect(ctx, userID)
+	reconnectResult, err := reinstalled.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, reconnectResult.Status)
-	require.Equal(t, oversqlite.ConnectOutcomeUsedRemote, reconnectResult.Outcome)
+	require.Equal(t, oversqlite.AttachStatusConnected, reconnectResult.Status)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, reconnectResult.Outcome)
 
 	var name string
 	require.NoError(t, db.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
@@ -518,11 +588,11 @@ func TestEndToEnd_ConcurrentFirstInitializerRaceHasSingleWinner(t *testing.T) {
 	require.NoError(t, err)
 	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, uuid.NewString(), "B", "b@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.Open(ctx, "device-a"))
-	require.NoError(t, clientB.Open(ctx, "device-b"))
+	mustOpenE2E(t, clientA, ctx, "device-a")
+	mustOpenE2E(t, clientB, ctx, "device-b")
 
 	start := make(chan struct{})
-	results := make(chan oversqlite.ConnectResult, 2)
+	results := make(chan oversqlite.AttachResult, 2)
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
 	for _, tc := range []struct {
@@ -536,7 +606,7 @@ func TestEndToEnd_ConcurrentFirstInitializerRaceHasSingleWinner(t *testing.T) {
 		go func(client *oversqlite.Client, userID string) {
 			defer wg.Done()
 			<-start
-			result, err := client.Connect(ctx, userID)
+			result, err := client.Attach(ctx, userID)
 			if err != nil {
 				errs <- err
 				return
@@ -555,9 +625,9 @@ func TestEndToEnd_ConcurrentFirstInitializerRaceHasSingleWinner(t *testing.T) {
 	var seededCount, retryCount int
 	for result := range results {
 		switch {
-		case result.Status == oversqlite.ConnectStatusConnected && result.Outcome == oversqlite.ConnectOutcomeSeededLocal:
+		case result.Status == oversqlite.AttachStatusConnected && result.Outcome == oversqlite.AttachOutcomeSeededLocal:
 			seededCount++
-		case result.Status == oversqlite.ConnectStatusRetryLater:
+		case result.Status == oversqlite.AttachStatusRetryLater:
 			retryCount++
 		}
 	}
@@ -577,15 +647,15 @@ func TestEndToEnd_StaleInitializerLeaseExpiryRejectsSeedPush(t *testing.T) {
 
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, uuid.NewString(), "Seed", "seed@example.com")
 	require.NoError(t, err)
-	require.NoError(t, client.Open(ctx, "device-a"))
+	mustOpenE2E(t, client, ctx, "device-a")
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectOutcomeSeededLocal, connectResult.Outcome)
+	require.Equal(t, oversqlite.AttachOutcomeSeededLocal, connectResult.Outcome)
 
 	time.Sleep(300 * time.Millisecond)
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "initialization_expired")
 }
@@ -604,37 +674,36 @@ func TestEndToEnd_ExpiredInitializerReconnectCanSeedAgain(t *testing.T) {
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Seed", "seed@example.com")
 	require.NoError(t, err)
 
-	connectResult, err := client.Connect(ctx, userID)
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectOutcomeSeededLocal, connectResult.Outcome)
+	require.Equal(t, oversqlite.AttachOutcomeSeededLocal, connectResult.Outcome)
 
 	time.Sleep(300 * time.Millisecond)
 
-	err = client.PushPending(ctx)
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "initialization_expired")
 
-	var pendingInitializationID string
-	require.NoError(t, db.QueryRow(`SELECT pending_initialization_id FROM _sync_lifecycle_state WHERE singleton_key = 1`).Scan(&pendingInitializationID))
+	pendingInitializationID := requirePendingInitializationID(t, db)
 	require.Empty(t, pendingInitializationID)
 
-	reconnectResult, err := client.Connect(ctx, userID)
+	reconnectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectOutcomeStartedEmpty, reconnectResult.Outcome)
+	require.Equal(t, oversqlite.AttachOutcomeStartedEmpty, reconnectResult.Outcome)
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPendingE2E(t, client, ctx)
 
 	peer, peerDB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	peerConnect, err := peer.Connect(ctx, userID)
+	peerConnect, err := peer.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectOutcomeUsedRemote, peerConnect.Outcome)
+	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, peerConnect.Outcome)
 
 	var name string
 	require.NoError(t, peerDB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
 	require.Equal(t, "Seed", name)
 }
 
-func TestEndToEnd_RecoverRotationSurvivesRestart(t *testing.T) {
+func TestEndToEnd_RebuildRotateSourceSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_recover_restart_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -645,7 +714,7 @@ func TestEndToEnd_RecoverRotationSurvivesRestart(t *testing.T) {
 	rowID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Remote", "remote@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	dbPath := filepath.Join(t.TempDir(), "recover-restart.db")
 	openPersistentClient := func() (*oversqlite.Client, *sql.DB) {
@@ -671,20 +740,20 @@ func TestEndToEnd_RecoverRotationSurvivesRestart(t *testing.T) {
 	}
 
 	clientB, dbB := openPersistentClient()
-	require.NoError(t, clientB.Open(ctx, "device-b"))
-	connectResult, err := clientB.Connect(ctx, userID)
+	mustOpenE2E(t, clientB, ctx, "device-b")
+	connectResult, err := clientB.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	originalSourceID := clientB.SourceID
-	require.NoError(t, clientB.Recover(ctx))
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildRotateSource, newE2ESourceID())
 	rotatedSourceID := clientB.SourceID
 	require.NotEqual(t, originalSourceID, rotatedSourceID)
 	require.NoError(t, clientB.Close())
 	require.NoError(t, dbB.Close())
 
 	mismatchClient, mismatchDB := openPersistentClient()
-	err = mismatchClient.Open(ctx, originalSourceID)
+	_, err = mismatchClient.Open(ctx, originalSourceID)
 	var mismatchErr *oversqlite.SourceMismatchError
 	require.ErrorAs(t, err, &mismatchErr)
 	require.NoError(t, mismatchClient.Close())
@@ -693,11 +762,11 @@ func TestEndToEnd_RecoverRotationSurvivesRestart(t *testing.T) {
 	restartedClient, restartedDB := openPersistentClient()
 	defer restartedClient.Close()
 	defer restartedDB.Close()
-	require.NoError(t, restartedClient.Open(ctx, rotatedSourceID))
+	mustOpenE2E(t, restartedClient, ctx, rotatedSourceID)
 
-	restartedResult, err := restartedClient.Connect(ctx, userID)
+	restartedResult, err := restartedClient.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, restartedResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, restartedResult.Status)
 
 	var name string
 	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))

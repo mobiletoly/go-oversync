@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestEndToEnd_HydratePullAndServerCascadeOnCategories(t *testing.T) {
+func TestEndToEnd_RebuildKeepSourcePullAndServerCascadeOnCategories(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_server_cascade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -33,8 +33,8 @@ func TestEndToEnd_HydratePullAndServerCascadeOnCategories(t *testing.T) {
 	_, err = dbA.Exec(`INSERT INTO categories (id, name, parent_id) VALUES (?, ?, ?)`, childID, "Child", rootID)
 	require.NoError(t, err)
 
-	require.NoError(t, clientA.PushPending(ctx))
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -45,7 +45,7 @@ func TestEndToEnd_HydratePullAndServerCascadeOnCategories(t *testing.T) {
 		return err
 	}))
 
-	require.NoError(t, clientB.PullToStable(ctx))
+	mustPullToStableE2E(t, clientB, ctx)
 
 	var count int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM categories`).Scan(&count))
@@ -64,13 +64,13 @@ func TestEndToEnd_PushThenOwnPushThenPullStillFetchesEarlierPeerBundle(t *testin
 	rowAID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	rowBID := uuid.NewString()
 	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowBID, "From B", "from-b@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientB.PushPending(ctx))
-	require.NoError(t, clientB.PullToStable(ctx))
+	mustPushPendingE2E(t, clientB, ctx)
+	mustPullToStableE2E(t, clientB, ctx)
 
 	var nameA, nameB string
 	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowAID).Scan(&nameA))
@@ -78,12 +78,7 @@ func TestEndToEnd_PushThenOwnPushThenPullStillFetchesEarlierPeerBundle(t *testin
 	require.Equal(t, "From A", nameA)
 	require.Equal(t, "From B", nameB)
 
-	var lastBundleSeq int64
-	require.NoError(t, dbB.QueryRow(`
-		SELECT last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, clientB.UserID).Scan(&lastBundleSeq))
+	lastBundleSeq := requireLastBundleSeqSeen(t, dbB)
 	require.Equal(t, int64(2), lastBundleSeq)
 }
 
@@ -100,21 +95,21 @@ func TestEndToEnd_ThreeDevicesPushWithoutPullThenAllPullConverge(t *testing.T) {
 	rowAID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	rowBID := uuid.NewString()
 	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowBID, "From B", "from-b@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientB.PushPending(ctx))
+	mustPushPendingE2E(t, clientB, ctx)
 
 	rowCID := uuid.NewString()
 	_, err = dbC.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowCID, "From C", "from-c@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientC.PushPending(ctx))
+	mustPushPendingE2E(t, clientC, ctx)
 
-	require.NoError(t, clientA.PullToStable(ctx))
-	require.NoError(t, clientB.PullToStable(ctx))
-	require.NoError(t, clientC.PullToStable(ctx))
+	mustPullToStableE2E(t, clientA, ctx)
+	mustPullToStableE2E(t, clientB, ctx)
+	mustPullToStableE2E(t, clientC, ctx)
 
 	for _, db := range []*sql.DB{dbA, dbB, dbC} {
 		var userCount int
@@ -131,8 +126,7 @@ func TestEndToEnd_ThreeDevicesPushWithoutPullThenAllPullConverge(t *testing.T) {
 	require.Equal(t, "From B", name)
 
 	for _, client := range []*oversqlite.Client{clientA, clientB, clientC} {
-		var lastBundleSeq int64
-		require.NoError(t, client.DB.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_client_state WHERE user_id = ?`, client.UserID).Scan(&lastBundleSeq))
+		lastBundleSeq := requireLastBundleSeqSeen(t, client.DB)
 		require.Equal(t, int64(3), lastBundleSeq)
 	}
 }
@@ -149,12 +143,12 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 	rowAID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	rowBID := uuid.NewString()
 	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowBID, "From B", "from-b@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientB.PushPending(ctx))
+	mustPushPendingE2E(t, clientB, ctx)
 	require.NoError(t, clientB.Close())
 
 	restartedConfig := oversqlite.DefaultConfig(schema, syncTables("users"))
@@ -163,11 +157,11 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 	}, restartedConfig)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, restarted.Close()) }()
-	require.NoError(t, restarted.Open(ctx, clientB.SourceID))
-	restartedConnect, err := restarted.Connect(ctx, userID)
+	mustOpenE2E(t, restarted, ctx, clientB.SourceID)
+	restartedConnect, err := restarted.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, restartedConnect.Status)
-	require.NoError(t, restarted.PullToStable(ctx))
+	require.Equal(t, oversqlite.AttachStatusConnected, restartedConnect.Status)
+	mustPullToStableE2E(t, restarted, ctx)
 
 	var nameA, nameB string
 	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowAID).Scan(&nameA))
@@ -175,12 +169,7 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 	require.Equal(t, "From A", nameA)
 	require.Equal(t, "From B", nameB)
 
-	var lastBundleSeq int64
-	require.NoError(t, dbB.QueryRow(`
-		SELECT last_bundle_seq_seen
-		FROM _sync_client_state
-		WHERE user_id = ?
-	`, restarted.UserID).Scan(&lastBundleSeq))
+	lastBundleSeq := requireLastBundleSeqSeen(t, dbB)
 	require.Equal(t, int64(2), lastBundleSeq)
 }
 
@@ -208,10 +197,10 @@ func TestEndToEnd_ExampleServerSchemaTimestampParity(t *testing.T) {
 	client, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users", "posts")))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	require.NoError(t, client.Open(ctx, "device-a"))
-	connectResult, err := client.Connect(ctx, userID)
+	mustOpenE2E(t, client, ctx, "device-a")
+	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.ConnectStatusConnected, connectResult.Status)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	userRowID := uuid.NewString()
 	postRowID := uuid.NewString()
@@ -221,7 +210,7 @@ func TestEndToEnd_ExampleServerSchemaTimestampParity(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO posts (id, title, content, author_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, postRowID, "Hello", "Post body", userRowID, now, now)
 	require.NoError(t, err)
 
-	require.NoError(t, client.PushPending(ctx))
+	mustPushPendingE2E(t, client, ctx)
 
 	var gotCreatedAt, gotUpdatedAt string
 	require.NoError(t, server.Pool.QueryRow(ctx, fmt.Sprintf(`SELECT created_at::text, updated_at::text FROM %s.users WHERE id = $1`, pgx.Identifier{schema}.Sanitize()), userRowID).Scan(&gotCreatedAt, &gotUpdatedAt))
@@ -256,7 +245,7 @@ func TestEndToEnd_PushSessionCreateTransportRetryLeavesClientRecoverable(t *test
 		return baseTransport.RoundTrip(r)
 	})}
 
-	err = clientA.PushPending(ctx)
+	_, err = clientA.PushPending(ctx)
 	require.Error(t, err)
 
 	var dirtyCount int
@@ -264,8 +253,8 @@ func TestEndToEnd_PushSessionCreateTransportRetryLeavesClientRecoverable(t *test
 	require.Equal(t, 0, dirtyCount)
 
 	clientA.HTTP = &http.Client{Transport: baseTransport}
-	require.NoError(t, clientA.PushPending(ctx))
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 }
 
 func TestEndToEnd_StaleFollowerConvergesAfterChunkedPushAndPruneFallback(t *testing.T) {
@@ -291,7 +280,7 @@ func TestEndToEnd_StaleFollowerConvergesAfterChunkedPushAndPruneFallback(t *test
 	}
 
 	clientA.ResetPushTransferDiagnostics()
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 	pushStats := clientA.PushTransferDiagnostics()
 	require.Greater(t, pushStats.ChunksUploaded, int64(1))
 
@@ -307,7 +296,7 @@ func TestEndToEnd_StaleFollowerConvergesAfterChunkedPushAndPruneFallback(t *test
 	require.NoError(t, err)
 
 	clientB.ResetSnapshotTransferDiagnostics()
-	require.NoError(t, clientB.PullToStable(ctx))
+	mustPullToStableE2E(t, clientB, ctx)
 	snapshotStats := clientB.SnapshotTransferDiagnostics()
 	require.Greater(t, snapshotStats.ChunksFetched, int64(1))
 
@@ -335,8 +324,8 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	conflictUserID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Grace", "grace@example.com")
 	require.NoError(t, err)
-	require.NoError(t, clientA.PushPending(ctx))
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -361,7 +350,7 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	require.NoError(t, err)
 
 	clientB.ResetPushTransferDiagnostics()
-	require.NoError(t, clientB.PushPending(ctx))
+	mustPushPendingE2E(t, clientB, ctx)
 
 	pushStats := clientB.PushTransferDiagnostics()
 	require.Equal(t, int64(2), pushStats.SessionsCreated)
@@ -369,14 +358,13 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 
 	var dirtyCount, outboundCount, stagedCount int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_push_outbound`).Scan(&outboundCount))
+	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&stagedCount))
 	require.Equal(t, 0, dirtyCount)
 	require.Equal(t, 0, outboundCount)
 	require.Equal(t, 0, stagedCount)
 
-	var nextSourceBundleID int64
-	require.NoError(t, dbB.QueryRow(`SELECT next_source_bundle_id FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&nextSourceBundleID))
+	nextSourceBundleID := requireNextSourceBundleID(t, dbB)
 	require.Equal(t, int64(2), nextSourceBundleID)
 
 	var serverName string
@@ -388,7 +376,7 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	require.Equal(t, 2, extraCount)
 }
 
-func TestEndToEnd_PullRetryPruneFallbackAndRecover(t *testing.T) {
+func TestEndToEnd_PullRetryPruneFallbackAndRebuild(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_pull_retry_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -400,12 +388,12 @@ func TestEndToEnd_PullRetryPruneFallbackAndRecover(t *testing.T) {
 	insertUser := func(id, name string) {
 		_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, id, name, strings.ToLower(name)+"@example.com")
 		require.NoError(t, err)
-		require.NoError(t, clientA.PushPending(ctx))
+		mustPushPendingE2E(t, clientA, ctx)
 	}
 
 	userOne := uuid.NewString()
 	insertUser(userOne, "Ada")
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 
 	userTwo := uuid.NewString()
 	insertUser(userTwo, "Grace")
@@ -420,11 +408,11 @@ func TestEndToEnd_PullRetryPruneFallbackAndRecover(t *testing.T) {
 		return baseTransport.RoundTrip(r)
 	})}
 
-	err := clientB.PullToStable(ctx)
+	_, err := clientB.PullToStable(ctx)
 	require.Error(t, err)
 
 	clientB.HTTP = &http.Client{Transport: baseTransport}
-	require.NoError(t, clientB.PullToStable(ctx))
+	mustPullToStableE2E(t, clientB, ctx)
 
 	var localCount int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&localCount))
@@ -436,7 +424,7 @@ func TestEndToEnd_PullRetryPruneFallbackAndRecover(t *testing.T) {
 	_, err = server.Pool.Exec(ctx, `UPDATE sync.user_state SET retained_bundle_floor = 3 WHERE user_id = $1`, userID)
 	require.NoError(t, err)
 
-	require.NoError(t, clientB.PullToStable(ctx))
+	mustPullToStableE2E(t, clientB, ctx)
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&localCount))
 	require.Equal(t, 3, localCount)
 
@@ -446,15 +434,15 @@ func TestEndToEnd_PullRetryPruneFallbackAndRecover(t *testing.T) {
 
 	oldSourceID := clientB.SourceID
 	tx := mustBeginTx(t, dbB)
-	_, err = tx.ExecContext(ctx, `UPDATE _sync_client_state SET apply_mode = 1 WHERE user_id = ?`, userID)
+	_, err = tx.ExecContext(ctx, `UPDATE _sync_apply_state SET apply_mode = 1 WHERE singleton_key = 1`)
 	require.NoError(t, err)
 	_, err = tx.ExecContext(ctx, `DELETE FROM users`)
 	require.NoError(t, err)
-	_, err = tx.ExecContext(ctx, `UPDATE _sync_client_state SET apply_mode = 0 WHERE user_id = ?`, userID)
+	_, err = tx.ExecContext(ctx, `UPDATE _sync_apply_state SET apply_mode = 0 WHERE singleton_key = 1`)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, clientB.Recover(ctx))
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildRotateSource, newE2ESourceID())
 	require.NotEqual(t, oldSourceID, clientB.SourceID)
 
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&localCount))
@@ -486,10 +474,10 @@ func TestEndToEnd_LargeFKConnectedHydrateUsesChunkedSnapshot(t *testing.T) {
 			require.NoError(t, err)
 		}
 	}
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	clientB.ResetSnapshotTransferDiagnostics()
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 	stats := clientB.SnapshotTransferDiagnostics()
 	require.Greater(t, stats.SessionsCreated, int64(0))
 	require.Greater(t, stats.ChunksFetched, int64(1))
@@ -501,7 +489,7 @@ func TestEndToEnd_LargeFKConnectedHydrateUsesChunkedSnapshot(t *testing.T) {
 	require.Equal(t, 30, count)
 }
 
-func TestEndToEnd_HydrateRetryClearsStaleStageAndStartsNewSession(t *testing.T) {
+func TestEndToEnd_RebuildRetryClearsStaleStageAndStartsNewSession(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_chunked_retry_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -516,7 +504,7 @@ func TestEndToEnd_HydrateRetryClearsStaleStageAndStartsNewSession(t *testing.T) 
 		_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, uuid.NewString(), fmt.Sprintf("User %d", i), fmt.Sprintf("user%d@example.com", i))
 		require.NoError(t, err)
 	}
-	require.NoError(t, clientA.PushPending(ctx))
+	mustPushPendingE2E(t, clientA, ctx)
 
 	baseTransport := http.DefaultTransport
 	chunkFetches := 0
@@ -530,7 +518,7 @@ func TestEndToEnd_HydrateRetryClearsStaleStageAndStartsNewSession(t *testing.T) 
 		return baseTransport.RoundTrip(r)
 	})}
 
-	err := clientB.Hydrate(ctx)
+	_, err := clientB.Rebuild(ctx, oversqlite.RebuildKeepSource, "")
 	require.Error(t, err)
 	require.Greater(t, snapshotStageCount(t, dbB), 0)
 
@@ -540,7 +528,7 @@ func TestEndToEnd_HydrateRetryClearsStaleStageAndStartsNewSession(t *testing.T) 
 
 	clientB.HTTP = &http.Client{Timeout: 120 * time.Second}
 	clientB.ResetSnapshotTransferDiagnostics()
-	require.NoError(t, clientB.Hydrate(ctx))
+	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
 	require.Equal(t, 0, snapshotStageCount(t, dbB))
 
 	stats := clientB.SnapshotTransferDiagnostics()

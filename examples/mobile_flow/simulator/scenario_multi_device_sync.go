@@ -89,10 +89,10 @@ func (s *MultiDeviceSyncScenario) Setup(ctx context.Context) error {
 	s.device2App = device2App
 
 	// Launch both apps
-	if err := s.app.OnLaunch(ctx); err != nil {
+	if err := s.app.onLaunch(ctx); err != nil {
 		return fmt.Errorf("failed to launch device 1 app: %w", err)
 	}
-	if err := s.device2App.OnLaunch(ctx); err != nil {
+	if err := s.device2App.onLaunch(ctx); err != nil {
 		return fmt.Errorf("failed to launch device 2 app: %w", err)
 	}
 
@@ -116,7 +116,7 @@ func (s *MultiDeviceSyncScenario) createDeviceApp(scenarioConfig *config.Scenari
 	}
 
 	// Create mobile app config
-	appConfig := &MobileAppConfig{
+	appConfig := &mobileAppConfig{
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           scenarioConfig.UserID,
@@ -129,7 +129,7 @@ func (s *MultiDeviceSyncScenario) createDeviceApp(scenarioConfig *config.Scenari
 	}
 
 	// Create mobile app
-	app, err := NewMobileApp(appConfig)
+	app, err := newMobileApp(appConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create mobile app: %w", err)
 	}
@@ -146,28 +146,28 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 
 	// Step 1: Sign in with user A on device 1
 	logger.Info("👤 Step 1: Device 1 - Sign in with User A")
-	err := s.app.SignIn(ctx, s.userA)
+	err := s.app.signIn(ctx, s.userA)
 	if err != nil {
 		return fmt.Errorf("failed to sign in user A on device 1: %w", err)
 	}
 
 	// Step 2: Sign in with user A on device 2
 	logger.Info("👤 Step 2: Device 2 - Sign in with User A")
-	err = s.device2App.SignIn(ctx, s.userA)
+	err = s.device2App.signIn(ctx, s.userA)
 	if err != nil {
 		return fmt.Errorf("failed to sign in user A on device 2: %w", err)
 	}
 
 	// Step 3: Sync device 1
 	logger.Info("🔄 Step 3: Sync Device 1 (User A)")
-	err = s.app.Hydrate(ctx)
+	err = s.app.rebuildKeepSource(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync device 1: %w", err)
 	}
 
 	// Step 4: Sync device 2
 	logger.Info("🔄 Step 4: Sync Device 2 (User A)")
-	err = s.device2App.Hydrate(ctx)
+	err = s.device2App.rebuildKeepSource(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync device 2: %w", err)
 	}
@@ -175,7 +175,7 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 	// Step 5: Device 1 adds person record
 	logger.Info("📱 Step 5: Device 1 creates person record")
 	s.personAID = uuid.New().String()
-	err = s.app.CreateUserWithContext(ctx, s.personAID, "Person A (Device 1)", "persona@example.com")
+	err = s.app.createUserWithContext(ctx, s.personAID, "Person A (Device 1)", "persona@example.com")
 	if err != nil {
 		return fmt.Errorf("failed to create person on device 1: %w", err)
 	}
@@ -183,40 +183,40 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 	// Step 6: Device 2 adds person record
 	logger.Info("📱 Step 6: Device 2 creates person record")
 	s.personBID = uuid.New().String()
-	err = s.device2App.CreateUserWithContext(ctx, s.personBID, "Person B (Device 2)", "personb@example.com")
+	err = s.device2App.createUserWithContext(ctx, s.personBID, "Person B (Device 2)", "personb@example.com")
 	if err != nil {
 		return fmt.Errorf("failed to create person on device 2: %w", err)
 	}
 
 	// Step 7: Sync device 1 (upload person A)
 	logger.Info("🔄 Step 7: Sync Device 1 (upload person A)")
-	err = s.app.PushPending(ctx)
+	err = s.app.pushPending(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync device 1: %w", err)
 	}
-	if _, _, err := s.app.PullToStable(ctx); err != nil {
+	if _, _, err := s.app.pullToStable(ctx); err != nil {
 		return fmt.Errorf("post-upload pull (device 1) failed: %w", err)
 	}
 
 	// Step 8: Sync device 2 (upload person B)
 	logger.Info("🔄 Step 8: Sync Device 2 (upload person B)")
-	err = s.device2App.PushPending(ctx)
+	err = s.device2App.pushPending(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync device 2: %w", err)
 	}
-	if _, _, err := s.device2App.PullToStable(ctx); err != nil {
+	if _, _, err := s.device2App.pullToStable(ctx); err != nil {
 		return fmt.Errorf("post-upload pull (device 2) failed: %w", err)
 	}
 
 	// Step 9: Delete person A record (this is the critical test)
 	logger.Info("🗑️ Step 9: User A deletes person A record")
-	err = s.app.DeleteUserWithContext(ctx, s.personAID)
+	err = s.app.deleteUserWithContext(ctx, s.personAID)
 	if err != nil {
 		return fmt.Errorf("failed to delete person A: %w", err)
 	}
 
 	// Verify the record is deleted locally
-	hasPersonA, err := s.app.HasUser(ctx, s.personAID)
+	hasPersonA, err := s.app.hasUser(ctx, s.personAID)
 	if err != nil {
 		return fmt.Errorf("failed to check if person A exists: %w", err)
 	}
@@ -227,16 +227,16 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 
 	// Step 10: Sync user A (upload delete operation)
 	logger.Info("🔄 Step 10: Sync User A (upload delete operation)")
-	err = s.app.PushPending(ctx)
+	err = s.app.pushPending(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to sync user A after delete: %w", err)
 	}
-	if _, _, err := s.app.PullToStable(ctx); err != nil {
+	if _, _, err := s.app.pullToStable(ctx); err != nil {
 		return fmt.Errorf("post-delete pull (device 1) failed: %w", err)
 	}
 
 	// Verify the record is still deleted after sync
-	hasPersonAAfterSync, err := s.app.HasUser(ctx, s.personAID)
+	hasPersonAAfterSync, err := s.app.hasUser(ctx, s.personAID)
 	if err != nil {
 		return fmt.Errorf("failed to check if person A exists after sync: %w", err)
 	}
@@ -250,7 +250,7 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 
 	// Final convergence: ensure Device 2 pulls the deletion as in full sync flows
 	logger.Info("🔄 Final convergence sync: Device 2 downloads deletions")
-	if _, _, err := s.device2App.PullToStable(ctx); err != nil {
+	if _, _, err := s.device2App.pullToStable(ctx); err != nil {
 		return fmt.Errorf("final convergence pull (device 2) failed: %w", err)
 	}
 
@@ -269,13 +269,13 @@ func (s *MultiDeviceSyncScenario) Execute(ctx context.Context) error {
 // verifyDataConsistency checks the final state after delete operations
 func (s *MultiDeviceSyncScenario) verifyDataConsistency(ctx context.Context, logger *slog.Logger) error {
 	// Get user count from device 1
-	device1Count, err := s.app.GetUserCount(ctx)
+	device1Count, err := s.app.userCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get user count from device 1: %w", err)
 	}
 
 	// Get user count from device 2
-	device2Count, err := s.device2App.GetUserCount(ctx)
+	device2Count, err := s.device2App.userCount(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get user count from device 2: %w", err)
 	}
@@ -293,7 +293,7 @@ func (s *MultiDeviceSyncScenario) verifyDataConsistency(ctx context.Context, log
 	}
 
 	// Verify person A is deleted on device 1
-	hasPersonA, err := s.app.HasUser(ctx, s.personAID)
+	hasPersonA, err := s.app.hasUser(ctx, s.personAID)
 	if err != nil {
 		return fmt.Errorf("failed to check if person A exists: %w", err)
 	}
@@ -302,11 +302,11 @@ func (s *MultiDeviceSyncScenario) verifyDataConsistency(ctx context.Context, log
 	}
 
 	// Verify person B still exists on both devices
-	hasPersonB1, err := s.app.HasUser(ctx, s.personBID)
+	hasPersonB1, err := s.app.hasUser(ctx, s.personBID)
 	if err != nil {
 		return fmt.Errorf("failed to check if person B exists on device 1: %w", err)
 	}
-	hasPersonB2, err := s.device2App.HasUser(ctx, s.personBID)
+	hasPersonB2, err := s.device2App.hasUser(ctx, s.personBID)
 	if err != nil {
 		return fmt.Errorf("failed to check if person B exists on device 2: %w", err)
 	}
@@ -348,11 +348,11 @@ func (s *MultiDeviceSyncScenario) Cleanup(ctx context.Context) error {
 	var err1, err2 error
 
 	if s.app != nil {
-		err1 = s.app.Close()
+		err1 = s.app.close()
 	}
 
 	if s.device2App != nil {
-		err2 = s.device2App.Close()
+		err2 = s.device2App.close()
 	}
 
 	if err1 != nil {

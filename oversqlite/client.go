@@ -22,7 +22,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -62,6 +61,7 @@ type DatabaseAlreadyOwnedError struct {
 	Database string
 }
 
+// Error implements error.
 func (e *DatabaseAlreadyOwnedError) Error() string {
 	if e == nil || strings.TrimSpace(e.Database) == "" {
 		return "another oversqlite client is already active for this SQLite database"
@@ -72,6 +72,7 @@ func (e *DatabaseAlreadyOwnedError) Error() string {
 // ClientClosedError indicates that Close() has already been called on the client.
 type ClientClosedError struct{}
 
+// Error implements error.
 func (e *ClientClosedError) Error() string {
 	return "oversqlite client has been closed"
 }
@@ -98,6 +99,7 @@ type snapshotTransferStats struct {
 	chunksFetched   int64
 }
 
+// SnapshotTransferStats exposes snapshot-session transfer counters for diagnostics.
 type SnapshotTransferStats struct {
 	SessionsCreated int64
 	ChunksFetched   int64
@@ -109,6 +111,7 @@ type pushTransferStats struct {
 	committedBundleChunksRead int64
 }
 
+// PushTransferStats exposes push-session transfer counters for diagnostics.
 type PushTransferStats struct {
 	SessionsCreated           int64
 	ChunksUploaded            int64
@@ -116,12 +119,15 @@ type PushTransferStats struct {
 }
 
 var syncMetadataTableNames = []string{
-	"_sync_client_state",
-	"_sync_lifecycle_state",
+	"_sync_source_state",
+	"_sync_attachment_state",
+	"_sync_operation_state",
+	"_sync_apply_state",
 	"_sync_row_state",
 	"_sync_dirty_rows",
 	"_sync_snapshot_stage",
-	"_sync_push_outbound",
+	"_sync_outbox_bundle",
+	"_sync_outbox_rows",
 	"_sync_push_stage",
 	"_sync_managed_tables",
 }
@@ -304,6 +310,7 @@ func (c *Client) ResetSnapshotTransferDiagnostics() {
 	atomic.StoreInt64(&c.snapshotStats.chunksFetched, 0)
 }
 
+// PushTransferDiagnostics returns cumulative push transfer counters for the current client instance.
 func (c *Client) PushTransferDiagnostics() PushTransferStats {
 	if c == nil {
 		return PushTransferStats{}
@@ -315,6 +322,7 @@ func (c *Client) PushTransferDiagnostics() PushTransferStats {
 	}
 }
 
+// ResetPushTransferDiagnostics resets the push transfer counters.
 func (c *Client) ResetPushTransferDiagnostics() {
 	if c == nil {
 		return
@@ -324,6 +332,7 @@ func (c *Client) ResetPushTransferDiagnostics() {
 	atomic.StoreInt64(&c.pushStats.committedBundleChunksRead, 0)
 }
 
+// SetBeforePushReplayHook installs a test or debug hook that runs after remote commit and before local replay.
 func (c *Client) SetBeforePushReplayHook(hook func(context.Context) error) {
 	if c == nil {
 		return
@@ -331,6 +340,7 @@ func (c *Client) SetBeforePushReplayHook(hook func(context.Context) error) {
 	c.beforePushReplayHook = hook
 }
 
+// SetBeforePushFreezeHook installs a test or debug hook that runs after freezing the local outbox and before commit.
 func (c *Client) SetBeforePushFreezeHook(hook func(context.Context) error) {
 	if c == nil {
 		return
@@ -338,6 +348,7 @@ func (c *Client) SetBeforePushFreezeHook(hook func(context.Context) error) {
 	c.beforePushFreezeHook = hook
 }
 
+// SetBeforePushCommitHook installs a test or debug hook that runs just before push-session commit.
 func (c *Client) SetBeforePushCommitHook(hook func(context.Context) error) {
 	if c == nil {
 		return
@@ -542,7 +553,7 @@ func validateClientSchemaScope(db *sql.DB, schemaName string) error {
 	rows, err := db.Query(`
 			SELECT DISTINCT schema_name
 			FROM (
-				SELECT schema_name FROM _sync_client_state
+				SELECT schema_name FROM _sync_attachment_state
 				UNION ALL
 				SELECT schema_name FROM _sync_row_state
 				UNION ALL
@@ -550,7 +561,7 @@ func validateClientSchemaScope(db *sql.DB, schemaName string) error {
 				UNION ALL
 				SELECT schema_name FROM _sync_snapshot_stage
 				UNION ALL
-				SELECT schema_name FROM _sync_push_outbound
+				SELECT schema_name FROM _sync_outbox_rows
 				UNION ALL
 				SELECT schema_name FROM _sync_push_stage
 			)
@@ -764,51 +775,6 @@ func (c *Client) syncKeyColumnsForTable(tableName string) ([]string, error) {
 	return append([]string(nil), keyColumns...), nil
 }
 
-// EnsureSourceID generates and persists a source ID if not already present
-func EnsureSourceID(db *sql.DB, userID string) (string, error) {
-	return ensureClientSourceID(db, userID, "", "")
-}
-
-func ensureClientSourceID(db *sql.DB, userID, preferredSourceID, schemaName string) (string, error) {
-	userID = strings.TrimSpace(userID)
-	if userID == "" {
-		return "", fmt.Errorf("userID must be provided")
-	}
-
-	sourceID := strings.TrimSpace(preferredSourceID)
-	if sourceID == "" {
-		sourceID = uuid.NewString()
-	}
-
-	schemaName = strings.TrimSpace(schemaName)
-	if _, err := db.Exec(`
-		INSERT INTO _sync_client_state (user_id, source_id, schema_name, next_source_bundle_id, last_bundle_seq_seen, apply_mode, rebuild_required)
-		VALUES (?, ?, ?, 1, 0, 0, 0)
-		ON CONFLICT(user_id) DO NOTHING
-	`, userID, sourceID, schemaName); err != nil {
-		return "", fmt.Errorf("failed to ensure client state: %w", err)
-	}
-	if schemaName != "" {
-		if _, err := db.Exec(`
-			UPDATE _sync_client_state
-			SET schema_name = ?
-			WHERE user_id = ? AND TRIM(schema_name) = ''
-		`, schemaName, userID); err != nil {
-			return "", fmt.Errorf("failed to persist client schema identity: %w", err)
-		}
-	}
-
-	var persistedSourceID string
-	var persistedSchema string
-	if err := db.QueryRow(`SELECT source_id, schema_name FROM _sync_client_state WHERE user_id = ?`, userID).Scan(&persistedSourceID, &persistedSchema); err != nil {
-		return "", fmt.Errorf("failed to load client source id: %w", err)
-	}
-	if schemaName != "" && strings.TrimSpace(persistedSchema) != schemaName {
-		return "", fmt.Errorf("client state for user %s is bound to schema %s, not %s", userID, persistedSchema, schemaName)
-	}
-	return persistedSourceID, nil
-}
-
 // initializeDatabase creates sync metadata tables according to the spec (private function)
 func initializeDatabase(db *sql.DB) error {
 	// Enable WAL mode and foreign keys
@@ -821,33 +787,37 @@ func initializeDatabase(db *sql.DB) error {
 
 	// Create sync metadata tables according to spec
 	tables := []string{
-		`CREATE TABLE IF NOT EXISTS _sync_client_state (
-			user_id               TEXT NOT NULL,
-			source_id             TEXT NOT NULL,
-			schema_name           TEXT NOT NULL DEFAULT '',
-			next_source_bundle_id INTEGER NOT NULL DEFAULT 1,
-			last_bundle_seq_seen  INTEGER NOT NULL DEFAULT 0,
-			apply_mode            INTEGER NOT NULL DEFAULT 0,
-			rebuild_required      INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (user_id)
-		)`,
+		`CREATE TABLE IF NOT EXISTS _sync_source_state (
+				source_id             TEXT NOT NULL PRIMARY KEY,
+				next_source_bundle_id INTEGER NOT NULL DEFAULT 1,
+				replaced_by_source_id TEXT NOT NULL DEFAULT '',
+				created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+			)`,
 
-		`CREATE TABLE IF NOT EXISTS _sync_lifecycle_state (
-			singleton_key            INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
-			source_id                TEXT NOT NULL DEFAULT '',
-			binding_state            TEXT NOT NULL DEFAULT 'anonymous',
-			binding_scope            TEXT NOT NULL DEFAULT '',
-			pending_transition_kind  TEXT NOT NULL DEFAULT 'none',
-			pending_target_scope     TEXT NOT NULL DEFAULT '',
-			pending_target_source_id TEXT NOT NULL DEFAULT '',
-			pending_staged_snapshot_id TEXT NOT NULL DEFAULT '',
-			pending_snapshot_bundle_seq INTEGER NOT NULL DEFAULT 0,
-			pending_snapshot_row_count INTEGER NOT NULL DEFAULT 0,
-			pending_apply_cursor     INTEGER NOT NULL DEFAULT 0,
-			pending_initialization_id TEXT NOT NULL DEFAULT '',
-			preexisting_capture_done INTEGER NOT NULL DEFAULT 0,
-			runtime_bypass_active    INTEGER NOT NULL DEFAULT 0
-		)`,
+		`CREATE TABLE IF NOT EXISTS _sync_attachment_state (
+				singleton_key            INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
+				current_source_id        TEXT NOT NULL DEFAULT '',
+				binding_state            TEXT NOT NULL DEFAULT 'anonymous' CHECK (binding_state IN ('anonymous', 'attached')),
+				attached_user_id         TEXT NOT NULL DEFAULT '',
+				schema_name              TEXT NOT NULL DEFAULT '',
+				last_bundle_seq_seen     INTEGER NOT NULL DEFAULT 0,
+				rebuild_required         INTEGER NOT NULL DEFAULT 0,
+				pending_initialization_id TEXT NOT NULL DEFAULT ''
+			)`,
+
+		`CREATE TABLE IF NOT EXISTS _sync_operation_state (
+				singleton_key        INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
+				kind                 TEXT NOT NULL DEFAULT 'none' CHECK (kind IN ('none', 'remote_replace')),
+				target_user_id       TEXT NOT NULL DEFAULT '',
+				staged_snapshot_id   TEXT NOT NULL DEFAULT '',
+				snapshot_bundle_seq  INTEGER NOT NULL DEFAULT 0,
+				snapshot_row_count   INTEGER NOT NULL DEFAULT 0
+			)`,
+
+		`CREATE TABLE IF NOT EXISTS _sync_apply_state (
+				singleton_key INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
+				apply_mode    INTEGER NOT NULL DEFAULT 0
+			)`,
 
 		`CREATE TABLE IF NOT EXISTS _sync_row_state (
 			schema_name TEXT NOT NULL,
@@ -882,17 +852,31 @@ func initializeDatabase(db *sql.DB) error {
 			PRIMARY KEY (snapshot_id, row_ordinal)
 		)`,
 
-		`CREATE TABLE IF NOT EXISTS _sync_push_outbound (
-			source_bundle_id INTEGER NOT NULL,
-			row_ordinal      INTEGER NOT NULL,
-			schema_name      TEXT NOT NULL,
-			table_name       TEXT NOT NULL,
-			key_json         TEXT NOT NULL,
-			op               TEXT NOT NULL CHECK (op IN ('INSERT','UPDATE','DELETE')),
-			base_row_version INTEGER NOT NULL DEFAULT 0,
-			payload          TEXT,
-			PRIMARY KEY (source_bundle_id, row_ordinal)
-		)`,
+		`CREATE TABLE IF NOT EXISTS _sync_outbox_bundle (
+				singleton_key           INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
+				state                   TEXT NOT NULL DEFAULT 'none' CHECK (state IN ('none', 'prepared', 'committed_remote')),
+				source_id               TEXT NOT NULL DEFAULT '',
+				source_bundle_id        INTEGER NOT NULL DEFAULT 0,
+				canonical_request_hash  TEXT NOT NULL DEFAULT '',
+				row_count               INTEGER NOT NULL DEFAULT 0,
+				initialization_id       TEXT NOT NULL DEFAULT '',
+				remote_bundle_hash      TEXT NOT NULL DEFAULT '',
+				remote_bundle_seq       INTEGER NOT NULL DEFAULT 0
+			)`,
+
+		`CREATE TABLE IF NOT EXISTS _sync_outbox_rows (
+				source_bundle_id INTEGER NOT NULL,
+				row_ordinal      INTEGER NOT NULL,
+				schema_name      TEXT NOT NULL,
+				table_name       TEXT NOT NULL,
+				key_json         TEXT NOT NULL,
+				wire_key_json    TEXT NOT NULL,
+				op               TEXT NOT NULL CHECK (op IN ('INSERT','UPDATE','DELETE')),
+				base_row_version INTEGER NOT NULL DEFAULT 0,
+				local_payload    TEXT,
+				wire_payload     TEXT,
+				PRIMARY KEY (source_bundle_id, row_ordinal)
+			)`,
 
 		`CREATE TABLE IF NOT EXISTS _sync_push_stage (
 			bundle_seq   INTEGER NOT NULL,
@@ -919,35 +903,42 @@ func initializeDatabase(db *sql.DB) error {
 		}
 	}
 
-	if _, err := db.Exec(`ALTER TABLE _sync_client_state ADD COLUMN rebuild_required INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-		return fmt.Errorf("failed to add rebuild_required column: %w", err)
+	if _, err := db.Exec(`
+			INSERT INTO _sync_attachment_state (
+				singleton_key, current_source_id, binding_state, attached_user_id, schema_name, last_bundle_seq_seen, rebuild_required, pending_initialization_id
+			) VALUES (1, '', 'anonymous', '', '', 0, 0, '')
+			ON CONFLICT(singleton_key) DO NOTHING
+		`); err != nil {
+		return fmt.Errorf("failed to initialize attachment state row: %w", err)
 	}
 	if _, err := db.Exec(`
-		INSERT INTO _sync_lifecycle_state (
-			singleton_key, source_id, binding_state, binding_scope, pending_transition_kind, pending_target_scope, pending_target_source_id, pending_staged_snapshot_id, pending_snapshot_bundle_seq, pending_snapshot_row_count, pending_apply_cursor, pending_initialization_id, preexisting_capture_done, runtime_bypass_active
-		) VALUES (1, '', 'anonymous', '', 'none', '', '', '', 0, 0, 0, '', 0, 0)
-		ON CONFLICT(singleton_key) DO NOTHING
-	`); err != nil {
-		return fmt.Errorf("failed to initialize lifecycle state row: %w", err)
+			INSERT INTO _sync_operation_state (
+				singleton_key, kind, target_user_id, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count
+			) VALUES (1, 'none', '', '', 0, 0)
+			ON CONFLICT(singleton_key) DO NOTHING
+		`); err != nil {
+		return fmt.Errorf("failed to initialize operation state row: %w", err)
 	}
-	lifecycleColumnStatements := []string{
-		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_target_scope TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_target_source_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_staged_snapshot_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_snapshot_bundle_seq INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_snapshot_row_count INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE _sync_lifecycle_state ADD COLUMN pending_apply_cursor INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE _sync_lifecycle_state ADD COLUMN runtime_bypass_active INTEGER NOT NULL DEFAULT 0`,
+	if _, err := db.Exec(`
+			INSERT INTO _sync_apply_state (
+				singleton_key, apply_mode
+			) VALUES (1, 0)
+			ON CONFLICT(singleton_key) DO NOTHING
+		`); err != nil {
+		return fmt.Errorf("failed to initialize apply state row: %w", err)
 	}
-	for _, stmt := range lifecycleColumnStatements {
-		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-			return fmt.Errorf("failed to evolve lifecycle state table: %w", err)
-		}
+	if _, err := db.Exec(`
+			INSERT INTO _sync_outbox_bundle (
+				singleton_key, state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id, remote_bundle_hash, remote_bundle_seq
+			) VALUES (1, 'none', '', 0, '', 0, '', '', 0)
+			ON CONFLICT(singleton_key) DO NOTHING
+		`); err != nil {
+		return fmt.Errorf("failed to initialize outbox bundle row: %w", err)
 	}
 
 	// Reset apply_mode to 0 in case the app crashed while apply_mode was set to 1
 	// This ensures sync triggers are not permanently suppressed after a crash
-	if _, err := db.Exec(`UPDATE _sync_client_state SET apply_mode = 0 WHERE apply_mode = 1`); err != nil {
+	if _, err := db.Exec(`UPDATE _sync_apply_state SET apply_mode = 0 WHERE singleton_key = 1 AND apply_mode = 1`); err != nil {
 		fmt.Printf("Warning: failed to reset bundle apply_mode during initialization: %v\n", err)
 	}
 
@@ -972,52 +963,82 @@ func (c *Client) Stop(ctx context.Context) error {
 }
 
 // PullToStable pulls complete committed bundles until the client reaches the server's frozen stable ceiling.
-func (c *Client) PullToStable(ctx context.Context) error {
-	if atomic.LoadInt32(&c.downloadPaused) == 1 {
-		return nil
-	}
+func (c *Client) PullToStable(ctx context.Context) (RemoteSyncReport, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	defer c.writeMu.Unlock()
 	return c.pullToStableLocked(ctx)
 }
 
 // Sync pushes local changes and then pulls to a stable committed-bundle ceiling.
-func (c *Client) Sync(ctx context.Context) error {
-	if atomic.LoadInt32(&c.uploadPaused) == 1 && atomic.LoadInt32(&c.downloadPaused) == 1 {
-		return nil
-	}
+func (c *Client) Sync(ctx context.Context) (SyncReport, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
+		return SyncReport{}, err
 	}
 	defer c.writeMu.Unlock()
 	if err := c.ensureConnectedSessionLocked(ctx, "Sync()"); err != nil {
-		return err
+		return SyncReport{}, err
 	}
+	pushOutcome := PushOutcomeSkippedPaused
 	if atomic.LoadInt32(&c.uploadPaused) == 0 {
-		if err := c.pushPendingLocked(ctx, 0); err != nil {
-			return err
+		pushReport, err := c.pushPendingLocked(ctx, 0)
+		if err != nil {
+			return SyncReport{}, err
 		}
+		pushOutcome = pushReport.Outcome
 	}
+	remoteOutcome := RemoteSyncOutcomeSkippedPaused
+	var restore *RestoreSummary
 	if atomic.LoadInt32(&c.downloadPaused) == 0 {
-		if err := c.pullToStableLocked(ctx); err != nil {
-			return err
+		remoteReport, err := c.pullToStableLocked(ctx)
+		if err != nil {
+			return SyncReport{}, err
 		}
+		remoteOutcome = remoteReport.Outcome
+		restore = remoteReport.Restore
 	}
-	return nil
+	status, err := c.syncStatusLocked(ctx)
+	if err != nil {
+		return SyncReport{}, err
+	}
+	return SyncReport{
+		PushOutcome:   pushOutcome,
+		RemoteOutcome: remoteOutcome,
+		Status:        status,
+		Restore:       restore,
+	}, nil
 }
 
-// Hydrate rebuilds the managed tables from the current server snapshot.
-func (c *Client) Hydrate(ctx context.Context) error {
-	if atomic.LoadInt32(&c.downloadPaused) == 1 {
-		return nil
-	}
+// RebuildMode selects whether Rebuild keeps or rotates the caller-owned source identity.
+type RebuildMode string
+
+const (
+	RebuildKeepSource   RebuildMode = "keep_source"
+	RebuildRotateSource RebuildMode = "rotate_source"
+)
+
+// Rebuild rebuilds the managed tables from the current server snapshot.
+func (c *Client) Rebuild(ctx context.Context, mode RebuildMode, newSourceID string) (RemoteSyncReport, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return err
+		return RemoteSyncReport{}, err
 	}
 	defer c.writeMu.Unlock()
-	return c.hydrateLocked(ctx)
+	switch mode {
+	case RebuildKeepSource:
+		return c.rebuildKeepSourceLocked(ctx)
+	case RebuildRotateSource:
+		newSourceID = strings.TrimSpace(newSourceID)
+		if newSourceID == "" {
+			return RemoteSyncReport{}, fmt.Errorf("newSourceID must be provided for RebuildRotateSource")
+		}
+		if err := c.ensureRebuildPreconditionsLocked(ctx); err != nil {
+			return RemoteSyncReport{}, err
+		}
+		return c.rebuildFromSnapshotLocked(ctx, true, newSourceID)
+	default:
+		return RemoteSyncReport{}, fmt.Errorf("unsupported rebuild mode %q", mode)
+	}
 }
 
 // SerializeRow loads a row by (table, pk) and serializes it to JSON payload for upload

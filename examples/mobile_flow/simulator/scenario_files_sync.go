@@ -36,7 +36,7 @@ func (s *FilesSyncScenario) Execute(ctx context.Context) error {
 	// Phase 1: Sign in and prepare for testing
 	logger.Info("📱 Phase 1: Sign in and prepare for files testing")
 
-	if err := s.app.OnSignIn(ctx, s.config.UserID); err != nil {
+	if err := s.app.onSignIn(ctx, s.config.UserID); err != nil {
 		return fmt.Errorf("failed to sign in: %w", err)
 	}
 
@@ -63,7 +63,7 @@ func (s *FilesSyncScenario) Execute(ctx context.Context) error {
 	// Phase 4: Sync to server
 	logger.Info("📱 Phase 4: Syncing files and reviews to server")
 
-	if err := s.app.PushPending(ctx); err != nil {
+	if err := s.app.pushPending(ctx); err != nil {
 		return fmt.Errorf("failed to upload files and reviews: %w", err)
 	}
 
@@ -77,7 +77,7 @@ func (s *FilesSyncScenario) Execute(ctx context.Context) error {
 		}
 
 		// Sync the delete operation
-		if err := s.app.PushPending(ctx); err != nil {
+		if err := s.app.pushPending(ctx); err != nil {
 			return fmt.Errorf("failed to upload file deletion: %w", err)
 		}
 

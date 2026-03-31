@@ -57,7 +57,7 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 		CreatedAt:          &seedCreatedAt,
 	}
 	insertTypedRow(t, seedDB, seedRow)
-	require.NoError(t, seedClient.PushPending(ctx))
+	mustPushPendingE2E(t, seedClient, ctx)
 
 	activeNote := "second-device"
 	activeRatingLiteral := "6.57111473696007"
@@ -106,9 +106,9 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 		return err
 	}))
 
-	require.NoError(t, activeClient.PushPending(ctx))
-	require.NoError(t, activeClient.PullToStable(ctx))
-	require.NoError(t, hydrateClient.Hydrate(ctx))
+	mustPushPendingE2E(t, activeClient, ctx)
+	mustPullToStableE2E(t, activeClient, ctx)
+	mustRebuildE2E(t, hydrateClient, ctx, oversqlite.RebuildKeepSource, "")
 
 	assertTableCount(t, activeDB, "typed_rows", 3)
 	assertTableCount(t, hydrateDB, "typed_rows", 3)

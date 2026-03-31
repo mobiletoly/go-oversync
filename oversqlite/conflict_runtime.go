@@ -488,8 +488,11 @@ func (c *Client) requeueSnapshotRowsInTx(ctx context.Context, tx *sql.Tx, snapsh
 }
 
 func (c *Client) deletePushOutboundSnapshotInTx(ctx context.Context, tx *sql.Tx, sourceBundleID int64) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_push_outbound WHERE source_bundle_id = ?`, sourceBundleID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_outbox_rows WHERE source_bundle_id = ?`, sourceBundleID); err != nil {
 		return fmt.Errorf("failed to clear outbound push snapshot for source_bundle_id %d: %w", sourceBundleID, err)
+	}
+	if err := clearOutboxBundle(ctx, tx); err != nil {
+		return err
 	}
 	return nil
 }

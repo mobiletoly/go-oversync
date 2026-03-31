@@ -46,7 +46,8 @@ func newLifecycleTestClientWithTransport(t *testing.T, transport roundTripFunc) 
 		return "token", nil
 	}, config)
 	require.NoError(t, err)
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	openResult := mustOpen(t, client, context.Background(), "device-a")
+	require.Equal(t, OpenStateReadyAnonymous, openResult.State)
 	client.HTTP = &http.Client{Transport: transport}
 
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
@@ -68,7 +69,7 @@ func newLifecycleTestClientWithConfigAndTransport(t *testing.T, config *Config, 
 		return "token", nil
 	}, config)
 	require.NoError(t, err)
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	mustOpen(t, client, context.Background(), "device-a")
 	client.HTTP = &http.Client{Transport: transport}
 
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
@@ -100,9 +101,9 @@ func TestConnect_RetryLaterSurfacesRetryAfter(t *testing.T) {
 		RetryAfterSec: 7,
 	})
 
-	result, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusRetryLater, result.Status)
+	require.Equal(t, AttachStatusRetryLater, result.Status)
 	require.Equal(t, 7*time.Second, result.RetryAfter)
 }
 
@@ -127,10 +128,10 @@ func TestConnect_RetriesTransientHTTPFailureAndSucceeds(t *testing.T) {
 		}
 	})
 
-	result, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
-	require.Equal(t, ConnectOutcomeStartedEmpty, result.Outcome)
+	require.Equal(t, AttachStatusConnected, result.Status)
+	require.Equal(t, AttachOutcomeStartedEmpty, result.Outcome)
 	require.Equal(t, int32(2), atomic.LoadInt32(&connectRequests))
 }
 
@@ -153,7 +154,7 @@ func TestConnect_DoesNotRetryUnauthorized(t *testing.T) {
 		}
 	})
 
-	_, err := client.Connect(context.Background(), "lifecycle-user")
+	_, err := client.Attach(context.Background(), "lifecycle-user")
 	require.Error(t, err)
 	require.Equal(t, int32(1), atomic.LoadInt32(&connectRequests))
 }
@@ -177,7 +178,7 @@ func TestConnect_RetryExhaustionReturnsTypedError(t *testing.T) {
 		}
 	})
 
-	_, err := client.Connect(context.Background(), "lifecycle-user")
+	_, err := client.Attach(context.Background(), "lifecycle-user")
 	var retryErr *RetryExhaustedError
 	require.ErrorAs(t, err, &retryErr)
 	require.Equal(t, "connect_request", retryErr.Operation)
@@ -207,7 +208,7 @@ func TestConnect_RetryPolicyCanBeDisabledExplicitly(t *testing.T) {
 		}
 	})
 
-	_, err := client.Connect(context.Background(), "lifecycle-user")
+	_, err := client.Attach(context.Background(), "lifecycle-user")
 	require.Error(t, err)
 	require.Equal(t, int32(1), atomic.LoadInt32(&connectRequests))
 }
@@ -230,78 +231,363 @@ func TestConnect_NetworkFailureLeavesAnonymousStateIntact(t *testing.T) {
 
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
 	require.NoError(t, err)
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	mustOpen(t, client, context.Background(), "device-a")
 
-	_, err = client.Connect(context.Background(), "lifecycle-user")
+	_, err = client.Attach(context.Background(), "lifecycle-user")
 	require.ErrorContains(t, err, "connect network failed")
 	require.Empty(t, client.UserID)
 
 	var (
-		bindingState      string
-		bindingScope      string
-		pendingTransition string
-		dirtyCount        int
-		userCount         int
+		bindingState string
+		bindingScope string
+		dirtyCount   int
+		userCount    int
 	)
 	require.NoError(t, db.QueryRow(`
-		SELECT binding_state, binding_scope, pending_transition_kind
-		FROM _sync_lifecycle_state
+		SELECT binding_state, attached_user_id
+		FROM _sync_attachment_state
 		WHERE singleton_key = 1
-	`).Scan(&bindingState, &bindingScope, &pendingTransition))
+	`).Scan(&bindingState, &bindingScope))
 	require.Equal(t, lifecycleBindingAnonymous, bindingState)
 	require.Empty(t, bindingScope)
-	require.Equal(t, lifecycleTransitionNone, pendingTransition)
+	kind, _, _, _, _ := requireOperationState(t, db)
+	require.Equal(t, lifecycleTransitionNone, kind)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
 	require.Equal(t, 1, dirtyCount)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&userCount))
 	require.Equal(t, 1, userCount)
 }
 
-func TestSignOut_BlocksWhenAttachedDirtyRowsExist(t *testing.T) {
+func TestDetach_BlocksWhenAttachedDirtyRowsExist(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
 		Resolution: "initialize_empty",
 	})
 
-	result, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
+	require.Equal(t, AttachStatusConnected, result.Status)
 
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
 	require.NoError(t, err)
 
-	err = client.SignOut(context.Background())
-	var blockedErr *SignOutBlockedError
-	require.ErrorAs(t, err, &blockedErr)
-	require.Equal(t, 1, blockedErr.PendingRowCount)
+	detachResult, err := client.Detach(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, DetachOutcomeBlockedUnsyncedData, detachResult.Outcome)
+	require.EqualValues(t, 1, detachResult.PendingRowCount)
 	require.Equal(t, "lifecycle-user", client.UserID)
 }
 
-func TestResetForNewSource_ClearsPendingLocalState(t *testing.T) {
+func TestDetach_BlocksWhenPreparedOutboxExists(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
 		Resolution: "initialize_empty",
 	})
 
-	_, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
+	require.NoError(t, err)
+	require.Equal(t, AttachStatusConnected, result.Status)
+
+	_, err = db.Exec(`
+		UPDATE _sync_outbox_bundle
+		SET state = 'prepared', source_id = ?, source_bundle_id = 1, row_count = 1, canonical_request_hash = 'hash'
+		WHERE singleton_key = 1
+	`, client.SourceID)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_outbox_rows (
+			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
+		) VALUES (1, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?)
+	`, rowKeyJSON("1"), rowKeyJSON("1"), `{"id":"1","name":"Ada","email":"ada@example.com"}`, `{"id":"1","name":"Ada","email":"ada@example.com"}`)
+	require.NoError(t, err)
+
+	detachResult, err := client.Detach(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, DetachOutcomeBlockedUnsyncedData, detachResult.Outcome)
+	require.EqualValues(t, 1, detachResult.PendingRowCount)
+	require.Equal(t, "lifecycle-user", client.UserID)
+}
+
+func TestDetach_BlocksWhenCommittedRemoteOutboxExists(t *testing.T) {
+	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution: "initialize_empty",
+	})
+
+	result, err := client.Attach(context.Background(), "lifecycle-user")
+	require.NoError(t, err)
+	require.Equal(t, AttachStatusConnected, result.Status)
+
+	_, err = db.Exec(`
+		UPDATE _sync_outbox_bundle
+		SET state = 'committed_remote',
+			source_id = ?,
+			source_bundle_id = 1,
+			row_count = 1,
+			canonical_request_hash = 'hash',
+			remote_bundle_hash = 'remote-hash',
+			remote_bundle_seq = 7
+		WHERE singleton_key = 1
+	`, client.SourceID)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_outbox_rows (
+			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
+		) VALUES (1, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?)
+	`, rowKeyJSON("1"), rowKeyJSON("1"), `{"id":"1","name":"Ada","email":"ada@example.com"}`, `{"id":"1","name":"Ada","email":"ada@example.com"}`)
+	require.NoError(t, err)
+
+	detachResult, err := client.Detach(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, DetachOutcomeBlockedUnsyncedData, detachResult.Outcome)
+	require.EqualValues(t, 1, detachResult.PendingRowCount)
+	require.Equal(t, "lifecycle-user", client.UserID)
+}
+
+func TestDetach_ReenablesDirtyRowCaptureForAnonymousWrites(t *testing.T) {
+	ctx := context.Background()
+	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution: "initialize_empty",
+	})
+
+	result, err := client.Attach(ctx, "lifecycle-user")
+	require.NoError(t, err)
+	require.Equal(t, AttachStatusConnected, result.Status)
+
+	detachResult := mustDetach(t, client, ctx)
+	require.Equal(t, DetachOutcomeDetached, detachResult.Outcome)
+	require.Empty(t, client.UserID)
+	require.Equal(t, "device-a", client.SourceID)
+
+	var applyMode int
+	require.NoError(t, db.QueryRow(`SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1`).Scan(&applyMode))
+	require.Equal(t, 0, applyMode)
+
+	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	var dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 1, dirtyCount)
+
+	var op string
+	require.NoError(t, db.QueryRow(`SELECT op FROM _sync_dirty_rows WHERE table_name = 'users' AND key_json = ?`, rowKeyJSON("1")).Scan(&op))
+	require.Equal(t, string(oversync.OpInsert), op)
+}
+
+func TestDetach_ReopenDoesNotDuplicateAnonymousWrites(t *testing.T) {
+	ctx := context.Background()
+	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution: "initialize_empty",
+	})
+
+	result, err := client.Attach(ctx, "lifecycle-user")
+	require.NoError(t, err)
+	require.Equal(t, AttachStatusConnected, result.Status)
+
+	detachResult := mustDetach(t, client, ctx)
+	require.Equal(t, DetachOutcomeDetached, detachResult.Outcome)
+	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	var dirtyCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 1, dirtyCount)
+
+	require.NoError(t, client.Close())
+
+	reopened, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
+		return "token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+	require.NoError(t, err)
+	reopened.HTTP = client.HTTP
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+
+	mustOpen(t, reopened, ctx, "device-a")
+
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
+	require.Equal(t, 1, dirtyCount)
+
+	var op string
+	require.NoError(t, db.QueryRow(`SELECT op FROM _sync_dirty_rows WHERE table_name = 'users' AND key_json = ?`, rowKeyJSON("1")).Scan(&op))
+	require.Equal(t, string(oversync.OpInsert), op)
+}
+
+func TestManagedTableGuards_BlockDirectWritesDuringRemoteReplace(t *testing.T) {
+	ctx := context.Background()
+
+	testCases := []struct {
+		name       string
+		seedRow    bool
+		stmt       string
+		args       []any
+		verifyStmt string
+		verifyArgs []any
+		expected   int
+	}{
+		{
+			name:       "insert",
+			stmt:       `INSERT INTO users (id, name, email) VALUES (?, ?, ?)`,
+			args:       []any{"insert-1", "Ada", "ada@example.com"},
+			verifyStmt: `SELECT COUNT(*) FROM users WHERE id = ?`,
+			verifyArgs: []any{"insert-1"},
+			expected:   0,
+		},
+		{
+			name:       "update",
+			seedRow:    true,
+			stmt:       `UPDATE users SET name = ? WHERE id = ?`,
+			args:       []any{"Updated", "seed-1"},
+			verifyStmt: `SELECT COUNT(*) FROM users WHERE id = ? AND name = ?`,
+			verifyArgs: []any{"seed-1", "Updated"},
+			expected:   0,
+		},
+		{
+			name:       "delete",
+			seedRow:    true,
+			stmt:       `DELETE FROM users WHERE id = ?`,
+			args:       []any{"seed-1"},
+			verifyStmt: `SELECT COUNT(*) FROM users WHERE id = ?`,
+			verifyArgs: []any{"seed-1"},
+			expected:   1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+				Resolution: "initialize_empty",
+			})
+
+			if tc.seedRow {
+				setApplyModeForTest(t, db, true)
+				_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "seed-1", "Seed", "seed@example.com")
+				require.NoError(t, err)
+				setApplyModeForTest(t, db, false)
+				_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
+				require.NoError(t, err)
+			}
+
+			setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindRemoteReplace, TargetUserID: "lifecycle-user"})
+
+			_, err := db.ExecContext(ctx, tc.stmt, tc.args...)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), transitionPendingTriggerError)
+
+			var count int
+			require.NoError(t, db.QueryRow(tc.verifyStmt, tc.verifyArgs...).Scan(&count))
+			require.Equal(t, tc.expected, count)
+		})
+	}
+}
+
+func TestRotateSource_BlocksWhenCommittedRemoteOutboxExists(t *testing.T) {
+	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution: "initialize_empty",
+	})
+
+	result, err := client.Attach(context.Background(), "lifecycle-user")
+	require.NoError(t, err)
+	require.Equal(t, AttachStatusConnected, result.Status)
+
+	_, err = db.Exec(`
+		UPDATE _sync_outbox_bundle
+		SET state = 'committed_remote',
+			source_id = ?,
+			source_bundle_id = 1,
+			row_count = 1,
+			canonical_request_hash = 'hash',
+			remote_bundle_hash = 'remote-hash',
+			remote_bundle_seq = 7
+		WHERE singleton_key = 1
+	`, client.SourceID)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO _sync_outbox_rows (
+			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
+		) VALUES (1, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?)
+	`, rowKeyJSON("1"), rowKeyJSON("1"), `{"id":"1","name":"Ada","email":"ada@example.com"}`, `{"id":"1","name":"Ada","email":"ada@example.com"}`)
+	require.NoError(t, err)
+
+	_, err = client.RotateSource(context.Background(), "device-b")
+	require.EqualError(t, err, "cannot rotate source while 1 outbox rows are pending")
+}
+
+func TestRotateSource_PreservesPendingLocalState(t *testing.T) {
+	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution: "initialize_empty",
+	})
+
+	_, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
 
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
 	require.NoError(t, err)
 
-	require.NoError(t, client.ResetForNewSource(context.Background(), "device-b"))
+	mustRotateSource(t, client, context.Background(), "device-b")
 	require.Equal(t, "device-b", client.SourceID)
 	require.Empty(t, client.UserID)
 
 	var dirtyCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
-	require.Equal(t, 0, dirtyCount)
+	require.Equal(t, 1, dirtyCount)
+}
+
+func TestDetach_ReattachPreservesNextSourceBundleIDOnSameSource(t *testing.T) {
+	ctx := context.Background()
+	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution: "initialize_empty",
+	})
+
+	result, err := client.Attach(ctx, "lifecycle-user")
+	require.NoError(t, err)
+	require.Equal(t, AttachStatusConnected, result.Status)
+
+	attachment, err := loadAttachmentState(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, updateSourceNextBundleID(ctx, db, attachment.CurrentSourceID, 9))
+
+	mustDetach(t, client, ctx)
+	require.NoError(t, client.Close())
+
+	reopened, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
+		return "token", nil
+	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+	require.NoError(t, err)
+	reopened.HTTP = client.HTTP
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+
+	mustOpen(t, reopened, ctx, "device-a")
+	result, err = reopened.Attach(ctx, "lifecycle-user")
+	require.NoError(t, err)
+	require.Equal(t, AttachStatusConnected, result.Status)
+
+	_, nextSourceBundleID, _ := requireBundleState(t, db)
+	require.Equal(t, int64(9), nextSourceBundleID)
+}
+
+func TestSourceChangingOperationsRequireCallerProvidedSourceID(t *testing.T) {
+	ctx := context.Background()
+	client, _ := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution: "initialize_empty",
+	})
+
+	_, err := client.Open(ctx, "")
+	require.EqualError(t, err, "sourceID must be provided")
+
+	_, err = client.Attach(ctx, "lifecycle-user")
+	require.NoError(t, err)
+
+	_, err = client.RotateSource(ctx, "")
+	require.EqualError(t, err, "sourceID must be provided")
+
+	_, err = client.Rebuild(ctx, RebuildRotateSource, "")
+	require.EqualError(t, err, "newSourceID must be provided for RebuildRotateSource")
 }
 
 func TestOpen_FailsClosedOnPersistedSourceMismatch(t *testing.T) {
 	client, _ := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	mustOpen(t, client, context.Background(), "device-a")
 
-	err := client.Open(context.Background(), "device-b")
+	_, err := client.Open(context.Background(), "device-b")
 	var mismatchErr *SourceMismatchError
 	require.ErrorAs(t, err, &mismatchErr)
 	require.Equal(t, "device-a", mismatchErr.PersistedSourceID)
@@ -311,23 +597,23 @@ func TestOpen_FailsClosedOnPersistedSourceMismatch(t *testing.T) {
 func TestOpen_IsIdempotentForMatchingSource(t *testing.T) {
 	client, _ := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
-	require.NoError(t, client.Open(context.Background(), "device-a"))
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	mustOpen(t, client, context.Background(), "device-a")
+	mustOpen(t, client, context.Background(), "device-a")
 }
 
-func TestOpen_CapturesAnonymousPreexistingRowsWithoutBlockingSignOut(t *testing.T) {
+func TestOpen_CapturesAnonymousPreexistingRowsWithoutBlockingDetach(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
 	require.NoError(t, err)
 
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	mustOpen(t, client, context.Background(), "device-a")
 
 	status, err := client.PendingSyncStatus(context.Background())
 	require.NoError(t, err)
 	require.True(t, status.HasPendingSyncData)
-	require.Equal(t, 1, status.PendingRowCount)
-	require.False(t, status.BlocksSignOut)
+	require.EqualValues(t, 1, status.PendingRowCount)
+	require.False(t, status.BlocksDetach)
 }
 
 func TestConnect_FailsFastWhenLifecycleCapabilitiesAreMissing(t *testing.T) {
@@ -338,8 +624,8 @@ func TestConnect_FailsFastWhenLifecycleCapabilitiesAreMissing(t *testing.T) {
 		}), nil
 	})
 
-	_, err := client.Connect(context.Background(), "lifecycle-user")
-	var unsupportedErr *ConnectLifecycleUnsupportedError
+	_, err := client.Attach(context.Background(), "lifecycle-user")
+	var unsupportedErr *AttachLifecycleUnsupportedError
 	require.ErrorAs(t, err, &unsupportedErr)
 }
 
@@ -395,15 +681,14 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "seed-1", "Seed", "seed@example.com")
 	require.NoError(t, err)
 
-	result, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectOutcomeSeededLocal, result.Outcome)
+	require.Equal(t, AttachOutcomeSeededLocal, result.Outcome)
 
-	var pendingInitializationID string
-	require.NoError(t, db.QueryRow(`SELECT pending_initialization_id FROM _sync_lifecycle_state WHERE singleton_key = 1`).Scan(&pendingInitializationID))
+	pendingInitializationID := requirePendingInitializationID(t, db)
 	require.Equal(t, "init-1", pendingInitializationID)
 
-	err = client.PushPending(context.Background())
+	_, err = client.PushPending(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), errorCode)
 	require.Empty(t, client.UserID)
@@ -414,21 +699,21 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 		bindingScope string
 	)
 	require.NoError(t, db.QueryRow(`
-		SELECT binding_state, binding_scope, pending_initialization_id
-		FROM _sync_lifecycle_state
+		SELECT binding_state, attached_user_id, pending_initialization_id
+		FROM _sync_attachment_state
 		WHERE singleton_key = 1
 	`).Scan(&bindingState, &bindingScope, &pendingInitializationID))
 	require.Equal(t, lifecycleBindingAnonymous, bindingState)
 	require.Empty(t, bindingScope)
 	require.Empty(t, pendingInitializationID)
 
-	reconnectResult, err := client.Connect(context.Background(), "lifecycle-user")
+	reconnectResult, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectOutcomeSeededLocal, reconnectResult.Outcome)
+	require.Equal(t, AttachOutcomeSeededLocal, reconnectResult.Outcome)
 	require.Equal(t, int32(2), atomic.LoadInt32(&connectRequests))
 	require.Equal(t, "lifecycle-user", client.UserID)
 	require.Equal(t, "init-2", client.pendingInitializationID)
-	require.NoError(t, db.QueryRow(`SELECT pending_initialization_id FROM _sync_lifecycle_state WHERE singleton_key = 1`).Scan(&pendingInitializationID))
+	pendingInitializationID = requirePendingInitializationID(t, db)
 	require.Equal(t, "init-2", pendingInitializationID)
 }
 
@@ -437,9 +722,9 @@ func TestConnect_ResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 		Resolution: "initialize_empty",
 	})
 
-	result, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
+	require.Equal(t, AttachStatusConnected, result.Status)
 
 	require.NoError(t, client.Close())
 
@@ -457,31 +742,23 @@ func TestConnect_ResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 	})}
 	t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 
-	require.NoError(t, restarted.Open(context.Background(), "device-a"))
+	mustOpen(t, restarted, context.Background(), "device-a")
 
-	resumeResult, err := restarted.Connect(context.Background(), "lifecycle-user")
+	resumeResult, err := restarted.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, resumeResult.Status)
-	require.Equal(t, ConnectOutcomeResumedAttached, resumeResult.Outcome)
+	require.Equal(t, AttachStatusConnected, resumeResult.Status)
+	require.Equal(t, AttachOutcomeResumedAttached, resumeResult.Outcome)
 	require.Equal(t, int32(0), atomic.LoadInt32(&requestCount))
 }
 
 func TestOpen_ReportsPendingRemoteReplaceRecovery(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
-	_, err := db.Exec(`
-		UPDATE _sync_lifecycle_state
-		SET pending_transition_kind = 'remote_replace',
-		    pending_target_scope = 'lifecycle-user',
-		    pending_target_source_id = 'device-a'
-		WHERE singleton_key = 1
-	`)
-	require.NoError(t, err)
+	setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindRemoteReplace, TargetUserID: "lifecycle-user"})
 
-	err = client.Open(context.Background(), "device-a")
-	var pendingErr *RemoteReplacePendingError
-	require.ErrorAs(t, err, &pendingErr)
-	require.Equal(t, "lifecycle-user", pendingErr.TargetUserID)
+	openResult := mustOpen(t, client, context.Background(), "device-a")
+	require.Equal(t, OpenStateAttachRecoveryRequired, openResult.State)
+	require.Equal(t, "lifecycle-user", openResult.TargetUserID)
 }
 
 func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemovedFromConfig(t *testing.T) {
@@ -551,9 +828,9 @@ func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemove
 	`, rowKeyJSON("legacy-1"))
 	require.NoError(t, err)
 
-	result, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectOutcomeUsedRemote, result.Outcome)
+	require.Equal(t, AttachOutcomeUsedRemote, result.Outcome)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
@@ -566,102 +843,13 @@ func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemove
 	require.Equal(t, "Remote", name)
 }
 
-func TestOpen_ClearsStaleInterruptedSignOutMarkers(t *testing.T) {
-	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
-
-	_, err := client.Connect(context.Background(), "lifecycle-user")
-	require.NoError(t, err)
-
-	_, err = db.Exec(`
-		UPDATE _sync_client_state
-		SET apply_mode = 1
-		WHERE user_id = 'lifecycle-user'
-	`)
-	require.NoError(t, err)
-	_, err = db.Exec(`
-		UPDATE _sync_lifecycle_state
-		SET pending_transition_kind = 'signout_reset',
-		    pending_apply_cursor = 9,
-		    runtime_bypass_active = 1
-		WHERE singleton_key = 1
-	`)
-	require.NoError(t, err)
-
-	require.NoError(t, client.Open(context.Background(), "device-a"))
-
-	var (
-		applyMode         int
-		bindingState      string
-		bindingScope      string
-		pendingTransition string
-		pendingCursor     int64
-		runtimeBypass     int
-	)
-	require.NoError(t, db.QueryRow(`SELECT apply_mode FROM _sync_client_state WHERE user_id = 'lifecycle-user'`).Scan(&applyMode))
-	require.Equal(t, 0, applyMode)
-	require.NoError(t, db.QueryRow(`
-		SELECT binding_state, binding_scope, pending_transition_kind, pending_apply_cursor, runtime_bypass_active
-		FROM _sync_lifecycle_state
-		WHERE singleton_key = 1
-	`).Scan(&bindingState, &bindingScope, &pendingTransition, &pendingCursor, &runtimeBypass))
-	require.Equal(t, lifecycleBindingAttached, bindingState)
-	require.Equal(t, "lifecycle-user", bindingScope)
-	require.Equal(t, lifecycleTransitionNone, pendingTransition)
-	require.EqualValues(t, 0, pendingCursor)
-	require.Equal(t, 0, runtimeBypass)
-}
-
-func TestOpen_CancelsInterruptedSourceResetAndPreservesCurrentSource(t *testing.T) {
-	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
-
-	_, err := client.Connect(context.Background(), "lifecycle-user")
-	require.NoError(t, err)
-
-	_, err = db.Exec(`
-		UPDATE _sync_lifecycle_state
-		SET pending_transition_kind = 'source_reset',
-		    pending_target_source_id = 'device-b',
-		    pending_apply_cursor = 3,
-		    runtime_bypass_active = 1
-		WHERE singleton_key = 1
-	`)
-	require.NoError(t, err)
-
-	require.NoError(t, client.Open(context.Background(), "device-a"))
-
-	var (
-		sourceID          string
-		pendingTransition string
-		pendingTarget     string
-		pendingCursor     int64
-		runtimeBypass     int
-	)
-	require.NoError(t, db.QueryRow(`
-		SELECT source_id, pending_transition_kind, pending_target_source_id, pending_apply_cursor, runtime_bypass_active
-		FROM _sync_lifecycle_state
-		WHERE singleton_key = 1
-	`).Scan(&sourceID, &pendingTransition, &pendingTarget, &pendingCursor, &runtimeBypass))
-	require.Equal(t, "device-a", sourceID)
-	require.Equal(t, lifecycleTransitionNone, pendingTransition)
-	require.Empty(t, pendingTarget)
-	require.EqualValues(t, 0, pendingCursor)
-	require.Equal(t, 0, runtimeBypass)
-}
-
 func TestConnect_PendingRemoteReplaceMismatchedScopeFailsClosed(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
-	_, err := db.Exec(`
-		UPDATE _sync_lifecycle_state
-		SET pending_transition_kind = 'remote_replace',
-		    pending_target_scope = 'other-user',
-		    pending_target_source_id = 'device-a'
-		WHERE singleton_key = 1
-	`)
-	require.NoError(t, err)
+	setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindRemoteReplace, TargetUserID: "other-user"})
 
-	_, err = client.Connect(context.Background(), "lifecycle-user")
-	var conflictErr *ConnectLocalStateConflictError
+	_, err := client.Attach(context.Background(), "lifecycle-user")
+	var conflictErr *AttachLocalStateConflictError
 	require.ErrorAs(t, err, &conflictErr)
 	require.Contains(t, conflictErr.Reason, "pending remote_replace")
 }
@@ -674,35 +862,31 @@ func TestConnect_PendingRemoteReplaceFinalizesFromStagedSnapshotWithoutNetwork(t
 		}), nil
 	})
 
+	setOperationStateForTest(t, db, &operationStateRecord{
+		Kind:              operationKindRemoteReplace,
+		TargetUserID:      "lifecycle-user",
+		StagedSnapshotID:  "snapshot-1",
+		SnapshotBundleSeq: 11,
+		SnapshotRowCount:  1,
+	})
 	_, err := db.Exec(`
-		UPDATE _sync_lifecycle_state
-		SET pending_transition_kind = 'remote_replace',
-		    pending_target_scope = 'lifecycle-user',
-		    pending_target_source_id = 'device-a',
-		    pending_staged_snapshot_id = 'snapshot-1',
-		    pending_snapshot_bundle_seq = 11,
-		    pending_snapshot_row_count = 1
-		WHERE singleton_key = 1
-	`)
-	require.NoError(t, err)
-	_, err = db.Exec(`
 		INSERT INTO _sync_snapshot_stage (
 			snapshot_id, row_ordinal, schema_name, table_name, key_json, row_version, payload
 		) VALUES ('snapshot-1', 1, 'main', 'users', ?, 4, ?)
 	`, rowKeyJSON("remote-1"), `{"id":"remote-1","name":"Remote","email":"remote@example.com"}`)
 	require.NoError(t, err)
 
-	result, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
-	require.Equal(t, ConnectOutcomeUsedRemote, result.Outcome)
+	require.Equal(t, AttachStatusConnected, result.Status)
+	require.Equal(t, AttachOutcomeUsedRemote, result.Outcome)
 
 	var name string
 	require.NoError(t, db.QueryRow(`SELECT name FROM users WHERE id = ?`, "remote-1").Scan(&name))
 	require.Equal(t, "Remote", name)
 
 	var pendingTransition string
-	require.NoError(t, db.QueryRow(`SELECT pending_transition_kind FROM _sync_lifecycle_state WHERE singleton_key = 1`).Scan(&pendingTransition))
+	require.NoError(t, db.QueryRow(`SELECT kind FROM _sync_operation_state WHERE singleton_key = 1`).Scan(&pendingTransition))
 	require.Equal(t, "none", pendingTransition)
 }
 
@@ -745,12 +929,12 @@ func TestConnect_RemoteAuthoritativeStagesAndReplacesAnonymousLocalRows(t *testi
 
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "local-1", "Local", "local@example.com")
 	require.NoError(t, err)
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	mustOpen(t, client, context.Background(), "device-a")
 
-	result, err := client.Connect(context.Background(), "lifecycle-user")
+	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, ConnectStatusConnected, result.Status)
-	require.Equal(t, ConnectOutcomeUsedRemote, result.Outcome)
+	require.Equal(t, AttachStatusConnected, result.Status)
+	require.Equal(t, AttachOutcomeUsedRemote, result.Outcome)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, "local-1").Scan(&count))
@@ -759,68 +943,42 @@ func TestConnect_RemoteAuthoritativeStagesAndReplacesAnonymousLocalRows(t *testi
 	require.Equal(t, 1, count)
 }
 
-func TestPushPending_FailsClosedWhileDestructiveTransitionIsMarked(t *testing.T) {
+func TestDetach_CancelsPendingRemoteReplace(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
-	_, err := client.Connect(context.Background(), "lifecycle-user")
-	require.NoError(t, err)
-
-	_, err = db.Exec(`
-		UPDATE _sync_lifecycle_state
-		SET pending_transition_kind = 'signout_reset',
-		    runtime_bypass_active = 1
-		WHERE singleton_key = 1
-	`)
-	require.NoError(t, err)
-
-	err = client.PushPending(context.Background())
-	var transitionErr *DestructiveTransitionInProgressError
-	require.ErrorAs(t, err, &transitionErr)
-	require.Equal(t, lifecycleTransitionSignOut, transitionErr.TransitionKind)
-}
-
-func TestSignOut_CancelsPendingRemoteReplace(t *testing.T) {
-	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
-
+	setOperationStateForTest(t, db, &operationStateRecord{
+		Kind:              operationKindRemoteReplace,
+		TargetUserID:      "lifecycle-user",
+		StagedSnapshotID:  "snapshot-1",
+		SnapshotBundleSeq: 11,
+		SnapshotRowCount:  1,
+	})
 	_, err := db.Exec(`
-		UPDATE _sync_lifecycle_state
-		SET pending_transition_kind = 'remote_replace',
-		    pending_target_scope = 'lifecycle-user',
-		    pending_target_source_id = 'device-a',
-		    pending_staged_snapshot_id = 'snapshot-1',
-		    pending_snapshot_bundle_seq = 11,
-		    pending_snapshot_row_count = 1
-		WHERE singleton_key = 1
-	`)
-	require.NoError(t, err)
-	_, err = db.Exec(`
 		INSERT INTO _sync_snapshot_stage (
 			snapshot_id, row_ordinal, schema_name, table_name, key_json, row_version, payload
 		) VALUES ('snapshot-1', 1, 'main', 'users', ?, 4, ?)
 	`, rowKeyJSON("remote-1"), `{"id":"remote-1","name":"Remote","email":"remote@example.com"}`)
 	require.NoError(t, err)
 
-	require.NoError(t, client.SignOut(context.Background()))
+	mustDetach(t, client, context.Background())
 
 	var (
 		bindingState      string
 		pendingTransition string
 		stageCount        int
-		clientStateCount  int
 	)
-	require.NoError(t, db.QueryRow(`SELECT binding_state, pending_transition_kind FROM _sync_lifecycle_state WHERE singleton_key = 1`).Scan(&bindingState, &pendingTransition))
+	require.NoError(t, db.QueryRow(`SELECT binding_state FROM _sync_attachment_state WHERE singleton_key = 1`).Scan(&bindingState))
+	require.NoError(t, db.QueryRow(`SELECT kind FROM _sync_operation_state WHERE singleton_key = 1`).Scan(&pendingTransition))
 	require.Equal(t, lifecycleBindingAnonymous, bindingState)
 	require.Equal(t, lifecycleTransitionNone, pendingTransition)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_snapshot_stage`).Scan(&stageCount))
 	require.Equal(t, 0, stageCount)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_client_state`).Scan(&clientStateCount))
-	require.Equal(t, 0, clientStateCount)
 }
 
 func TestUninstallSync_RemovesMetadataAndTriggersButPreservesBusinessTables(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
-	_, err := client.Connect(context.Background(), "lifecycle-user")
+	_, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
 	require.NoError(t, err)
@@ -837,7 +995,14 @@ func TestUninstallSync_RemovesMetadataAndTriggersButPreservesBusinessTables(t *t
 		require.Equalf(t, 0, count, "metadata table %s should be removed", tableName)
 	}
 
-	for _, triggerName := range []string{"trg_users_ai", "trg_users_au", "trg_users_ad"} {
+	for _, triggerName := range []string{
+		"trg_users_bi_guard",
+		"trg_users_bu_guard",
+		"trg_users_bd_guard",
+		"trg_users_ai",
+		"trg_users_au",
+		"trg_users_ad",
+	} {
 		var count int
 		require.NoError(t, db.QueryRow(`
 			SELECT COUNT(*)
@@ -854,7 +1019,7 @@ func TestUninstallSync_RemovesMetadataAndTriggersButPreservesBusinessTables(t *t
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&userCount))
 	require.Equal(t, 2, userCount)
 
-	err = client.Open(context.Background(), "device-a")
+	_, err = client.Open(context.Background(), "device-a")
 	var closedErr *ClientClosedError
 	require.ErrorAs(t, err, &closedErr)
 }
@@ -862,7 +1027,7 @@ func TestUninstallSync_RemovesMetadataAndTriggersButPreservesBusinessTables(t *t
 func TestUninstallSync_AllowsFreshReinstallOnSameDatabase(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
-	require.NoError(t, client.Open(context.Background(), "device-a"))
+	mustOpen(t, client, context.Background(), "device-a")
 	require.NoError(t, client.UninstallSync(context.Background()))
 
 	reinstalled, err := NewClient(db, "http://example.invalid", func(context.Context) (string, error) {
@@ -893,7 +1058,7 @@ func TestUninstallSync_AllowsFreshReinstallOnSameDatabase(t *testing.T) {
 		require.Equalf(t, 1, count, "metadata table %s should be recreated", tableName)
 	}
 
-	require.NoError(t, reinstalled.Open(context.Background(), "device-b"))
+	mustOpen(t, reinstalled, context.Background(), "device-b")
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "3", "Linus", "linus@example.com")
 	require.NoError(t, err)
 

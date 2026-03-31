@@ -14,6 +14,7 @@ import (
 	"time"
 )
 
+// RetryPolicy configures bounded retry for transient sync I/O failures.
 type RetryPolicy struct {
 	Enabled        bool
 	MaxAttempts    int
@@ -22,12 +23,14 @@ type RetryPolicy struct {
 	JitterFraction float64
 }
 
+// RetryExhaustedError reports that the configured retry budget was exhausted for an operation.
 type RetryExhaustedError struct {
 	Operation string
 	Attempts  int
 	LastErr   error
 }
 
+// Error implements error.
 func (e *RetryExhaustedError) Error() string {
 	if e == nil {
 		return "oversqlite retry policy exhausted"
@@ -38,6 +41,7 @@ func (e *RetryExhaustedError) Error() string {
 	return fmt.Sprintf("oversqlite retry policy exhausted for %s after %d attempts: %v", e.Operation, e.Attempts, e.LastErr)
 }
 
+// Unwrap returns the last underlying retry failure.
 func (e *RetryExhaustedError) Unwrap() error {
 	if e == nil {
 		return nil

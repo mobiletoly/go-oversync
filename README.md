@@ -129,11 +129,11 @@ if err := client.Open(ctx, "device-abc"); err != nil {
     log.Fatal(err)
 }
 
-connectResult, err := client.Connect(ctx, "user-123")
+connectResult, err := client.Attach(ctx, "user-123")
 if err != nil {
     log.Fatal(err)
 }
-if connectResult.Status == oversqlite.ConnectStatusRetryLater {
+if connectResult.Status == oversqlite.AttachStatusRetryLater {
     log.Printf("connect pending, retry after %s", connectResult.RetryAfter)
     return
 }
@@ -142,7 +142,7 @@ if err := client.Sync(ctx); err != nil {
     log.Fatal(err)
 }
 
-if err := client.SignOut(ctx); err != nil {
+if err := client.Detach(ctx); err != nil {
     log.Fatal(err)
 }
 ```
@@ -158,7 +158,7 @@ if err := client.SignOut(ctx); err != nil {
 ## Examples
 
 - `examples/nethttp_server/`: reference server with JWT auth and test helpers
-- `examples/mobile_flow/`: simulator for implemented and scaffolded sync scenarios
+- `examples/mobile_flow/`: simulator for implemented sync scenarios plus a small number of still-partial CLI entries
 - `examples/samplesync_server/`: sample server used by the Kotlin sample app
 
 ## License

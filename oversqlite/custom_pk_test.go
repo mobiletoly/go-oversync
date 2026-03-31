@@ -82,8 +82,8 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 		t.Fatalf("Failed to count triggers: %v", err)
 	}
 
-	// Should have 3 triggers per table (INSERT, UPDATE, DELETE) * 3 tables = 9 triggers
-	expectedTriggers := 9
+	// Each managed table now gets 3 guard triggers plus 3 dirty-capture triggers.
+	expectedTriggers := 18
 	if triggerCount != expectedTriggers {
 		t.Errorf("Expected %d triggers, got %d", expectedTriggers, triggerCount)
 	}
@@ -259,9 +259,12 @@ func TestTriggerGenerationWithCustomPK(t *testing.T) {
 	}
 
 	expectedTriggers := []string{
-		"trg_test_table_ad", // DELETE trigger
-		"trg_test_table_ai", // INSERT trigger
-		"trg_test_table_au", // UPDATE trigger
+		"trg_test_table_ad",       // DELETE trigger
+		"trg_test_table_ai",       // INSERT trigger
+		"trg_test_table_au",       // UPDATE trigger
+		"trg_test_table_bd_guard", // BEFORE DELETE guard trigger
+		"trg_test_table_bi_guard", // BEFORE INSERT guard trigger
+		"trg_test_table_bu_guard", // BEFORE UPDATE guard trigger
 	}
 
 	if len(triggerNames) != len(expectedTriggers) {
@@ -309,15 +312,6 @@ func TestTriggersWithCustomPKFunctionality(t *testing.T) {
 	err = createTriggersForTable(db, syncTable)
 	if err != nil {
 		t.Fatalf("Failed to create triggers: %v", err)
-	}
-
-	// Set up client state for triggers to work
-	_, err = db.Exec(`
-		INSERT INTO _sync_client_state (user_id, source_id, next_source_bundle_id, last_bundle_seq_seen, apply_mode)
-		VALUES ('test-user', 'test-source', 1, 0, 0)
-	`)
-	if err != nil {
-		t.Fatalf("Failed to insert client state: %v", err)
 	}
 
 	// Test INSERT trigger

@@ -31,10 +31,10 @@ func (s *NormalUsageScenario) Execute(ctx context.Context) error {
 	logger.Info("🎯 Executing Normal Usage Scenario")
 
 	// Sign in immediately (established user)
-	if err := s.app.OnSignIn(ctx, s.config.UserID); err != nil {
+	if err := s.app.onSignIn(ctx, s.config.UserID); err != nil {
 		return fmt.Errorf("failed to sign in: %w", err)
 	}
-	s.app.StopSync()
+	s.app.stopSync()
 
 	// Simulate normal CRUD operations with immediate sync
 	logger.Info("📱 Performing normal CRUD operations")
@@ -43,7 +43,7 @@ func (s *NormalUsageScenario) Execute(ctx context.Context) error {
 
 	// Create records
 	for i := 0; i < s.config.InitialRecords; i++ {
-		userID, err := s.app.CreateUser(
+		userID, err := s.app.createUser(
 			fmt.Sprintf("Normal User %d", i+1),
 			fmt.Sprintf("normal.user%d@example.com", i+1),
 		)
@@ -55,7 +55,7 @@ func (s *NormalUsageScenario) Execute(ctx context.Context) error {
 
 	// Update records
 	for i := 0; i < s.config.UpdateOperations && i < len(userIDs); i++ {
-		err := s.app.UpdateUser(
+		err := s.app.updateUser(
 			userIDs[i],
 			fmt.Sprintf("Updated Normal User %d", i+1),
 			fmt.Sprintf("updated.normal.user%d@example.com", i+1),
@@ -67,13 +67,13 @@ func (s *NormalUsageScenario) Execute(ctx context.Context) error {
 
 	// Delete records
 	for i := 0; i < s.config.DeleteOperations && i < len(userIDs); i++ {
-		err := s.app.DeleteUser(userIDs[len(userIDs)-1-i])
+		err := s.app.deleteUser(userIDs[len(userIDs)-1-i])
 		if err != nil {
 			return fmt.Errorf("failed to delete user: %w", err)
 		}
 	}
 
-	if err := s.app.PushPending(ctx); err != nil {
+	if err := s.app.pushPending(ctx); err != nil {
 		return fmt.Errorf("failed to push normal usage changes: %w", err)
 	}
 
