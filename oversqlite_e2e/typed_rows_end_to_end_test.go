@@ -88,7 +88,7 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
-		SourceBundleID: 101,
+		SourceBundleID: 1,
 	}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.typed_rows (id, name, note, count_value, enabled_flag, rating, data, created_at)

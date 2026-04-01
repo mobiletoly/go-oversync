@@ -163,22 +163,26 @@ func (f *pushSessionFixture) setPushSessionExpiry(t *testing.T, ctx context.Cont
 func (f *pushSessionFixture) committedBundleStoredKeys(t *testing.T, ctx context.Context, bundleSeq int64) []string {
 	t.Helper()
 
+	userPK, err := lookupUserPK(ctx, f.pool, f.writer.UserID)
+	require.NoError(t, err)
 	rows, err := f.pool.Query(ctx, `
-		SELECT key_json
+		SELECT key_bytes
 		FROM sync.bundle_rows
-		WHERE user_id = $1
+		WHERE user_pk = $1
 		  AND bundle_seq = $2
 		ORDER BY row_ordinal
-	`, f.writer.UserID, bundleSeq)
+	`, userPK, bundleSeq)
 	require.NoError(t, err)
 	defer rows.Close()
 
 	keys := make([]string, 0)
+	info, err := f.svc.syncKeyInfoForTable(f.schemaName, "users")
+	require.NoError(t, err)
 	for rows.Next() {
-		var keyJSON string
-		require.NoError(t, rows.Scan(&keyJSON))
-		var key SyncKey
-		require.NoError(t, json.Unmarshal([]byte(keyJSON), &key))
+		var keyBytes []byte
+		require.NoError(t, rows.Scan(&keyBytes))
+		key, err := wireSyncKeyFromBytes(info, keyBytes)
+		require.NoError(t, err)
 		keys = append(keys, key["id"].(string))
 	}
 	require.NoError(t, rows.Err())
@@ -202,15 +206,17 @@ func insertPreparedPushSessionRow(
 
 	prepared := preparedRows[0]
 	var payload any
-	if prepared.op != OpDelete {
+	opCode, err := opCodeFromString(prepared.op)
+	require.NoError(t, err)
+	if opCode != opCodeDelete {
 		payload = string(prepared.payload)
 	}
 
 	_, err = pool.Exec(ctx, `
 		INSERT INTO sync.push_session_rows (
-			push_id, row_ordinal, schema_name, table_name, key_json, op, base_row_version, payload
-		) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8::jsonb)
-	`, pushID, rowOrdinal, prepared.schema, prepared.table, prepared.keyJSON, prepared.op, prepared.baseRowVersion, payload)
+			push_id, row_ordinal, table_id, key_bytes, op_code, base_bundle_seq, payload_apply
+		) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::json)
+	`, pushID, rowOrdinal, prepared.tableID, prepared.keyBytes, opCode, prepared.baseRowVersion, payload)
 	require.NoError(t, err)
 }
 
@@ -268,20 +274,25 @@ func TestPushSessions_StagedRowsRemainInvisibleUntilCommit(t *testing.T) {
 	fixture.uploadChunk(t, ctx, session.PushID, 0, fixture.userRow(rowID, "Alpha"))
 
 	require.Equal(t, 0, fixture.businessUserCount(t, ctx))
-
-	pullBeforeCommit, err := fixture.svc.ProcessPull(ctx, fixture.reader, 0, 10, 0)
-	require.Nil(t, pullBeforeCommit)
-	var initializingErr *ScopeInitializingError
-	require.ErrorAs(t, err, &initializingErr)
+	var committedBefore int
+	require.NoError(t, fixture.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.bundle_log
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, fixture.writer.UserID).Scan(&committedBefore))
+	require.Zero(t, committedBefore)
 
 	commit := fixture.commitSession(t, ctx, session.PushID)
 	require.Equal(t, int64(1), commit.RowCount)
 	require.Equal(t, 1, fixture.businessUserCount(t, ctx))
 
-	pullAfterCommit, err := fixture.svc.ProcessPull(ctx, fixture.reader, 0, 10, 0)
-	require.NoError(t, err)
-	require.Len(t, pullAfterCommit.Bundles, 1)
-	require.Equal(t, commit.BundleSeq, pullAfterCommit.Bundles[0].BundleSeq)
+	var committedAfter int
+	require.NoError(t, fixture.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.bundle_log
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, fixture.writer.UserID).Scan(&committedAfter))
+	require.Equal(t, 1, committedAfter)
 }
 
 func TestPushSessions_CommitConflictResponseIncludesStructuredRow(t *testing.T) {
@@ -389,17 +400,22 @@ func TestPushSessions_DuplicateCommitIsIdempotent(t *testing.T) {
 	fixture.uploadChunk(t, ctx, session.PushID, 0, fixture.userRow(uuid.New(), "Alpha"))
 
 	firstCommit := fixture.commitSession(t, ctx, session.PushID)
-	secondCommit := fixture.commitSession(t, ctx, session.PushID)
 
-	require.Equal(t, firstCommit.BundleSeq, secondCommit.BundleSeq)
-	require.Equal(t, firstCommit.RowCount, secondCommit.RowCount)
-	require.Equal(t, firstCommit.BundleHash, secondCommit.BundleHash)
+	_, err := fixture.svc.CommitPushSession(ctx, fixture.writer, session.PushID)
+	var notFoundErr *PushSessionNotFoundError
+	require.ErrorAs(t, err, &notFoundErr)
+
+	recovered := fixture.createSession(t, ctx, 1, 1)
+	require.Equal(t, "already_committed", recovered.Status)
+	require.Equal(t, firstCommit.BundleSeq, recovered.BundleSeq)
+	require.Equal(t, firstCommit.RowCount, recovered.RowCount)
+	require.Equal(t, firstCommit.BundleHash, recovered.BundleHash)
 
 	var bundleCount int
 	require.NoError(t, fixture.pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM sync.bundle_log
-		WHERE user_id = $1
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 	`, fixture.writer.UserID).Scan(&bundleCount))
 	require.Equal(t, 1, bundleCount)
 }
@@ -538,8 +554,14 @@ func TestPushSessions_RejectIncompleteOrNonContiguousStagingAtCommit(t *testing.
 
 		insertPreparedPushSessionRow(t, ctx, fixture.pool, fixture.svc, session.PushID, 0, fixture.userRow(uuid.New(), "Alpha"))
 		insertPreparedPushSessionRow(t, ctx, fixture.pool, fixture.svc, session.PushID, 2, fixture.userRow(uuid.New(), "Bravo"))
+		_, err := fixture.pool.Exec(ctx, `
+			UPDATE sync.push_sessions
+			SET next_expected_row_ordinal = 2
+			WHERE push_id = $1::uuid
+		`, session.PushID)
+		require.NoError(t, err)
 
-		_, err := fixture.svc.CommitPushSession(ctx, fixture.writer, session.PushID)
+		_, err = fixture.svc.CommitPushSession(ctx, fixture.writer, session.PushID)
 		var invalidErr *PushCommitInvalidError
 		require.ErrorAs(t, err, &invalidErr)
 		require.Contains(t, invalidErr.Error(), "not contiguous")
@@ -569,10 +591,9 @@ func TestPushSessions_RestartedSessionDeletesPartialStagingAndInvalidatesOldPush
 	require.NoError(t, fixture.pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM sync.push_sessions
-		WHERE user_id = $1
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 		  AND source_id = $2
 		  AND source_bundle_id = $3
-		  AND status = 'staging'
 	`, fixture.writer.UserID, fixture.writer.SourceID, int64(1)).Scan(&stagingSessionCount))
 	require.Equal(t, 1, stagingSessionCount)
 }
@@ -596,13 +617,12 @@ func TestPushSessions_UploadRefreshesExpiry(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestPushSessions_AcceptedPushReplaySurvivesNormalHistoryPruning(t *testing.T) {
+func TestPushSessions_CommittedBundleReplayReturnsHistoryPrunedAtRetainedFloor(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
 
-	rowID := uuid.New()
 	session := fixture.createSession(t, ctx, 1, 1)
-	fixture.uploadChunk(t, ctx, session.PushID, 0, fixture.userRow(rowID, "Alpha"))
+	fixture.uploadChunk(t, ctx, session.PushID, 0, fixture.userRow(uuid.New(), "Alpha"))
 	commit := fixture.commitSession(t, ctx, session.PushID)
 
 	_, err := fixture.pool.Exec(ctx, `
@@ -617,17 +637,9 @@ func TestPushSessions_AcceptedPushReplaySurvivesNormalHistoryPruning(t *testing.
 	require.ErrorAs(t, err, &prunedErr)
 	require.Equal(t, commit.BundleSeq, prunedErr.RetainedFloor)
 
-	page, err := fixture.svc.GetCommittedBundleRows(ctx, fixture.writer, commit.BundleSeq, nil, 10)
-	require.NoError(t, err)
-	require.Equal(t, commit.BundleSeq, page.BundleSeq)
-	require.Equal(t, commit.SourceID, page.SourceID)
-	require.Equal(t, commit.SourceBundleID, page.SourceBundleID)
-	require.Equal(t, commit.RowCount, page.RowCount)
-	require.Equal(t, commit.BundleHash, page.BundleHash)
-	require.Len(t, page.Rows, 1)
-	require.Equal(t, rowID.String(), page.Rows[0].Key["id"])
-	require.Equal(t, int64(0), page.NextRowOrdinal)
-	require.False(t, page.HasMore)
+	_, err = fixture.svc.GetCommittedBundleRows(ctx, fixture.writer, commit.BundleSeq, nil, 10)
+	require.ErrorAs(t, err, &prunedErr)
+	require.Equal(t, commit.BundleSeq, prunedErr.ProvidedSeq)
 }
 
 func TestPushSessions_ConcurrentSessionCreationLeavesOneActiveStagingSession(t *testing.T) {
@@ -713,20 +725,18 @@ func TestPushSessions_ConcurrentSessionCreationLeavesOneActiveStagingSession(t *
 	require.NoError(t, fixture.pool.QueryRow(ctx, `
 		SELECT push_id::text
 		FROM sync.push_sessions
-		WHERE user_id = $1
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 		  AND source_id = $2
 		  AND source_bundle_id = $3
-		  AND status = 'staging'
 	`, fixture.writer.UserID, fixture.writer.SourceID, int64(1)).Scan(&activePushID))
 
 	var stagingCount int
 	require.NoError(t, fixture.pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM sync.push_sessions
-		WHERE user_id = $1
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 		  AND source_id = $2
 		  AND source_bundle_id = $3
-		  AND status = 'staging'
 	`, fixture.writer.UserID, fixture.writer.SourceID, int64(1)).Scan(&stagingCount))
 	require.Equal(t, 1, stagingCount)
 	require.Contains(t, []string{collected[0].resp.PushID, collected[1].resp.PushID}, activePushID)
@@ -756,7 +766,15 @@ func TestPushSessions_UnknownExpiredAndForeignIDsFailClosed(t *testing.T) {
 	foreignActor := Actor{UserID: "other-user-" + uuid.NewString(), SourceID: "other-source"}
 	foreignSession := fixture.createSession(t, ctx, 1, 1)
 
-	expiredSession := fixture.createSession(t, ctx, 2, 1)
+	expiredActor := Actor{UserID: "expired-user-" + uuid.NewString(), SourceID: "writer-expired"}
+	expiredInitializationID := resolveConnectForPushSession(t, ctx, fixture.svc, expiredActor, true)
+	expiredSession, err := fixture.svc.CreatePushSession(ctx, expiredActor, &PushSessionCreateRequest{
+		SourceID:         expiredActor.SourceID,
+		SourceBundleID:   1,
+		PlannedRowCount:  1,
+		InitializationID: expiredInitializationID,
+	})
+	require.NoError(t, err)
 	fixture.setPushSessionExpiry(t, ctx, expiredSession.PushID, time.Now().UTC().Add(-time.Second))
 
 	validRow := fixture.userRow(uuid.New(), "Alpha")
@@ -846,7 +864,7 @@ func TestPushSessions_UnknownExpiredAndForeignIDsFailClosed(t *testing.T) {
 		{
 			name: "upload expired",
 			run: func() error {
-				_, err := fixture.svc.UploadPushChunk(ctx, fixture.writer, expiredSession.PushID, &PushSessionChunkRequest{
+				_, err := fixture.svc.UploadPushChunk(ctx, expiredActor, expiredSession.PushID, &PushSessionChunkRequest{
 					StartRowOrdinal: 0,
 					Rows:            []PushRequestRow{validRow},
 				})
@@ -861,7 +879,7 @@ func TestPushSessions_UnknownExpiredAndForeignIDsFailClosed(t *testing.T) {
 		{
 			name: "commit expired",
 			run: func() error {
-				_, err := fixture.svc.CommitPushSession(ctx, fixture.writer, expiredSession.PushID)
+				_, err := fixture.svc.CommitPushSession(ctx, expiredActor, expiredSession.PushID)
 				return err
 			},
 			assertError: func(t *testing.T, err error) {
@@ -873,7 +891,7 @@ func TestPushSessions_UnknownExpiredAndForeignIDsFailClosed(t *testing.T) {
 		{
 			name: "delete expired",
 			run: func() error {
-				return fixture.svc.DeletePushSession(ctx, fixture.writer, expiredSession.PushID)
+				return fixture.svc.DeletePushSession(ctx, expiredActor, expiredSession.PushID)
 			},
 			assertError: func(t *testing.T, err error) {
 				t.Helper()
@@ -896,21 +914,72 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{maxRowsPerPushChunk: 1})
 	handlers := NewHTTPSyncHandlers(fixture.svc, slog.Default())
 	foreignActor := Actor{UserID: "other-user-" + uuid.NewString(), SourceID: "other-source"}
+	validActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-valid"}
+	outOfOrderActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-out-of-order"}
+	commitInvalidActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-commit-invalid"}
+	committedActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-committed"}
+	prunedActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-pruned"}
+	expiredActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-expired"}
+	sequenceChangedActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-sequence-changed"}
 
-	bootstrapSession := fixture.createSession(t, ctx, 100, 1)
+	bootstrapSession := fixture.createSession(t, ctx, 1, 1)
 	fixture.uploadChunk(t, ctx, bootstrapSession.PushID, 0, fixture.userRow(uuid.New(), "Bootstrap"))
 	fixture.commitSession(t, ctx, bootstrapSession.PushID)
 
-	validSession := fixture.createSession(t, ctx, 1, 1)
-	outOfOrderSession := fixture.createSession(t, ctx, 2, 1)
+	createSessionForActor := func(actor Actor, sourceBundleID, plannedRowCount int64) *PushSessionCreateResponse {
+		initializationID := resolveConnectForPushSession(t, ctx, fixture.svc, actor, plannedRowCount > 0)
+		resp, err := fixture.svc.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
+			SourceID:         actor.SourceID,
+			SourceBundleID:   sourceBundleID,
+			PlannedRowCount:  plannedRowCount,
+			InitializationID: initializationID,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		return resp
+	}
+
+	validSession := createSessionForActor(validActor, 1, 1)
+	outOfOrderSession := createSessionForActor(outOfOrderActor, 1, 1)
 	fixture.uploadChunk(t, ctx, outOfOrderSession.PushID, 0, fixture.userRow(uuid.New(), "Alpha"))
 
-	commitInvalidSession := fixture.createSession(t, ctx, 3, 2)
+	commitInvalidSession := createSessionForActor(commitInvalidActor, 1, 2)
 	fixture.uploadChunk(t, ctx, commitInvalidSession.PushID, 0, fixture.userRow(uuid.New(), "Bravo"))
 
-	committedSession := fixture.createSession(t, ctx, 5, 1)
+	sequenceChangedSession := createSessionForActor(sequenceChangedActor, 1, 1)
+	fixture.uploadChunk(t, ctx, sequenceChangedSession.PushID, 0, fixture.userRow(uuid.New(), "SequenceChanged"))
+
+	committedSession := createSessionForActor(committedActor, 1, 1)
 	fixture.uploadChunk(t, ctx, committedSession.PushID, 0, fixture.userRow(uuid.New(), "Charlie"))
-	commitResp := fixture.commitSession(t, ctx, committedSession.PushID)
+	fixture.commitSession(t, ctx, committedSession.PushID)
+
+	prunedSession := createSessionForActor(prunedActor, 1, 1)
+	fixture.uploadChunk(t, ctx, prunedSession.PushID, 0, fixture.userRow(uuid.New(), "Pruned"))
+	prunedCommit := fixture.commitSession(t, ctx, prunedSession.PushID)
+	_, err := fixture.pool.Exec(ctx, `
+		UPDATE sync.user_state
+		SET retained_bundle_floor = $2
+		WHERE user_id = $1
+	`, prunedActor.UserID, prunedCommit.BundleSeq)
+	require.NoError(t, err)
+	_, err = fixture.pool.Exec(ctx, `
+		DELETE FROM sync.bundle_log
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+		  AND source_id = $2
+		  AND source_bundle_id = $3
+	`, prunedActor.UserID, prunedActor.SourceID, prunedCommit.SourceBundleID)
+	require.NoError(t, err)
+	_, err = fixture.pool.Exec(ctx, `
+		INSERT INTO sync.source_state (user_pk, source_id, max_committed_source_bundle_id)
+		VALUES ((SELECT user_pk FROM sync.user_state WHERE user_id = $1), $2, 1)
+		ON CONFLICT (user_pk, source_id) DO UPDATE
+		SET max_committed_source_bundle_id = EXCLUDED.max_committed_source_bundle_id
+	`, sequenceChangedActor.UserID, sequenceChangedActor.SourceID)
+	require.NoError(t, err)
+
+	postPruneCommittedSession := createSessionForActor(committedActor, 2, 1)
+	fixture.uploadChunk(t, ctx, postPruneCommittedSession.PushID, 0, fixture.userRow(uuid.New(), "CommittedAfterPrune"))
+	postPruneCommitResp := fixture.commitSession(t, ctx, postPruneCommittedSession.PushID)
 
 	cases := []struct {
 		name           string
@@ -938,7 +1007,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			handler:        handlers.HandlePushSessionChunk,
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions/" + validSession.PushID + "/chunks",
-			actor:          fixture.writer,
+			actor:          validActor,
 			body:           PushSessionChunkRequest{StartRowOrdinal: 0},
 			pathValues:     map[string]string{"push_id": validSession.PushID},
 			expectedStatus: http.StatusBadRequest,
@@ -949,7 +1018,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			handler:        handlers.HandlePushSessionChunk,
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions/" + outOfOrderSession.PushID + "/chunks",
-			actor:          fixture.writer,
+			actor:          outOfOrderActor,
 			body:           PushSessionChunkRequest{StartRowOrdinal: 0, Rows: []PushRequestRow{fixture.userRow(uuid.New(), "Delta")}},
 			pathValues:     map[string]string{"push_id": outOfOrderSession.PushID},
 			expectedStatus: http.StatusConflict,
@@ -960,7 +1029,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			handler:        handlers.HandlePushSessionChunk,
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions/" + uuid.NewString() + "/chunks",
-			actor:          fixture.writer,
+			actor:          validActor,
 			body:           PushSessionChunkRequest{StartRowOrdinal: 0, Rows: []PushRequestRow{fixture.userRow(uuid.New(), "Echo")}},
 			pathValues:     map[string]string{"push_id": uuid.NewString()},
 			expectedStatus: http.StatusNotFound,
@@ -982,17 +1051,47 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			handler:        handlers.HandleCommitPushSession,
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions/" + commitInvalidSession.PushID + "/commit",
-			actor:          fixture.writer,
+			actor:          commitInvalidActor,
 			pathValues:     map[string]string{"push_id": commitInvalidSession.PushID},
 			expectedStatus: http.StatusBadRequest,
 			expectedCode:   "push_commit_invalid",
+		},
+		{
+			name:           "commit source sequence changed",
+			handler:        handlers.HandleCommitPushSession,
+			method:         http.MethodPost,
+			path:           "/sync/push-sessions/" + sequenceChangedSession.PushID + "/commit",
+			actor:          sequenceChangedActor,
+			pathValues:     map[string]string{"push_id": sequenceChangedSession.PushID},
+			expectedStatus: http.StatusConflict,
+			expectedCode:   "source_sequence_changed",
+		},
+		{
+			name:           "create history pruned",
+			handler:        handlers.HandleCreatePushSession,
+			method:         http.MethodPost,
+			path:           "/sync/push-sessions",
+			actor:          prunedActor,
+			body:           PushSessionCreateRequest{SourceID: prunedActor.SourceID, SourceBundleID: 1, PlannedRowCount: 1},
+			expectedStatus: http.StatusConflict,
+			expectedCode:   "history_pruned",
+		},
+		{
+			name:           "create source sequence out of order",
+			handler:        handlers.HandleCreatePushSession,
+			method:         http.MethodPost,
+			path:           "/sync/push-sessions",
+			actor:          validActor,
+			body:           PushSessionCreateRequest{SourceID: validActor.SourceID, SourceBundleID: 2, PlannedRowCount: 1},
+			expectedStatus: http.StatusConflict,
+			expectedCode:   "source_sequence_out_of_order",
 		},
 		{
 			name:           "get invalid",
 			handler:        handlers.HandleGetCommittedBundleRows,
 			method:         http.MethodGet,
 			path:           "/sync/committed-bundles/not-a-number/rows",
-			actor:          fixture.writer,
+			actor:          committedActor,
 			pathValues:     map[string]string{"bundle_seq": "not-a-number"},
 			expectedStatus: http.StatusBadRequest,
 			expectedCode:   "committed_bundle_chunk_invalid",
@@ -1002,28 +1101,28 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			handler:        handlers.HandleGetCommittedBundleRows,
 			method:         http.MethodGet,
 			path:           "/sync/committed-bundles/999999/rows",
-			actor:          fixture.writer,
+			actor:          committedActor,
 			pathValues:     map[string]string{"bundle_seq": "999999"},
 			expectedStatus: http.StatusNotFound,
 			expectedCode:   "committed_bundle_not_found",
 		},
 		{
-			name:           "committed delete invalid",
+			name:           "committed delete not found",
 			handler:        handlers.HandleDeletePushSession,
 			method:         http.MethodDelete,
 			path:           "/sync/push-sessions/" + committedSession.PushID,
-			actor:          fixture.writer,
+			actor:          committedActor,
 			pathValues:     map[string]string{"push_id": committedSession.PushID},
-			expectedStatus: http.StatusBadRequest,
-			expectedCode:   "push_chunk_invalid",
+			expectedStatus: http.StatusNotFound,
+			expectedCode:   "push_session_not_found",
 		},
 		{
 			name:           "commit response stays valid after mappings setup",
 			handler:        handlers.HandleGetCommittedBundleRows,
 			method:         http.MethodGet,
-			path:           fmt.Sprintf("/sync/committed-bundles/%d/rows", commitResp.BundleSeq),
-			actor:          fixture.writer,
-			pathValues:     map[string]string{"bundle_seq": fmt.Sprintf("%d", commitResp.BundleSeq)},
+			path:           fmt.Sprintf("/sync/committed-bundles/%d/rows", postPruneCommitResp.BundleSeq),
+			actor:          committedActor,
+			pathValues:     map[string]string{"bundle_seq": fmt.Sprintf("%d", postPruneCommitResp.BundleSeq)},
 			expectedStatus: http.StatusOK,
 		},
 	}
@@ -1040,13 +1139,14 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 		})
 	}
 
-	expiredSession := fixture.createSession(t, ctx, 6, 1)
+	expiredSession := createSessionForActor(expiredActor, 1, 1)
 	fixture.setPushSessionExpiry(t, ctx, expiredSession.PushID, time.Now().UTC().Add(-time.Second))
 	expiredCases := []struct {
 		name       string
 		handler    func(http.ResponseWriter, *http.Request)
 		method     string
 		path       string
+		actor      Actor
 		body       any
 		pathValues map[string]string
 	}{
@@ -1055,6 +1155,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			handler:    handlers.HandlePushSessionChunk,
 			method:     http.MethodPost,
 			path:       "/sync/push-sessions/" + expiredSession.PushID + "/chunks",
+			actor:      expiredActor,
 			body:       PushSessionChunkRequest{StartRowOrdinal: 0, Rows: []PushRequestRow{fixture.userRow(uuid.New(), "Expired")}},
 			pathValues: map[string]string{"push_id": expiredSession.PushID},
 		},
@@ -1063,6 +1164,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			handler:    handlers.HandleCommitPushSession,
 			method:     http.MethodPost,
 			path:       "/sync/push-sessions/" + expiredSession.PushID + "/commit",
+			actor:      expiredActor,
 			pathValues: map[string]string{"push_id": expiredSession.PushID},
 		},
 		{
@@ -1070,12 +1172,13 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			handler:    handlers.HandleDeletePushSession,
 			method:     http.MethodDelete,
 			path:       "/sync/push-sessions/" + expiredSession.PushID,
+			actor:      expiredActor,
 			pathValues: map[string]string{"push_id": expiredSession.PushID},
 		},
 	}
 	for _, tc := range expiredCases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := doJSONHandlerRequest(t, tc.handler, tc.method, tc.path, fixture.writer, tc.body, tc.pathValues)
+			rec := doJSONHandlerRequest(t, tc.handler, tc.method, tc.path, tc.actor, tc.body, tc.pathValues)
 			require.Equal(t, http.StatusGone, rec.Code)
 			errResp := decodeErrorResponse(t, rec)
 			require.Equal(t, "push_session_expired", errResp.Error)

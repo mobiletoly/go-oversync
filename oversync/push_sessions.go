@@ -87,6 +87,57 @@ func (e *CommittedBundleNotFoundError) Error() string {
 	return fmt.Sprintf("committed bundle %d was not found", e.BundleSeq)
 }
 
+type SourceTupleHistoryPrunedError struct {
+	UserID                         string
+	SourceID                       string
+	SourceBundleID                 int64
+	MaxCommittedSourceBundleIDHint int64
+}
+
+func (e *SourceTupleHistoryPrunedError) Error() string {
+	return fmt.Sprintf(
+		"source tuple (%s, %d) for user %s is older than retained duplicate history; max committed source_bundle_id is %d",
+		e.SourceID,
+		e.SourceBundleID,
+		e.UserID,
+		e.MaxCommittedSourceBundleIDHint,
+	)
+}
+
+type SourceSequenceOutOfOrderError struct {
+	UserID   string
+	SourceID string
+	Expected int64
+	Actual   int64
+}
+
+func (e *SourceSequenceOutOfOrderError) Error() string {
+	return fmt.Sprintf(
+		"source %s for user %s expected next source_bundle_id %d, got %d",
+		e.SourceID,
+		e.UserID,
+		e.Expected,
+		e.Actual,
+	)
+}
+
+type SourceSequenceChangedError struct {
+	UserID   string
+	SourceID string
+	Expected int64
+	Actual   int64
+}
+
+func (e *SourceSequenceChangedError) Error() string {
+	return fmt.Sprintf(
+		"source %s for user %s changed expected next source_bundle_id from staged %d to %d before commit",
+		e.SourceID,
+		e.UserID,
+		e.Actual,
+		e.Expected,
+	)
+}
+
 type committedBundleMeta struct {
 	BundleSeq      int64
 	SourceID       string
@@ -96,17 +147,15 @@ type committedBundleMeta struct {
 }
 
 type pushSessionState struct {
-	PushID           string
-	UserID           string
-	SourceID         string
-	SourceBundleID   int64
-	PlannedRowCount  int64
-	InitializationID string
-	Status           string
-	BundleSeq        int64
-	RowCount         int64
-	BundleHash       string
-	ExpiresAt        time.Time
+	PushID                 string
+	UserPK                 int64
+	UserID                 string
+	SourceID               string
+	SourceBundleID         int64
+	PlannedRowCount        int64
+	NextExpectedRowOrdinal int64
+	InitializationID       string
+	ExpiresAt              time.Time
 }
 
 func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *PushSessionCreateRequest) (_ *PushSessionCreateResponse, err error) {
@@ -188,7 +237,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				return fmt.Errorf("unexpected scope state %q", scopeState.State)
 			}
 
-			meta, err := loadAppliedPushMetadata(ctx, tx, actor.UserID, req.SourceID, req.SourceBundleID)
+			meta, err := loadCommittedPushMetadataBySourceTuple(ctx, tx, scopeState.UserPK, req.SourceID, req.SourceBundleID)
 			if err != nil {
 				return err
 			}
@@ -204,13 +253,33 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				return nil
 			}
 
+			expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleID(ctx, tx, scopeState.UserPK, req.SourceID)
+			if err != nil {
+				return err
+			}
+			switch {
+			case req.SourceBundleID < expectedSourceBundleID:
+				return &SourceTupleHistoryPrunedError{
+					UserID:                         actor.UserID,
+					SourceID:                       req.SourceID,
+					SourceBundleID:                 req.SourceBundleID,
+					MaxCommittedSourceBundleIDHint: maxCommittedSourceBundleID,
+				}
+			case req.SourceBundleID > expectedSourceBundleID:
+				return &SourceSequenceOutOfOrderError{
+					UserID:   actor.UserID,
+					SourceID: req.SourceID,
+					Expected: expectedSourceBundleID,
+					Actual:   req.SourceBundleID,
+				}
+			}
+
 			if _, err := tx.Exec(ctx, `
 				DELETE FROM sync.push_sessions
-				WHERE user_id = $1
+				WHERE user_pk = $1
 				  AND source_id = $2
 				  AND source_bundle_id = $3
-				  AND status = 'staging'
-			`, actor.UserID, req.SourceID, req.SourceBundleID); err != nil {
+			`, scopeState.UserPK, req.SourceID, req.SourceBundleID); err != nil {
 				return fmt.Errorf("delete existing staging push session: %w", err)
 			}
 
@@ -218,9 +287,9 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 			expiresAt := time.Now().UTC().Add(s.pushSessionTTL())
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO sync.push_sessions (
-					push_id, user_id, source_id, source_bundle_id, planned_row_count, initialization_id, status, expires_at
-				) VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, 'staging', $7)
-			`, pushID, actor.UserID, req.SourceID, req.SourceBundleID, req.PlannedRowCount, nullableUUIDString(initializationID), expiresAt); err != nil {
+					push_id, user_pk, source_id, source_bundle_id, planned_row_count, next_expected_row_ordinal, initialization_id, expires_at
+				) VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::uuid, $7)
+			`, pushID, scopeState.UserPK, req.SourceID, req.SourceBundleID, req.PlannedRowCount, nullableUUIDString(initializationID), expiresAt); err != nil {
 				return fmt.Errorf("insert push session: %w", err)
 			}
 
@@ -293,9 +362,6 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 			if time.Now().UTC().After(session.ExpiresAt) {
 				return &PushSessionExpiredError{PushID: pushID}
 			}
-			if session.Status != "staging" {
-				return &PushChunkInvalidError{Message: fmt.Sprintf("push session %s is already committed", pushID)}
-			}
 			if session.InitializationID != "" {
 				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
 				if _, err := requireActiveInitializationLease(ctx, tx, actor.UserID, session.SourceID, session.InitializationID, refreshUntil); err != nil {
@@ -303,16 +369,8 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 				}
 			}
 
-			var nextExpected int64
-			if err := tx.QueryRow(ctx, `
-			SELECT COALESCE(COUNT(*), 0)
-			FROM sync.push_session_rows
-			WHERE push_id = $1::uuid
-		`, pushID).Scan(&nextExpected); err != nil {
-				return fmt.Errorf("count push session rows: %w", err)
-			}
-			if req.StartRowOrdinal != nextExpected {
-				return &PushChunkOutOfOrderError{PushID: pushID, Expected: nextExpected, Actual: req.StartRowOrdinal}
+			if req.StartRowOrdinal != session.NextExpectedRowOrdinal {
+				return &PushChunkOutOfOrderError{PushID: pushID, Expected: session.NextExpectedRowOrdinal, Actual: req.StartRowOrdinal}
 			}
 			if req.StartRowOrdinal+int64(len(preparedRows)) > session.PlannedRowCount {
 				return &PushChunkInvalidError{Message: "chunk exceeds planned_row_count"}
@@ -320,34 +378,38 @@ func (s *SyncService) UploadPushChunk(ctx context.Context, actor Actor, pushID s
 
 			rowsData := make([][]any, 0, len(preparedRows))
 			for idx, row := range preparedRows {
+				opCode, err := opCodeFromString(row.op)
+				if err != nil {
+					return err
+				}
 				rowOrdinal := req.StartRowOrdinal + int64(idx)
 				var payload any
-				if row.op != OpDelete {
+				if opCode != opCodeDelete {
 					payload = string(row.payload)
 				}
 				rowsData = append(rowsData, []any{
 					pushID,
 					rowOrdinal,
-					row.schema,
-					row.table,
-					row.keyJSON,
-					row.op,
+					row.tableID,
+					row.keyBytes,
+					opCode,
 					row.baseRowVersion,
 					payload,
 				})
 			}
 			if _, err := tx.CopyFrom(ctx,
 				pgx.Identifier{"sync", "push_session_rows"},
-				[]string{"push_id", "row_ordinal", "schema_name", "table_name", "key_json", "op", "base_row_version", "payload"},
+				[]string{"push_id", "row_ordinal", "table_id", "key_bytes", "op_code", "base_bundle_seq", "payload_apply"},
 				pgx.CopyFromRows(rowsData),
 			); err != nil {
 				return fmt.Errorf("insert push session rows: %w", err)
 			}
 			if _, err := tx.Exec(ctx, `
 			UPDATE sync.push_sessions
-			SET expires_at = $2
+			SET next_expected_row_ordinal = $2,
+				expires_at = $3
 			WHERE push_id = $1::uuid
-		`, pushID, time.Now().UTC().Add(s.pushSessionTTL())); err != nil {
+		`, pushID, req.StartRowOrdinal+int64(len(preparedRows)), time.Now().UTC().Add(s.pushSessionTTL())); err != nil {
 				return fmt.Errorf("refresh push session expiry: %w", err)
 			}
 			resp = &PushSessionChunkResponse{
@@ -396,22 +458,12 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 			if time.Now().UTC().After(session.ExpiresAt) {
 				return &PushSessionExpiredError{PushID: pushID}
 			}
-			if session.Status == "committed" {
-				resp = &PushSessionCommitResponse{
-					BundleSeq:      session.BundleSeq,
-					SourceID:       session.SourceID,
-					SourceBundleID: session.SourceBundleID,
-					RowCount:       session.RowCount,
-					BundleHash:     session.BundleHash,
-				}
-				return nil
-			}
 
 			rows, err := s.loadPushSessionPreparedRows(ctx, tx, pushID)
 			if err != nil {
 				return err
 			}
-			if int64(len(rows)) != session.PlannedRowCount {
+			if session.NextExpectedRowOrdinal != session.PlannedRowCount || int64(len(rows)) != session.PlannedRowCount {
 				return &PushCommitInvalidError{Message: fmt.Sprintf("staged row count %d does not match planned_row_count %d", len(rows), session.PlannedRowCount)}
 			}
 
@@ -420,7 +472,7 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 				if row.inputOrder != idx {
 					return &PushCommitInvalidError{Message: fmt.Sprintf("staged rows are not contiguous at row_ordinal %d", idx)}
 				}
-				targetKey := row.schema + "\x00" + row.table + "\x00" + row.keyJSON
+				targetKey := string(appendInt32BigEndian(append([]byte(nil), row.keyBytes...), row.tableID))
 				if _, exists := seenTargets[targetKey]; exists {
 					return &PushCommitInvalidError{Message: fmt.Sprintf("duplicate target row in staged push session: %s.%s %s", row.schema, row.table, row.keyString)}
 				}
@@ -443,17 +495,30 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 					return err
 				}
 			}
-			if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_user_id', $1, true)`, actor.UserID); err != nil {
-				return fmt.Errorf("set push bundle user_id: %w", err)
+
+			expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, session.UserPK, session.SourceID)
+			if err != nil {
+				return err
 			}
-			if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_id', $1, true)`, session.SourceID); err != nil {
-				return fmt.Errorf("set push bundle source_id: %w", err)
+			if session.SourceBundleID != expectedSourceBundleID {
+				return &SourceSequenceChangedError{
+					UserID:   actor.UserID,
+					SourceID: session.SourceID,
+					Expected: expectedSourceBundleID,
+					Actual:   session.SourceBundleID,
+				}
 			}
-			if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_bundle_id', $1, true)`, fmt.Sprintf("%d", session.SourceBundleID)); err != nil {
-				return fmt.Errorf("set push bundle source_bundle_id: %w", err)
+			if err := setBundleTxContext(ctx, tx, bundleTxContext{
+				UserID:           actor.UserID,
+				UserPK:           session.UserPK,
+				SourceID:         session.SourceID,
+				SourceBundleID:   session.SourceBundleID,
+				InitializationID: session.InitializationID,
+			}); err != nil {
+				return err
 			}
 
-			rowStates, err := loadRowStateSnapshots(ctx, tx, actor.UserID, rows)
+			rowStates, err := loadRowStateSnapshots(ctx, tx, session.UserPK, rows)
 			if err != nil {
 				return err
 			}
@@ -473,7 +538,7 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 				}
 			}
 
-			bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, BundleSource{
+			bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, session.UserPK, BundleSource{
 				SourceID:       session.SourceID,
 				SourceBundleID: session.SourceBundleID,
 			})
@@ -485,28 +550,23 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 			}
 
 			if _, err := tx.Exec(ctx, `
-			INSERT INTO sync.applied_pushes (
-				user_id, source_id, source_bundle_id, bundle_seq, row_count, bundle_hash, committed_at, recorded_at
-			) VALUES ($1, $2, $3, $4, $5, $6, now(), now())
-			ON CONFLICT (user_id, source_id, source_bundle_id) DO UPDATE
-			SET bundle_seq = EXCLUDED.bundle_seq,
-				row_count = EXCLUDED.row_count,
-				bundle_hash = EXCLUDED.bundle_hash,
-				committed_at = EXCLUDED.committed_at,
-				recorded_at = EXCLUDED.recorded_at
-		`, actor.UserID, session.SourceID, session.SourceBundleID, bundle.BundleSeq, bundle.RowCount, bundle.BundleHash); err != nil {
-				return fmt.Errorf("record applied push replay key: %w", err)
+			INSERT INTO sync.source_state (
+				user_pk, source_id, max_committed_source_bundle_id
+			) VALUES ($1, $2, $3)
+			ON CONFLICT (user_pk, source_id) DO UPDATE
+			SET max_committed_source_bundle_id = EXCLUDED.max_committed_source_bundle_id
+		`, session.UserPK, session.SourceID, session.SourceBundleID); err != nil {
+				return fmt.Errorf("upsert source_state row: %w", err)
+			}
+			if err := s.applyRetentionPolicyForUser(ctx, tx, session.UserPK); err != nil {
+				return err
 			}
 
 			if _, err := tx.Exec(ctx, `
-			UPDATE sync.push_sessions
-			SET status = 'committed',
-				bundle_seq = $2,
-				row_count = $3,
-				bundle_hash = $4
+			DELETE FROM sync.push_sessions
 			WHERE push_id = $1::uuid
-		`, pushID, bundle.BundleSeq, bundle.RowCount, bundle.BundleHash); err != nil {
-				return fmt.Errorf("mark push session committed: %w", err)
+		`, pushID); err != nil {
+				return fmt.Errorf("delete committed push session: %w", err)
 			}
 			if session.InitializationID != "" {
 				if err := transitionScopeToInitialized(ctx, tx, actor.UserID, session.SourceID); err != nil {
@@ -559,6 +619,10 @@ func (s *SyncService) GetCommittedBundleRows(ctx context.Context, actor Actor, b
 		if err != nil {
 			return err
 		}
+		userPK, err := lookupUserPK(ctx, tx, actor.UserID)
+		if err != nil {
+			return err
+		}
 
 		logicalAfter := int64(-1)
 		if afterRowOrdinal != nil {
@@ -567,14 +631,14 @@ func (s *SyncService) GetCommittedBundleRows(ctx context.Context, actor Actor, b
 		storageAfter := logicalAfter + 1
 
 		queryRows, err := tx.Query(ctx, `
-			SELECT row_ordinal, schema_name, table_name, key_json, op, row_version, payload
+			SELECT row_ordinal, table_id, key_bytes, op_code, payload_wire
 			FROM sync.bundle_rows
-			WHERE user_id = $1
+			WHERE user_pk = $1
 			  AND bundle_seq = $2
 			  AND row_ordinal > $3
 			ORDER BY row_ordinal
 			LIMIT $4
-		`, actor.UserID, bundleSeq, storageAfter, effectiveMaxRows+1)
+		`, userPK, bundleSeq, storageAfter, effectiveMaxRows+1)
 		if err != nil {
 			return fmt.Errorf("query committed bundle rows: %w", err)
 		}
@@ -582,22 +646,32 @@ func (s *SyncService) GetCommittedBundleRows(ctx context.Context, actor Actor, b
 
 		rows := make([]BundleRow, 0, effectiveMaxRows+1)
 		for queryRows.Next() {
-			var row BundleRow
-			var keyJSON string
-			if err := queryRows.Scan(new(int64), &row.Schema, &row.Table, &keyJSON, &row.Op, &row.RowVersion, &row.Payload); err != nil {
+			var (
+				row         BundleRow
+				tableID     int32
+				keyBytes    []byte
+				opCode      int16
+				payloadWire []byte
+			)
+			if err := queryRows.Scan(new(int64), &tableID, &keyBytes, &opCode, &payloadWire); err != nil {
 				return fmt.Errorf("scan committed bundle row: %w", err)
 			}
-			key, err := decodeSyncKeyJSON(keyJSON)
+			info, err := s.tableInfoForID(tableID)
+			if err != nil {
+				return err
+			}
+			row.Schema = info.schemaName
+			row.Table = info.tableName
+			row.Key, err = wireSyncKeyFromBytes(info, keyBytes)
 			if err != nil {
 				return fmt.Errorf("decode committed bundle row key: %w", err)
 			}
-			row.Key = key
-			if row.Op != OpDelete {
-				row.Payload, err = s.canonicalizeWirePayload(row.Schema, row.Table, row.Payload)
-				if err != nil {
-					return fmt.Errorf("canonicalize committed bundle row payload for %s.%s: %w", row.Schema, row.Table, err)
-				}
+			row.Op, err = opStringFromCode(opCode)
+			if err != nil {
+				return err
 			}
+			row.RowVersion = bundleSeq
+			row.Payload = payloadWire
 			rows = append(rows, row)
 		}
 		if err := queryRows.Err(); err != nil {
@@ -657,9 +731,6 @@ func (s *SyncService) DeletePushSession(ctx context.Context, actor Actor, pushID
 		if time.Now().UTC().After(session.ExpiresAt) {
 			return &PushSessionExpiredError{PushID: pushID}
 		}
-		if session.Status != "staging" {
-			return &PushChunkInvalidError{Message: fmt.Sprintf("push session %s is already committed", pushID)}
-		}
 		if _, err := tx.Exec(ctx, `DELETE FROM sync.push_sessions WHERE push_id = $1::uuid`, pushID); err != nil {
 			return fmt.Errorf("delete push session: %w", err)
 		}
@@ -675,31 +746,28 @@ func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*p
 	var session pushSessionState
 	if err := tx.QueryRow(ctx, `
 		SELECT
-			push_id::text,
-			user_id,
-			source_id,
-			source_bundle_id,
-			planned_row_count,
-			COALESCE(initialization_id::text, ''),
-			status,
-			COALESCE(bundle_seq, 0),
-			COALESCE(row_count, 0),
-			COALESCE(bundle_hash, ''),
-			expires_at
-		FROM sync.push_sessions
-		WHERE push_id = $1::uuid
+			ps.push_id::text,
+			ps.user_pk,
+			us.user_id,
+			ps.source_id,
+			ps.source_bundle_id,
+			ps.planned_row_count,
+			ps.next_expected_row_ordinal,
+			COALESCE(ps.initialization_id::text, ''),
+			ps.expires_at
+		FROM sync.push_sessions ps
+		JOIN sync.user_state us ON us.user_pk = ps.user_pk
+		WHERE ps.push_id = $1::uuid
 		FOR UPDATE
 	`, pushID).Scan(
 		&session.PushID,
+		&session.UserPK,
 		&session.UserID,
 		&session.SourceID,
 		&session.SourceBundleID,
 		&session.PlannedRowCount,
+		&session.NextExpectedRowOrdinal,
 		&session.InitializationID,
-		&session.Status,
-		&session.BundleSeq,
-		&session.RowCount,
-		&session.BundleHash,
 		&session.ExpiresAt,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -710,42 +778,96 @@ func loadPushSessionForUpdate(ctx context.Context, tx pgx.Tx, pushID string) (*p
 	return &session, nil
 }
 
-func loadAppliedPushMetadata(ctx context.Context, tx pgx.Tx, userID, sourceID string, sourceBundleID int64) (*committedBundleMeta, error) {
+func loadCommittedPushMetadataBySourceTuple(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string, sourceBundleID int64) (*committedBundleMeta, error) {
 	var meta committedBundleMeta
+	var bundleHash []byte
 	if err := tx.QueryRow(ctx, `
-		SELECT bundle_seq, source_id, source_bundle_id, row_count, bundle_hash
-		FROM sync.applied_pushes
-		WHERE user_id = $1
-		  AND source_id = $2
-		  AND source_bundle_id = $3
-	`, userID, sourceID, sourceBundleID).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &meta.BundleHash); err != nil {
+		SELECT bl.bundle_seq, bl.source_id, bl.source_bundle_id, bl.row_count, bl.bundle_hash
+		FROM sync.bundle_log AS bl
+		JOIN sync.user_state AS us ON us.user_pk = bl.user_pk
+		WHERE bl.user_pk = $1
+		  AND bl.source_id = $2
+		  AND bl.source_bundle_id = $3
+		  AND bl.bundle_seq > us.retained_bundle_floor
+	`, userPK, sourceID, sourceBundleID).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &bundleHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("query applied push metadata: %w", err)
+		return nil, fmt.Errorf("query committed push metadata: %w", err)
 	}
+	meta.BundleHash = renderBundleHash(bundleHash)
 	return &meta, nil
 }
 
+func loadNextExpectedSourceBundleID(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string) (int64, int64, error) {
+	var maxCommittedSourceBundleID int64
+	err := tx.QueryRow(ctx, `
+		SELECT max_committed_source_bundle_id
+		FROM sync.source_state
+		WHERE user_pk = $1
+		  AND source_id = $2
+	`, userPK, sourceID).Scan(&maxCommittedSourceBundleID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 1, 0, nil
+		}
+		return 0, 0, fmt.Errorf("query source_state next expected bundle for %s: %w", sourceID, err)
+	}
+	return maxCommittedSourceBundleID + 1, maxCommittedSourceBundleID, nil
+}
+
+func loadNextExpectedSourceBundleIDForUpdate(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string) (int64, int64, error) {
+	var maxCommittedSourceBundleID int64
+	err := tx.QueryRow(ctx, `
+		SELECT max_committed_source_bundle_id
+		FROM sync.source_state
+		WHERE user_pk = $1
+		  AND source_id = $2
+		FOR UPDATE
+	`, userPK, sourceID).Scan(&maxCommittedSourceBundleID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 1, 0, nil
+		}
+		return 0, 0, fmt.Errorf("query source_state next expected bundle for update %s: %w", sourceID, err)
+	}
+	return maxCommittedSourceBundleID + 1, maxCommittedSourceBundleID, nil
+}
+
 func loadCommittedBundleMeta(ctx context.Context, tx pgx.Tx, userID string, bundleSeq int64) (*committedBundleMeta, error) {
+	userPK, err := lookupUserPK(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
+	retainedState, err := loadRetainedHistoryStateByUserPK(ctx, tx, userPK)
+	if err != nil {
+		return nil, err
+	}
+	if retainedState != nil {
+		if err := enforceRetainedBundleFloor(userID, bundleSeq, retainedState.RetainedFloor); err != nil {
+			return nil, err
+		}
+	}
 	var meta committedBundleMeta
+	var bundleHash []byte
 	if err := tx.QueryRow(ctx, `
 		SELECT bundle_seq, source_id, source_bundle_id, row_count, bundle_hash
 		FROM sync.bundle_log
-		WHERE user_id = $1
+		WHERE user_pk = $1
 		  AND bundle_seq = $2
-	`, userID, bundleSeq).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &meta.BundleHash); err != nil {
+	`, userPK, bundleSeq).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &bundleHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, &CommittedBundleNotFoundError{BundleSeq: bundleSeq}
 		}
 		return nil, fmt.Errorf("query committed bundle metadata: %w", err)
 	}
+	meta.BundleHash = renderBundleHash(bundleHash)
 	return &meta, nil
 }
 
 func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx, pushID string) ([]pushPreparedRow, error) {
 	queryRows, err := tx.Query(ctx, `
-		SELECT row_ordinal, schema_name, table_name, key_json, op, base_row_version, payload
+		SELECT row_ordinal, table_id, key_bytes, op_code, base_bundle_seq, payload_apply
 		FROM sync.push_session_rows
 		WHERE push_id = $1::uuid
 		ORDER BY row_ordinal
@@ -761,22 +883,22 @@ func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx
 			rowOrdinal int64
 			row        pushPreparedRow
 			payload    []byte
+			opCode     int16
 		)
-		if err := queryRows.Scan(&rowOrdinal, &row.schema, &row.table, &row.keyJSON, &row.op, &row.baseRowVersion, &payload); err != nil {
+		if err := queryRows.Scan(&rowOrdinal, &row.tableID, &row.keyBytes, &opCode, &row.baseRowVersion, &payload); err != nil {
 			return nil, fmt.Errorf("scan push session row: %w", err)
 		}
-		keyColumn, err := s.syncKeyColumnForTable(row.schema, row.table)
+		info, err := s.tableInfoForID(row.tableID)
 		if err != nil {
 			return nil, err
 		}
-		keyType, err := s.syncKeyTypeForTable(row.schema, row.table)
+		row.schema = info.schemaName
+		row.table = info.tableName
+		normalizedKey, err := decodeNormalizedStoredSyncKeyBytes(row.schema, row.table, info, row.keyBytes)
 		if err != nil {
 			return nil, err
 		}
-		normalizedKey, err := decodeNormalizedStoredSyncKey(row.schema, row.table, registeredTableRuntimeInfo{
-			syncKeyColumn: keyColumn,
-			syncKeyType:   keyType,
-		}, row.keyJSON)
+		row.op, err = opStringFromCode(opCode)
 		if err != nil {
 			return nil, err
 		}
@@ -784,6 +906,7 @@ func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx
 		row.keyType = normalizedKey.keyType
 		row.keyString = normalizedKey.keyString
 		row.keyValue = normalizedKey.dbValue
+		row.keyBytes = normalizedKey.keyBytes
 		row.payload = payload
 		if row.op != OpDelete {
 			var payloadObj map[string]any
@@ -807,7 +930,7 @@ func (s *SyncService) loadPushSessionPreparedRows(ctx context.Context, tx pgx.Tx
 func cleanupExpiredPushSessionsQuerier(ctx context.Context, q interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }) error {
-	if _, err := q.Exec(ctx, `DELETE FROM sync.push_sessions WHERE status = 'staging' AND expires_at <= now()`); err != nil {
+	if _, err := q.Exec(ctx, `DELETE FROM sync.push_sessions WHERE expires_at <= now()`); err != nil {
 		return fmt.Errorf("cleanup expired push sessions: %w", err)
 	}
 	return nil

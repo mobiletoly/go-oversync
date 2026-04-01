@@ -110,14 +110,7 @@ func TestEndToEnd_ConnectInitializeEmptyThenPushWorks(t *testing.T) {
 	require.NoError(t, err)
 	mustPushPendingE2E(t, client, ctx)
 
-	var count int
-	require.NoError(t, server.Pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.scope_state
-		WHERE user_id = $1
-		  AND state = 'INITIALIZED'
-	`, userID).Scan(&count))
-	require.Equal(t, 1, count)
+	require.Equal(t, "INITIALIZED", requireServerScopeState(t, server, userID))
 }
 
 func TestEndToEnd_ConnectRemoteAuthoritativeRebuildsExistingRemote(t *testing.T) {

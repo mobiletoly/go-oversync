@@ -807,8 +807,9 @@ func initializeDatabase(db *sql.DB) error {
 
 		`CREATE TABLE IF NOT EXISTS _sync_operation_state (
 				singleton_key        INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
-				kind                 TEXT NOT NULL DEFAULT 'none' CHECK (kind IN ('none', 'remote_replace')),
+				kind                 TEXT NOT NULL DEFAULT 'none' CHECK (kind IN ('none', 'remote_replace', 'source_recovery')),
 				target_user_id       TEXT NOT NULL DEFAULT '',
+				reason               TEXT NOT NULL DEFAULT '',
 				staged_snapshot_id   TEXT NOT NULL DEFAULT '',
 				snapshot_bundle_seq  INTEGER NOT NULL DEFAULT 0,
 				snapshot_row_count   INTEGER NOT NULL DEFAULT 0
@@ -913,8 +914,8 @@ func initializeDatabase(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`
 			INSERT INTO _sync_operation_state (
-				singleton_key, kind, target_user_id, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count
-			) VALUES (1, 'none', '', '', 0, 0)
+				singleton_key, kind, target_user_id, reason, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count
+			) VALUES (1, 'none', '', '', '', 0, 0)
 			ON CONFLICT(singleton_key) DO NOTHING
 		`); err != nil {
 		return fmt.Errorf("failed to initialize operation state row: %w", err)
@@ -1024,13 +1025,23 @@ func (c *Client) Rebuild(ctx context.Context, mode RebuildMode, newSourceID stri
 		return RemoteSyncReport{}, err
 	}
 	defer c.writeMu.Unlock()
+	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
 	switch mode {
 	case RebuildKeepSource:
+		if sourceRecoveryErr != nil {
+			return RemoteSyncReport{}, sourceRecoveryErr
+		}
 		return c.rebuildKeepSourceLocked(ctx)
 	case RebuildRotateSource:
 		newSourceID = strings.TrimSpace(newSourceID)
 		if newSourceID == "" {
 			return RemoteSyncReport{}, fmt.Errorf("newSourceID must be provided for RebuildRotateSource")
+		}
+		if sourceRecoveryErr != nil {
+			return c.rebuildSourceRecoveryLocked(ctx, newSourceID)
 		}
 		if err := c.ensureRebuildPreconditionsLocked(ctx); err != nil {
 			return RemoteSyncReport{}, err

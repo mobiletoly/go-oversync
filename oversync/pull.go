@@ -74,24 +74,42 @@ func (s *SyncService) processPullQuerier(
 	if err := requireScopeInitializedQuerier(ctx, tx, userID); err != nil {
 		return nil, err
 	}
+	retainedState, err := loadRetainedHistoryStateByUserID(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if retainedState == nil {
+		return &PullResponse{
+			StableBundleSeq: 0,
+			Bundles:         []Bundle{},
+			HasMore:         false,
+		}, nil
+	}
 	stageStart := s.stageStart()
-	if err := enforceRetainedBundleFloorQuerier(ctx, tx, userID, afterBundleSeq); err != nil {
+	if err := enforceRetainedBundleFloor(userID, afterBundleSeq, retainedState.RetainedFloor); err != nil {
 		s.observeStageErr(ctx, "pull", "retained_floor_check", stageStart, 1, 0, err)
 		return nil, err
+	}
+	if targetBundleSeq > 0 {
+		if err := enforceRetainedBundleFloor(userID, targetBundleSeq, retainedState.RetainedFloor); err != nil {
+			s.observeStageErr(ctx, "pull", "retained_floor_check", stageStart, 1, 0, err)
+			return nil, err
+		}
 	}
 	s.observeStage(ctx, "pull", "retained_floor_check", stageStart, 1, 0, false)
 
 	stableBundleSeq := targetBundleSeq
 	if stableBundleSeq <= 0 {
 		stageStart = s.stageStart()
-		var err error
-		stableBundleSeq, err = userHighestBundleSeqQuerier(ctx, tx, userID)
-		s.observeStageErr(ctx, "pull", "resolve_stable_bundle_seq", stageStart, 1, 0, err)
-		if err != nil {
-			return nil, err
-		}
+		stableBundleSeq = retainedState.highestBundleSeq()
+		s.observeStage(ctx, "pull", "resolve_stable_bundle_seq", stageStart, 1, 0, false)
 	} else {
 		s.observeStage(ctx, "pull", "resolve_stable_bundle_seq", s.stageStart(), 1, 0, false)
+	}
+	if stableBundleSeq > 0 {
+		if err := enforceRetainedBundleFloor(userID, stableBundleSeq, retainedState.RetainedFloor); err != nil {
+			return nil, err
+		}
 	}
 	if afterBundleSeq >= stableBundleSeq {
 		return &PullResponse{
@@ -105,12 +123,13 @@ func (s *SyncService) processPullQuerier(
 	rows, err := tx.Query(ctx, `
 		SELECT bundle_seq
 		FROM sync.bundle_log
-		WHERE user_id = $1
+		WHERE user_pk = $1
 		  AND bundle_seq > $2
-		  AND bundle_seq <= $3
+		  AND bundle_seq > $3
+		  AND bundle_seq <= $4
 		ORDER BY bundle_seq
-		LIMIT $4
-	`, userID, afterBundleSeq, stableBundleSeq, maxBundles+1)
+		LIMIT $5
+	`, retainedState.UserPK, afterBundleSeq, retainedState.RetainedFloor, stableBundleSeq, maxBundles+1)
 	if err != nil {
 		s.observeStageErr(ctx, "pull", "list_bundle_seqs", stageStart, maxBundles, 0, err)
 		return nil, fmt.Errorf("query bundle pull page: %w", err)
@@ -162,12 +181,14 @@ func userHighestBundleSeqQuerier(ctx context.Context, q interface {
 }, userID string) (int64, error) {
 	var maxSeq int64
 	err := q.QueryRow(ctx, `
-		SELECT GREATEST(
-			COALESCE((SELECT MAX(bundle_seq) FROM sync.bundle_log WHERE user_id = @user_id), 0),
-			COALESCE((SELECT next_bundle_seq - 1 FROM sync.user_state WHERE user_id = @user_id), 0)
-		)
+		SELECT next_bundle_seq - 1
+		FROM sync.user_state
+		WHERE user_id = @user_id
 	`, pgx.NamedArgs{"user_id": userID}).Scan(&maxSeq)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
 		return 0, fmt.Errorf("query user highest bundle seq: %w", err)
 	}
 	return maxSeq, nil
@@ -176,25 +197,14 @@ func userHighestBundleSeqQuerier(ctx context.Context, q interface {
 func enforceRetainedBundleFloorQuerier(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, userID string, providedSeq int64) error {
-	var floor int64
-	if err := q.QueryRow(ctx, `
-		SELECT COALESCE(retained_bundle_floor, 0)
-		FROM sync.user_state
-		WHERE user_id = $1
-	`, userID).Scan(&floor); err != nil {
-		if err == pgx.ErrNoRows {
-			return nil
-		}
-		return fmt.Errorf("query retained bundle floor: %w", err)
+	state, err := loadRetainedHistoryStateByUserID(ctx, q, userID)
+	if err != nil {
+		return err
 	}
-	if providedSeq < floor {
-		return &HistoryPrunedError{
-			UserID:        userID,
-			ProvidedSeq:   providedSeq,
-			RetainedFloor: floor,
-		}
+	if state == nil {
+		return nil
 	}
-	return nil
+	return enforceRetainedBundleFloor(userID, providedSeq, state.RetainedFloor)
 }
 
 func (s *SyncService) recordHistoryPrunedError(ctx context.Context) error {

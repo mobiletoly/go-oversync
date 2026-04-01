@@ -5,16 +5,18 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
@@ -68,7 +70,7 @@ func integrationTestDatabaseURL() string {
 	if dbURL := os.Getenv("TEST_DATABASE_URL"); dbURL != "" {
 		return dbURL
 	}
-	return "postgres://postgres:password@localhost:5432/clisync_test?sslmode=disable"
+	return "postgres://postgres:password@localhost:5432/clisync_oversqlite_e2e_test?sslmode=disable"
 }
 
 func newExampleServer(t *testing.T, schema string) *exampleserver.TestServer {
@@ -103,8 +105,12 @@ func newExampleServerWithConfig(
 ) *exampleserver.TestServer {
 	t.Helper()
 
+	databaseURL := integrationTestDatabaseURL()
+	ensureSharedExampleDatabase(t, databaseURL)
+	resetSharedExampleDatabase(t, databaseURL)
+
 	cfg := &exampleserver.ServerConfig{
-		DatabaseURL:    integrationTestDatabaseURL(),
+		DatabaseURL:    databaseURL,
 		JWTSecret:      "oversqlite-end-to-end-secret",
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn})),
 		AppName:        "oversqlite-end-to-end",
@@ -118,19 +124,88 @@ func newExampleServerWithConfig(
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		require.NoError(t, dropSchema(context.Background(), ts.Pool, schema))
 		ts.Close()
 	})
 
 	return ts
 }
 
-func dropSchema(ctx context.Context, pool *pgxpool.Pool, schema string) error {
-	if pool == nil {
-		return nil
+func ensureSharedExampleDatabase(t *testing.T, databaseURL string) {
+	t.Helper()
+
+	adminURL, _, dbName := buildSharedDatabaseURLs(t, databaseURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	adminConn, err := pgx.Connect(ctx, adminURL)
+	require.NoError(t, err)
+	defer adminConn.Close(ctx)
+
+	var exists bool
+	require.NoError(t, adminConn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`, dbName).Scan(&exists))
+	if exists {
+		return
 	}
-	_, err := pool.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, pgx.Identifier{schema}.Sanitize()))
-	return err
+
+	_, err = adminConn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{dbName}.Sanitize())
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42P04" {
+			require.NoError(t, err)
+		}
+	}
+}
+
+func resetSharedExampleDatabase(t *testing.T, databaseURL string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, databaseURL)
+	require.NoError(t, err)
+	defer conn.Close(ctx)
+
+	rows, err := conn.Query(ctx, `
+		SELECT nspname
+		FROM pg_namespace
+		WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'public')
+		  AND nspname NOT LIKE 'pg_toast%'
+		  AND nspname NOT LIKE 'pg_temp_%'
+		  AND nspname NOT LIKE 'pg_toast_temp_%'
+		ORDER BY nspname
+	`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var schemas []string
+	for rows.Next() {
+		var schema string
+		require.NoError(t, rows.Scan(&schema))
+		schemas = append(schemas, schema)
+	}
+	require.NoError(t, rows.Err())
+
+	for _, schema := range schemas {
+		_, err := conn.Exec(ctx, `DROP SCHEMA IF EXISTS `+pgx.Identifier{schema}.Sanitize()+` CASCADE`)
+		require.NoError(t, err)
+	}
+}
+
+func buildSharedDatabaseURLs(t *testing.T, databaseURL string) (adminURL string, resolvedDatabaseURL string, dbName string) {
+	t.Helper()
+
+	parsed, err := url.Parse(databaseURL)
+	require.NoError(t, err)
+
+	dbName = strings.TrimPrefix(parsed.Path, "/")
+	require.NotEmpty(t, dbName)
+
+	admin := *parsed
+	admin.Path = "/postgres"
+	adminURL = admin.String()
+
+	return adminURL, parsed.String(), dbName
 }
 
 func newSQLiteClient(
@@ -255,6 +330,54 @@ func loadDirtyRowForKey(t *testing.T, db *sql.DB, keyJSON string) (string, int64
 	}
 	require.NoError(t, err)
 	return op, baseRowVersion, payload, true
+}
+
+func requireServerScopeState(t *testing.T, server *exampleserver.TestServer, userID string) string {
+	t.Helper()
+	var state string
+	require.NoError(t, server.Pool.QueryRow(context.Background(), `
+		SELECT CASE ss.state_code
+			WHEN 0 THEN 'UNINITIALIZED'
+			WHEN 1 THEN 'INITIALIZING'
+			WHEN 2 THEN 'INITIALIZED'
+			ELSE 'UNKNOWN'
+		END
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&state))
+	return state
+}
+
+func requireServerScopeStateFields(t *testing.T, server *exampleserver.TestServer, userID string) (state string, initializationID sql.NullString, leaseExpiresAt sql.NullTime, initializedBySource sql.NullString) {
+	t.Helper()
+	require.NoError(t, server.Pool.QueryRow(context.Background(), `
+		SELECT CASE ss.state_code
+			WHEN 0 THEN 'UNINITIALIZED'
+			WHEN 1 THEN 'INITIALIZING'
+			WHEN 2 THEN 'INITIALIZED'
+			ELSE 'UNKNOWN'
+		END,
+		ss.initialization_id::text,
+		ss.lease_expires_at,
+		ss.initialized_by_source_id
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&state, &initializationID, &leaseExpiresAt, &initializedBySource))
+	return state, initializationID, leaseExpiresAt, initializedBySource
+}
+
+func requireServerScopeRowCount(t *testing.T, server *exampleserver.TestServer, userID string) int {
+	t.Helper()
+	var count int
+	require.NoError(t, server.Pool.QueryRow(context.Background(), `
+		SELECT COUNT(*)
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&count))
+	return count
 }
 
 func snapshotStageCount(t *testing.T, db *sql.DB) int {

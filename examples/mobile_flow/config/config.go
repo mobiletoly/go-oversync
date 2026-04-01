@@ -112,7 +112,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			SourceID:         "device-normal-001",
 			DeviceName:       "iPhone Normal",
 			OfflineMode:      false,
-			CleanDatabase:    false,
+			CleanDatabase:    true,
 			InitialRecords:   10,
 			UpdateOperations: 8,
 			DeleteOperations: 2,

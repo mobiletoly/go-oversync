@@ -381,7 +381,7 @@ func TestApplyStagedSnapshot_FailsClosedWhenAttachedStateIsMissing(t *testing.T)
 		SnapshotID:        "snapshot-missing-state",
 		SnapshotBundleSeq: 7,
 		RowCount:          1,
-	}, false, "")
+	}, snapshotApplyOptions{})
 	var connectErr *AttachRequiredError
 	require.ErrorAs(t, err, &connectErr)
 
@@ -1302,7 +1302,7 @@ func TestRebuildKeepSource_OneChunkStillStagesBeforeFinalApply(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
 	require.Equal(t, 0, count)
 
-	require.NoError(t, client.applyStagedSnapshotLocked(ctx, session, false, ""))
+	require.NoError(t, client.applyStagedSnapshotLocked(ctx, session, snapshotApplyOptions{}))
 	require.Equal(t, 0, snapshotStageCount(t, db))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
 	require.Equal(t, 1, count)

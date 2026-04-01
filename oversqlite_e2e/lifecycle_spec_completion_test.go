@@ -117,7 +117,6 @@ func TestEndToEnd_ConcurrentFirstInitializerRaceFollowThroughConvergesLoserViaRe
 }
 
 func TestEndToEnd_RawConnectSameSourceReconnectDuringInitializationReusesInitializationIDAndRefreshesLease(t *testing.T) {
-	ctx := context.Background()
 	schema := "e2e_raw_refresh_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServerWithConfig(t, schema, func(cfg *exampleserver.ServerConfig) {
 		cfg.InitializationLeaseTTL = 2 * time.Second
@@ -141,21 +140,15 @@ func TestEndToEnd_RawConnectSameSourceReconnectDuringInitializationReusesInitial
 	require.NoError(t, err)
 	require.True(t, secondLease.After(firstLease), "expected refreshed lease %s to be after %s", secondLease, firstLease)
 
-	var (
-		initializationID string
-		leaseExpiresAt   time.Time
-	)
-	require.NoError(t, server.Pool.QueryRow(ctx, `
-		SELECT initialization_id, lease_expires_at
-		FROM sync.scope_state
-		WHERE user_id = $1
-	`, userID).Scan(&initializationID, &leaseExpiresAt))
-	require.Equal(t, first.InitializationID, initializationID)
-	require.True(t, leaseExpiresAt.After(firstLease))
+	state, initializationID, leaseExpiresAt, _ := requireServerScopeStateFields(t, server, userID)
+	require.Equal(t, "INITIALIZING", state)
+	require.True(t, initializationID.Valid)
+	require.Equal(t, first.InitializationID, initializationID.String)
+	require.True(t, leaseExpiresAt.Valid)
+	require.True(t, leaseExpiresAt.Time.After(firstLease))
 }
 
 func TestEndToEnd_RawConnectSameSourceWithoutPendingRowsTransitionsToInitializeEmpty(t *testing.T) {
-	ctx := context.Background()
 	schema := "e2e_raw_abandon_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 
@@ -167,17 +160,10 @@ func TestEndToEnd_RawConnectSameSourceWithoutPendingRowsTransitionsToInitializeE
 	require.Equal(t, "initialize_empty", second.Resolution)
 	require.Empty(t, second.InitializationID)
 
-	var (
-		state               string
-		initializedBySource string
-	)
-	require.NoError(t, server.Pool.QueryRow(ctx, `
-		SELECT state, initialized_by_source_id
-		FROM sync.scope_state
-		WHERE user_id = $1
-	`, userID).Scan(&state, &initializedBySource))
+	state, _, _, initializedBySource := requireServerScopeStateFields(t, server, userID)
 	require.Equal(t, "INITIALIZED", state)
-	require.Equal(t, "device-a", initializedBySource)
+	require.True(t, initializedBySource.Valid)
+	require.Equal(t, "device-a", initializedBySource.String)
 
 	snapshot := rawCreateSnapshotSession(t, server, userID, "device-a", http.StatusOK)
 	require.Equal(t, int64(0), snapshot.RowCount)
@@ -208,12 +194,10 @@ func TestEndToEnd_RawInitializerCrashBeforeCommitDoesNotLeakAuthoritativeRowsAnd
 	})
 
 	var (
-		scopeState       string
 		stagedCount      int
 		authoritativeCnt int
 	)
-	require.NoError(t, server.Pool.QueryRow(ctx, `SELECT state FROM sync.scope_state WHERE user_id = $1`, userID).Scan(&scopeState))
-	require.Equal(t, "INITIALIZING", scopeState)
+	require.Equal(t, "INITIALIZING", requireServerScopeState(t, server, userID))
 	require.NoError(t, server.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.push_session_rows WHERE push_id = $1::uuid`, createResp.PushID).Scan(&stagedCount))
 	require.Equal(t, 1, stagedCount)
 	require.NoError(t, server.Pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.users WHERE id = $1`, schema), crashedRowID).Scan(&authoritativeCnt))
@@ -247,7 +231,6 @@ func TestEndToEnd_RawInitializerCrashBeforeCommitDoesNotLeakAuthoritativeRowsAnd
 }
 
 func TestEndToEnd_RawServerRejectsPushAndSnapshotBeforeInitialization(t *testing.T) {
-	ctx := context.Background()
 	schema := "e2e_raw_scope_uninit_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 
@@ -262,8 +245,7 @@ func TestEndToEnd_RawServerRejectsPushAndSnapshotBeforeInitialization(t *testing
 	snapshotErr := rawCreateSnapshotSessionError(t, server, userID, "device-a", http.StatusConflict)
 	require.Equal(t, "scope_uninitialized", snapshotErr.Error)
 
-	var scopeRows int
-	require.NoError(t, server.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.scope_state WHERE user_id = $1`, userID).Scan(&scopeRows))
+	scopeRows := requireServerScopeRowCount(t, server, userID)
 	require.LessOrEqual(t, scopeRows, 1)
 }
 

@@ -1424,6 +1424,9 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 	`, s.config.UserID, s.stableBundleSeq); err != nil {
 		return fmt.Errorf("failed to advance retained bundle floor for prune fallback: %w", err)
 	}
+	if err := s.verifyServerHistoryPrunedState(ctx, logger); err != nil {
+		return fmt.Errorf("failed to verify pruned retained history state: %w", err)
+	}
 
 	s.app.resetSnapshotTransferDiagnostics()
 	if verboseLog {
@@ -1463,6 +1466,105 @@ func (s *ComplexMultiBatchScenario) stage4DownloadVerificationPhone(ctx context.
 		logger.Info("📊 Download verification", "device", "phone", "users_total", usersAfter, "posts_total", postsAfter, "targets", fmt.Sprintf("users=%d posts=%d", targetTotalUsers, targetTotalPosts), "last_seen_bundle_seq", lastSeen)
 	}
 
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) verifyServerHistoryPrunedState(ctx context.Context, logger *slog.Logger) error {
+	if s.simulator.verifier == nil {
+		return fmt.Errorf("database verifier is required for retained-history verification")
+	}
+
+	retentionState, err := s.simulator.verifier.GetUserRetentionState(ctx, s.config.UserID)
+	if err != nil {
+		return err
+	}
+	if retentionState.RetainedBundleFloor != s.stableBundleSeq {
+		return fmt.Errorf("expected retained bundle floor %d, got %d", s.stableBundleSeq, retentionState.RetainedBundleFloor)
+	}
+
+	bundlesBeforeDelete, err := s.simulator.verifier.CountCommittedBundlesAtOrBelowRetainedFloor(ctx, s.config.UserID)
+	if err != nil {
+		return err
+	}
+	if bundlesBeforeDelete == 0 {
+		return fmt.Errorf("expected committed bundles at or below retained floor %d before deletion", retentionState.RetainedBundleFloor)
+	}
+
+	rowsBeforeDelete, err := s.simulator.verifier.CountCommittedBundleRowsAtOrBelowRetainedFloor(ctx, s.config.UserID)
+	if err != nil {
+		return err
+	}
+	if rowsBeforeDelete == 0 {
+		return fmt.Errorf("expected committed bundle rows at or below retained floor %d before deletion", retentionState.RetainedBundleFloor)
+	}
+
+	sourceStateCountBefore, err := s.simulator.verifier.CountSourceStateRows(ctx, s.config.UserID)
+	if err != nil {
+		return err
+	}
+	if sourceStateCountBefore == 0 {
+		return fmt.Errorf("expected source_state rows to survive retained-history pruning setup")
+	}
+
+	if verboseLog {
+		logger.Info("🗜️ Pruning retained history on the server",
+			"retained_bundle_floor", retentionState.RetainedBundleFloor,
+			"bundle_log_rows_before", bundlesBeforeDelete,
+			"bundle_row_rows_before", rowsBeforeDelete,
+			"source_state_rows", sourceStateCountBefore)
+	}
+
+	if err := s.simulator.verifier.DeleteCommittedHistoryAtOrBelowRetainedFloor(ctx, s.config.UserID); err != nil {
+		return err
+	}
+
+	bundlesAfterDelete, err := s.simulator.verifier.CountCommittedBundlesAtOrBelowRetainedFloor(ctx, s.config.UserID)
+	if err != nil {
+		return err
+	}
+	if bundlesAfterDelete != 0 {
+		return fmt.Errorf("expected no committed bundles at or below retained floor after deletion, got %d", bundlesAfterDelete)
+	}
+
+	rowsAfterDelete, err := s.simulator.verifier.CountCommittedBundleRowsAtOrBelowRetainedFloor(ctx, s.config.UserID)
+	if err != nil {
+		return err
+	}
+	if rowsAfterDelete != 0 {
+		return fmt.Errorf("expected no committed bundle rows at or below retained floor after deletion, got %d", rowsAfterDelete)
+	}
+
+	sourceStateCountAfter, err := s.simulator.verifier.CountSourceStateRows(ctx, s.config.UserID)
+	if err != nil {
+		return err
+	}
+	if sourceStateCountAfter != sourceStateCountBefore {
+		return fmt.Errorf("expected source_state row count to remain %d after history deletion, got %d", sourceStateCountBefore, sourceStateCountAfter)
+	}
+
+	expectedLiveCounts := map[string]int{
+		"business.users":        s.expectedUserCount(),
+		"business.posts":        s.expectedPostCount(),
+		"business.files":        s.expectedFileCount(),
+		"business.file_reviews": s.expectedReviewCount(),
+	}
+	for tableName, expectedCount := range expectedLiveCounts {
+		rowStateCount, err := s.simulator.verifier.CountUserRecords(ctx, tableName, s.config.UserID)
+		if err != nil {
+			return fmt.Errorf("failed to count row_state-backed records in %s after retained-history deletion: %w", tableName, err)
+		}
+		if rowStateCount != expectedCount {
+			return fmt.Errorf("unexpected live row_state count in %s after retained-history deletion: expected %d, got %d", tableName, expectedCount, rowStateCount)
+		}
+	}
+
+	if verboseLog {
+		logger.Info("✅ Retained-history deletion verified on the server",
+			"retained_bundle_floor", retentionState.RetainedBundleFloor,
+			"bundle_log_rows_after", bundlesAfterDelete,
+			"bundle_row_rows_after", rowsAfterDelete,
+			"source_state_rows", sourceStateCountAfter)
+	}
 	return nil
 }
 

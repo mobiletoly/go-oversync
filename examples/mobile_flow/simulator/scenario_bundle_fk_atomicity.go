@@ -267,48 +267,70 @@ func (s *BundleFKAtomicityScenario) Verify(ctx context.Context, verifier *Databa
 	schema := "business"
 	liveUsersQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM sync.row_state
-		WHERE user_id = '%s'
-		  AND schema_name = '%s'
-		  AND table_name = 'users'
-		  AND deleted = FALSE
+		FROM sync.row_state rs
+		INNER JOIN sync.user_state us
+			ON us.user_pk = rs.user_pk
+		INNER JOIN sync.table_catalog tc
+			ON tc.table_id = rs.table_id
+		WHERE us.user_id = '%s'
+		  AND tc.schema_name = '%s'
+		  AND tc.table_name = 'users'
+		  AND rs.deleted = FALSE
 	`, userID, schema)
 	livePostsQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM sync.row_state
-		WHERE user_id = '%s'
-		  AND schema_name = '%s'
-		  AND table_name = 'posts'
-		  AND deleted = FALSE
+		FROM sync.row_state rs
+		INNER JOIN sync.user_state us
+			ON us.user_pk = rs.user_pk
+		INNER JOIN sync.table_catalog tc
+			ON tc.table_id = rs.table_id
+		WHERE us.user_id = '%s'
+		  AND tc.schema_name = '%s'
+		  AND tc.table_name = 'posts'
+		  AND rs.deleted = FALSE
 	`, userID, schema)
 	liveCategoriesQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM sync.row_state
-		WHERE user_id = '%s'
-		  AND schema_name = '%s'
-		  AND table_name = 'categories'
-		  AND deleted = FALSE
+		FROM sync.row_state rs
+		INNER JOIN sync.user_state us
+			ON us.user_pk = rs.user_pk
+		INNER JOIN sync.table_catalog tc
+			ON tc.table_id = rs.table_id
+		WHERE us.user_id = '%s'
+		  AND tc.schema_name = '%s'
+		  AND tc.table_name = 'categories'
+		  AND rs.deleted = FALSE
 	`, userID, schema)
 	liveTeamsQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM sync.row_state
-		WHERE user_id = '%s'
-		  AND schema_name = '%s'
-		  AND table_name = 'teams'
-		  AND deleted = FALSE
+		FROM sync.row_state rs
+		INNER JOIN sync.user_state us
+			ON us.user_pk = rs.user_pk
+		INNER JOIN sync.table_catalog tc
+			ON tc.table_id = rs.table_id
+		WHERE us.user_id = '%s'
+		  AND tc.schema_name = '%s'
+		  AND tc.table_name = 'teams'
+		  AND rs.deleted = FALSE
 	`, userID, schema)
 	liveTeamMembersQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM sync.row_state
-		WHERE user_id = '%s'
-		  AND schema_name = '%s'
-		  AND table_name = 'team_members'
-		  AND deleted = FALSE
+		FROM sync.row_state rs
+		INNER JOIN sync.user_state us
+			ON us.user_pk = rs.user_pk
+		INNER JOIN sync.table_catalog tc
+			ON tc.table_id = rs.table_id
+		WHERE us.user_id = '%s'
+		  AND tc.schema_name = '%s'
+		  AND tc.table_name = 'team_members'
+		  AND rs.deleted = FALSE
 	`, userID, schema)
 	bundleCountQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM sync.bundle_log
-		WHERE user_id = '%s'
+		FROM sync.bundle_log bl
+		INNER JOIN sync.user_state us
+			ON us.user_pk = bl.user_pk
+		WHERE us.user_id = '%s'
 	`, userID)
 
 	liveUsers, err := verifier.CountRecordsWithQuery(ctx, liveUsersQuery)
@@ -420,6 +442,9 @@ func (s *BundleFKAtomicityScenario) deleteSupportedFKGraph(ctx context.Context) 
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM teams WHERE id = ?`, s.teamID); err != nil {
 		return fmt.Errorf("failed to delete team: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM posts WHERE id = ?`, s.postRowID); err != nil {
+		return fmt.Errorf("failed to delete seed post: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, s.userRowID); err != nil {
 		return fmt.Errorf("failed to delete seed user: %w", err)

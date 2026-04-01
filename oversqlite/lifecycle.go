@@ -678,7 +678,7 @@ func (c *Client) finalizeRemoteReplaceLocked(ctx context.Context, state *lifecyc
 		SnapshotBundleSeq: refreshedState.PendingSnapshotBundleSeq,
 		RowCount:          refreshedState.PendingSnapshotRowCount,
 	}
-	if err := c.applyStagedSnapshotLocked(ctx, session, false, ""); err != nil {
+	if err := c.applyStagedSnapshotLocked(ctx, session, snapshotApplyOptions{}); err != nil {
 		return nil, err
 	}
 	return &RestoreSummary{

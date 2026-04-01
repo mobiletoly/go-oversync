@@ -4,6 +4,7 @@
 package oversync
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,27 +29,33 @@ type BundleSource struct {
 }
 
 type capturedBundleEvent struct {
-	ordinal    int64
-	schemaName string
-	tableName  string
-	op         string
-	keyJSON    string
-	payload    []byte
+	ordinal  int64
+	userPK   int64
+	tableID  int32
+	opCode   int16
+	keyBytes []byte
+	payload  []byte
 }
 
 type normalizedBundleRow struct {
 	firstOrdinal int64
-	schemaName   string
-	tableName    string
-	keyJSON      string
-	op           string
-	payload      []byte
+	tableID      int32
+	keyBytes     []byte
+	opCode       int16
+	payloadDB    []byte
+}
+
+type committedBundleStorageRow struct {
+	tableID     int32
+	keyBytes    []byte
+	opCode      int16
+	payloadWire []byte
 }
 
 type bundleAccumulator struct {
 	firstOrdinal int64
-	firstOp      string
-	lastOp       string
+	firstOpCode  int16
+	lastOpCode   int16
 	lastPayload  []byte
 }
 
@@ -69,6 +76,10 @@ func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context)
 			keyColumns := table.normalizedSyncKeyColumns()
 			if len(keyColumns) != 1 {
 				return fmt.Errorf("registered table %s requires exactly one sync key column to install capture trigger", table.normalizedKey())
+			}
+			info, ok := s.registeredTableInfo[table.normalizedKey()]
+			if !ok {
+				return fmt.Errorf("registered table %s is missing runtime metadata for trigger installation", table.normalizedKey())
 			}
 
 			tableIdent := pgx.Identifier{table.normalizedSchema(), table.normalizedTable()}.Sanitize()
@@ -91,10 +102,12 @@ func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context)
 			}
 
 			stmt = fmt.Sprintf(
-				`CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s)`,
+				`CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s, %s, %s)`,
 				registeredTableCaptureTriggerName,
 				tableIdent,
 				quoteSQLLiteral(keyColumns[0]),
+				quoteSQLLiteral(strconv.Itoa(int(info.syncKeyKind))),
+				quoteSQLLiteral(strconv.Itoa(int(info.tableID))),
 			)
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("create capture trigger for %s: %w", table.normalizedKey(), err)
@@ -104,15 +117,14 @@ func (s *SyncService) installRegisteredTableCaptureTriggers(ctx context.Context)
 	})
 }
 
-func reserveUserBundleSeq(ctx context.Context, tx pgx.Tx, userID string) (int64, error) {
+func reserveUserBundleSeq(ctx context.Context, tx pgx.Tx, userPK int64) (int64, error) {
 	var bundleSeq int64
 	if err := tx.QueryRow(ctx, `
 		UPDATE sync.user_state
-		SET next_bundle_seq = next_bundle_seq + 1,
-			updated_at = now()
-		WHERE user_id = $1
+		SET next_bundle_seq = next_bundle_seq + 1
+		WHERE user_pk = $1
 		RETURNING next_bundle_seq - 1
-	`, userID).Scan(&bundleSeq); err != nil {
+	`, userPK).Scan(&bundleSeq); err != nil {
 		return 0, fmt.Errorf("reserve user bundle_seq: %w", err)
 	}
 	return bundleSeq, nil
@@ -174,33 +186,67 @@ func (s *SyncService) WithinSyncBundle(
 		if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_user_id', $1, true)`, actor.UserID); err != nil {
-			return fmt.Errorf("set bundle user_id: %w", err)
+		expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, source.SourceID)
+		if err != nil {
+			return err
 		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_id', $1, true)`, source.SourceID); err != nil {
-			return fmt.Errorf("set bundle source_id: %w", err)
+		switch {
+		case source.SourceBundleID < expectedSourceBundleID:
+			return &SourceTupleHistoryPrunedError{
+				UserID:                         actor.UserID,
+				SourceID:                       source.SourceID,
+				SourceBundleID:                 source.SourceBundleID,
+				MaxCommittedSourceBundleIDHint: maxCommittedSourceBundleID,
+			}
+		case source.SourceBundleID > expectedSourceBundleID:
+			return &SourceSequenceOutOfOrderError{
+				UserID:   actor.UserID,
+				SourceID: source.SourceID,
+				Expected: expectedSourceBundleID,
+				Actual:   source.SourceBundleID,
+			}
 		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_bundle_id', $1, true)`, strconv.FormatInt(source.SourceBundleID, 10)); err != nil {
-			return fmt.Errorf("set bundle source_bundle_id: %w", err)
+		if err := setBundleTxContext(ctx, tx, bundleTxContext{
+			UserID:         actor.UserID,
+			UserPK:         scopeState.UserPK,
+			SourceID:       source.SourceID,
+			SourceBundleID: source.SourceBundleID,
+		}); err != nil {
+			return err
 		}
 
 		if err := fn(tx); err != nil {
 			return err
 		}
-		if _, err := s.finalizeCapturedBundle(ctx, tx, actor, source); err != nil {
+		bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, scopeState.UserPK, source)
+		if err != nil {
 			return err
+		}
+		if bundle != nil {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO sync.source_state (
+					user_pk, source_id, max_committed_source_bundle_id
+				) VALUES ($1, $2, $3)
+				ON CONFLICT (user_pk, source_id) DO UPDATE
+				SET max_committed_source_bundle_id = EXCLUDED.max_committed_source_bundle_id
+			`, scopeState.UserPK, source.SourceID, source.SourceBundleID); err != nil {
+				return fmt.Errorf("upsert source_state row: %w", err)
+			}
+			if err := s.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 }
 
-func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, actor Actor, source BundleSource) (*Bundle, error) {
+func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, source BundleSource) (*Bundle, error) {
 	var txid int64
 	if err := tx.QueryRow(ctx, `SELECT txid_current()`).Scan(&txid); err != nil {
 		return nil, fmt.Errorf("read current txid for bundle capture: %w", err)
 	}
 
-	events, err := loadCapturedBundleEvents(ctx, tx, txid, actor.UserID)
+	events, err := loadCapturedBundleEvents(ctx, tx, txid, userPK)
 	if err != nil {
 		return nil, err
 	}
@@ -210,72 +256,75 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 
 	rows := normalizeCapturedBundleEvents(events)
 	if len(rows) == 0 {
-		if _, err := tx.Exec(ctx, `DELETE FROM sync.bundle_capture_stage WHERE txid = $1 AND user_id = $2`, txid, actor.UserID); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM sync.bundle_capture_stage WHERE txid = $1 AND user_pk = $2`, txid, userPK); err != nil {
 			return nil, fmt.Errorf("clear empty captured bundle stage rows: %w", err)
 		}
 		return nil, nil
 	}
 
-	bundleSeq, err := reserveUserBundleSeq(ctx, tx, actor.UserID)
+	bundleSeq, err := reserveUserBundleSeq(ctx, tx, userPK)
 	if err != nil {
 		return nil, err
 	}
 
-	rowCount := len(rows)
-	var byteCount int64
-	for _, row := range rows {
-		byteCount += int64(len(row.schemaName) + len(row.tableName) + len(row.keyJSON) + len(row.op) + len(row.payload))
-	}
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO sync.bundle_log (
-			user_id, bundle_seq, source_id, source_bundle_id, row_count, byte_count, committed_at
-		)
-		VALUES ($1, $2, $3, $4, $5, $6, now())
-	`, actor.UserID, bundleSeq, source.SourceID, source.SourceBundleID, rowCount, byteCount); err != nil {
-		return nil, fmt.Errorf("insert bundle_log row: %w", err)
-	}
-
+	storageRows := make([]committedBundleStorageRow, 0, len(rows))
 	bundleRows := make([]BundleRow, 0, len(rows))
 	for _, row := range rows {
-		key, err := decodeSyncKeyJSON(row.keyJSON)
+		info, err := s.tableInfoForID(row.tableID)
 		if err != nil {
-			return nil, fmt.Errorf("decode bundle row key: %w", err)
+			return nil, err
+		}
+		key, err := wireSyncKeyFromBytes(info, row.keyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode bundle row key for table_id %d: %w", row.tableID, err)
+		}
+		op, err := opStringFromCode(row.opCode)
+		if err != nil {
+			return nil, err
 		}
 		bundleRow := BundleRow{
-			Schema:     row.schemaName,
-			Table:      row.tableName,
+			Schema:     info.schemaName,
+			Table:      info.tableName,
 			Key:        key,
-			Op:         row.op,
+			Op:         op,
 			RowVersion: bundleSeq,
 		}
-		if row.op != OpDelete {
-			bundleRow.Payload, err = s.canonicalizeWirePayload(row.schemaName, row.tableName, row.payload)
+		var payloadWire []byte
+		if row.opCode != opCodeDelete {
+			payloadWire, err = s.canonicalizeWirePayload(info.schemaName, info.tableName, row.payloadDB)
 			if err != nil {
-				return nil, fmt.Errorf("canonicalize bundle row payload for %s.%s: %w", row.schemaName, row.tableName, err)
+				return nil, fmt.Errorf("canonicalize bundle row payload for %s.%s: %w", info.schemaName, info.tableName, err)
 			}
+			bundleRow.Payload = payloadWire
 		}
+		storageRows = append(storageRows, committedBundleStorageRow{
+			tableID:     row.tableID,
+			keyBytes:    append([]byte(nil), row.keyBytes...),
+			opCode:      row.opCode,
+			payloadWire: append([]byte(nil), payloadWire...),
+		})
 		bundleRows = append(bundleRows, bundleRow)
 	}
 
-	bundleHash, err := computeCommittedBundleHash(bundleRows)
+	bundleHash, byteCount, err := computeCommittedBundleHash(bundleRows)
 	if err != nil {
 		return nil, fmt.Errorf("compute committed bundle hash: %w", err)
 	}
 
-	if err := persistNormalizedBundleRows(ctx, tx, actor.UserID, bundleSeq, rows); err != nil {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sync.bundle_log (
+			user_pk, bundle_seq, source_id, source_bundle_id, row_count, byte_count, bundle_hash, committed_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+	`, userPK, bundleSeq, source.SourceID, source.SourceBundleID, len(bundleRows), byteCount, bundleHash); err != nil {
+		return nil, fmt.Errorf("insert bundle_log row: %w", err)
+	}
+
+	if err := persistCommittedBundleRows(ctx, tx, userPK, bundleSeq, storageRows); err != nil {
 		return nil, err
 	}
 
-	if _, err := tx.Exec(ctx, `
-		UPDATE sync.bundle_log
-		SET bundle_hash = $3
-		WHERE user_id = $1 AND bundle_seq = $2
-	`, actor.UserID, bundleSeq, bundleHash); err != nil {
-		return nil, fmt.Errorf("persist bundle_log hash: %w", err)
-	}
-
-	if _, err := tx.Exec(ctx, `DELETE FROM sync.bundle_capture_stage WHERE txid = $1 AND user_id = $2`, txid, actor.UserID); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM sync.bundle_capture_stage WHERE txid = $1 AND user_pk = $2`, txid, userPK); err != nil {
 		return nil, fmt.Errorf("delete captured bundle stage rows: %w", err)
 	}
 	return &Bundle{
@@ -283,18 +332,22 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 		SourceID:       source.SourceID,
 		SourceBundleID: source.SourceBundleID,
 		RowCount:       int64(len(bundleRows)),
-		BundleHash:     bundleHash,
+		BundleHash:     renderBundleHash(bundleHash),
 		Rows:           bundleRows,
 	}, nil
 }
 
-func computeCommittedBundleHash(rows []BundleRow) (string, error) {
+func renderBundleHash(bundleHash []byte) string {
+	return hex.EncodeToString(bundleHash)
+}
+
+func computeCommittedBundleHash(rows []BundleRow) ([]byte, int64, error) {
 	logicalRows := make([]map[string]any, 0, len(rows))
 	for i, row := range rows {
 		payloadValue := any(nil)
 		if row.Op != OpDelete && len(row.Payload) > 0 {
 			if err := json.Unmarshal(row.Payload, &payloadValue); err != nil {
-				return "", fmt.Errorf("decode payload for %s.%s row %d: %w", row.Schema, row.Table, i, err)
+				return nil, 0, fmt.Errorf("decode payload for %s.%s row %d: %w", row.Schema, row.Table, i, err)
 			}
 		}
 		logicalRows = append(logicalRows, map[string]any{
@@ -309,24 +362,24 @@ func computeCommittedBundleHash(rows []BundleRow) (string, error) {
 	}
 	raw, err := json.Marshal(logicalRows)
 	if err != nil {
-		return "", fmt.Errorf("marshal logical bundle rows: %w", err)
+		return nil, 0, fmt.Errorf("marshal logical bundle rows: %w", err)
 	}
 	canonical, err := canonicalJSON(raw)
 	if err != nil {
-		return "", fmt.Errorf("canonicalize logical bundle rows: %w", err)
+		return nil, 0, fmt.Errorf("canonicalize logical bundle rows: %w", err)
 	}
 	sum := sha256.Sum256(canonical)
-	return hex.EncodeToString(sum[:]), nil
+	return sum[:], int64(len(canonical)), nil
 }
 
-func loadCapturedBundleEvents(ctx context.Context, tx pgx.Tx, txid int64, userID string) ([]capturedBundleEvent, error) {
+func loadCapturedBundleEvents(ctx context.Context, tx pgx.Tx, txid int64, userPK int64) ([]capturedBundleEvent, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT capture_id, schema_name, table_name, op, key_json, payload
+		SELECT capture_ordinal, user_pk, table_id, op_code, key_bytes, payload_db
 		FROM sync.bundle_capture_stage
 		WHERE txid = $1
-		  AND user_id = $2
-		ORDER BY capture_id
-	`, txid, userID)
+		  AND user_pk = $2
+		ORDER BY capture_ordinal
+	`, txid, userPK)
 	if err != nil {
 		return nil, fmt.Errorf("query captured bundle stage rows: %w", err)
 	}
@@ -336,21 +389,17 @@ func loadCapturedBundleEvents(ctx context.Context, tx pgx.Tx, txid int64, userID
 	for rows.Next() {
 		var event capturedBundleEvent
 		var payload []byte
-		if err := rows.Scan(&event.ordinal, &event.schemaName, &event.tableName, &event.op, &event.keyJSON, &payload); err != nil {
+		if err := rows.Scan(&event.ordinal, &event.userPK, &event.tableID, &event.opCode, &event.keyBytes, &payload); err != nil {
 			return nil, fmt.Errorf("scan captured bundle stage row: %w", err)
 		}
-		keyJSON, err := canonicalJSON([]byte(event.keyJSON))
-		if err != nil {
-			return nil, fmt.Errorf("canonicalize captured key_json for %s.%s: %w", event.schemaName, event.tableName, err)
-		}
-		event.keyJSON = string(keyJSON)
 		if payload != nil {
 			canonicalPayload, err := canonicalJSON(payload)
 			if err != nil {
-				return nil, fmt.Errorf("canonicalize captured payload for %s.%s: %w", event.schemaName, event.tableName, err)
+				return nil, fmt.Errorf("canonicalize captured payload for table_id %d: %w", event.tableID, err)
 			}
 			event.payload = append([]byte(nil), canonicalPayload...)
 		}
+		event.keyBytes = append([]byte(nil), event.keyBytes...)
 		events = append(events, event)
 	}
 	if rows.Err() != nil {
@@ -362,16 +411,16 @@ func loadCapturedBundleEvents(ctx context.Context, tx pgx.Tx, txid int64, userID
 func normalizeCapturedBundleEvents(events []capturedBundleEvent) []normalizedBundleRow {
 	accumulators := make(map[string]*bundleAccumulator, len(events))
 	for _, event := range events {
-		key := event.schemaName + "\x00" + event.tableName + "\x00" + event.keyJSON
+		key := string(appendInt32BigEndian(append([]byte(nil), event.keyBytes...), event.tableID))
 		acc := accumulators[key]
 		if acc == nil {
 			acc = &bundleAccumulator{
 				firstOrdinal: event.ordinal,
-				firstOp:      event.op,
+				firstOpCode:  event.opCode,
 			}
 			accumulators[key] = acc
 		}
-		acc.lastOp = event.op
+		acc.lastOpCode = event.opCode
 		if event.payload != nil {
 			acc.lastPayload = append(acc.lastPayload[:0], event.payload...)
 		} else {
@@ -380,137 +429,113 @@ func normalizeCapturedBundleEvents(events []capturedBundleEvent) []normalizedBun
 	}
 
 	rows := make([]normalizedBundleRow, 0, len(accumulators))
-	for key, acc := range accumulators {
-		parts := strings.SplitN(key, "\x00", 3)
-		if len(parts) != 3 {
+	for _, event := range events {
+		key := string(appendInt32BigEndian(append([]byte(nil), event.keyBytes...), event.tableID))
+		acc, ok := accumulators[key]
+		if !ok {
 			continue
 		}
+		delete(accumulators, key)
 
 		row := normalizedBundleRow{
 			firstOrdinal: acc.firstOrdinal,
-			schemaName:   parts[0],
-			tableName:    parts[1],
-			keyJSON:      parts[2],
+			tableID:      event.tableID,
+			keyBytes:     append([]byte(nil), event.keyBytes...),
 		}
 
-		switch acc.lastOp {
-		case OpDelete:
-			if acc.firstOp == OpInsert {
+		switch acc.lastOpCode {
+		case opCodeDelete:
+			if acc.firstOpCode == opCodeInsert {
 				continue
 			}
-			row.op = OpDelete
+			row.opCode = opCodeDelete
 		default:
-			if acc.firstOp == OpInsert {
-				row.op = OpInsert
+			if acc.firstOpCode == opCodeInsert {
+				row.opCode = opCodeInsert
 			} else {
-				row.op = OpUpdate
+				row.opCode = opCodeUpdate
 			}
-			row.payload = append([]byte(nil), acc.lastPayload...)
+			row.payloadDB = append([]byte(nil), acc.lastPayload...)
 		}
 		rows = append(rows, row)
 	}
 
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].firstOrdinal == rows[j].firstOrdinal {
-			if rows[i].schemaName == rows[j].schemaName {
-				if rows[i].tableName == rows[j].tableName {
-					return rows[i].keyJSON < rows[j].keyJSON
-				}
-				return rows[i].tableName < rows[j].tableName
+			if rows[i].tableID == rows[j].tableID {
+				return bytes.Compare(rows[i].keyBytes, rows[j].keyBytes) < 0
 			}
-			return rows[i].schemaName < rows[j].schemaName
+			return rows[i].tableID < rows[j].tableID
 		}
 		return rows[i].firstOrdinal < rows[j].firstOrdinal
 	})
 	return rows
 }
 
-func persistNormalizedBundleRows(ctx context.Context, tx pgx.Tx, userID string, bundleSeq int64, rows []normalizedBundleRow) error {
-	rowOrdinals := make([]int32, len(rows))
-	schemaNames := make([]string, len(rows))
-	tableNames := make([]string, len(rows))
-	keyJSONs := make([]string, len(rows))
-	ops := make([]string, len(rows))
+func persistCommittedBundleRows(ctx context.Context, tx pgx.Tx, userPK, bundleSeq int64, rows []committedBundleStorageRow) error {
+	rowOrdinals := make([]int64, len(rows))
+	tableIDs := make([]int32, len(rows))
+	keyBytes := make([][]byte, len(rows))
+	opCodes := make([]int16, len(rows))
 	hasPayload := make([]bool, len(rows))
 	payloadTexts := make([]string, len(rows))
 	deletedFlags := make([]bool, len(rows))
-	hasPayloadHash := make([]bool, len(rows))
-	payloadHashHex := make([]string, len(rows))
 
 	for i, row := range rows {
-		rowOrdinals[i] = int32(i + 1)
-		schemaNames[i] = row.schemaName
-		tableNames[i] = row.tableName
-		keyJSONs[i] = row.keyJSON
-		ops[i] = row.op
-		deletedFlags[i] = row.op == OpDelete
-
-		if row.op != OpDelete {
+		rowOrdinals[i] = int64(i + 1)
+		tableIDs[i] = row.tableID
+		keyBytes[i] = append([]byte(nil), row.keyBytes...)
+		opCodes[i] = row.opCode
+		deletedFlags[i] = row.opCode == opCodeDelete
+		if row.opCode != opCodeDelete {
 			hasPayload[i] = true
-			payloadTexts[i] = string(row.payload)
-
-			sum := sha256.Sum256(row.payload)
-			hasPayloadHash[i] = true
-			payloadHashHex[i] = fmt.Sprintf("%x", sum[:])
+			payloadTexts[i] = string(row.payloadWire)
 		}
 	}
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO sync.bundle_rows (
-			user_id, bundle_seq, row_ordinal, schema_name, table_name, key_json, op, row_version, payload
+			user_pk, bundle_seq, row_ordinal, table_id, key_bytes, op_code, payload_wire
 		)
 		SELECT
 			$1,
 			$2,
 			rows.row_ordinal,
-			rows.schema_name,
-			rows.table_name,
-			rows.key_json,
-			rows.op,
-			$2,
-			CASE WHEN rows.has_payload THEN rows.payload_text::jsonb ELSE NULL END
+			rows.table_id,
+			rows.key_bytes,
+			rows.op_code,
+			CASE WHEN rows.has_payload THEN rows.payload_text::json ELSE NULL END
 		FROM unnest(
-			$3::int4[],
-			$4::text[],
-			$5::text[],
-			$6::text[],
-			$7::text[],
-			$8::bool[],
-			$9::text[]
-		) AS rows(row_ordinal, schema_name, table_name, key_json, op, has_payload, payload_text)
-	`, userID, bundleSeq, rowOrdinals, schemaNames, tableNames, keyJSONs, ops, hasPayload, payloadTexts); err != nil {
+			$3::int8[],
+			$4::int4[],
+			$5::bytea[],
+			$6::int2[],
+			$7::bool[],
+			$8::text[]
+		) AS rows(row_ordinal, table_id, key_bytes, op_code, has_payload, payload_text)
+	`, userPK, bundleSeq, rowOrdinals, tableIDs, keyBytes, opCodes, hasPayload, payloadTexts); err != nil {
 		return fmt.Errorf("bulk insert bundle_rows: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO sync.row_state (
-			user_id, schema_name, table_name, key_json, row_version, deleted, bundle_seq, payload_hash, updated_at
+			user_pk, table_id, key_bytes, bundle_seq, deleted
 		)
 		SELECT
 			$1,
-			rows.schema_name,
-			rows.table_name,
-			rows.key_json,
+			rows.table_id,
+			rows.key_bytes,
 			$2,
-			rows.deleted,
-			$2,
-			CASE WHEN rows.has_payload_hash THEN decode(rows.payload_hash_hex, 'hex') ELSE NULL END,
-			now()
+			rows.deleted
 		FROM unnest(
-			$3::text[],
-			$4::text[],
-			$5::text[],
-			$6::bool[],
-			$7::bool[],
-			$8::text[]
-		) AS rows(schema_name, table_name, key_json, deleted, has_payload_hash, payload_hash_hex)
-		ON CONFLICT (user_id, schema_name, table_name, key_json) DO UPDATE
-		SET row_version = EXCLUDED.row_version,
-			deleted = EXCLUDED.deleted,
-			bundle_seq = EXCLUDED.bundle_seq,
-			payload_hash = EXCLUDED.payload_hash,
-			updated_at = now()
-	`, userID, bundleSeq, schemaNames, tableNames, keyJSONs, deletedFlags, hasPayloadHash, payloadHashHex); err != nil {
+			$3::int4[],
+			$4::bytea[],
+			$5::bool[]
+		) AS rows(table_id, key_bytes, deleted)
+		ON CONFLICT (user_pk, table_id, key_bytes) DO UPDATE
+		SET bundle_seq = EXCLUDED.bundle_seq,
+			deleted = EXCLUDED.deleted
+	`, userPK, bundleSeq, tableIDs, keyBytes, deletedFlags); err != nil {
 		return fmt.Errorf("bulk upsert row_state: %w", err)
 	}
 

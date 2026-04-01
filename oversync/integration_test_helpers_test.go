@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -30,6 +31,8 @@ func newIntegrationTestPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("create integration test pool: %v", err)
 	}
+	require.NoError(t, resetTestSyncSchema(ctx, pool))
+	t.Cleanup(func() { _ = resetTestSyncSchema(context.Background(), pool) })
 	t.Cleanup(pool.Close)
 	return pool
 }
@@ -125,17 +128,33 @@ func resetTestBusinessSchema(ctx context.Context, pool *pgxpool.Pool, schema str
 	return nil
 }
 
+func resetTestSyncSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS sync CASCADE`); err != nil {
+		return fmt.Errorf("drop sync schema: %w", err)
+	}
+	return nil
+}
+
 func cleanupSyncUser(ctx context.Context, pool *pgxpool.Pool, userID string) error {
+	userPK, err := lookupUserPK(ctx, pool, userID)
+	if err != nil {
+		if strings.Contains(err.Error(), "missing user_state row") {
+			return nil
+		}
+		return err
+	}
 	queries := []string{
-		`DELETE FROM sync.bundle_capture_stage WHERE user_id = $1`,
-		`DELETE FROM sync.applied_pushes WHERE user_id = $1`,
-		`DELETE FROM sync.bundle_rows WHERE user_id = $1`,
-		`DELETE FROM sync.bundle_log WHERE user_id = $1`,
-		`DELETE FROM sync.row_state WHERE user_id = $1`,
-		`DELETE FROM sync.user_state WHERE user_id = $1`,
+		`DELETE FROM sync.bundle_capture_stage WHERE user_pk = $1`,
+		`DELETE FROM sync.push_sessions WHERE user_pk = $1`,
+		`DELETE FROM sync.source_state WHERE user_pk = $1`,
+		`DELETE FROM sync.bundle_rows WHERE user_pk = $1`,
+		`DELETE FROM sync.bundle_log WHERE user_pk = $1`,
+		`DELETE FROM sync.row_state WHERE user_pk = $1`,
+		`DELETE FROM sync.scope_state WHERE user_pk = $1`,
+		`DELETE FROM sync.user_state WHERE user_pk = $1`,
 	}
 	for _, q := range queries {
-		if _, err := pool.Exec(ctx, q, userID); err != nil {
+		if _, err := pool.Exec(ctx, q, userPK); err != nil {
 			return err
 		}
 	}
@@ -238,4 +257,26 @@ func pushRowsViaSession(
 	default:
 		return nil, fmt.Errorf("unexpected push session status %q", createResp.Status)
 	}
+}
+
+func mustCompactStorageIdentity(
+	t *testing.T,
+	ctx context.Context,
+	svc *SyncService,
+	userID string,
+	schemaName string,
+	tableName string,
+	keyString string,
+) (int64, int32, []byte) {
+	t.Helper()
+
+	userPK, err := lookupUserPK(ctx, svc.pool, userID)
+	require.NoError(t, err)
+
+	info, err := svc.syncKeyInfoForTable(schemaName, tableName)
+	require.NoError(t, err)
+
+	keyBytes, _, err := encodeKeyBytes(info.syncKeyType, keyString)
+	require.NoError(t, err)
+	return userPK, info.tableID, keyBytes
 }

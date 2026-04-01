@@ -35,12 +35,13 @@ func (e *PushConflictError) Error() string {
 type pushPreparedRow struct {
 	schema         string
 	table          string
+	tableID        int32
 	op             string
 	keyColumn      string
 	keyType        string
 	keyString      string
 	keyValue       any
-	keyJSON        string
+	keyBytes       []byte
 	baseRowVersion int64
 	payload        []byte
 	payloadColumns []string
@@ -96,8 +97,12 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 		if err != nil {
 			return nil, err
 		}
+		tableID, err := s.tableIDForTable(schemaName, tableName)
+		if err != nil {
+			return nil, err
+		}
 
-		targetKey := schemaName + "\x00" + tableName + "\x00" + normalizedKey.keyJSON
+		targetKey := string(appendInt32BigEndian(append([]byte(nil), normalizedKey.keyBytes...), tableID))
 		if _, exists := seenTargets[targetKey]; exists {
 			return nil, &PushValidationError{Message: fmt.Sprintf("duplicate target row in push request: %s.%s %s", schemaName, tableName, normalizedKey.keyString)}
 		}
@@ -149,12 +154,13 @@ func (s *SyncService) preparePushRowsWithOptions(rows []PushRequestRow, preserve
 		prepared = append(prepared, pushPreparedRow{
 			schema:         schemaName,
 			table:          tableName,
+			tableID:        tableID,
 			op:             op,
 			keyColumn:      normalizedKey.column,
 			keyType:        normalizedKey.keyType,
 			keyString:      normalizedKey.keyString,
 			keyValue:       normalizedKey.dbValue,
-			keyJSON:        normalizedKey.keyJSON,
+			keyBytes:       append([]byte(nil), normalizedKey.keyBytes...),
 			baseRowVersion: row.BaseRowVersion,
 			payload:        payload,
 			payloadColumns: payloadColumns,
@@ -200,54 +206,50 @@ func (s *SyncService) tableOrderIndex(schemaName, tableName string) int {
 	return 0
 }
 
-func loadRowStateSnapshot(ctx context.Context, tx pgx.Tx, userID, schemaName, tableName, keyJSON string) (*rowStateSnapshot, error) {
+func loadRowStateSnapshot(ctx context.Context, tx pgx.Tx, userPK int64, tableID int32, keyBytes []byte) (*rowStateSnapshot, error) {
 	var state rowStateSnapshot
 	err := tx.QueryRow(ctx, `
-		SELECT row_version, deleted
+		SELECT bundle_seq, deleted
 		FROM sync.row_state
-		WHERE user_id = $1
-		  AND schema_name = $2
-		  AND table_name = $3
-		  AND key_json = $4
-	`, userID, schemaName, tableName, keyJSON).Scan(&state.rowVersion, &state.deleted)
+		WHERE user_pk = $1
+		  AND table_id = $2
+		  AND key_bytes = $3
+	`, userPK, tableID, keyBytes).Scan(&state.rowVersion, &state.deleted)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("load row state for %s.%s %s: %w", schemaName, tableName, keyJSON, err)
+		return nil, fmt.Errorf("load row state for table_id %d: %w", tableID, err)
 	}
 	return &state, nil
 }
 
-func loadRowStateSnapshots(ctx context.Context, tx pgx.Tx, userID string, rows []pushPreparedRow) ([]indexedRowStateSnapshot, error) {
+func loadRowStateSnapshots(ctx context.Context, tx pgx.Tx, userPK int64, rows []pushPreparedRow) ([]indexedRowStateSnapshot, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
 
-	schemaNames := make([]string, len(rows))
-	tableNames := make([]string, len(rows))
-	keyJSONs := make([]string, len(rows))
+	tableIDs := make([]int32, len(rows))
+	keyBytes := make([][]byte, len(rows))
 	for i, row := range rows {
-		schemaNames[i] = row.schema
-		tableNames[i] = row.table
-		keyJSONs[i] = row.keyJSON
+		tableIDs[i] = row.tableID
+		keyBytes[i] = append([]byte(nil), row.keyBytes...)
 	}
 
 	queryRows, err := tx.Query(ctx, `
 		WITH requested AS (
-			SELECT ord::bigint, schema_name, table_name, key_json
-			FROM unnest($2::text[], $3::text[], $4::text[]) WITH ORDINALITY
-				AS req(schema_name, table_name, key_json, ord)
+			SELECT ord::bigint, table_id, key_bytes
+			FROM unnest($2::int4[], $3::bytea[]) WITH ORDINALITY
+				AS req(table_id, key_bytes, ord)
 		)
-		SELECT req.ord, rs.row_version, rs.deleted
+		SELECT req.ord, rs.bundle_seq, rs.deleted
 		FROM requested AS req
 		LEFT JOIN sync.row_state AS rs
-		  ON rs.user_id = $1
-		 AND rs.schema_name = req.schema_name
-		 AND rs.table_name = req.table_name
-		 AND rs.key_json = req.key_json
+		  ON rs.user_pk = $1
+		 AND rs.table_id = req.table_id
+		 AND rs.key_bytes = req.key_bytes
 		ORDER BY req.ord
-	`, userID, schemaNames, tableNames, keyJSONs)
+	`, userPK, tableIDs, keyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("bulk load row state snapshots: %w", err)
 	}
@@ -571,22 +573,28 @@ func quotedInsertColumnList(columns []string) string {
 
 func (s *SyncService) loadCommittedBundle(ctx context.Context, tx pgx.Tx, userID string, bundleSeq int64) (*Bundle, error) {
 	var bundle Bundle
+	userPK, err := lookupUserPK(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
+	var bundleHash []byte
 	if err := tx.QueryRow(ctx, `
 		SELECT bundle_seq, source_id, source_bundle_id, row_count, bundle_hash
 		FROM sync.bundle_log
-		WHERE user_id = $1
+		WHERE user_pk = $1
 		  AND bundle_seq = $2
-	`, userID, bundleSeq).Scan(&bundle.BundleSeq, &bundle.SourceID, &bundle.SourceBundleID, &bundle.RowCount, &bundle.BundleHash); err != nil {
+	`, userPK, bundleSeq).Scan(&bundle.BundleSeq, &bundle.SourceID, &bundle.SourceBundleID, &bundle.RowCount, &bundleHash); err != nil {
 		return nil, fmt.Errorf("load bundle_log %d: %w", bundleSeq, err)
 	}
+	bundle.BundleHash = renderBundleHash(bundleHash)
 
 	rows, err := tx.Query(ctx, `
-		SELECT schema_name, table_name, key_json, op, row_version, payload
+		SELECT table_id, key_bytes, op_code, payload_wire
 		FROM sync.bundle_rows
-		WHERE user_id = $1
+		WHERE user_pk = $1
 		  AND bundle_seq = $2
 		ORDER BY row_ordinal
-	`, userID, bundleSeq)
+	`, userPK, bundleSeq)
 	if err != nil {
 		return nil, fmt.Errorf("query bundle_rows %d: %w", bundleSeq, err)
 	}
@@ -594,18 +602,31 @@ func (s *SyncService) loadCommittedBundle(ctx context.Context, tx pgx.Tx, userID
 
 	for rows.Next() {
 		var row BundleRow
-		var keyJSON string
-		if err := rows.Scan(&row.Schema, &row.Table, &keyJSON, &row.Op, &row.RowVersion, &row.Payload); err != nil {
+		var (
+			tableID     int32
+			keyBytes    []byte
+			opCode      int16
+			payloadWire []byte
+		)
+		if err := rows.Scan(&tableID, &keyBytes, &opCode, &payloadWire); err != nil {
 			return nil, fmt.Errorf("scan bundle_rows %d: %w", bundleSeq, err)
 		}
-		row.Key, err = decodeSyncKeyJSON(keyJSON)
+		info, err := s.tableInfoForID(tableID)
+		if err != nil {
+			return nil, err
+		}
+		row.Schema = info.schemaName
+		row.Table = info.tableName
+		row.Key, err = wireSyncKeyFromBytes(info, keyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("decode bundle row key %d: %w", bundleSeq, err)
 		}
-		row.Payload, err = s.canonicalizeWirePayload(row.Schema, row.Table, row.Payload)
+		row.Op, err = opStringFromCode(opCode)
 		if err != nil {
-			return nil, fmt.Errorf("canonicalize bundle row payload %d for %s.%s: %w", bundleSeq, row.Schema, row.Table, err)
+			return nil, err
 		}
+		row.RowVersion = bundleSeq
+		row.Payload = payloadWire
 		bundle.Rows = append(bundle.Rows, row)
 	}
 	if rows.Err() != nil {

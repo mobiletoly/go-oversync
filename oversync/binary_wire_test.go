@@ -95,13 +95,14 @@ func TestBinaryWire_ProcessPushAcceptedBundleCanonicalizesByteaPayload(t *testin
 	`, schemaName), fileID).Scan(&persistedData))
 	require.Equal(t, fileData, persistedData)
 
+	userPK, _, _ := mustCompactStorageIdentity(t, ctx, svc, userID, schemaName, "files", fileID.String())
 	var storedData string
 	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT payload->>'data'
+		SELECT payload_wire->>'data'
 		FROM sync.bundle_rows
-		WHERE user_id = $1 AND bundle_seq = $2 AND schema_name = $3 AND table_name = 'files'
-	`, userID, bundle.BundleSeq, schemaName).Scan(&storedData))
-	require.True(t, strings.HasPrefix(storedData, "\\x"), "expected internal bundle_rows payload to remain postgres bytea text, got %q", storedData)
+		WHERE user_pk = $1 AND bundle_seq = $2
+	`, userPK, bundle.BundleSeq).Scan(&storedData))
+	require.Equal(t, base64.StdEncoding.EncodeToString(fileData), storedData)
 }
 
 func TestBinaryWire_ProcessPullCanonicalizesByteaPayload(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,8 @@ const (
 	defaultMaxRowsPerSnapshotChunk        int                   = 5000
 	defaultRowsPerSnapshotChunk           int                   = 1000
 	defaultSnapshotSessionTTL             time.Duration         = 15 * time.Minute
+	defaultRetainedBundlesPerUser         int64                 = 10000
+	defaultRetentionPruneBatchSize        int64                 = 1000
 )
 
 var errServiceShuttingDown = errors.New("sync service is shutting down")
@@ -44,8 +47,12 @@ const (
 )
 
 type registeredTableRuntimeInfo struct {
+	schemaName    string
+	tableName     string
+	tableID       int32
 	syncKeyColumn string
 	syncKeyType   string
+	syncKeyKind   int16
 }
 
 // RegisteredTable represents a table that is registered for sync operations
@@ -111,6 +118,7 @@ type SyncService struct {
 	config              *ServiceConfig
 	registeredTables    map[string]bool // Set of "schema.table" combinations allowed in sync operations
 	registeredTableInfo map[string]registeredTableRuntimeInfo
+	registeredTableByID map[int32]registeredTableRuntimeInfo
 	columnTypesByTable  map[string]map[string]string
 
 	// Schema discovery snapshot for bootstrap validation and FK-safe bundle ordering.
@@ -145,6 +153,8 @@ type ServiceConfig struct {
 	SnapshotSessionTTL          time.Duration
 	MaxRowsPerSnapshotSession   int64
 	MaxBytesPerSnapshotSession  int64
+	RetainedBundlesPerUser      int64
+	RetentionPruneBatchSize     int64
 	// UploadLockTimeout bounds lock waits inside upload transactions.
 	// Zero disables SET LOCAL lock_timeout so lock waits are governed only by the request context,
 	// which is the reliability-first default.
@@ -233,6 +243,20 @@ func (s *SyncService) maxBytesPerSnapshotSession() int64 {
 	return 0
 }
 
+func (s *SyncService) retainedBundlesPerUser() int64 {
+	if s != nil && s.config != nil && s.config.RetainedBundlesPerUser > 0 {
+		return s.config.RetainedBundlesPerUser
+	}
+	return defaultRetainedBundlesPerUser
+}
+
+func (s *SyncService) retentionPruneBatchSize() int64 {
+	if s != nil && s.config != nil && s.config.RetentionPruneBatchSize > 0 {
+		return s.config.RetentionPruneBatchSize
+	}
+	return defaultRetentionPruneBatchSize
+}
+
 // NewRuntimeService creates a runtime-only sync service instance from an existing pool.
 // It does not mutate database schema or discover runtime topology.
 func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.Logger) (*SyncService, error) {
@@ -252,6 +276,7 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 		config:              config,
 		registeredTables:    make(map[string]bool),
 		registeredTableInfo: make(map[string]registeredTableRuntimeInfo),
+		registeredTableByID: make(map[int32]registeredTableRuntimeInfo),
 		columnTypesByTable:  make(map[string]map[string]string),
 		lifecycle:           serviceLifecycleRunning,
 	}
@@ -276,26 +301,19 @@ func (s *SyncService) Bootstrap(ctx context.Context) error {
 	if s.pool == nil {
 		return fmt.Errorf("bootstrap requires a database pool")
 	}
-	ready, err := scaleRedesignSchemaReady(ctx, s.pool)
-	if err != nil {
+	if err := s.normalizeAndValidateRegisteredSyncKeys(ctx); err != nil {
 		return err
 	}
-	if !ready {
-		if err := runRetryableTx(ctx, 3, 50*time.Millisecond, func() error {
-			return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-				if err := s.initializeSchemaInTx(ctx, tx); err != nil {
-					s.logger.Error("Failed to initialize database schema", "error", err)
-					return err
-				}
-				s.logger.Debug("Database schema initialized successfully")
-				return nil
-			})
-		}); err != nil {
-			return err
-		}
-	}
-
-	if err := s.normalizeAndValidateRegisteredSyncKeys(ctx); err != nil {
+	if err := runRetryableTx(ctx, 3, 50*time.Millisecond, func() error {
+		return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+			if err := s.initializeSchemaInTx(ctx, tx); err != nil {
+				s.logger.Error("Failed to initialize database schema", "error", err)
+				return err
+			}
+			s.logger.Debug("Database schema initialized successfully")
+			return nil
+		})
+	}); err != nil {
 		return err
 	}
 
@@ -442,6 +460,7 @@ ORDER BY n.nspname, c.relname, i.relname, ord.ordinality
 	}
 
 	registeredInfo := make(map[string]registeredTableRuntimeInfo, len(s.config.RegisteredTables))
+	normalizedTableKeys := make([]string, 0, len(s.config.RegisteredTables))
 	for i := range s.config.RegisteredTables {
 		tbl := &s.config.RegisteredTables[i]
 		tableKey := tbl.normalizedKey()
@@ -489,13 +508,31 @@ ORDER BY n.nspname, c.relname, i.relname, ord.ordinality
 		}
 
 		tbl.SyncKeyColumns = []string{keyColumns[0]}
+		syncKeyKind, err := syncKeyKindCode(keyType)
+		if err != nil {
+			return err
+		}
 		registeredInfo[tableKey] = registeredTableRuntimeInfo{
+			schemaName:    tbl.normalizedSchema(),
+			tableName:     tbl.normalizedTable(),
 			syncKeyColumn: keyColumns[0],
 			syncKeyType:   keyType,
+			syncKeyKind:   syncKeyKind,
 		}
+		normalizedTableKeys = append(normalizedTableKeys, tableKey)
+	}
+
+	sort.Strings(normalizedTableKeys)
+	registeredByID := make(map[int32]registeredTableRuntimeInfo, len(normalizedTableKeys))
+	for i, tableKey := range normalizedTableKeys {
+		info := registeredInfo[tableKey]
+		info.tableID = int32(i + 1)
+		registeredInfo[tableKey] = info
+		registeredByID[info.tableID] = info
 	}
 
 	s.registeredTableInfo = registeredInfo
+	s.registeredTableByID = registeredByID
 	s.columnTypesByTable = make(map[string]map[string]string, len(columnTypes))
 	for tableKey, cols := range columnTypes {
 		cloned := make(map[string]string, len(cols))

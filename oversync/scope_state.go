@@ -19,10 +19,14 @@ const (
 	scopeStateUninitialized       = "UNINITIALIZED"
 	scopeStateInitializing        = "INITIALIZING"
 	scopeStateInitialized         = "INITIALIZED"
+	scopeStateCodeUninitialized   = int16(0)
+	scopeStateCodeInitializing    = int16(1)
+	scopeStateCodeInitialized     = int16(2)
 	defaultInitializationLeaseTTL = 15 * time.Minute
 )
 
 type scopeStateRow struct {
+	UserPK              int64
 	UserID              string
 	State               string
 	InitializerSourceID string
@@ -77,14 +81,32 @@ func (s *SyncService) initializationLeaseTTL() time.Duration {
 	return defaultInitializationLeaseTTL
 }
 
+func scopeStateNameFromCode(code int16) (string, error) {
+	switch code {
+	case scopeStateCodeUninitialized:
+		return scopeStateUninitialized, nil
+	case scopeStateCodeInitializing:
+		return scopeStateInitializing, nil
+	case scopeStateCodeInitialized:
+		return scopeStateInitialized, nil
+	default:
+		return "", fmt.Errorf("unexpected scope state code %d", code)
+	}
+}
+
 func ensureScopeStateExistsWithExec(ctx context.Context, exec interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }, userID string) error {
+	if err := ensureUserStateBaselineWithExec(ctx, exec, userID); err != nil {
+		return err
+	}
 	if _, err := exec.Exec(ctx, `
-		INSERT INTO sync.scope_state (user_id, state, created_at, updated_at)
-		VALUES ($1, 'UNINITIALIZED', now(), now())
-		ON CONFLICT (user_id) DO NOTHING
-	`, userID); err != nil {
+		INSERT INTO sync.scope_state (user_pk, state_code)
+		SELECT user_pk, $2
+		FROM sync.user_state
+		WHERE user_id = $1
+		ON CONFLICT (user_pk) DO NOTHING
+	`, userID, scopeStateCodeUninitialized); err != nil {
 		return fmt.Errorf("ensure scope_state row: %w", err)
 	}
 	return nil
@@ -93,6 +115,7 @@ func ensureScopeStateExistsWithExec(ctx context.Context, exec interface {
 func loadScopeStateForUpdate(ctx context.Context, tx pgx.Tx, userID string) (*scopeStateRow, error) {
 	var (
 		row                 scopeStateRow
+		stateCode           int16
 		initializerSourceID sql.NullString
 		initializationID    sql.NullString
 		leaseExpiresAt      sql.NullTime
@@ -100,13 +123,23 @@ func loadScopeStateForUpdate(ctx context.Context, tx pgx.Tx, userID string) (*sc
 		initializedBySource sql.NullString
 	)
 	if err := tx.QueryRow(ctx, `
-		SELECT user_id, state, initializer_source_id, initialization_id::text, lease_expires_at, initialized_at, initialized_by_source_id
-		FROM sync.scope_state
-		WHERE user_id = $1
+		SELECT
+			us.user_pk,
+			us.user_id,
+			ss.state_code,
+			ss.initializer_source_id,
+			ss.initialization_id::text,
+			ss.lease_expires_at,
+			ss.initialized_at,
+			ss.initialized_by_source_id
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
 		FOR UPDATE
 	`, userID).Scan(
+		&row.UserPK,
 		&row.UserID,
-		&row.State,
+		&stateCode,
 		&initializerSourceID,
 		&initializationID,
 		&leaseExpiresAt,
@@ -126,6 +159,11 @@ func loadScopeStateForUpdate(ctx context.Context, tx pgx.Tx, userID string) (*sc
 	if initializedAt.Valid {
 		row.InitializedAt = initializedAt.Time.UTC()
 	}
+	stateName, err := scopeStateNameFromCode(stateCode)
+	if err != nil {
+		return nil, err
+	}
+	row.State = stateName
 	row.InitializedBySource = initializedBySource.String
 	return &row, nil
 }
@@ -134,18 +172,23 @@ func currentScopeStateQuerier(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, userID string) (string, *time.Time, error) {
 	var (
-		state          string
+		stateCode      int16
 		leaseExpiresAt sql.NullTime
 	)
 	if err := q.QueryRow(ctx, `
-		SELECT state, lease_expires_at
-		FROM sync.scope_state
-		WHERE user_id = $1
-	`, userID).Scan(&state, &leaseExpiresAt); err != nil {
+		SELECT ss.state_code, ss.lease_expires_at
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&stateCode, &leaseExpiresAt); err != nil {
 		if err == pgx.ErrNoRows {
 			return scopeStateUninitialized, nil, nil
 		}
 		return "", nil, fmt.Errorf("query scope_state row: %w", err)
+	}
+	state, err := scopeStateNameFromCode(stateCode)
+	if err != nil {
+		return "", nil, err
 	}
 	if leaseExpiresAt.Valid {
 		ts := leaseExpiresAt.Time.UTC()
@@ -160,13 +203,12 @@ func expireInitializationLeaseIfNeeded(ctx context.Context, tx pgx.Tx, row *scop
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE sync.scope_state
-		SET state = 'UNINITIALIZED',
+		SET state_code = $2,
 			initializer_source_id = NULL,
 			initialization_id = NULL,
-			lease_expires_at = NULL,
-			updated_at = now()
-		WHERE user_id = $1
-	`, row.UserID); err != nil {
+			lease_expires_at = NULL
+		WHERE user_pk = $1
+	`, row.UserPK, scopeStateCodeUninitialized); err != nil {
 		return nil, fmt.Errorf("expire initialization lease: %w", err)
 	}
 	row.State = scopeStateUninitialized
@@ -180,8 +222,8 @@ func ensureUserStateBaselineWithExec(ctx context.Context, exec interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }, userID string) error {
 	if _, err := exec.Exec(ctx, `
-		INSERT INTO sync.user_state (user_id, next_bundle_seq, retained_bundle_floor, updated_at)
-		VALUES ($1, 1, 0, now())
+		INSERT INTO sync.user_state (user_id, next_bundle_seq, retained_bundle_floor)
+		VALUES ($1, 1, 0)
 		ON CONFLICT (user_id) DO NOTHING
 	`, userID); err != nil {
 		return fmt.Errorf("ensure user_state baseline row: %w", err)
@@ -237,10 +279,9 @@ func requireActiveInitializationLease(ctx context.Context, tx pgx.Tx, userID, so
 	if !refreshTo.IsZero() {
 		if _, err := tx.Exec(ctx, `
 			UPDATE sync.scope_state
-			SET lease_expires_at = $2,
-				updated_at = now()
-			WHERE user_id = $1
-		`, userID, refreshTo.UTC()); err != nil {
+			SET lease_expires_at = $2
+			WHERE user_pk = $1
+		`, row.UserPK, refreshTo.UTC()); err != nil {
 			return nil, fmt.Errorf("refresh initialization lease: %w", err)
 		}
 		row.LeaseExpiresAt = refreshTo.UTC()
@@ -254,15 +295,14 @@ func transitionScopeToInitialized(ctx context.Context, tx pgx.Tx, userID, source
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE sync.scope_state
-		SET state = 'INITIALIZED',
+		SET state_code = $2,
 			initializer_source_id = NULL,
 			initialization_id = NULL,
 			lease_expires_at = NULL,
 			initialized_at = now(),
-			initialized_by_source_id = $2,
-			updated_at = now()
-		WHERE user_id = $1
-	`, userID, sourceID); err != nil {
+			initialized_by_source_id = $3
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, userID, scopeStateCodeInitialized, sourceID); err != nil {
 		return fmt.Errorf("transition scope_state to INITIALIZED: %w", err)
 	}
 	return nil
@@ -276,13 +316,14 @@ func transitionScopeToInitializing(ctx context.Context, tx pgx.Tx, userID, sourc
 	leaseExpiresAt := time.Now().UTC().Add(leaseTTL)
 	if _, err := tx.Exec(ctx, `
 		UPDATE sync.scope_state
-		SET state = 'INITIALIZING',
-			initializer_source_id = $2,
-			initialization_id = $3::uuid,
-			lease_expires_at = $4,
-			updated_at = now()
-		WHERE user_id = $1
-	`, userID, sourceID, initializationID, leaseExpiresAt); err != nil {
+		SET state_code = $2,
+			initializer_source_id = $3,
+			initialization_id = $4::uuid,
+			lease_expires_at = $5,
+			initialized_at = NULL,
+			initialized_by_source_id = NULL
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, userID, scopeStateCodeInitializing, sourceID, initializationID, leaseExpiresAt); err != nil {
 		return nil, fmt.Errorf("transition scope_state to INITIALIZING: %w", err)
 	}
 	return &scopeStateRow{

@@ -56,6 +56,18 @@ type committedPushBundle struct {
 	AlreadyCommitted bool
 }
 
+type committedRemoteReplayPrunedError struct {
+	Committed *committedPushBundle
+	Message   string
+}
+
+func (e *committedRemoteReplayPrunedError) Error() string {
+	if e != nil && strings.TrimSpace(e.Message) != "" {
+		return e.Message
+	}
+	return "committed remote bundle replay is no longer retained; keep-source rebuild is required"
+}
+
 type stagedPushBundleRow struct {
 	SchemaName string
 	TableName  string
@@ -83,6 +95,13 @@ func atomicLoadPaused(v *int32) bool {
 func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) (PushReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "PushPending()"); err != nil {
 		return PushReport{}, err
+	}
+	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
+	if err != nil {
+		return PushReport{}, err
+	}
+	if sourceRecoveryErr != nil {
+		return PushReport{}, sourceRecoveryErr
 	}
 	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
 		return PushReport{}, err
@@ -130,11 +149,22 @@ func (c *Client) pushPendingLocked(ctx context.Context, conflictRetryCount int) 
 			return nil, err
 		}
 		if err := c.fetchCommittedPushBundle(ctx, committed); err != nil {
+			var prunedErr *HistoryPrunedError
+			if errors.As(err, &prunedErr) {
+				return nil, &committedRemoteReplayPrunedError{
+					Committed: committed,
+					Message:   prunedErr.Message,
+				}
+			}
 			return nil, err
 		}
 		return committed, nil
 	})
 	if err != nil {
+		var replayPrunedErr *committedRemoteReplayPrunedError
+		if errors.As(err, &replayPrunedErr) {
+			return c.recoverCommittedRemoteReplayPrunedLocked(ctx, replayPrunedErr.Committed)
+		}
 		var conflictErr *PushConflictError
 		if errors.As(err, &conflictErr) {
 			if err := c.resolvePushConflict(ctx, snapshot, conflictErr); err != nil {
@@ -289,8 +319,39 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 		return nil, fmt.Errorf("outbound push snapshot is empty")
 	}
 
+	currentOutbox, err := loadOutboxBundle(ctx, c.DB)
+	if err != nil {
+		return nil, err
+	}
+
 	sessionResp, err := c.createPushSession(ctx, snapshot.SourceBundleID, int64(len(snapshot.Rows)))
 	if err != nil {
+		var prunedErr *HistoryPrunedError
+		if errors.As(err, &prunedErr) {
+			if currentOutbox.State == outboxStateCommittedRemote {
+				return &committedPushBundle{
+						BundleSeq:      currentOutbox.RemoteBundleSeq,
+						SourceID:       currentOutbox.SourceID,
+						SourceBundleID: currentOutbox.SourceBundleID,
+						RowCount:       currentOutbox.RowCount,
+						BundleHash:     currentOutbox.RemoteBundleHash,
+					}, &committedRemoteReplayPrunedError{
+						Committed: &committedPushBundle{
+							BundleSeq:      currentOutbox.RemoteBundleSeq,
+							SourceID:       currentOutbox.SourceID,
+							SourceBundleID: currentOutbox.SourceBundleID,
+							RowCount:       currentOutbox.RowCount,
+							BundleHash:     currentOutbox.RemoteBundleHash,
+						},
+						Message: prunedErr.Message,
+					}
+			}
+			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryHistoryPruned, prunedErr.Message)
+		}
+		var outOfOrderErr *sourceSequenceOutOfOrderError
+		if errors.As(err, &outOfOrderErr) {
+			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoverySequenceOutOfOrder, outOfOrderErr.Message)
+		}
 		return nil, err
 	}
 	switch sessionResp.Status {
@@ -352,6 +413,10 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 	}
 	commitResp, err := c.commitPushSession(ctx, pushID)
 	if err != nil {
+		var sequenceErr *sourceSequenceChangedError
+		if errors.As(err, &sequenceErr) {
+			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoverySequenceChanged, sequenceErr.Message)
+		}
 		return nil, err
 	}
 	cleanupPushSession = false
@@ -1204,6 +1269,22 @@ func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedR
 		if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, statusCode, body); handled {
 			return nil, initErr
 		}
+		if statusCode == http.StatusConflict {
+			if errorResp, ok := decodeServerErrorResponse(body); ok {
+				switch errorResp.Error {
+				case "history_pruned":
+					return nil, &HistoryPrunedError{
+						Status:  statusCode,
+						Message: errorResp.Message,
+					}
+				case "source_sequence_out_of_order":
+					return nil, &sourceSequenceOutOfOrderError{
+						Status:  statusCode,
+						Message: errorResp.Message,
+					}
+				}
+			}
+		}
 		if conflictErr := decodePushConflictError(statusCode, body); conflictErr != nil {
 			return nil, conflictErr
 		}
@@ -1271,6 +1352,14 @@ func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversyn
 		if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, statusCode, body); handled {
 			return nil, initErr
 		}
+		if statusCode == http.StatusConflict {
+			if errorResp, ok := decodeServerErrorResponse(body); ok && errorResp.Error == "source_sequence_changed" {
+				return nil, &sourceSequenceChangedError{
+					Status:  statusCode,
+					Message: errorResp.Message,
+				}
+			}
+		}
 		if conflictErr := decodePushConflictError(statusCode, body); conflictErr != nil {
 			return nil, conflictErr
 		}
@@ -1313,6 +1402,14 @@ func (c *Client) fetchCommittedBundleChunk(ctx context.Context, bundleSeq int64,
 		return nil, fmt.Errorf("failed to send committed bundle chunk request: %w", err)
 	}
 	if statusCode != http.StatusOK {
+		if statusCode == http.StatusConflict {
+			if errorResp, ok := decodeServerErrorResponse(body); ok && errorResp.Error == "history_pruned" {
+				return nil, &HistoryPrunedError{
+					Status:  statusCode,
+					Message: errorResp.Message,
+				}
+			}
+		}
 		return nil, &retryHTTPError{
 			Operation:  "committed_bundle_chunk_fetch",
 			StatusCode: statusCode,

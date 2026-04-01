@@ -15,6 +15,13 @@ type DatabaseVerifier struct {
 	logger *slog.Logger
 }
 
+// UserRetentionState captures per-user retained-history state from sync.user_state.
+type UserRetentionState struct {
+	UserPK              int64
+	NextBundleSeq       int64
+	RetainedBundleFloor int64
+}
+
 // NewDatabaseVerifier creates a new database verifier
 func NewDatabaseVerifier(databaseURL string, logger *slog.Logger) (*DatabaseVerifier, error) {
 	pool, err := pgxpool.New(context.Background(), databaseURL)
@@ -67,7 +74,9 @@ func (v *DatabaseVerifier) CountOrphanedReviews() (int, error) {
 	query := `
 		SELECT COUNT(*)
 		FROM business.file_reviews fr
-		LEFT JOIN business.files f ON fr.file_id = f.id
+		LEFT JOIN business.files f
+			ON fr._sync_scope_id = f._sync_scope_id
+			AND fr.file_id = f.id
 		WHERE f.id IS NULL
 	`
 
@@ -84,14 +93,18 @@ func (v *DatabaseVerifier) CountOrphanedReviews() (int, error) {
 func (v *DatabaseVerifier) CountUserRecords(ctx context.Context, tableName string, userID string) (int, error) {
 	var count int
 
-	// Query the authoritative bundle-era row state so we only count live rows that belong to this user.
+	// Query the authoritative row_state joined through compact internal identities.
 	query := `
 		SELECT COUNT(*)
-		FROM sync.row_state
-		WHERE user_id = $1
-		AND schema_name = $2
-		AND table_name = $3
-		AND deleted = FALSE`
+		FROM sync.row_state rs
+		INNER JOIN sync.user_state us
+			ON us.user_pk = rs.user_pk
+		INNER JOIN sync.table_catalog tc
+			ON tc.table_id = rs.table_id
+		WHERE us.user_id = $1
+		AND tc.schema_name = $2
+		AND tc.table_name = $3
+		AND rs.deleted = FALSE`
 
 	// Extract table name from full table name (e.g., "business.users" -> "users")
 	parts := strings.Split(tableName, ".")
@@ -122,18 +135,13 @@ func (v *DatabaseVerifier) CountActualBusinessRecords(ctx context.Context, table
 	schemaName := parts[0]
 	tableNameOnly := parts[1]
 
-	// Count records by joining business rows with authoritative bundle-era row ownership.
+	// Business tables are authoritative for live payload state and carry owner scope directly.
 	query := fmt.Sprintf(`
-		SELECT COUNT(DISTINCT bt.id)
+		SELECT COUNT(*)
 		FROM %s.%s bt
-		INNER JOIN sync.row_state rs
-			ON rs.key_json::jsonb ->> 'id' = bt.id::text
-		WHERE rs.user_id = $1
-		AND rs.schema_name = $2
-		AND rs.table_name = $3
-		AND rs.deleted = FALSE`, schemaName, tableNameOnly)
+		WHERE bt._sync_scope_id = $1`, schemaName, tableNameOnly)
 
-	err := v.pool.QueryRow(ctx, query, userID, schemaName, tableNameOnly).Scan(&count)
+	err := v.pool.QueryRow(ctx, query, userID).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count actual business records in %s for user %s: %w", tableName, userID, err)
 	}
@@ -156,22 +164,18 @@ func (v *DatabaseVerifier) VerifyBusinessRecordsExist(ctx context.Context, table
 	schemaName := parts[0]
 	tableNameOnly := parts[1]
 
-	// Check each record exists by joining with authoritative bundle-era row ownership.
+	// Check each record exists in the authoritative business table for this scoped user.
 	for _, recordID := range recordIDs {
 		var exists bool
 		query := fmt.Sprintf(`
 			SELECT EXISTS(
-				SELECT 1 FROM %s.%s bt
-				INNER JOIN sync.row_state rs
-					ON rs.key_json::jsonb ->> 'id' = bt.id::text
-				WHERE rs.user_id = $1
-				AND bt.id = $2
-				AND rs.schema_name = $3
-				AND rs.table_name = $4
-				AND rs.deleted = FALSE
+				SELECT 1
+				FROM %s.%s bt
+				WHERE bt._sync_scope_id = $1
+				AND bt.id = $2::uuid
 			)`, schemaName, tableNameOnly)
 
-		err := v.pool.QueryRow(ctx, query, userID, recordID, schemaName, tableNameOnly).Scan(&exists)
+		err := v.pool.QueryRow(ctx, query, userID, recordID).Scan(&exists)
 		if err != nil {
 			return fmt.Errorf("failed to check if record %s exists in %s: %w", recordID, tableName, err)
 		}
@@ -188,7 +192,12 @@ func (v *DatabaseVerifier) VerifyBusinessRecordsExist(ctx context.Context, table
 // CountSyncChanges counts committed row effects for a specific user.
 func (v *DatabaseVerifier) CountSyncChanges(ctx context.Context, userID string) (int, error) {
 	var count int
-	query := "SELECT COUNT(*) FROM sync.bundle_rows WHERE user_id = $1"
+	query := `
+		SELECT COUNT(*)
+		FROM sync.bundle_rows br
+		INNER JOIN sync.user_state us
+			ON us.user_pk = br.user_pk
+		WHERE us.user_id = $1`
 
 	err := v.pool.QueryRow(ctx, query, userID).Scan(&count)
 	if err != nil {
@@ -224,7 +233,13 @@ func (v *DatabaseVerifier) GetSyncMetadata(ctx context.Context, userID string) (
 
 	// Count by operation type in bundle rows.
 	opCounts := make(map[string]int)
-	query = "SELECT op, COUNT(*) FROM sync.bundle_rows WHERE user_id = $1 GROUP BY op"
+	query = `
+		SELECT br.op_code, COUNT(*)
+		FROM sync.bundle_rows br
+		INNER JOIN sync.user_state us
+			ON us.user_pk = br.user_pk
+		WHERE us.user_id = $1
+		GROUP BY br.op_code`
 	rows, err := v.pool.Query(ctx, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get operation counts for user %s: %w", userID, err)
@@ -232,12 +247,21 @@ func (v *DatabaseVerifier) GetSyncMetadata(ctx context.Context, userID string) (
 	defer rows.Close()
 
 	for rows.Next() {
-		var op string
+		var opCode int16
 		var count int
-		if err := rows.Scan(&op, &count); err != nil {
+		if err := rows.Scan(&opCode, &count); err != nil {
 			return nil, fmt.Errorf("failed to scan operation count: %w", err)
 		}
-		opCounts[op] = count
+		switch opCode {
+		case 1:
+			opCounts["INSERT"] = count
+		case 2:
+			opCounts["UPDATE"] = count
+		case 3:
+			opCounts["DELETE"] = count
+		default:
+			opCounts[fmt.Sprintf("OP_%d", opCode)] = count
+		}
 	}
 
 	metadata.OperationCounts = opCounts
@@ -259,6 +283,95 @@ func (v *DatabaseVerifier) CountRecordsWithQuery(ctx context.Context, query stri
 		return 0, fmt.Errorf("failed to execute count query: %w", err)
 	}
 	return count, nil
+}
+
+// GetUserRetentionState loads the authoritative retained-history state for one user.
+func (v *DatabaseVerifier) GetUserRetentionState(ctx context.Context, userID string) (*UserRetentionState, error) {
+	state := &UserRetentionState{}
+	err := v.pool.QueryRow(ctx, `
+		SELECT user_pk, next_bundle_seq, retained_bundle_floor
+		FROM sync.user_state
+		WHERE user_id = $1
+	`, userID).Scan(&state.UserPK, &state.NextBundleSeq, &state.RetainedBundleFloor)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load retention state for user %s: %w", userID, err)
+	}
+
+	v.logger.Debug("User retention state",
+		"user_id", userID,
+		"user_pk", state.UserPK,
+		"next_bundle_seq", state.NextBundleSeq,
+		"retained_bundle_floor", state.RetainedBundleFloor)
+	return state, nil
+}
+
+// CountCommittedBundlesAtOrBelowRetainedFloor counts committed bundle_log rows at or below the user's retained floor.
+func (v *DatabaseVerifier) CountCommittedBundlesAtOrBelowRetainedFloor(ctx context.Context, userID string) (int, error) {
+	var count int
+	err := v.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.bundle_log bl
+		INNER JOIN sync.user_state us
+			ON us.user_pk = bl.user_pk
+		WHERE us.user_id = $1
+		  AND bl.bundle_seq <= us.retained_bundle_floor
+	`, userID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count committed bundles at or below retained floor for user %s: %w", userID, err)
+	}
+	return count, nil
+}
+
+// CountCommittedBundleRowsAtOrBelowRetainedFloor counts committed bundle_rows at or below the user's retained floor.
+func (v *DatabaseVerifier) CountCommittedBundleRowsAtOrBelowRetainedFloor(ctx context.Context, userID string) (int, error) {
+	var count int
+	err := v.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.bundle_rows br
+		INNER JOIN sync.user_state us
+			ON us.user_pk = br.user_pk
+		WHERE us.user_id = $1
+		  AND br.bundle_seq <= us.retained_bundle_floor
+	`, userID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count committed bundle rows at or below retained floor for user %s: %w", userID, err)
+	}
+	return count, nil
+}
+
+// CountSourceStateRows counts retained source_state rows for one user.
+func (v *DatabaseVerifier) CountSourceStateRows(ctx context.Context, userID string) (int, error) {
+	var count int
+	err := v.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.source_state ss
+		INNER JOIN sync.user_state us
+			ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count source_state rows for user %s: %w", userID, err)
+	}
+	return count, nil
+}
+
+// DeleteCommittedHistoryAtOrBelowRetainedFloor physically deletes committed history below the current retained floor.
+func (v *DatabaseVerifier) DeleteCommittedHistoryAtOrBelowRetainedFloor(ctx context.Context, userID string) error {
+	tag, err := v.pool.Exec(ctx, `
+		DELETE FROM sync.bundle_log bl
+		USING sync.user_state us
+		WHERE us.user_id = $1
+		  AND bl.user_pk = us.user_pk
+		  AND bl.bundle_seq <= us.retained_bundle_floor
+	`, userID)
+	if err != nil {
+		return fmt.Errorf("failed to delete committed history at or below retained floor for user %s: %w", userID, err)
+	}
+
+	v.logger.Debug("Deleted committed history at or below retained floor",
+		"user_id", userID,
+		"deleted_bundles", tag.RowsAffected())
+	return nil
 }
 
 // VerifyDataConsistency checks if client and server data are consistent

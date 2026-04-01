@@ -438,6 +438,7 @@ func cleanupServerDatabase(ctx context.Context, cfg *config.Config) error {
 			business.files,
 			business.posts,
 			business.users,
+			business.typed_rows,
 			business.categories,
 			business.team_members,
 			business.teams
@@ -448,10 +449,14 @@ func cleanupServerDatabase(ctx context.Context, cfg *config.Config) error {
 
 	if _, err := tx.ExecContext(ctx, `
 		TRUNCATE TABLE
+			sync.snapshot_session_rows,
+			sync.snapshot_sessions,
+			sync.push_session_rows,
+			sync.push_sessions,
 			sync.bundle_capture_stage,
-			sync.applied_pushes,
 			sync.bundle_rows,
 			sync.bundle_log,
+			sync.source_state,
 			sync.scope_state,
 			sync.row_state,
 			sync.user_state

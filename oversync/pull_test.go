@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -184,4 +185,67 @@ func TestGetStatus_ReportsRetentionAndHistoryPrunedVisibility(t *testing.T) {
 	require.GreaterOrEqual(t, status.RetainedBundleFloorMax, status.RetainedBundleFloorMin)
 	require.GreaterOrEqual(t, status.RetainedBundleWindowMax, status.RetainedBundleWindowMin)
 	require.Equal(t, prunedBefore+1, status.HistoryPrunedErrorCount)
+}
+
+func TestProcessPull_RepeatableReadSnapshotDoesNotMixWithConcurrentPrune(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "pull_repeatable_prune_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "pull-repeatable-prune-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "pull-repeatable-prune-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	row1 := uuid.New()
+	row2 := uuid.New()
+
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, row1, "One")
+	bundle2 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Two")
+
+	tx, err := svc.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	retainedState, err := loadRetainedHistoryStateByUserID(ctx, tx, userID)
+	require.NoError(t, err)
+	require.NotNil(t, retainedState)
+	require.Equal(t, int64(0), retainedState.RetainedFloor)
+
+	userPK, err := lookupUserPK(ctx, pool, userID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		UPDATE sync.user_state
+		SET retained_bundle_floor = 2
+		WHERE user_pk = $1
+	`, userPK)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		DELETE FROM sync.bundle_log
+		WHERE user_pk = $1
+		  AND bundle_seq <= 2
+	`, userPK)
+	require.NoError(t, err)
+
+	page, err := svc.processPullQuerier(ctx, tx, userID, 1, 10, 0)
+	require.NoError(t, err)
+	require.Equal(t, bundle2.BundleSeq, page.StableBundleSeq)
+	require.Len(t, page.Bundles, 1)
+	require.Equal(t, bundle2.BundleSeq, page.Bundles[0].BundleSeq)
+
+	_, err = svc.ProcessPull(ctx, reader, 1, 10, 0)
+	var prunedErr *HistoryPrunedError
+	require.ErrorAs(t, err, &prunedErr)
+	require.Equal(t, int64(2), prunedErr.RetainedFloor)
 }

@@ -423,9 +423,15 @@ func loadHarnessScopeState(ctx context.Context, pool *pgxpool.Pool, userID strin
 	}
 	var state string
 	err := pool.QueryRow(ctx, `
-		SELECT state
-		FROM sync.scope_state
-		WHERE user_id = $1
+		SELECT CASE ss.state_code
+			WHEN 0 THEN 'UNINITIALIZED'
+			WHEN 1 THEN 'INITIALIZING'
+			WHEN 2 THEN 'INITIALIZED'
+			ELSE 'UNKNOWN'
+		END
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
 	`, userID).Scan(&state)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

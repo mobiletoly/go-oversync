@@ -37,6 +37,21 @@ func newConnectTestService(t *testing.T, ctx context.Context) (*SyncService, str
 	return svc, schemaName
 }
 
+func requireScopeStateForUser(t *testing.T, ctx context.Context, svc *SyncService, userID string) string {
+	t.Helper()
+
+	var stateCode int16
+	require.NoError(t, svc.pool.QueryRow(ctx, `
+		SELECT ss.state_code
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&stateCode))
+	state, err := scopeStateNameFromCode(stateCode)
+	require.NoError(t, err)
+	return state
+}
+
 func TestConnect_InitializeEmptyMarksScopeInitialized(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newConnectTestService(t, ctx)
@@ -49,8 +64,7 @@ func TestConnect_InitializeEmptyMarksScopeInitialized(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "initialize_empty", resp.Resolution)
 
-	var state string
-	require.NoError(t, svc.pool.QueryRow(ctx, `SELECT state FROM sync.scope_state WHERE user_id = $1`, userID).Scan(&state))
+	state := requireScopeStateForUser(t, ctx, svc, userID)
 	require.Equal(t, scopeStateInitialized, state)
 
 	session, err := svc.CreateSnapshotSession(ctx, Actor{UserID: userID})
@@ -115,8 +129,7 @@ func TestConnect_InitializeLocalSameSourceReconnectAndCommit(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(1), commitResp.BundleSeq)
 
-	var state string
-	require.NoError(t, svc.pool.QueryRow(ctx, `SELECT state FROM sync.scope_state WHERE user_id = $1`, userID).Scan(&state))
+	state := requireScopeStateForUser(t, ctx, svc, userID)
 	require.Equal(t, scopeStateInitialized, state)
 }
 
@@ -141,14 +154,17 @@ func TestConnect_InitializingSameSourceWithoutPendingRowsTransitionsToInitialize
 	require.Empty(t, secondResp.InitializationID)
 
 	var (
-		state            string
+		stateCode        int16
 		initializedBySrc string
 	)
 	require.NoError(t, svc.pool.QueryRow(ctx, `
-		SELECT state, initialized_by_source_id
-		FROM sync.scope_state
-		WHERE user_id = $1
-	`, userID).Scan(&state, &initializedBySrc))
+		SELECT ss.state_code, ss.initialized_by_source_id
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&stateCode, &initializedBySrc))
+	state, err := scopeStateNameFromCode(stateCode)
+	require.NoError(t, err)
 	require.Equal(t, scopeStateInitialized, state)
 	require.Equal(t, "device-a", initializedBySrc)
 }
@@ -195,7 +211,7 @@ func TestConnect_ExpiredInitializerCannotUpload(t *testing.T) {
 	_, err = svc.pool.Exec(ctx, `
 		UPDATE sync.scope_state
 		SET lease_expires_at = now() - interval '1 second'
-		WHERE user_id = $1
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 	`, userID)
 	require.NoError(t, err)
 
@@ -337,7 +353,7 @@ func TestHandleConnect_ExpiredInitializerLeaseMapsToFreshInitializeLocal(t *test
 	_, err = svc.pool.Exec(ctx, `
 		UPDATE sync.scope_state
 		SET lease_expires_at = now() - interval '1 second'
-		WHERE user_id = $1
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 	`, userID)
 	require.NoError(t, err)
 

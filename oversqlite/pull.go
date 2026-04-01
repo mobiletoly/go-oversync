@@ -2,6 +2,7 @@ package oversqlite
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,15 @@ type DirtyStateRejectedError struct {
 	DirtyCount int
 }
 
+type snapshotApplyOptions struct {
+	RotateSource              bool
+	NewSourceID               string
+	PreserveOutbox            bool
+	ClearSourceRecovery       bool
+	RequireFreshRotatedSource bool
+	AdvanceSourceBundleFloor  int64
+}
+
 // Error implements error.
 func (e *DirtyStateRejectedError) Error() string {
 	return fmt.Sprintf("cannot pull while %d local dirty rows exist", e.DirtyCount)
@@ -27,6 +37,13 @@ func (e *DirtyStateRejectedError) Error() string {
 func (c *Client) pullToStableLocked(ctx context.Context) (RemoteSyncReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "PullToStable()"); err != nil {
 		return RemoteSyncReport{}, err
+	}
+	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if sourceRecoveryErr != nil {
+		return RemoteSyncReport{}, sourceRecoveryErr
 	}
 	if err := c.ensureNoDestructiveTransitionLocked(ctx); err != nil {
 		return RemoteSyncReport{}, err
@@ -238,6 +255,13 @@ func (c *Client) LastBundleSeqSeen(ctx context.Context) (int64, error) {
 }
 
 func (c *Client) rebuildKeepSourceLocked(ctx context.Context) (RemoteSyncReport, error) {
+	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if sourceRecoveryErr != nil {
+		return RemoteSyncReport{}, sourceRecoveryErr
+	}
 	if err := c.ensureRebuildPreconditionsLocked(ctx); err != nil {
 		return RemoteSyncReport{}, err
 	}
@@ -251,7 +275,53 @@ func (c *Client) rebuildKeepSourceLocked(ctx context.Context) (RemoteSyncReport,
 			Status:  status,
 		}, nil
 	}
-	return c.rebuildFromSnapshotLocked(ctx, false, "")
+	return c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{})
+}
+
+func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context, newSourceID string) (RemoteSyncReport, error) {
+	if err := c.ensureConnectedSessionLocked(ctx, "Rebuild()"); err != nil {
+		return RemoteSyncReport{}, err
+	}
+	pendingCount, err := c.pendingChangeCount(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if pendingCount > 0 {
+		return RemoteSyncReport{}, &DirtyStateRejectedError{DirtyCount: pendingCount}
+	}
+	if atomic.LoadInt32(&c.downloadPaused) == 1 {
+		status, err := c.syncStatusLocked(ctx)
+		if err != nil {
+			return RemoteSyncReport{}, err
+		}
+		return RemoteSyncReport{
+			Outcome: RemoteSyncOutcomeSkippedPaused,
+			Status:  status,
+		}, nil
+	}
+	return c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{
+		RotateSource:              true,
+		NewSourceID:               newSourceID,
+		PreserveOutbox:            true,
+		ClearSourceRecovery:       true,
+		RequireFreshRotatedSource: true,
+	})
+}
+
+func (c *Client) recoverCommittedRemoteReplayPrunedLocked(ctx context.Context, committed *committedPushBundle) (PushReport, error) {
+	if committed == nil {
+		return PushReport{}, fmt.Errorf("committed push bundle metadata is required for replay-pruned recovery")
+	}
+	remoteReport, err := c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{
+		AdvanceSourceBundleFloor: committed.SourceBundleID + 1,
+	})
+	if err != nil {
+		return PushReport{}, err
+	}
+	return PushReport{
+		Outcome: PushOutcomeCommitted,
+		Status:  remoteReport.Status,
+	}, nil
 }
 
 func (c *Client) ensureRebuildPreconditionsLocked(ctx context.Context) error {
@@ -286,6 +356,13 @@ func (c *Client) ensureRebuildPreconditionsLocked(ctx context.Context) error {
 }
 
 func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource bool, newSourceID string) (RemoteSyncReport, error) {
+	return c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{
+		RotateSource: rotateSource,
+		NewSourceID:  newSourceID,
+	})
+}
+
+func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, options snapshotApplyOptions) (RemoteSyncReport, error) {
 	if err := c.setRebuildRequired(ctx, true); err != nil {
 		return RemoteSyncReport{}, err
 	}
@@ -314,7 +391,7 @@ func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource boo
 		afterRowOrdinal = chunk.NextRowOrdinal
 	}
 
-	if err := c.applyStagedSnapshotLocked(ctx, session, rotateSource, newSourceID); err != nil {
+	if err := c.applyStagedSnapshotLocked(ctx, session, options); err != nil {
 		return RemoteSyncReport{}, err
 	}
 	status, err := c.syncStatusLocked(ctx)
@@ -322,8 +399,8 @@ func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource boo
 		return RemoteSyncReport{}, err
 	}
 	rotatedSourceID := ""
-	if rotateSource {
-		rotatedSourceID = strings.TrimSpace(newSourceID)
+	if options.RotateSource {
+		rotatedSourceID = strings.TrimSpace(options.NewSourceID)
 	}
 	return RemoteSyncReport{
 		Outcome: RemoteSyncOutcomeAppliedSnapshot,
@@ -443,7 +520,113 @@ func (c *Client) stageSnapshotChunk(ctx context.Context, chunk *oversync.Snapsho
 	return nil
 }
 
-func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversync.SnapshotSession, rotateSource bool, newSourceID string) error {
+func (c *Client) ensureFreshRotatedSourceInTx(ctx context.Context, tx *sql.Tx, sourceID string) error {
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return fmt.Errorf("newSourceID must be provided for rotated rebuild")
+	}
+	if err := ensureSourceState(ctx, tx, sourceID); err != nil {
+		return err
+	}
+	state, err := loadSourceState(ctx, tx, sourceID)
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		return fmt.Errorf("missing source state for rotated source %s", sourceID)
+	}
+	if state.NextSourceBundleID != 1 || strings.TrimSpace(state.ReplacedBySourceID) != "" {
+		return fmt.Errorf("rotated rebuild requires a fresh source id; %s is already in use", sourceID)
+	}
+	return nil
+}
+
+func (c *Client) retargetPreparedOutboxInTx(ctx context.Context, tx *sql.Tx, sourceID string, sourceBundleID int64) error {
+	if sourceBundleID <= 0 {
+		return fmt.Errorf("sourceBundleID must be positive when preserving prepared outbox")
+	}
+	outbox, err := loadOutboxBundle(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if outbox.State != outboxStatePrepared {
+		return fmt.Errorf("cannot preserve outbox during source recovery when outbox state is %q", outbox.State)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE _sync_outbox_rows SET source_bundle_id = ? WHERE source_bundle_id = ?`, sourceBundleID, outbox.SourceBundleID); err != nil {
+		return fmt.Errorf("failed to retarget preserved outbox rows: %w", err)
+	}
+	outbox.SourceID = sourceID
+	outbox.SourceBundleID = sourceBundleID
+	outbox.RemoteBundleHash = ""
+	outbox.RemoteBundleSeq = 0
+	if err := persistOutboxBundle(ctx, tx, outbox); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) reapplyPreparedOutboxIntentLocallyInTx(ctx context.Context, stmtCache *txStmtCache, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT table_name, key_json, op, local_payload
+		FROM _sync_outbox_rows
+		ORDER BY row_ordinal
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to query preserved outbox rows for local replay: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			tableName    string
+			keyJSON      string
+			op           string
+			localPayload sql.NullString
+		)
+		if err := rows.Scan(&tableName, &keyJSON, &op, &localPayload); err != nil {
+			return fmt.Errorf("failed to scan preserved outbox row for local replay: %w", err)
+		}
+
+		switch op {
+		case oversync.OpDelete:
+			localPK, _, err := c.decodeDirtyKeyForPush(tx, tableName, keyJSON)
+			if err != nil {
+				return err
+			}
+			pkColumn, err := c.primaryKeyColumnForTable(tableName)
+			if err != nil {
+				return err
+			}
+			pkValue, err := c.convertPKForQueryInTx(tx, tableName, localPK)
+			if err != nil {
+				return fmt.Errorf("failed to convert preserved outbox delete key for %s: %w", tableName, err)
+			}
+			query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", quoteIdent(tableName), quoteIdent(pkColumn))
+			if _, err := stmtCache.ExecContext(ctx, query, pkValue); err != nil {
+				return fmt.Errorf("failed to replay preserved outbox delete for %s: %w", tableName, err)
+			}
+		case oversync.OpInsert, oversync.OpUpdate:
+			if !localPayload.Valid {
+				return fmt.Errorf("preserved outbox row for %s is missing local_payload", tableName)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(localPayload.String), &payload); err != nil {
+				return fmt.Errorf("failed to decode preserved outbox payload for %s: %w", tableName, err)
+			}
+			if err := c.upsertRowInTxUsing(ctx, stmtCache, tx, tableName, payload); err != nil {
+				return fmt.Errorf("failed to replay preserved outbox upsert for %s: %w", tableName, err)
+			}
+		default:
+			return fmt.Errorf("unsupported preserved outbox op %q", op)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate preserved outbox rows for local replay: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversync.SnapshotSession, options snapshotApplyOptions) error {
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin staged snapshot apply transaction: %w", err)
@@ -465,7 +648,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if err := c.setBundleApplyModeInTx(ctx, tx, true); err != nil {
 		return err
 	}
-	if err := c.clearManagedTablesInTx(ctx, tx); err != nil {
+	if err := c.clearManagedTablesInTxWithOptions(ctx, tx, clearManagedTablesOptions{PreserveOutbox: options.PreserveOutbox}); err != nil {
 		return err
 	}
 
@@ -516,14 +699,20 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if stagedRowCount != session.RowCount {
 		return fmt.Errorf("staged snapshot row count %d does not match expected row_count %d", stagedRowCount, session.RowCount)
 	}
+	if options.PreserveOutbox {
+		if err := c.reapplyPreparedOutboxIntentLocallyInTx(ctx, stmtCache, tx); err != nil {
+			return err
+		}
+	}
 
 	targetSourceID := c.SourceID
-	if rotateSource {
-		targetSourceID = strings.TrimSpace(newSourceID)
-		if targetSourceID == "" {
-			return fmt.Errorf("newSourceID must be provided for rotated rebuild")
-		}
-		if err := ensureSourceState(ctx, tx, targetSourceID); err != nil {
+	if options.RotateSource {
+		targetSourceID = strings.TrimSpace(options.NewSourceID)
+		if options.RequireFreshRotatedSource {
+			if err := c.ensureFreshRotatedSourceInTx(ctx, tx, targetSourceID); err != nil {
+				return err
+			}
+		} else if err := ensureSourceState(ctx, tx, targetSourceID); err != nil {
 			return err
 		}
 		if strings.TrimSpace(c.SourceID) != "" && c.SourceID != targetSourceID {
@@ -538,6 +727,21 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
 		return fmt.Errorf("failed to persist snapshot bundle checkpoint: %w", err)
 	}
+	if options.PreserveOutbox {
+		if err := c.retargetPreparedOutboxInTx(ctx, tx, targetSourceID, 1); err != nil {
+			return err
+		}
+	}
+	if options.AdvanceSourceBundleFloor > 0 {
+		if err := updateSourceNextBundleID(ctx, tx, targetSourceID, options.AdvanceSourceBundleFloor); err != nil {
+			return err
+		}
+	}
+	if options.ClearSourceRecovery {
+		if err := c.clearSourceRecoveryRequiredInTx(ctx, tx); err != nil {
+			return err
+		}
+	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_snapshot_stage WHERE snapshot_id = ?`, session.SnapshotID); err != nil {
 		return fmt.Errorf("failed to clear snapshot staging after apply: %w", err)
@@ -548,7 +752,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit staged snapshot apply: %w", err)
 	}
-	if rotateSource {
+	if options.RotateSource {
 		c.SourceID = targetSourceID
 	}
 	return nil

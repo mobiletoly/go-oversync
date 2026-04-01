@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,10 +22,14 @@ type userStateExecer interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }
 
+type userStateQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 func ensureUserStateExistsWithExec(ctx context.Context, exec userStateExecer, userID string) error {
 	if _, err := exec.Exec(ctx, `
-		INSERT INTO sync.user_state (user_id, updated_at)
-		VALUES ($1, now())
+		INSERT INTO sync.user_state (user_id)
+		VALUES ($1)
 		ON CONFLICT (user_id) DO NOTHING
 	`, userID); err != nil {
 		return fmt.Errorf("ensure user_state row: %w", err)
@@ -33,6 +39,55 @@ func ensureUserStateExistsWithExec(ctx context.Context, exec userStateExecer, us
 
 func (s *SyncService) ensureUserStateExists(ctx context.Context, userID string) error {
 	return ensureUserStateExistsWithExec(ctx, s.pool, userID)
+}
+
+func lookupUserPK(ctx context.Context, q userStateQuerier, userID string) (int64, error) {
+	var userPK int64
+	if err := q.QueryRow(ctx, `
+		SELECT user_pk
+		FROM sync.user_state
+		WHERE user_id = $1
+	`, userID).Scan(&userPK); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, fmt.Errorf("missing user_state row for %q", userID)
+		}
+		return 0, fmt.Errorf("lookup user_pk for %q: %w", userID, err)
+	}
+	return userPK, nil
+}
+
+type bundleTxContext struct {
+	UserID           string
+	UserPK           int64
+	SourceID         string
+	SourceBundleID   int64
+	InitializationID string
+}
+
+func setBundleTxContext(ctx context.Context, tx pgx.Tx, bundle bundleTxContext) error {
+	settings := []struct {
+		name  string
+		value string
+	}{
+		{name: "oversync.bundle_user_id", value: bundle.UserID},
+		{name: "oversync.bundle_user_pk", value: strconv.FormatInt(bundle.UserPK, 10)},
+		{name: "oversync.bundle_source_id", value: bundle.SourceID},
+		{name: "oversync.bundle_source_bundle_id", value: strconv.FormatInt(bundle.SourceBundleID, 10)},
+		{name: "oversync.bundle_initialization_id", value: bundle.InitializationID},
+	}
+	for _, setting := range settings {
+		var existing string
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(current_setting($1, true), '')`, setting.name).Scan(&existing); err != nil {
+			return fmt.Errorf("read existing bundle tx setting %s: %w", setting.name, err)
+		}
+		if existing != "" && existing != setting.value {
+			return fmt.Errorf("transaction already carries conflicting sync bundle context for %s", setting.name)
+		}
+		if _, err := tx.Exec(ctx, `SELECT set_config($1, $2, true)`, setting.name, setting.value); err != nil {
+			return fmt.Errorf("set bundle tx setting %s: %w", setting.name, err)
+		}
+	}
+	return nil
 }
 
 // acquireUserUploadConn pins push processing for one user to one connection and acquires

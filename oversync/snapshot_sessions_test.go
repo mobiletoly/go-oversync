@@ -227,6 +227,71 @@ func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
 	require.Equal(t, snapshotRowIdentity(rows[1]), snapshotRowIdentity(deterministicChunk.Rows[1]))
 }
 
+func TestSnapshotSessions_ActiveSessionRemainsReadableAfterHistoryPrune(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_prune_session_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion:   1,
+		AppName:                     "snapshot-prune-session-test",
+		DefaultRowsPerSnapshotChunk: 10,
+		MaxRowsPerSnapshotChunk:     10,
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "snapshot-prune-session-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+
+	row1 := uuid.New()
+	row2 := uuid.New()
+	row3 := uuid.New()
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, row1, "One")
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Two")
+	bundle3 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 3, row3, "Three")
+
+	session, err := svc.CreateSnapshotSession(ctx, reader)
+	require.NoError(t, err)
+	require.Equal(t, bundle3.BundleSeq, session.SnapshotBundleSeq)
+
+	userPK, err := lookupUserPK(ctx, pool, userID)
+	require.NoError(t, err)
+
+	var sourceStateCountBefore int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.source_state WHERE user_pk = $1`, userPK).Scan(&sourceStateCountBefore))
+	require.Greater(t, sourceStateCountBefore, 0)
+
+	_, err = pool.Exec(ctx, `
+		UPDATE sync.user_state
+		SET retained_bundle_floor = $2
+		WHERE user_pk = $1
+	`, userPK, session.SnapshotBundleSeq)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		DELETE FROM sync.bundle_log
+		WHERE user_pk = $1
+		  AND bundle_seq <= $2
+	`, userPK, session.SnapshotBundleSeq)
+	require.NoError(t, err)
+
+	var sourceStateCountAfter int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.source_state WHERE user_pk = $1`, userPK).Scan(&sourceStateCountAfter))
+	require.Equal(t, sourceStateCountBefore, sourceStateCountAfter)
+
+	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	require.NoError(t, err)
+	require.Equal(t, session.SnapshotBundleSeq, chunk.SnapshotBundleSeq)
+	require.Len(t, chunk.Rows, 3)
+}
+
 func TestSnapshotSessions_RepeatedSessionCreationUsesDeterministicRowOrdering(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
@@ -586,7 +651,11 @@ func TestSnapshotSessions_CreateRejectsRowLimitAndRollsBack(t *testing.T) {
 	require.Equal(t, int64(1), limitErr.Limit)
 
 	var sessionCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.snapshot_sessions WHERE user_id = $1`, userID).Scan(&sessionCount))
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_sessions
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, userID).Scan(&sessionCount))
 	require.Zero(t, sessionCount)
 
 	var rowCount int
@@ -594,7 +663,7 @@ func TestSnapshotSessions_CreateRejectsRowLimitAndRollsBack(t *testing.T) {
 		SELECT COUNT(*)
 		FROM sync.snapshot_session_rows ssr
 		JOIN sync.snapshot_sessions ss ON ss.snapshot_id = ssr.snapshot_id
-		WHERE ss.user_id = $1
+		WHERE ss.user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 	`, userID).Scan(&rowCount))
 	require.Zero(t, rowCount)
 }
@@ -632,7 +701,11 @@ func TestSnapshotSessions_CreateRejectsByteLimitAndRollsBack(t *testing.T) {
 	require.Equal(t, int64(1), limitErr.Limit)
 
 	var sessionCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.snapshot_sessions WHERE user_id = $1`, userID).Scan(&sessionCount))
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_sessions
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, userID).Scan(&sessionCount))
 	require.Zero(t, sessionCount)
 }
 
@@ -718,7 +791,7 @@ func TestSnapshotSessions_CleanupExpiredSessionsRemovesRows(t *testing.T) {
 	require.Zero(t, rowCount)
 }
 
-func TestSnapshotSessions_CreateQueryPlanUsesSnapshotIndexes(t *testing.T) {
+func TestSnapshotSessions_CreateQueryPlanUsesRowStateSnapshotIndex(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -756,22 +829,11 @@ func TestSnapshotSessions_CreateQueryPlanUsesSnapshotIndexes(t *testing.T) {
 
 		rows, err := tx.Query(ctx, `
 			EXPLAIN (COSTS OFF)
-			SELECT
-				rs.schema_name,
-				rs.table_name,
-				rs.key_json,
-				rs.row_version,
-				br.payload
-			FROM sync.row_state AS rs
-			JOIN sync.bundle_rows AS br
-			  ON br.user_id = rs.user_id
-			 AND br.bundle_seq = rs.bundle_seq
-			 AND br.schema_name = rs.schema_name
-			 AND br.table_name = rs.table_name
-			 AND br.key_json = rs.key_json
-			WHERE rs.user_id = $1
-			  AND rs.deleted = FALSE
-			ORDER BY rs.schema_name, rs.table_name, rs.key_json
+			SELECT table_id, key_bytes, bundle_seq
+			FROM sync.row_state
+			WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+			  AND deleted = FALSE
+			ORDER BY table_id, key_bytes
 		`, userID)
 		if err != nil {
 			return err
@@ -792,17 +854,7 @@ func TestSnapshotSessions_CreateQueryPlanUsesSnapshotIndexes(t *testing.T) {
 
 	planText := strings.Join(planLines, "\n")
 	require.Contains(t, planText, "rs_user_live_snapshot_idx")
-	require.True(t,
-		strings.Contains(planText, "br_user_bundle_key_idx") ||
-			strings.Contains(planText, "br_user_bundle_ordinal_idx"),
-		"expected snapshot join to use a bundle_rows covering index, got:\n%s",
-		planText,
-	)
 	require.True(t, slices.ContainsFunc(planLines, func(line string) bool {
 		return strings.Contains(line, "Index") && strings.Contains(line, "rs_user_live_snapshot_idx")
-	}))
-	require.True(t, slices.ContainsFunc(planLines, func(line string) bool {
-		return strings.Contains(line, "Index") &&
-			(strings.Contains(line, "br_user_bundle_key_idx") || strings.Contains(line, "br_user_bundle_ordinal_idx"))
 	}))
 }

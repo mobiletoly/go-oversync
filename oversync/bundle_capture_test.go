@@ -103,33 +103,21 @@ func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT bundle_seq, source_id, row_count, byte_count
 		FROM sync.bundle_log
-		WHERE user_id = $1
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 	`, userID).Scan(&bundleSeq, &bundleSourceID, &rowCount, &byteCount))
 	require.Equal(t, int64(1), bundleSeq)
 	require.Equal(t, source.SourceID, bundleSourceID)
 	require.Equal(t, 1, rowCount)
 	require.Positive(t, byteCount)
 
-	var (
-		op         string
-		keyJSON    string
-		rowVersion int64
-		payload    []byte
-	)
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT op, key_json, row_version, payload
-		FROM sync.bundle_rows
-		WHERE user_id = $1 AND bundle_seq = $2 AND row_ordinal = 1
-	`, userID, bundleSeq).Scan(&op, &keyJSON, &rowVersion, &payload))
-	require.Equal(t, OpInsert, op)
-	require.Equal(t, bundleSeq, rowVersion)
-
-	key, err := decodeSyncKeyJSON(keyJSON)
-	require.NoError(t, err)
-	require.Equal(t, rowID.String(), key["id"])
+	bundle := loadCommittedBundleForUser(t, ctx, svc, userID, bundleSeq)
+	require.Len(t, bundle.Rows, 1)
+	require.Equal(t, OpInsert, bundle.Rows[0].Op)
+	require.Equal(t, bundleSeq, bundle.Rows[0].RowVersion)
+	require.Equal(t, SyncKey{"id": rowID.String()}, bundle.Rows[0].Key)
 
 	var payloadMap map[string]any
-	require.NoError(t, json.Unmarshal(payload, &payloadMap))
+	require.NoError(t, json.Unmarshal(bundle.Rows[0].Payload, &payloadMap))
 	require.Equal(t, rowID.String(), payloadMap["id"])
 	require.Equal(t, "Alice", payloadMap["name"])
 	require.Equal(t, "alice@example.com", payloadMap["email"])
@@ -137,19 +125,25 @@ func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
 	var (
 		deleted        bool
 		stateBundleSeq int64
-		stateVersion   int64
 	)
+	userPK, tableID, keyBytes := mustCompactStorageIdentity(t, ctx, svc, userID, schemaName, "users", rowID.String())
 	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT deleted, bundle_seq, row_version
+		SELECT deleted, bundle_seq
 		FROM sync.row_state
-		WHERE user_id = $1
-		  AND schema_name = $2
-		  AND table_name = 'users'
-		  AND key_json = $3
-	`, userID, schemaName, keyJSON).Scan(&deleted, &stateBundleSeq, &stateVersion))
+		WHERE user_pk = $1
+		  AND table_id = $2
+		  AND key_bytes = $3
+	`, userPK, tableID, keyBytes).Scan(&deleted, &stateBundleSeq))
 	require.False(t, deleted)
 	require.Equal(t, bundleSeq, stateBundleSeq)
-	require.Equal(t, bundleSeq, stateVersion)
+
+	var maxCommittedSourceBundleID int64
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT max_committed_source_bundle_id
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, source.SourceID).Scan(&maxCommittedSourceBundleID))
+	require.Equal(t, int64(1), maxCommittedSourceBundleID)
 }
 
 func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
@@ -194,19 +188,19 @@ func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 	require.Zero(t, businessCount)
 
 	var bundleCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_id = $1`, userID).Scan(&bundleCount))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleCount))
 	require.Zero(t, bundleCount)
 
 	var bundleRowCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_rows WHERE user_id = $1`, userID).Scan(&bundleRowCount))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_rows WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleRowCount))
 	require.Zero(t, bundleRowCount)
 
 	var rowStateCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.row_state WHERE user_id = $1`, userID).Scan(&rowStateCount))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.row_state WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&rowStateCount))
 	require.Zero(t, rowStateCount)
 
 	var stagedCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_capture_stage WHERE user_id = $1`, userID).Scan(&stagedCount))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_capture_stage WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&stagedCount))
 	require.Zero(t, stagedCount)
 }
 
@@ -240,8 +234,16 @@ func TestWithinSyncBundle_DoesNotRetryCallbackOnRetryableTransactionError(t *tes
 	require.Equal(t, 1, attempts)
 
 	var bundleCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_id = $1`, userID).Scan(&bundleCount))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleCount))
 	require.Zero(t, bundleCount)
+
+	var sourceStateCount int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.source_state
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, userID).Scan(&sourceStateCount))
+	require.Zero(t, sourceStateCount)
 }
 
 func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
@@ -290,28 +292,16 @@ func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 		return err
 	}))
 
-	rows, err := pool.Query(ctx, `
-		SELECT schema_name, table_name, op
-		FROM sync.bundle_rows
-		WHERE user_id = $1
-		  AND bundle_seq = 2
-		ORDER BY row_ordinal
-	`, userID)
-	require.NoError(t, err)
-	defer rows.Close()
-
 	type bundleDelete struct {
 		schema string
 		table  string
 		op     string
 	}
 	var deletes []bundleDelete
-	for rows.Next() {
-		var item bundleDelete
-		require.NoError(t, rows.Scan(&item.schema, &item.table, &item.op))
-		deletes = append(deletes, item)
+	bundle := loadCommittedBundleForUser(t, ctx, svc, userID, 2)
+	for _, row := range bundle.Rows {
+		deletes = append(deletes, bundleDelete{schema: row.Schema, table: row.Table, op: row.Op})
 	}
-	require.NoError(t, rows.Err())
 	require.Len(t, deletes, 2)
 	require.ElementsMatch(t, []bundleDelete{
 		{schema: schemaName, table: "posts", op: OpDelete},
@@ -401,29 +391,16 @@ func TestWithinSyncBundle_CapturesCascadeUpdates(t *testing.T) {
 		return err
 	}))
 
-	rows, err := pool.Query(ctx, `
-		SELECT table_name, op, key_json, payload
-		FROM sync.bundle_rows
-		WHERE user_id = $1
-		  AND bundle_seq = 2
-		ORDER BY row_ordinal
-	`, userID)
-	require.NoError(t, err)
-	defer rows.Close()
-
 	type bundleEffect struct {
 		table   string
 		op      string
-		keyJSON string
 		payload []byte
 	}
 	var effects []bundleEffect
-	for rows.Next() {
-		var item bundleEffect
-		require.NoError(t, rows.Scan(&item.table, &item.op, &item.keyJSON, &item.payload))
-		effects = append(effects, item)
+	bundle := loadCommittedBundleForUser(t, ctx, svc, userID, 2)
+	for _, row := range bundle.Rows {
+		effects = append(effects, bundleEffect{table: row.Table, op: row.Op, payload: row.Payload})
 	}
-	require.NoError(t, rows.Err())
 	require.Len(t, effects, 3)
 
 	type effectShape struct {
@@ -536,27 +513,15 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 		return err
 	}))
 
-	rows, err := pool.Query(ctx, `
-		SELECT table_name, op
-		FROM sync.bundle_rows
-		WHERE user_id = $1
-		  AND bundle_seq = 1
-		ORDER BY row_ordinal
-	`, userID)
-	require.NoError(t, err)
-	defer rows.Close()
-
 	type triggerEffect struct {
 		table string
 		op    string
 	}
 	var effects []triggerEffect
-	for rows.Next() {
-		var item triggerEffect
-		require.NoError(t, rows.Scan(&item.table, &item.op))
-		effects = append(effects, item)
+	bundle := loadCommittedBundleForUser(t, ctx, svc, userID, 1)
+	for _, row := range bundle.Rows {
+		effects = append(effects, triggerEffect{table: row.Table, op: row.Op})
 	}
-	require.NoError(t, rows.Err())
 	require.ElementsMatch(t, []triggerEffect{
 		{table: "users", op: OpInsert},
 		{table: "profiles", op: OpInsert},
@@ -631,7 +596,7 @@ func TestWithinSyncBundle_RejectsCrossOwnerWriteByVisibleKeyAlone(t *testing.T) 
 		return err
 	}))
 
-	err := svc.WithinSyncBundle(ctx, Actor{UserID: "owner-b"}, BundleSource{SourceID: "server-app", SourceBundleID: 2}, func(tx pgx.Tx) error {
+	err := svc.WithinSyncBundle(ctx, Actor{UserID: "owner-b"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
 			SET name = $2
@@ -642,7 +607,7 @@ func TestWithinSyncBundle_RejectsCrossOwnerWriteByVisibleKeyAlone(t *testing.T) 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "scope mismatch")
 
-	err = svc.WithinSyncBundle(ctx, Actor{UserID: "owner-b"}, BundleSource{SourceID: "server-app", SourceBundleID: 3}, func(tx pgx.Tx) error {
+	err = svc.WithinSyncBundle(ctx, Actor{UserID: "owner-b"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			DELETE FROM %s.users
 			WHERE id = $1

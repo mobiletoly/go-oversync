@@ -39,7 +39,7 @@ func TestEndToEnd_RebuildKeepSourcePullAndServerCascadeOnCategories(t *testing.T
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
-		SourceBundleID: 100,
+		SourceBundleID: 1,
 	}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.categories WHERE id = $1`, pgx.Identifier{schema}.Sanitize()), rootID)
 		return err
@@ -330,7 +330,7 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
-		SourceBundleID: 201,
+		SourceBundleID: 1,
 	}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users

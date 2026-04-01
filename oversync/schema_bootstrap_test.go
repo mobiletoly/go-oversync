@@ -12,22 +12,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
+func TestBootstrap_CreatesExplicitLayoutMarkerAndExactTableCatalog(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "schema_bootstrap_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
 
 	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   "schema-bootstrap-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
+		},
 	}, logger)
 
-	// Bootstrap should remain idempotent for the bundle-era metadata schema.
 	require.NoError(t, svc.Bootstrap(ctx))
 
 	var (
+		metaExists                       bool
 		userStateExists                  bool
+		tableCatalogExists               bool
 		scopeStateExists                 bool
+		sourceStateExists                bool
 		bundleCaptureStageExists         bool
 		rowStateExists                   bool
 		bundleLogExists                  bool
@@ -39,25 +51,28 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		rejectedRegisteredWriteSeqExists bool
 		historyPrunedErrorSeqExists      bool
 		bundleCaptureIndexExists         bool
-		rowStateIndexExists              bool
 		rowStateSnapshotIndexExists      bool
-		bundleLogIndexExists             bool
-		bundleRowsIndexExists            bool
 		bundleRowsKeyIndexExists         bool
 		snapshotSessionsTTLIndexExists   bool
-		snapshotSessionRowsIndexExists   bool
-		scopeStateLeaseIndexExists       bool
+		oldReadinessIndexExists          bool
 		ownerGuardFunctionExists         bool
 		captureFunctionExists            bool
 		snapshotLastAccessedColumnCount  int
-		primaryKeyCount                  int
-		namedCheckConstraintCount        int
+		userStateUpdatedAtColumnCount    int
+		scopeStateTextColumnCount        int
+		scopeStateCodeColumnCount        int
+		sourceStatePKCount               int
+		layoutProtocolLabel              string
+		layoutName                       string
 	)
 
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT
+			to_regclass('sync.meta') IS NOT NULL,
 			to_regclass('sync.user_state') IS NOT NULL,
+			to_regclass('sync.table_catalog') IS NOT NULL,
 			to_regclass('sync.scope_state') IS NOT NULL,
+			to_regclass('sync.source_state') IS NOT NULL,
 			to_regclass('sync.bundle_capture_stage') IS NOT NULL,
 			to_regclass('sync.row_state') IS NOT NULL,
 			to_regclass('sync.bundle_log') IS NOT NULL,
@@ -69,19 +84,18 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 			to_regclass('sync.rejected_registered_write_seq') IS NOT NULL,
 			to_regclass('sync.history_pruned_error_seq') IS NOT NULL,
 			to_regclass('sync.bcs_tx_user_ordinal_idx') IS NOT NULL,
-			to_regclass('sync.rs_user_table_bundle_idx') IS NOT NULL,
 			to_regclass('sync.rs_user_live_snapshot_idx') IS NOT NULL,
-			to_regclass('sync.bl_user_committed_idx') IS NOT NULL,
-			to_regclass('sync.br_user_bundle_ordinal_idx') IS NOT NULL,
 			to_regclass('sync.br_user_bundle_key_idx') IS NOT NULL,
 			to_regclass('sync.ss_expires_at_idx') IS NOT NULL,
-			to_regclass('sync.ssr_snapshot_row_ordinal_idx') IS NOT NULL,
-			to_regclass('sync.scope_state_lease_idx') IS NOT NULL,
+			to_regclass('sync.rs_user_table_bundle_idx') IS NOT NULL,
 			to_regprocedure('sync.enforce_registered_row_owner()') IS NOT NULL,
 			to_regprocedure('sync.capture_registered_row_change()') IS NOT NULL
 	`).Scan(
+		&metaExists,
 		&userStateExists,
+		&tableCatalogExists,
 		&scopeStateExists,
+		&sourceStateExists,
 		&bundleCaptureStageExists,
 		&rowStateExists,
 		&bundleLogExists,
@@ -93,41 +107,64 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 		&rejectedRegisteredWriteSeqExists,
 		&historyPrunedErrorSeqExists,
 		&bundleCaptureIndexExists,
-		&rowStateIndexExists,
 		&rowStateSnapshotIndexExists,
-		&bundleLogIndexExists,
-		&bundleRowsIndexExists,
 		&bundleRowsKeyIndexExists,
 		&snapshotSessionsTTLIndexExists,
-		&snapshotSessionRowsIndexExists,
-		&scopeStateLeaseIndexExists,
+		&oldReadinessIndexExists,
 		&ownerGuardFunctionExists,
 		&captureFunctionExists,
 	))
 
+	require.True(t, metaExists)
 	require.True(t, userStateExists)
+	require.True(t, tableCatalogExists)
 	require.True(t, scopeStateExists)
+	require.True(t, sourceStateExists)
 	require.True(t, bundleCaptureStageExists)
 	require.True(t, rowStateExists)
 	require.True(t, bundleLogExists)
 	require.True(t, bundleRowsExists)
-	require.True(t, appliedPushesExists)
+	require.False(t, appliedPushesExists)
 	require.True(t, snapshotSessionsExists)
 	require.True(t, snapshotSessionRowsExists)
 	require.True(t, acceptedPushReplaySeqExists)
 	require.True(t, rejectedRegisteredWriteSeqExists)
 	require.True(t, historyPrunedErrorSeqExists)
 	require.True(t, bundleCaptureIndexExists)
-	require.True(t, rowStateIndexExists)
 	require.True(t, rowStateSnapshotIndexExists)
-	require.True(t, bundleLogIndexExists)
-	require.True(t, bundleRowsIndexExists)
-	require.True(t, bundleRowsKeyIndexExists)
+	require.False(t, bundleRowsKeyIndexExists)
 	require.True(t, snapshotSessionsTTLIndexExists)
-	require.True(t, snapshotSessionRowsIndexExists)
-	require.True(t, scopeStateLeaseIndexExists)
+	require.False(t, oldReadinessIndexExists)
 	require.True(t, ownerGuardFunctionExists)
 	require.True(t, captureFunctionExists)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT protocol_label, layout_name
+		FROM sync.meta
+		WHERE singleton_key = TRUE
+	`).Scan(&layoutProtocolLabel, &layoutName))
+	require.Equal(t, syncSchemaProtocolLabel, layoutProtocolLabel)
+	require.Equal(t, syncSchemaLayoutName, layoutName)
+
+	rows, err := pool.Query(ctx, `
+		SELECT table_id, schema_name, table_name, sync_key_column, sync_key_kind
+		FROM sync.table_catalog
+		ORDER BY table_id
+	`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var catalogRows []expectedTableCatalogRow
+	for rows.Next() {
+		var row expectedTableCatalogRow
+		require.NoError(t, rows.Scan(&row.TableID, &row.SchemaName, &row.TableName, &row.SyncKeyColumn, &row.SyncKeyKind))
+		catalogRows = append(catalogRows, row)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []expectedTableCatalogRow{
+		{TableID: 1, SchemaName: schemaName, TableName: "files", SyncKeyColumn: "id", SyncKeyKind: syncKeyKindUUIDCode},
+		{TableID: 2, SchemaName: schemaName, TableName: "users", SyncKeyColumn: "id", SyncKeyKind: syncKeyKindUUIDCode},
+	}, catalogRows)
 
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT COUNT(*)
@@ -140,21 +177,104 @@ func TestBootstrap_CreatesScaleRedesignSchemaObjects(t *testing.T) {
 
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT COUNT(*)
-		FROM information_schema.table_constraints
+		FROM information_schema.columns
 		WHERE table_schema = 'sync'
-		  AND table_name IN ('user_state', 'scope_state', 'bundle_capture_stage', 'row_state', 'bundle_log', 'bundle_rows', 'applied_pushes', 'snapshot_sessions', 'snapshot_session_rows')
-		  AND constraint_type = 'PRIMARY KEY'
-	`).Scan(&primaryKeyCount))
-	require.Equal(t, 9, primaryKeyCount)
+		  AND table_name = 'user_state'
+		  AND column_name = 'updated_at'
+	`).Scan(&userStateUpdatedAtColumnCount))
+	require.Zero(t, userStateUpdatedAtColumnCount)
 
 	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT c.conname)
-		FROM pg_constraint c
-		JOIN pg_namespace n ON n.oid = c.connamespace
-		WHERE n.nspname = 'sync'
-		  AND c.conname IN ('bundle_rows_payload_by_op_chk', 'bundle_capture_stage_payload_by_op_chk')
-	`).Scan(&namedCheckConstraintCount))
-	require.Equal(t, 2, namedCheckConstraintCount)
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'sync'
+		  AND table_name = 'scope_state'
+		  AND column_name = 'state'
+	`).Scan(&scopeStateTextColumnCount))
+	require.Zero(t, scopeStateTextColumnCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'sync'
+		  AND table_name = 'scope_state'
+		  AND column_name = 'state_code'
+	`).Scan(&scopeStateCodeColumnCount))
+	require.Equal(t, 1, scopeStateCodeColumnCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.table_constraints
+		WHERE table_schema = 'sync'
+		  AND table_name = 'source_state'
+		  AND constraint_type = 'PRIMARY KEY'
+	`).Scan(&sourceStatePKCount))
+	require.Equal(t, 1, sourceStatePKCount)
+}
+
+func TestBootstrap_FailsClosedWhenRegisteredTableCatalogDiffers(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "table_catalog_mismatch_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	defer func() {
+		_ = dropTestSchema(ctx, pool, schemaName)
+	}()
+
+	firstSvc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "schema-bootstrap-first",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+	require.NoError(t, err)
+	require.NoError(t, firstSvc.Bootstrap(ctx))
+
+	secondSvc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "schema-bootstrap-second",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+	require.NoError(t, err)
+
+	err = secondSvc.Bootstrap(ctx)
+	require.Error(t, err)
+	var schemaErr *UnsupportedSchemaError
+	require.ErrorAs(t, err, &schemaErr)
+	require.Contains(t, err.Error(), "sync.table_catalog")
+}
+
+func TestBootstrap_FailsClosedForLegacySyncSchemaWithoutLayoutMarker(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	_, err := pool.Exec(ctx, `CREATE SCHEMA sync`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		CREATE TABLE sync.user_state (
+			user_id TEXT PRIMARY KEY
+		)
+	`)
+	require.NoError(t, err)
+
+	svc, err := NewRuntimeService(pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "legacy-sync-layout-test",
+	}, logger)
+	require.NoError(t, err)
+
+	err = svc.Bootstrap(ctx)
+	require.Error(t, err)
+	var schemaErr *UnsupportedSchemaError
+	require.ErrorAs(t, err, &schemaErr)
+	require.Contains(t, err.Error(), "unsupported layout")
 }
 
 func TestBootstrap_FailsWhenRegisteredTablesAreNotFKClosed(t *testing.T) {

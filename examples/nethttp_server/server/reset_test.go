@@ -2,11 +2,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/mobiletoly/go-oversync/oversync"
 )
 
 func TestResetEndpointClearsExampleDatabase(t *testing.T) {
@@ -16,30 +18,28 @@ func TestResetEndpointClearsExampleDatabase(t *testing.T) {
 	}
 	defer ts.Close()
 
-	ctx := t.Context()
-	if err := pgx.BeginFunc(ctx, ts.Pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_user_id', $1, true)`, "test-user"); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_id', $1, true)`, "device-a"); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('oversync.bundle_source_bundle_id', $1, true)`, "1"); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, `
+	ctx := context.Background()
+	_, err = ts.SyncService.Connect(ctx, oversync.Actor{UserID: "test-user", SourceID: "device-a"}, &oversync.ConnectRequest{
+		SourceID:            "device-a",
+		HasLocalPendingRows: false,
+	})
+	if err != nil {
+		t.Fatalf("initialize test-user scope: %v", err)
+	}
+	err = ts.SyncService.WithinSyncBundle(
+		ctx,
+		oversync.Actor{UserID: "test-user", SourceID: "device-a"},
+		oversync.BundleSource{SourceID: "device-a", SourceBundleID: 1},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
 			INSERT INTO business.users(id, name, email)
 			VALUES ('00000000-0000-0000-0000-000000000001', 'Ada', 'ada@example.com')
 		`)
-		return err
-	}); err != nil {
+			return err
+		},
+	)
+	if err != nil {
 		t.Fatalf("seed user row: %v", err)
-	}
-	if _, err := ts.Pool.Exec(ctx, `
-		INSERT INTO sync.user_state(user_id, next_bundle_seq, retained_bundle_floor)
-		VALUES ('test-user', 9, 0)
-	`); err != nil {
-		t.Fatalf("seed sync.user_state row: %v", err)
 	}
 
 	resp, err := http.Post(ts.URL()+"/test/reset", "application/json", bytes.NewReader([]byte(`{}`)))

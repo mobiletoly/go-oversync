@@ -49,6 +49,48 @@ func requireOperationState(t *testing.T, db *sql.DB) (string, string, string, in
 	return kind, targetUserID, stagedSnapshotID, bundleSeq, rowCount
 }
 
+func requireOperationReason(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var reason string
+	require.NoError(t, db.QueryRow(`
+		SELECT reason
+		FROM _sync_operation_state
+		WHERE singleton_key = 1
+	`).Scan(&reason))
+	return reason
+}
+
+func requireOperationKind(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var kind string
+	require.NoError(t, db.QueryRow(`
+		SELECT kind
+		FROM _sync_operation_state
+		WHERE singleton_key = 1
+	`).Scan(&kind))
+	return kind
+}
+
+func requireOutboxBundle(t *testing.T, db *sql.DB) outboxBundleRecord {
+	t.Helper()
+	var rec outboxBundleRecord
+	require.NoError(t, db.QueryRow(`
+		SELECT state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id, remote_bundle_hash, remote_bundle_seq
+		FROM _sync_outbox_bundle
+		WHERE singleton_key = 1
+	`).Scan(
+		&rec.State,
+		&rec.SourceID,
+		&rec.SourceBundleID,
+		&rec.CanonicalRequestHash,
+		&rec.RowCount,
+		&rec.InitializationID,
+		&rec.RemoteBundleHash,
+		&rec.RemoteBundleSeq,
+	))
+	return rec
+}
+
 func setCurrentSourceBundleState(t *testing.T, db *sql.DB, nextSourceBundleID, lastBundleSeqSeen int64) {
 	t.Helper()
 	ctx := context.Background()

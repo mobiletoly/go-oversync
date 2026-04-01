@@ -18,8 +18,7 @@ import (
 
 func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 	ts, err := NewTestServer(&ServerConfig{
-		BusinessSchema: "main",
-		JWTSecret:      "real-server-e2e-secret",
+		JWTSecret: "real-server-e2e-secret",
 	})
 	require.NoError(t, err)
 	defer ts.Close()
@@ -54,7 +53,7 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 		db,
 		ts.URL(),
 		func(context.Context) (string, error) { return token, nil },
-		oversqlite.DefaultConfig("main", []oversqlite.SyncTable{
+		oversqlite.DefaultConfig("business", []oversqlite.SyncTable{
 			{TableName: "users", SyncKeyColumnName: "id"},
 		}),
 	)
@@ -80,9 +79,9 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 		oversync.BundleSource{SourceID: "server-admin", SourceBundleID: 1},
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `
-				INSERT INTO main.users (id, name, email)
-				VALUES ($1, $2, $3)
-			`, rowID, "Server Ada", "server.ada@example.com")
+			INSERT INTO business.users (id, name, email)
+			VALUES ($1, $2, $3)
+		`, rowID, "Server Ada", "server.ada@example.com")
 			return err
 		},
 	)
@@ -117,17 +116,21 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 	var latestBundleSeq int64
 	require.NoError(t, ts.Pool.QueryRow(ctx, `
 		SELECT COALESCE(MAX(bundle_seq), 0)
-		FROM sync.bundle_log
-		WHERE user_id = $1
+		FROM sync.bundle_log bl
+		INNER JOIN sync.user_state us
+			ON us.user_pk = bl.user_pk
+		WHERE us.user_id = $1
 	`, userID).Scan(&latestBundleSeq))
 	require.Equal(t, latestBundleSeq, lastBundleSeqSeen)
 
 	var rowCount int
 	require.NoError(t, ts.Pool.QueryRow(ctx, `
 		SELECT COUNT(*)
-		FROM sync.bundle_log
-		WHERE user_id = $1
-		  AND source_id = $2
+		FROM sync.bundle_log bl
+		INNER JOIN sync.user_state us
+			ON us.user_pk = bl.user_pk
+		WHERE us.user_id = $1
+		  AND bl.source_id = $2
 	`, userID, "server-admin").Scan(&rowCount))
 	require.Equal(t, 1, rowCount)
 
@@ -137,6 +140,6 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 		FROM %s.users
 		WHERE _sync_scope_id = $1
 		  AND id = $2
-	`, "main"), userID, rowID).Scan(&storedName))
+	`, "business"), userID, rowID).Scan(&storedName))
 	require.Equal(t, "Server Ada", storedName)
 }

@@ -89,7 +89,10 @@ paths:
         Creates or restarts the transport session for one logical dirty-set bundle identified by
         `(source_id, source_bundle_id)`. If that tuple was already committed previously, the server
         returns `already_committed` plus the authoritative committed bundle metadata instead of
-        creating a new staging session.
+        creating a new staging session. If the tuple is already known but retained replay metadata
+        for that tuple has been pruned, the server returns `409 history_pruned` instead of
+        reopening staging. If `source_bundle_id` is not the next expected contiguous value for the
+        current source, the server returns `409 source_sequence_out_of_order`.
       security:
         - BearerAuth: []
       requestBody:
@@ -112,7 +115,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Scope not ready for this push create (`scope_uninitialized`, `scope_initializing`, or `initialization_stale`)
+          description: Scope not ready, retained replay for the requested source tuple is pruned, or the source bundle sequence is not the next expected value (`scope_uninitialized`, `scope_initializing`, `initialization_stale`, `history_pruned`, or `source_sequence_out_of_order`)
           content:
             application/json:
               schema:
@@ -210,7 +213,9 @@ paths:
       description: |
         Validates the full staged dirty set, runs whole-bundle conflict detection, and commits the
         authoritative business-table effects atomically. On success, the response returns the
-        authoritative committed bundle metadata; the client fetches committed rows separately.
+        authoritative committed bundle metadata; the client fetches committed rows separately. If
+        the per-source bundle sequence changes between create-time validation and commit-time
+        finalization, the server returns `409 source_sequence_changed`.
       security:
         - BearerAuth: []
       parameters:
@@ -247,7 +252,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Whole-bundle conflict rejection or stale initialization lease (`push_conflict` or `initialization_stale`)
+          description: Whole-bundle conflict rejection, stale initialization lease, or commit-time source sequence revalidation failure (`push_conflict`, `initialization_stale`, or `source_sequence_changed`)
           content:
             application/json:
               schema:
@@ -330,6 +335,8 @@ paths:
         For `bundle_hash` verification, clients reconstruct absolute `row_ordinal` from stream
         position: the first row of the first page is ordinal 0, the first row after
         `after_row_ordinal = N` is ordinal `N + 1`, and each following row increments by 1 in order.
+        Requests for bundles at or below the retained history floor return `409 history_pruned`
+        even if those rows have not yet been physically deleted.
       security:
         - BearerAuth: []
       parameters:
@@ -371,6 +378,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Authentication required
+        '409':
+          description: Requested committed bundle is below the retained history floor (`history_pruned`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Bundle not found
           content:

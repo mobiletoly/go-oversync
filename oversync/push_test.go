@@ -83,7 +83,7 @@ func TestPushSessions_ConflictRejectsWholeBundle(t *testing.T) {
 	require.NotContains(t, string(conflictErr.Conflict.ServerRow), `"_sync_scope_id"`)
 
 	var bundleCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_id = $1`, userID).Scan(&bundleCount))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleCount))
 	require.Equal(t, 1, bundleCount)
 
 	var name string
@@ -198,7 +198,7 @@ func TestPushSessions_WrongOwnerUpdateDeleteDoNotAffectAnotherUsersRow(t *testin
 	require.ErrorAs(t, err, &updateConflict)
 	require.Equal(t, SyncKey{"id": rowID.String()}, updateConflict.Conflict.Key)
 
-	_, err = pushRowsViaSession(t, ctx, svc, actorB, 2, []PushRequestRow{{
+	_, err = pushRowsViaSession(t, ctx, svc, actorB, 1, []PushRequestRow{{
 		Schema:         schemaName,
 		Table:          "users",
 		Key:            SyncKey{"id": rowID.String()},
@@ -270,13 +270,14 @@ func TestPushSessions_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(2), secondBundle.BundleSeq)
 
-	var canonicalKeyJSON string
+	userPK, tableID, keyBytes := mustCompactStorageIdentity(t, ctx, svc, userID, schemaName, "users", rowID.String())
+	var stateBundleSeq int64
 	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT key_json
+		SELECT bundle_seq
 		FROM sync.row_state
-		WHERE user_id = $1 AND schema_name = $2 AND table_name = 'users' AND row_version = 2
-	`, userID, schemaName).Scan(&canonicalKeyJSON))
-	require.Equal(t, fmt.Sprintf(`{"id":"%s"}`, rowID), canonicalKeyJSON)
+		WHERE user_pk = $1 AND table_id = $2 AND key_bytes = $3
+	`, userPK, tableID, keyBytes).Scan(&stateBundleSeq))
+	require.Equal(t, int64(2), stateBundleSeq)
 
 	var name string
 	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id = $1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&name))
@@ -356,16 +357,18 @@ func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t 
 	}
 	var userState rowState
 	var postState rowState
+	userPK, userTableID, userKeyBytes := mustCompactStorageIdentity(t, ctx, svc, userID, schemaName, "users", userRowID.String())
+	_, postTableID, postKeyBytes := mustCompactStorageIdentity(t, ctx, svc, userID, schemaName, "posts", postRowID.String())
 	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT deleted, row_version
+		SELECT deleted, bundle_seq
 		FROM sync.row_state
-		WHERE user_id = $1 AND schema_name = $2 AND table_name = 'users' AND key_json = $3
-	`, userID, schemaName, fmt.Sprintf(`{"id":"%s"}`, userRowID)).Scan(&userState.deleted, &userState.rowVersion))
+		WHERE user_pk = $1 AND table_id = $2 AND key_bytes = $3
+	`, userPK, userTableID, userKeyBytes).Scan(&userState.deleted, &userState.rowVersion))
 	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT deleted, row_version
+		SELECT deleted, bundle_seq
 		FROM sync.row_state
-		WHERE user_id = $1 AND schema_name = $2 AND table_name = 'posts' AND key_json = $3
-	`, userID, schemaName, fmt.Sprintf(`{"id":"%s"}`, postRowID)).Scan(&postState.deleted, &postState.rowVersion))
+		WHERE user_pk = $1 AND table_id = $2 AND key_bytes = $3
+	`, userPK, postTableID, postKeyBytes).Scan(&postState.deleted, &postState.rowVersion))
 	require.True(t, userState.deleted)
 	require.True(t, postState.deleted)
 	require.Equal(t, int64(2), userState.rowVersion)
@@ -402,14 +405,14 @@ func TestPushSessions_AlreadyCommittedReturnsSameCommittedBundle(t *testing.T) {
 		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Replay","email":"replay@example.com"}`, rowID)),
 	}}
 
-	firstBundle, err := pushRowsViaSession(t, ctx, svc, actor, 7, rows)
+	firstBundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, rows)
 	require.NoError(t, err)
-	replayBundle, err := pushRowsViaSession(t, ctx, svc, actor, 7, rows)
+	replayBundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, rows)
 	require.NoError(t, err)
 	requireBundlesSemanticallyEqual(t, firstBundle, replayBundle)
 
 	var bundleCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_id = $1`, userID).Scan(&bundleCount))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleCount))
 	require.Equal(t, 1, bundleCount)
 }
 

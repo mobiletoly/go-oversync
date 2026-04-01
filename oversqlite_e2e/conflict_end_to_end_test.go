@@ -32,7 +32,7 @@ func TestEndToEnd_ConflictServerWinsResolverRecoversAutomatically(t *testing.T) 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
-		SourceBundleID: 201,
+		SourceBundleID: 1,
 	}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
@@ -80,7 +80,7 @@ func TestEndToEnd_ConflictClientWinsResolverStillConvergesWithUnseenPeerBundle(t
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
-		SourceBundleID: 202,
+		SourceBundleID: 1,
 	}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
@@ -127,7 +127,7 @@ func TestEndToEnd_ConflictKeepMergedResolverRetriesMergedPayload(t *testing.T) {
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
-		SourceBundleID: 203,
+		SourceBundleID: 1,
 	}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
@@ -178,7 +178,7 @@ func TestEndToEnd_ConflictKeepLocalResolverAutoRetriesAndWins(t *testing.T) {
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 		SourceID:       serverActor.SourceID,
-		SourceBundleID: 204,
+		SourceBundleID: 1,
 	}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
@@ -226,7 +226,7 @@ func TestEndToEnd_ConflictRetryExhaustionLeavesReplayableDirtyState(t *testing.T
 			commitAttempts++
 			require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
 				SourceID:       serverActor.SourceID,
-				SourceBundleID: int64(300 + commitAttempts),
+				SourceBundleID: int64(commitAttempts),
 			}, func(tx pgx.Tx) error {
 				_, err := tx.Exec(ctx, fmt.Sprintf(`
 					UPDATE %s.users

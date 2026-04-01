@@ -83,10 +83,9 @@ func (s *SyncService) Connect(ctx context.Context, actor Actor, req *ConnectRequ
 				refreshedUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
 				if _, err := tx.Exec(ctx, `
 					UPDATE sync.scope_state
-					SET lease_expires_at = $2,
-						updated_at = now()
-					WHERE user_id = $1
-				`, actor.UserID, refreshedUntil); err != nil {
+					SET lease_expires_at = $2
+					WHERE user_pk = $1
+				`, state.UserPK, refreshedUntil); err != nil {
 					return fmt.Errorf("refresh initialization lease during reconnect: %w", err)
 				}
 				resp = &ConnectResponse{

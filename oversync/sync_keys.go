@@ -1,6 +1,8 @@
 package oversync
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -12,7 +14,7 @@ type normalizedVisibleSyncKey struct {
 	column    string
 	keyType   string
 	keyString string
-	keyJSON   string
+	keyBytes  []byte
 	dbValue   any
 }
 
@@ -43,6 +45,62 @@ func (s *SyncService) syncKeyTypeForTable(schemaName, tableName string) (string,
 	return info.syncKeyType, nil
 }
 
+func (s *SyncService) tableIDForTable(schemaName, tableName string) (int32, error) {
+	info, err := s.syncKeyInfoForTable(schemaName, tableName)
+	if err != nil {
+		return 0, err
+	}
+	return info.tableID, nil
+}
+
+func (s *SyncService) tableInfoForID(tableID int32) (registeredTableRuntimeInfo, error) {
+	if s == nil {
+		return registeredTableRuntimeInfo{}, fmt.Errorf("table_id %d is not configured for sync", tableID)
+	}
+	info, ok := s.registeredTableByID[tableID]
+	if !ok {
+		return registeredTableRuntimeInfo{}, fmt.Errorf("table_id %d is not configured for sync", tableID)
+	}
+	return info, nil
+}
+
+func encodeKeyBytes(keyType, keyString string) ([]byte, any, error) {
+	switch keyType {
+	case syncKeyTypeUUID:
+		parsed, err := uuid.Parse(keyString)
+		if err != nil {
+			return nil, nil, err
+		}
+		canonical := parsed.String()
+		if keyString != canonical {
+			return nil, nil, fmt.Errorf("key must use canonical dashed lowercase UUID text")
+		}
+		raw := make([]byte, 16)
+		copy(raw, parsed[:])
+		return raw, parsed, nil
+	case syncKeyTypeText:
+		return []byte(keyString), keyString, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported sync key type %q", keyType)
+	}
+}
+
+func decodeKeyBytes(keyType string, keyBytes []byte) (string, any, error) {
+	switch keyType {
+	case syncKeyTypeUUID:
+		if len(keyBytes) != 16 {
+			return "", nil, fmt.Errorf("uuid key_bytes length must be 16, got %d", len(keyBytes))
+		}
+		var id uuid.UUID
+		copy(id[:], keyBytes)
+		return id.String(), id, nil
+	case syncKeyTypeText:
+		return string(keyBytes), string(keyBytes), nil
+	default:
+		return "", nil, fmt.Errorf("unsupported sync key type %q", keyType)
+	}
+}
+
 func (s *SyncService) normalizeVisibleSyncKey(schemaName, tableName string, rawKey SyncKey) (normalizedVisibleSyncKey, error) {
 	info, err := s.syncKeyInfoForTable(schemaName, tableName)
 	if err != nil {
@@ -62,34 +120,16 @@ func (s *SyncService) normalizeVisibleSyncKey(schemaName, tableName string, rawK
 		column:    info.syncKeyColumn,
 		keyType:   info.syncKeyType,
 		keyString: keyString,
-		dbValue:   keyString,
 	}
-	switch info.syncKeyType {
-	case syncKeyTypeUUID:
-		parsed, err := uuid.Parse(keyString)
-		if err != nil {
-			return normalizedVisibleSyncKey{}, &PushValidationError{Message: fmt.Sprintf("row key %s.%s.%s must be a UUID", schemaName, tableName, info.syncKeyColumn)}
-		}
-		canonical := parsed.String()
-		if keyString != canonical {
+	keyBytes, dbValue, err := encodeKeyBytes(info.syncKeyType, keyString)
+	if err != nil {
+		if info.syncKeyType == syncKeyTypeUUID {
 			return normalizedVisibleSyncKey{}, &PushValidationError{Message: fmt.Sprintf("row key %s.%s.%s must use canonical dashed lowercase UUID text", schemaName, tableName, info.syncKeyColumn)}
 		}
-		normalized.keyString = canonical
-		normalized.dbValue = parsed
-	case syncKeyTypeText:
-	default:
 		return normalizedVisibleSyncKey{}, &PushValidationError{Message: fmt.Sprintf("table %s.%s uses unsupported sync key type %q", schemaName, tableName, info.syncKeyType)}
 	}
-
-	keyRaw, err := json.Marshal(map[string]any{info.syncKeyColumn: normalized.keyString})
-	if err != nil {
-		return normalizedVisibleSyncKey{}, &PushValidationError{Message: fmt.Sprintf("marshal row key for %s.%s: %v", schemaName, tableName, err)}
-	}
-	keyJSONBytes, err := canonicalJSON(keyRaw)
-	if err != nil {
-		return normalizedVisibleSyncKey{}, &PushValidationError{Message: fmt.Sprintf("canonicalize row key for %s.%s: %v", schemaName, tableName, err)}
-	}
-	normalized.keyJSON = string(keyJSONBytes)
+	normalized.keyBytes = keyBytes
+	normalized.dbValue = dbValue
 	return normalized, nil
 }
 
@@ -118,41 +158,37 @@ func injectOwnerUserIDPayload(payload []byte, ownerUserID string) ([]byte, error
 	return canonicalJSON(payloadRaw)
 }
 
-func decodeNormalizedStoredSyncKey(schemaName, tableName string, info registeredTableRuntimeInfo, keyJSON string) (normalizedVisibleSyncKey, error) {
-	key, err := decodeSyncKeyJSON(keyJSON)
+func decodeNormalizedStoredSyncKeyBytes(schemaName, tableName string, info registeredTableRuntimeInfo, keyBytes []byte) (normalizedVisibleSyncKey, error) {
+	keyString, dbValue, err := decodeKeyBytes(info.syncKeyType, keyBytes)
 	if err != nil {
 		return normalizedVisibleSyncKey{}, fmt.Errorf("decode sync key for %s.%s: %w", schemaName, tableName, err)
-	}
-	rawValue, ok := key[info.syncKeyColumn]
-	if !ok {
-		return normalizedVisibleSyncKey{}, fmt.Errorf("push session key missing %s for %s.%s", info.syncKeyColumn, schemaName, tableName)
-	}
-	keyString, ok := rawValue.(string)
-	if !ok {
-		return normalizedVisibleSyncKey{}, fmt.Errorf("push session key %s.%s.%s must be string", schemaName, tableName, info.syncKeyColumn)
 	}
 	normalized := normalizedVisibleSyncKey{
 		column:    info.syncKeyColumn,
 		keyType:   info.syncKeyType,
 		keyString: keyString,
-		dbValue:   keyString,
-		keyJSON:   keyJSON,
-	}
-	switch info.syncKeyType {
-	case syncKeyTypeUUID:
-		parsed, err := uuid.Parse(keyString)
-		if err != nil {
-			return normalizedVisibleSyncKey{}, fmt.Errorf("push session key %s.%s.%s must be UUID: %w", schemaName, tableName, info.syncKeyColumn, err)
-		}
-		if keyString != parsed.String() {
-			return normalizedVisibleSyncKey{}, fmt.Errorf("push session key %s.%s.%s must use canonical dashed lowercase UUID text", schemaName, tableName, info.syncKeyColumn)
-		}
-		normalized.dbValue = parsed
-	case syncKeyTypeText:
-	default:
-		return normalizedVisibleSyncKey{}, fmt.Errorf("push session key %s.%s uses unsupported sync key type %q", schemaName, tableName, info.syncKeyType)
+		keyBytes:  append([]byte(nil), keyBytes...),
+		dbValue:   dbValue,
 	}
 	return normalized, nil
+}
+
+func wireSyncKeyFromBytes(info registeredTableRuntimeInfo, keyBytes []byte) (SyncKey, error) {
+	keyString, _, err := decodeKeyBytes(info.syncKeyType, keyBytes)
+	if err != nil {
+		return nil, err
+	}
+	return SyncKey{info.syncKeyColumn: keyString}, nil
+}
+
+func keyBytesEqual(a, b []byte) bool {
+	return bytes.Equal(a, b)
+}
+
+func appendInt32BigEndian(dst []byte, value int32) []byte {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], uint32(value))
+	return append(dst, buf[:]...)
 }
 
 func syncKeyArray(rows []pushPreparedRow) any {

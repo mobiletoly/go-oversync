@@ -11,8 +11,9 @@ const (
 	attachmentBindingAnonymous = "anonymous"
 	attachmentBindingAttached  = "attached"
 
-	operationKindNone          = "none"
-	operationKindRemoteReplace = "remote_replace"
+	operationKindNone           = "none"
+	operationKindRemoteReplace  = "remote_replace"
+	operationKindSourceRecovery = "source_recovery"
 
 	outboxStateNone            = "none"
 	outboxStatePrepared        = "prepared"
@@ -38,6 +39,7 @@ type sourceStateRecord struct {
 type operationStateRecord struct {
 	Kind              string
 	TargetUserID      string
+	Reason            string
 	StagedSnapshotID  string
 	SnapshotBundleSeq int64
 	SnapshotRowCount  int64
@@ -116,10 +118,10 @@ func persistAttachmentState(ctx context.Context, e execer, rec *attachmentStateR
 func loadOperationState(ctx context.Context, q queryRower) (*operationStateRecord, error) {
 	var rec operationStateRecord
 	if err := q.QueryRowContext(ctx, `
-		SELECT kind, target_user_id, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count
+		SELECT kind, target_user_id, reason, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count
 		FROM _sync_operation_state
 		WHERE singleton_key = 1
-	`).Scan(&rec.Kind, &rec.TargetUserID, &rec.StagedSnapshotID, &rec.SnapshotBundleSeq, &rec.SnapshotRowCount); err != nil {
+	`).Scan(&rec.Kind, &rec.TargetUserID, &rec.Reason, &rec.StagedSnapshotID, &rec.SnapshotBundleSeq, &rec.SnapshotRowCount); err != nil {
 		return nil, fmt.Errorf("failed to load operation state: %w", err)
 	}
 	if strings.TrimSpace(rec.Kind) == "" {
@@ -139,11 +141,12 @@ func persistOperationState(ctx context.Context, e execer, rec *operationStateRec
 		UPDATE _sync_operation_state
 		SET kind = ?,
 			target_user_id = ?,
+			reason = ?,
 			staged_snapshot_id = ?,
 			snapshot_bundle_seq = ?,
 			snapshot_row_count = ?
 		WHERE singleton_key = 1
-	`, rec.Kind, rec.TargetUserID, rec.StagedSnapshotID, rec.SnapshotBundleSeq, rec.SnapshotRowCount); err != nil {
+	`, rec.Kind, rec.TargetUserID, rec.Reason, rec.StagedSnapshotID, rec.SnapshotBundleSeq, rec.SnapshotRowCount); err != nil {
 		return fmt.Errorf("failed to persist operation state: %w", err)
 	}
 	return nil

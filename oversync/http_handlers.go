@@ -84,6 +84,16 @@ func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *htt
 			h.writeError(w, http.StatusGone, "initialization_expired", expiredErr.Error())
 			return
 		}
+		var prunedErr *SourceTupleHistoryPrunedError
+		if errors.As(err, &prunedErr) {
+			h.writeError(w, http.StatusConflict, "history_pruned", prunedErr.Error())
+			return
+		}
+		var sequenceErr *SourceSequenceOutOfOrderError
+		if errors.As(err, &sequenceErr) {
+			h.writeError(w, http.StatusConflict, "source_sequence_out_of_order", sequenceErr.Error())
+			return
+		}
 		h.logger.Error("Failed to create push session", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
 		h.writeError(w, http.StatusInternalServerError, "push_session_create_failed", "Failed to create push session")
 		return
@@ -220,6 +230,11 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 			h.writeError(w, http.StatusForbidden, "push_session_forbidden", forbiddenErr.Error())
 			return
 		}
+		var sequenceErr *SourceSequenceChangedError
+		if errors.As(err, &sequenceErr) {
+			h.writeError(w, http.StatusConflict, "source_sequence_changed", sequenceErr.Error())
+			return
+		}
 		h.logger.Error("Failed to commit push session", "error", err, "user_id", actor.UserID, "push_id", pushID)
 		h.writeError(w, http.StatusInternalServerError, "push_session_commit_failed", "Failed to commit push session")
 		return
@@ -318,6 +333,11 @@ func (h *HTTPSyncHandlers) HandleGetCommittedBundleRows(w http.ResponseWriter, r
 		var invalidErr *CommittedBundleChunkInvalidError
 		if errors.As(err, &invalidErr) {
 			h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", invalidErr.Error())
+			return
+		}
+		var prunedErr *HistoryPrunedError
+		if errors.As(err, &prunedErr) {
+			h.writeError(w, http.StatusConflict, "history_pruned", prunedErr.Error())
 			return
 		}
 		var notFoundErr *CommittedBundleNotFoundError

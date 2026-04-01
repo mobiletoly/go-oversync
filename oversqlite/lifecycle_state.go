@@ -156,12 +156,18 @@ func toLifecycleState(attachment *attachmentStateRecord, operation *operationSta
 	if operation == nil {
 		operation = &operationStateRecord{Kind: operationKindNone}
 	}
+	pendingTransitionKind := operation.Kind
+	pendingTargetScope := operation.TargetUserID
+	if operation.Kind == operationKindSourceRecovery {
+		pendingTransitionKind = lifecycleTransitionNone
+		pendingTargetScope = ""
+	}
 	return &lifecycleState{
 		SourceID:                 attachment.CurrentSourceID,
 		BindingState:             attachment.BindingState,
 		BindingScope:             attachment.AttachedUserID,
-		PendingTransitionKind:    operation.Kind,
-		PendingTargetScope:       operation.TargetUserID,
+		PendingTransitionKind:    pendingTransitionKind,
+		PendingTargetScope:       pendingTargetScope,
 		PendingStagedSnapshotID:  operation.StagedSnapshotID,
 		PendingSnapshotBundleSeq: operation.SnapshotBundleSeq,
 		PendingSnapshotRowCount:  operation.SnapshotRowCount,
