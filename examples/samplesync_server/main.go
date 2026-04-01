@@ -46,7 +46,8 @@ func main() {
 	logger.Info("  GET  /sync/capabilities   - Get protocol capabilities and limits")
 	logger.Info("  GET  /status              - Service lifecycle and bundle visibility status")
 	logger.Info("  GET  /health              - Readiness health check")
-	logger.Info("  POST /dummy-signin        - Dummy signin to obtain JWT (user/device)")
+	logger.Info("  POST /dummy-signin        - Dummy signin to obtain JWT (user)")
+	logger.Info("Sync source: send Oversync-Source-ID on authenticated /sync/* requests")
 
 	// Create HTTP server with custom timeout settings
 	server := &http.Server{

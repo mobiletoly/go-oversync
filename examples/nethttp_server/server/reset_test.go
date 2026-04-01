@@ -19,10 +19,7 @@ func TestResetEndpointClearsExampleDatabase(t *testing.T) {
 	defer ts.Close()
 
 	ctx := context.Background()
-	_, err = ts.SyncService.Connect(ctx, oversync.Actor{UserID: "test-user", SourceID: "device-a"}, &oversync.ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: false,
-	})
+	_, err = ts.SyncService.Connect(ctx, oversync.Actor{UserID: "test-user", SourceID: "device-a"}, &oversync.ConnectRequest{HasLocalPendingRows: false})
 	if err != nil {
 		t.Fatalf("initialize test-user scope: %v", err)
 	}

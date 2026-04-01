@@ -28,7 +28,7 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 	userID := "e2e-server-originated-user-" + suffix
 	deviceID := "device-e2e-a-" + suffix
 
-	token, err := ts.GenerateToken(userID, deviceID, time.Hour)
+	token, err := ts.GenerateToken(userID, time.Hour)
 	require.NoError(t, err)
 
 	dbPath := filepath.Join(t.TempDir(), "client.sqlite")

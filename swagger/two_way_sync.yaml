@@ -52,6 +52,8 @@ paths:
         authentication failure.
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
       requestBody:
         required: true
         content:
@@ -95,6 +97,8 @@ paths:
         current source, the server returns `409 source_sequence_out_of_order`.
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
       requestBody:
         required: true
         content:
@@ -148,6 +152,7 @@ paths:
       security:
         - BearerAuth: []
       parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
         - name: push_id
           in: path
           required: true
@@ -219,6 +224,7 @@ paths:
       security:
         - BearerAuth: []
       parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
         - name: push_id
           in: path
           required: true
@@ -340,6 +346,7 @@ paths:
       security:
         - BearerAuth: []
       parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
         - name: bundle_seq
           in: path
           required: true
@@ -409,6 +416,8 @@ paths:
       security:
         - BearerAuth: []
       parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
+      parameters:
         - name: after_bundle_seq
           in: query
           required: false
@@ -472,6 +481,8 @@ paths:
         Creates one frozen current-state snapshot session for chunked hydration or recovery.
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
       responses:
         '200':
           description: Snapshot session created successfully
@@ -504,6 +515,7 @@ paths:
       security:
         - BearerAuth: []
       parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
         - name: snapshot_id
           in: path
           required: true
@@ -573,6 +585,7 @@ paths:
       security:
         - BearerAuth: []
       parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
         - name: snapshot_id
           in: path
           required: true
@@ -615,6 +628,8 @@ paths:
       summary: Get protocol capabilities
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
       responses:
         '200':
           description: Capabilities retrieved successfully
@@ -626,6 +641,16 @@ paths:
           description: Authentication required
 
 components:
+  parameters:
+    SourceIDHeader:
+      name: Oversync-Source-ID
+      in: header
+      required: true
+      schema:
+        type: string
+      description: |
+        Caller-owned current sync source identity for this authenticated request. This header is
+        sync transport metadata, not authentication.
   securitySchemes:
     BearerAuth:
       type: http
@@ -707,10 +732,8 @@ components:
 
     PushSessionCreateRequest:
       type: object
-      required: [source_id, source_bundle_id, planned_row_count]
+      required: [source_bundle_id, planned_row_count]
       properties:
-        source_id:
-          type: string
         source_bundle_id:
           type: integer
           format: int64
@@ -725,11 +748,8 @@ components:
 
     ConnectRequest:
       type: object
-      required: [source_id, has_local_pending_rows]
+      required: [has_local_pending_rows]
       properties:
-        source_id:
-          type: string
-          description: Caller-owned per-install or per-device source identity.
         has_local_pending_rows:
           type: boolean
           description: Whether this client captured anonymous local rows that could seed an uninitialized scope.

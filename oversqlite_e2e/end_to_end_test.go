@@ -153,7 +153,7 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 
 	restartedConfig := oversqlite.DefaultConfig(schema, syncTables("users"))
 	restarted, err := oversqlite.NewClient(dbB, server.URL(), func(context.Context) (string, error) {
-		return server.GenerateToken(userID, clientB.SourceID, time.Hour)
+		return server.GenerateToken(userID, time.Hour)
 	}, restartedConfig)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, restarted.Close()) }()
@@ -192,7 +192,7 @@ func TestEndToEnd_ExampleServerSchemaTimestampParity(t *testing.T) {
 
 	var client *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
-		return server.GenerateToken(userID, client.SourceID, time.Hour)
+		return server.GenerateToken(userID, time.Hour)
 	}
 	client, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users", "posts")))
 	require.NoError(t, err)

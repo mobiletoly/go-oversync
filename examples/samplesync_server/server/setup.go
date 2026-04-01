@@ -9,11 +9,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mobiletoly/go-oversync/examples/internal/exampleauth"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -27,7 +27,7 @@ type ServerConfig struct {
 type ServerComponents struct {
 	Pool        *pgxpool.Pool
 	SyncService *oversync.SyncService
-	JWTAuth     *oversync.JWTAuth
+	Auth        *exampleauth.TokenAuth
 	Handler     http.Handler
 	Logger      *slog.Logger
 	ctx         context.Context
@@ -115,7 +115,16 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	if jwtSecret == "" {
 		jwtSecret = "dev-secret"
 	}
-	jwtAuth := oversync.NewJWTAuth(jwtSecret)
+	auth := exampleauth.New(jwtSecret)
+	actorMiddleware := oversync.ActorMiddleware(oversync.ActorMiddlewareConfig{
+		UserIDFromContext: func(ctx context.Context) (string, error) {
+			userID, ok := exampleauth.UserIDFromContext(ctx)
+			if !ok || strings.TrimSpace(userID) == "" {
+				return "", fmt.Errorf("authenticated user_id not found")
+			}
+			return userID, nil
+		},
+	})
 
 	syncHandlers := oversync.NewHTTPSyncHandlers(syncService, logger)
 
@@ -123,12 +132,11 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	mux.HandleFunc("GET /health", syncHandlers.HandleHealth)
 	mux.HandleFunc("GET /status", syncHandlers.HandleStatus)
 	mux.HandleFunc("POST /dummy-signin", func(w http.ResponseWriter, r *http.Request) {
-		type req struct{ User, Password, Device string }
+		type req struct{ User, Password string }
 		type resp struct {
 			Token     string `json:"token"`
 			ExpiresIn int64  `json:"expires_in"`
 			User      string `json:"user"`
-			Device    string `json:"device"`
 		}
 		var rr req
 		if err := json.NewDecoder(r.Body).Decode(&rr); err != nil {
@@ -143,11 +151,8 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "user_required"})
 			return
 		}
-		if rr.Device == "" {
-			rr.Device = "device-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-		}
 		// TODO (any username/password accepted for now)
-		tok, err := jwtAuth.GenerateToken(rr.User, rr.Device, 10*time.Minute)
+		tok, err := auth.GenerateToken(rr.User, 10*time.Minute)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(500)
@@ -155,24 +160,27 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp{Token: tok, ExpiresIn: 600, User: rr.User, Device: rr.Device})
+		_ = json.NewEncoder(w).Encode(resp{Token: tok, ExpiresIn: 600, User: rr.User})
 	})
-	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreatePushSession)), logger))
-	mux.Handle("POST /sync/connect", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleConnect)), logger))
-	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandlePushSessionChunk)), logger))
-	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCommitPushSession)), logger))
-	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))
-	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows)), logger))
-	mux.Handle("GET /sync/pull", LoggingMiddleware(true, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandlePull)), logger))
-	mux.Handle("POST /sync/snapshot-sessions", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession)))
-	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk)))
-	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)))
-	mux.Handle("GET /sync/capabilities", jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCapabilities)))
+	withSyncActor := func(next http.Handler) http.Handler {
+		return auth.Middleware(actorMiddleware(next))
+	}
+	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleCreatePushSession)), logger))
+	mux.Handle("POST /sync/connect", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleConnect)), logger))
+	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushSessionChunk)), logger))
+	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleCommitPushSession)), logger))
+	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))
+	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows)), logger))
+	mux.Handle("GET /sync/pull", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePull)), logger))
+	mux.Handle("POST /sync/snapshot-sessions", withSyncActor(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession)))
+	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk)))
+	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)))
+	mux.Handle("GET /sync/capabilities", withSyncActor(http.HandlerFunc(syncHandlers.HandleCapabilities)))
 
 	return &ServerComponents{
 		Pool:        pool,
 		SyncService: syncService,
-		JWTAuth:     jwtAuth,
+		Auth:        auth,
 		Handler:     BrowserTestCORSMiddleware(mux),
 		Logger:      logger,
 		ctx:         ctx,
@@ -185,7 +193,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 func BrowserTestCORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, "+oversync.SourceIDHeader)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Max-Age", "600")
 		if r.Method == http.MethodOptions {

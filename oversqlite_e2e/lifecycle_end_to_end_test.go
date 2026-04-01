@@ -37,7 +37,7 @@ func TestEndToEnd_ConnectBeforeOpenReturnsTypedLifecycleError(t *testing.T) {
 	userID := "e2e-connect-before-open-user-" + uuid.NewString()
 	var client *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
-		return server.GenerateToken(userID, client.SourceID, time.Hour)
+		return server.GenerateToken(userID, time.Hour)
 	}
 	client, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
 	require.NoError(t, err)
@@ -257,7 +257,7 @@ func TestEndToEnd_ConnectResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 
 	var restarted *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
-		return server.GenerateToken(userID, restarted.SourceID, time.Hour)
+		return server.GenerateToken(userID, time.Hour)
 	}
 	restarted, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
 	require.NoError(t, err)
@@ -421,7 +421,7 @@ func TestEndToEnd_DifferentUserCanConnectAfterSuccessfulDetach(t *testing.T) {
 	currentUserID := "user-a-" + uuid.NewString()
 	var client *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
-		return server.GenerateToken(currentUserID, client.SourceID, time.Hour)
+		return server.GenerateToken(currentUserID, time.Hour)
 	}
 	client, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
 	require.NoError(t, err)
@@ -550,7 +550,7 @@ func TestEndToEnd_UninstallSyncThenReinstallOpenAndConnectOnSameDatabase(t *test
 
 	var reinstalled *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
-		return server.GenerateToken(userID, reinstalled.SourceID, time.Hour)
+		return server.GenerateToken(userID, time.Hour)
 	}
 	reinstalled, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
 	require.NoError(t, err)
@@ -725,7 +725,7 @@ func TestEndToEnd_RebuildRotateSourceSurvivesRestart(t *testing.T) {
 
 		var client *oversqlite.Client
 		tokenFn := func(ctx context.Context) (string, error) {
-			return server.GenerateToken(userID, client.SourceID, time.Hour)
+			return server.GenerateToken(userID, time.Hour)
 		}
 		client, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
 		require.NoError(t, err)

@@ -186,10 +186,7 @@ func loadCommittedBundleForUser(t *testing.T, ctx context.Context, svc *SyncServ
 func resolveConnectForPushSession(t *testing.T, ctx context.Context, svc *SyncService, actor Actor, hasLocalPendingRows bool) string {
 	t.Helper()
 
-	resp, err := svc.Connect(ctx, Actor{UserID: actor.UserID}, &ConnectRequest{
-		SourceID:            actor.SourceID,
-		HasLocalPendingRows: hasLocalPendingRows,
-	})
+	resp, err := svc.Connect(ctx, actor, &ConnectRequest{HasLocalPendingRows: hasLocalPendingRows})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 
@@ -208,10 +205,7 @@ func resolveConnectForPushSession(t *testing.T, ctx context.Context, svc *SyncSe
 func mustInitializeEmptyScope(t *testing.T, ctx context.Context, svc *SyncService, userID, sourceID string) {
 	t.Helper()
 
-	resp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            sourceID,
-		HasLocalPendingRows: false,
-	})
+	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: sourceID}, &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.Contains(t, []string{"initialize_empty", "remote_authoritative"}, resp.Resolution)
@@ -229,7 +223,6 @@ func pushRowsViaSession(
 
 	initializationID := resolveConnectForPushSession(t, ctx, svc, actor, len(rows) > 0)
 	createResp, err := svc.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
-		SourceID:         actor.SourceID,
 		SourceBundleID:   sourceBundleID,
 		PlannedRowCount:  int64(len(rows)),
 		InitializationID: initializationID,

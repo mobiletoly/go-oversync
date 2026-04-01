@@ -6,14 +6,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mobiletoly/go-oversync/oversync"
+	"github.com/mobiletoly/go-oversync/examples/internal/exampleauth"
 )
 
-// Session manages user authentication and JWT tokens
+// Session manages user authentication and example JWT tokens.
 type Session struct {
 	userID   string
 	sourceID string
-	jwtAuth  *oversync.JWTAuth
+	auth     *exampleauth.TokenAuth
 	logger   *slog.Logger
 
 	// Current session state
@@ -29,7 +29,7 @@ func NewSession(userID, sourceID, jwtSecret string, logger *slog.Logger) *Sessio
 	return &Session{
 		userID:   userID,
 		sourceID: sourceID,
-		jwtAuth:  oversync.NewJWTAuth(jwtSecret),
+		auth:     exampleauth.New(jwtSecret),
 		logger:   logger,
 	}
 }
@@ -64,16 +64,12 @@ func (s *Session) SignIn(userID, sourceID string) error {
 	return nil
 }
 
-// SetSourceID updates the source identity used for future token refreshes.
-// It keeps the session active, but clears the cached token so the next request
-// regenerates credentials for the new source.
+// SetSourceID updates the current sync source identity without rotating auth state.
 func (s *Session) SetSourceID(sourceID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.sourceID = sourceID
-	s.token = ""
-	s.expiresAt = time.Time{}
 }
 
 // Detach clears the current authenticated app session state.
@@ -202,7 +198,7 @@ func (s *Session) Restore() error {
 func (s *Session) generateToken(userID, sourceID string) (string, time.Time, error) {
 	duration := 24 * time.Hour
 
-	token, err := s.jwtAuth.GenerateToken(userID, sourceID, duration)
+	token, err := s.auth.GenerateToken(userID, duration)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("failed to generate token: %w", err)
 	}

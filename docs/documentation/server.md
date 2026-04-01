@@ -101,7 +101,9 @@ registered schema is outside the supported envelope.
 ## Auth Contract
 
 The handlers expect the caller to authenticate first and place
-`oversync.Actor{UserID, SourceID}` into request context. The example servers do this with JWT
-middleware, but the runtime does not require any specific auth stack. `_sync_scope_id` is derived
-from `Actor.UserID`, enforced only on the authoritative PostgreSQL side, and excluded from
-client-visible payloads, conflicts, pulls, and snapshots.
+`oversync.Actor{UserID, SourceID}` into request context. The runtime does not require any specific
+auth stack. The built-in transport helper is `oversync.ActorMiddleware(...)`, which reads
+`Oversync-Source-ID` after host authentication has already established trusted `user_id` in
+request context. `_sync_scope_id` is derived from `Actor.UserID`, enforced only on the
+authoritative PostgreSQL side, and excluded from client-visible payloads, conflicts, pulls, and
+snapshots.

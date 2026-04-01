@@ -42,7 +42,6 @@ type PushRequestRow struct {
 }
 
 type PushSessionCreateRequest struct {
-	SourceID         string `json:"source_id"`
 	SourceBundleID   int64  `json:"source_bundle_id"`
 	PlannedRowCount  int64  `json:"planned_row_count"`
 	InitializationID string `json:"initialization_id,omitempty"`
@@ -61,8 +60,7 @@ type PushSessionCreateResponse struct {
 }
 
 type ConnectRequest struct {
-	SourceID            string `json:"source_id"`
-	HasLocalPendingRows bool   `json:"has_local_pending_rows"`
+	HasLocalPendingRows bool `json:"has_local_pending_rows"`
 }
 
 type ConnectResponse struct {

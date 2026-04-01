@@ -82,12 +82,14 @@ func newLifecycleTestClient(t *testing.T, connectResponse *oversync.ConnectRespo
 	return newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
+			requireAuthenticatedSyncHeaders(t, r, "device-a")
 			return jsonResponse(oversync.CapabilitiesResponse{
 				Features: map[string]bool{
 					"connect_lifecycle": true,
 				},
 			}), nil
 		case "/sync/connect":
+			requireAuthenticatedSyncHeaders(t, r, "device-a")
 			return jsonResponse(connectResponse), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, map[string]string{"error": "not_found"}), nil

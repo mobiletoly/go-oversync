@@ -74,10 +74,11 @@ func main() {
 		components.Logger.Info("  GET  /sync/capabilities  - Get protocol capabilities and limits")
 		components.Logger.Info("  GET  /status             - Service lifecycle and bundle visibility status")
 		components.Logger.Info("  GET  /health             - Readiness health check")
-		components.Logger.Info("  POST /dummy-signin       - Dummy signin to obtain JWT (user/device)")
+		components.Logger.Info("  POST /dummy-signin       - Dummy signin to obtain JWT (user)")
 		components.Logger.Info("  POST /test/retention-floor - Test helper to raise retained bundle floor for one user")
 		components.Logger.Info("")
 		components.Logger.Info("Authentication: JWT Bearer token required")
+		components.Logger.Info("Sync source: send Oversync-Source-ID on authenticated /sync/* requests")
 		components.Logger.Info("Example: Authorization: Bearer <jwt-token>")
 
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -182,7 +182,6 @@ func TestEndToEnd_RawInitializerCrashBeforeCommitDoesNotLeakAuthoritativeRowsAnd
 
 	crashedRowID := uuid.NewString()
 	createResp := rawCreatePushSession(t, server, userID, "device-a", http.StatusOK, oversync.PushSessionCreateRequest{
-		SourceID:         "device-a",
 		SourceBundleID:   1,
 		PlannedRowCount:  1,
 		InitializationID: firstConnect.InitializationID,
@@ -212,7 +211,6 @@ func TestEndToEnd_RawInitializerCrashBeforeCommitDoesNotLeakAuthoritativeRowsAnd
 
 	recoveredRowID := uuid.NewString()
 	recoverySession := rawCreatePushSession(t, server, userID, "device-b", http.StatusOK, oversync.PushSessionCreateRequest{
-		SourceID:         "device-b",
 		SourceBundleID:   1,
 		PlannedRowCount:  1,
 		InitializationID: recoveryConnect.InitializationID,
@@ -236,7 +234,6 @@ func TestEndToEnd_RawServerRejectsPushAndSnapshotBeforeInitialization(t *testing
 
 	userID := "e2e-raw-scope-uninitialized-user-" + uuid.NewString()
 	pushErr := rawCreatePushSessionError(t, server, userID, "device-a", http.StatusConflict, oversync.PushSessionCreateRequest{
-		SourceID:        "device-a",
 		SourceBundleID:  1,
 		PlannedRowCount: 1,
 	})
@@ -253,7 +250,6 @@ func rawConnect(t *testing.T, server *exampleserver.TestServer, userID, sourceID
 	t.Helper()
 	var resp oversync.ConnectResponse
 	rawDoSyncJSON(t, server, http.MethodPost, "/sync/connect", userID, sourceID, http.StatusOK, oversync.ConnectRequest{
-		SourceID:            sourceID,
 		HasLocalPendingRows: hasLocalPendingRows,
 	}, &resp)
 	return resp
@@ -357,9 +353,10 @@ func rawDoSyncJSON(
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	token, err := server.GenerateToken(userID, sourceID, time.Hour)
+	token, err := server.GenerateToken(userID, time.Hour)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set(oversync.SourceIDHeader, sourceID)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)

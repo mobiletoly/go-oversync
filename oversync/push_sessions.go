@@ -170,12 +170,6 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 	if req == nil {
 		return nil, &PushSessionInvalidError{Message: "push session request is required"}
 	}
-	if strings.TrimSpace(req.SourceID) == "" {
-		return nil, &PushSessionInvalidError{Message: "source_id is required"}
-	}
-	if req.SourceID != actor.SourceID {
-		return nil, &PushSessionInvalidError{Message: "request source_id must match authenticated actor"}
-	}
 	if req.SourceBundleID <= 0 {
 		return nil, &PushSessionInvalidError{Message: "source_bundle_id must be > 0"}
 	}
@@ -224,7 +218,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 					return &PushSessionInvalidError{Message: "initialization_id is required while the scope is initializing"}
 				}
 				refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
-				leasedState, err := requireActiveInitializationLease(ctx, tx, actor.UserID, req.SourceID, req.InitializationID, refreshUntil)
+				leasedState, err := requireActiveInitializationLease(ctx, tx, actor.UserID, actor.SourceID, req.InitializationID, refreshUntil)
 				if err != nil {
 					return err
 				}
@@ -237,7 +231,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				return fmt.Errorf("unexpected scope state %q", scopeState.State)
 			}
 
-			meta, err := loadCommittedPushMetadataBySourceTuple(ctx, tx, scopeState.UserPK, req.SourceID, req.SourceBundleID)
+			meta, err := loadCommittedPushMetadataBySourceTuple(ctx, tx, scopeState.UserPK, actor.SourceID, req.SourceBundleID)
 			if err != nil {
 				return err
 			}
@@ -253,7 +247,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				return nil
 			}
 
-			expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleID(ctx, tx, scopeState.UserPK, req.SourceID)
+			expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleID(ctx, tx, scopeState.UserPK, actor.SourceID)
 			if err != nil {
 				return err
 			}
@@ -261,14 +255,14 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 			case req.SourceBundleID < expectedSourceBundleID:
 				return &SourceTupleHistoryPrunedError{
 					UserID:                         actor.UserID,
-					SourceID:                       req.SourceID,
+					SourceID:                       actor.SourceID,
 					SourceBundleID:                 req.SourceBundleID,
 					MaxCommittedSourceBundleIDHint: maxCommittedSourceBundleID,
 				}
 			case req.SourceBundleID > expectedSourceBundleID:
 				return &SourceSequenceOutOfOrderError{
 					UserID:   actor.UserID,
-					SourceID: req.SourceID,
+					SourceID: actor.SourceID,
 					Expected: expectedSourceBundleID,
 					Actual:   req.SourceBundleID,
 				}
@@ -279,7 +273,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				WHERE user_pk = $1
 				  AND source_id = $2
 				  AND source_bundle_id = $3
-			`, scopeState.UserPK, req.SourceID, req.SourceBundleID); err != nil {
+			`, scopeState.UserPK, actor.SourceID, req.SourceBundleID); err != nil {
 				return fmt.Errorf("delete existing staging push session: %w", err)
 			}
 
@@ -289,7 +283,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				INSERT INTO sync.push_sessions (
 					push_id, user_pk, source_id, source_bundle_id, planned_row_count, next_expected_row_ordinal, initialization_id, expires_at
 				) VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::uuid, $7)
-			`, pushID, scopeState.UserPK, req.SourceID, req.SourceBundleID, req.PlannedRowCount, nullableUUIDString(initializationID), expiresAt); err != nil {
+			`, pushID, scopeState.UserPK, actor.SourceID, req.SourceBundleID, req.PlannedRowCount, nullableUUIDString(initializationID), expiresAt); err != nil {
 				return fmt.Errorf("insert push session: %w", err)
 			}
 

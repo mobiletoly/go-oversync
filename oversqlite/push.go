@@ -1252,7 +1252,6 @@ func (c *Client) committedBundleChunkRows() int {
 
 func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedRowCount int64) (*oversync.PushSessionCreateResponse, error) {
 	reqBody, err := json.Marshal(&oversync.PushSessionCreateRequest{
-		SourceID:         c.SourceID,
 		SourceBundleID:   sourceBundleID,
 		PlannedRowCount:  plannedRowCount,
 		InitializationID: c.pendingInitializationID,
@@ -1465,7 +1464,7 @@ func (c *Client) deletePushSessionBestEffort(ctx context.Context, pushID string)
 	if err != nil {
 		return
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
+	c.applyAuthenticatedSyncHeaders(httpReq, token)
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {

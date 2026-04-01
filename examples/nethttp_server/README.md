@@ -47,7 +47,7 @@ go run ./examples/nethttp_server
 ```bash
 curl -X POST http://localhost:8080/dummy-signin \
   -H "Content-Type: application/json" \
-  -d '{"user":"demo-user","password":"anything","device":"device-123"}'
+  -d '{"user":"demo-user","password":"anything"}'
 ```
 
 ## Example connect lifecycle
@@ -55,9 +55,9 @@ curl -X POST http://localhost:8080/dummy-signin \
 ```bash
 curl -X POST http://localhost:8080/sync/connect \
   -H "Authorization: Bearer <jwt-token>" \
+  -H "Oversync-Source-ID: source-123" \
   -H "Content-Type: application/json" \
   -d '{
-    "source_id": "device-123",
     "has_local_pending_rows": false
   }'
 ```
@@ -97,15 +97,16 @@ create request below. If the scope is already initialized, omit `initialization_
 ```bash
 PUSH_ID=$(curl -s -X POST http://localhost:8080/sync/push-sessions \
   -H "Authorization: Bearer <jwt-token>" \
+  -H "Oversync-Source-ID: source-123" \
   -H "Content-Type: application/json" \
   -d '{
-    "source_id": "device-123",
     "source_bundle_id": 1,
     "planned_row_count": 1
   }' | jq -r '.push_id')
 
 curl -X POST "http://localhost:8080/sync/push-sessions/${PUSH_ID}/chunks" \
   -H "Authorization: Bearer <jwt-token>" \
+  -H "Oversync-Source-ID: source-123" \
   -H "Content-Type: application/json" \
   -d '{
     "start_row_ordinal": 0,
@@ -126,13 +127,15 @@ curl -X POST "http://localhost:8080/sync/push-sessions/${PUSH_ID}/chunks" \
   }'
 
 curl -X POST "http://localhost:8080/sync/push-sessions/${PUSH_ID}/commit" \
-  -H "Authorization: Bearer <jwt-token>"
+  -H "Authorization: Bearer <jwt-token>" \
+  -H "Oversync-Source-ID: source-123"
 ```
 
 ## Example pull
 
 ```bash
 curl -H "Authorization: Bearer <jwt-token>" \
+  -H "Oversync-Source-ID: source-123" \
   "http://localhost:8080/sync/pull?after_bundle_seq=0&max_bundles=100"
 ```
 

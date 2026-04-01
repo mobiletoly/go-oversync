@@ -57,10 +57,7 @@ func TestConnect_InitializeEmptyMarksScopeInitialized(t *testing.T) {
 	svc, _ := newConnectTestService(t, ctx)
 
 	userID := "connect-empty-" + uuid.NewString()
-	resp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: false,
-	})
+	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_empty", resp.Resolution)
 
@@ -78,10 +75,7 @@ func TestConnect_InitializeLocalSameSourceReconnectAndCommit(t *testing.T) {
 	svc, schemaName := newConnectTestService(t, ctx)
 
 	userID := "connect-local-" + uuid.NewString()
-	firstResp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: true,
-	})
+	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", firstResp.Resolution)
 	require.NotEmpty(t, firstResp.InitializationID)
@@ -94,17 +88,13 @@ func TestConnect_InitializeLocalSameSourceReconnectAndCommit(t *testing.T) {
 	`, userID).Scan(&nextBundleSeq))
 	require.Equal(t, int64(1), nextBundleSeq)
 
-	secondResp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: true,
-	})
+	secondResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", secondResp.Resolution)
 	require.Equal(t, firstResp.InitializationID, secondResp.InitializationID)
 
 	rowID := uuid.NewString()
 	createResp, err := svc.CreatePushSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, &PushSessionCreateRequest{
-		SourceID:         "device-a",
 		SourceBundleID:   1,
 		PlannedRowCount:  1,
 		InitializationID: firstResp.InitializationID,
@@ -138,17 +128,11 @@ func TestConnect_InitializingSameSourceWithoutPendingRowsTransitionsToInitialize
 	svc, _ := newConnectTestService(t, ctx)
 
 	userID := "connect-abandon-" + uuid.NewString()
-	firstResp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: true,
-	})
+	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", firstResp.Resolution)
 
-	secondResp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: false,
-	})
+	secondResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_empty", secondResp.Resolution)
 	require.Empty(t, secondResp.InitializationID)
@@ -174,16 +158,10 @@ func TestConnect_RemoteAuthoritativeAfterPriorInitialization(t *testing.T) {
 	svc, _ := newConnectTestService(t, ctx)
 
 	userID := "connect-remote-" + uuid.NewString()
-	_, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: false,
-	})
+	_, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 
-	resp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-b",
-		HasLocalPendingRows: true,
-	})
+	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-b"}, &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "remote_authoritative", resp.Resolution)
 }
@@ -193,15 +171,11 @@ func TestConnect_ExpiredInitializerCannotUpload(t *testing.T) {
 	svc, schemaName := newConnectTestService(t, ctx)
 
 	userID := "connect-expired-" + uuid.NewString()
-	resp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: true,
-	})
+	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", resp.Resolution)
 
 	createResp, err := svc.CreatePushSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, &PushSessionCreateRequest{
-		SourceID:         "device-a",
 		SourceBundleID:   1,
 		PlannedRowCount:  1,
 		InitializationID: resp.InitializationID,
@@ -262,10 +236,7 @@ func TestConnect_ConcurrentFirstInitializerRaceHasSingleWinner(t *testing.T) {
 		go func(sourceID string) {
 			defer wg.Done()
 			<-start
-			resp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-				SourceID:            sourceID,
-				HasLocalPendingRows: true,
-			})
+			resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: sourceID}, &ConnectRequest{HasLocalPendingRows: true})
 			results <- result{sourceID: sourceID, resp: resp, err: err}
 		}(sourceID)
 	}
@@ -303,11 +274,8 @@ func TestHandleConnect_SuccessAndRetryLaterMappings(t *testing.T) {
 		handlers.HandleConnect,
 		http.MethodPost,
 		"/sync/connect",
-		Actor{UserID: userID},
-		ConnectRequest{
-			SourceID:            "device-a",
-			HasLocalPendingRows: true,
-		},
+		Actor{UserID: userID, SourceID: "device-a"},
+		ConnectRequest{HasLocalPendingRows: true},
 		nil,
 	)
 	require.Equal(t, http.StatusOK, successRec.Code)
@@ -322,11 +290,8 @@ func TestHandleConnect_SuccessAndRetryLaterMappings(t *testing.T) {
 		handlers.HandleConnect,
 		http.MethodPost,
 		"/sync/connect",
-		Actor{UserID: userID},
-		ConnectRequest{
-			SourceID:            "device-b",
-			HasLocalPendingRows: true,
-		},
+		Actor{UserID: userID, SourceID: "device-b"},
+		ConnectRequest{HasLocalPendingRows: true},
 		nil,
 	)
 	require.Equal(t, http.StatusOK, retryRec.Code)
@@ -343,10 +308,7 @@ func TestHandleConnect_ExpiredInitializerLeaseMapsToFreshInitializeLocal(t *test
 	handlers := NewHTTPSyncHandlers(svc, integrationTestLogger(slog.LevelWarn))
 
 	userID := "connect-handler-stale-" + uuid.NewString()
-	firstResp, err := svc.Connect(ctx, Actor{UserID: userID}, &ConnectRequest{
-		SourceID:            "device-a",
-		HasLocalPendingRows: true,
-	})
+	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", firstResp.Resolution)
 
@@ -362,11 +324,8 @@ func TestHandleConnect_ExpiredInitializerLeaseMapsToFreshInitializeLocal(t *test
 		handlers.HandleConnect,
 		http.MethodPost,
 		"/sync/connect",
-		Actor{UserID: userID},
-		ConnectRequest{
-			SourceID:            "device-b",
-			HasLocalPendingRows: true,
-		},
+		Actor{UserID: userID, SourceID: "device-b"},
+		ConnectRequest{HasLocalPendingRows: true},
 		nil,
 	)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -392,13 +351,39 @@ func TestHandleConnect_InvalidRequestMappings(t *testing.T) {
 		ConnectRequest{},
 		nil,
 	)
-	require.Equal(t, http.StatusBadRequest, connectInvalidRec.Code)
-	require.Equal(t, "connect_invalid", decodeErrorResponse(t, connectInvalidRec).Error)
+	require.Equal(t, http.StatusUnauthorized, connectInvalidRec.Code)
+	require.Equal(t, "authentication_failed", decodeErrorResponse(t, connectInvalidRec).Error)
 
 	req := httptest.NewRequest(http.MethodPost, "/sync/connect", strings.NewReader(`{"source_id":`))
-	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "connect-handler-badjson-" + uuid.NewString()}))
+	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "connect-handler-badjson-" + uuid.NewString(), SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
 	handlers.HandleConnect(rec, req)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Equal(t, "invalid_request", decodeErrorResponse(t, rec).Error)
+}
+
+func TestHandleConnect_UsesActorSourceIDAsOnlyRequestLevelSourceOfTruth(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newConnectTestService(t, ctx)
+	handlers := NewHTTPSyncHandlers(svc, integrationTestLogger(slog.LevelWarn))
+
+	userID := "connect-source-truth-" + uuid.NewString()
+	req := httptest.NewRequest(http.MethodPost, "/sync/connect", strings.NewReader(`{"source_id":"wrong-source","has_local_pending_rows":true}`))
+	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: userID, SourceID: "device-a"}))
+	rec := httptest.NewRecorder()
+	handlers.HandleConnect(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp ConnectResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, "initialize_local", resp.Resolution)
+
+	var initializerSourceID string
+	require.NoError(t, svc.pool.QueryRow(ctx, `
+		SELECT ss.initializer_source_id
+		FROM sync.scope_state ss
+		JOIN sync.user_state us ON us.user_pk = ss.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&initializerSourceID))
+	require.Equal(t, "device-a", initializerSourceID)
 }

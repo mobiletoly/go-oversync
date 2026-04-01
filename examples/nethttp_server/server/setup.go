@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mobiletoly/go-oversync/examples/internal/exampleauth"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -39,7 +40,7 @@ type ServerConfig struct {
 type ServerComponents struct {
 	Pool            *pgxpool.Pool
 	SyncService     *oversync.SyncService
-	JWTAuth         *oversync.JWTAuth
+	Auth            *exampleauth.TokenAuth
 	Handler         http.Handler
 	Logger          *slog.Logger
 	BusinessSchema  string
@@ -200,13 +201,22 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		cancel()
 		return nil, err
 	}
-	// Setup JWT authentication
+	// Setup example auth
 	jwtSecret := config.JWTSecret
 	if jwtSecret == "" {
 		jwtSecret = "your-secret-key-change-in-production"
 		logger.Warn("Using default JWT secret - change in production!")
 	}
-	jwtAuth := oversync.NewJWTAuth(jwtSecret)
+	auth := exampleauth.New(jwtSecret)
+	actorMiddleware := oversync.ActorMiddleware(oversync.ActorMiddlewareConfig{
+		UserIDFromContext: func(ctx context.Context) (string, error) {
+			userID, ok := exampleauth.UserIDFromContext(ctx)
+			if !ok || strings.TrimSpace(userID) == "" {
+				return "", fmt.Errorf("authenticated user_id not found")
+			}
+			return userID, nil
+		},
+	})
 
 	// Create sync handlers
 	syncHandlers := oversync.NewHTTPSyncHandlers(syncService, logger)
@@ -283,18 +293,16 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		})
 	})
 
-	// Dummy signin endpoint returns a JWT for provided user/device; any password accepted
+	// Dummy signin endpoint returns a JWT for the provided user; any password accepted.
 	mux.HandleFunc("POST /dummy-signin", func(w http.ResponseWriter, r *http.Request) {
 		type signinReq struct {
 			User     string `json:"user"`
 			Password string `json:"password"`
-			Device   string `json:"device"`
 		}
 		type signinResp struct {
 			Token     string `json:"token"`
 			ExpiresIn int64  `json:"expires_in"`
 			User      string `json:"user"`
-			Device    string `json:"device"`
 		}
 		var req signinReq
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -307,41 +315,41 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request", "message": "user required"})
 			return
 		}
-		if req.Device == "" {
-			req.Device = "device-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-		}
-		// Any password accepted; generate JWT valid for 5 minutes
-		tok, err := jwtAuth.GenerateToken(req.User, req.Device, 5*time.Minute)
+		// Any password accepted; generate JWT valid for 5 minutes.
+		tok, err := auth.GenerateToken(req.User, 5*time.Minute)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "token_error", "message": err.Error()})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(signinResp{Token: tok, ExpiresIn: int64(300), User: req.User, Device: req.Device})
-		logger.Info("Generated dummy JWT", "user", req.User, "device", req.Device)
+		_ = json.NewEncoder(w).Encode(signinResp{Token: tok, ExpiresIn: int64(300), User: req.User})
+		logger.Info("Generated dummy JWT", "user", req.User)
 	})
 
 	// Register sync endpoints with enhanced logging
-	mux.Handle("POST /sync/connect", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointConnect, jwtAuth.Middleware(connectHandler)), logger))
-	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionCreate, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreatePushSession))), logger))
-	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionChunk, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandlePushSessionChunk))), logger))
-	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionCommit, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCommitPushSession))), logger))
-	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))
-	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointCommittedBundleRows, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows))), logger))
-	mux.Handle("GET /sync/pull", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPull, jwtAuth.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	withSyncActor := func(next http.Handler) http.Handler {
+		return auth.Middleware(actorMiddleware(next))
+	}
+	mux.Handle("POST /sync/connect", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointConnect, withSyncActor(connectHandler)), logger))
+	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionCreate, withSyncActor(http.HandlerFunc(syncHandlers.HandleCreatePushSession))), logger))
+	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionChunk, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushSessionChunk))), logger))
+	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPushSessionCommit, withSyncActor(http.HandlerFunc(syncHandlers.HandleCommitPushSession))), logger))
+	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(false, withSyncActor(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))
+	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointCommittedBundleRows, withSyncActor(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows))), logger))
+	mux.Handle("GET /sync/pull", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPull, withSyncActor(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		syncHandlers.HandlePull(w, r)
 		logger.Info("🔥 PULL: Pull handler completed")
 	}))), logger))
-	mux.Handle("POST /sync/snapshot-sessions", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointSnapshotCreate, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession))), logger))
-	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointSnapshotChunk, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk))), logger))
-	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)), logger))
-	mux.Handle("GET /sync/capabilities", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointCapabilities, jwtAuth.Middleware(http.HandlerFunc(syncHandlers.HandleCapabilities))), logger))
+	mux.Handle("POST /sync/snapshot-sessions", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointSnapshotCreate, withSyncActor(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession))), logger))
+	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointSnapshotChunk, withSyncActor(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk))), logger))
+	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, withSyncActor(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)), logger))
+	mux.Handle("GET /sync/capabilities", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointCapabilities, withSyncActor(http.HandlerFunc(syncHandlers.HandleCapabilities))), logger))
 
 	return &ServerComponents{
 		Pool:            pool,
 		SyncService:     syncService,
-		JWTAuth:         jwtAuth,
+		Auth:            auth,
 		Handler:         BrowserTestCORSMiddleware(mux),
 		Logger:          logger,
 		BusinessSchema:  businessSchema,
@@ -407,7 +415,7 @@ func wrapConnectWithEmptyFirstDeferral(next http.Handler, pool *pgxpool.Pool, du
 		}
 
 		now := time.Now().UTC()
-		retryLater, expiresAt := controller.decide(actor.UserID, req.SourceID, now)
+		retryLater, expiresAt := controller.decide(actor.UserID, actor.SourceID, now)
 		if retryLater {
 			writeEmptyFirstRetryLater(w, expiresAt, now)
 			return
@@ -567,7 +575,7 @@ func (sc *ServerComponents) Close() {
 func BrowserTestCORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, "+oversync.SourceIDHeader)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Max-Age", "600")
 		if r.Method == http.MethodOptions {
@@ -607,9 +615,9 @@ func (ts *TestServer) URL() string {
 	return ts.HTTPServer.URL
 }
 
-// GenerateToken generates a JWT token for testing
-func (ts *TestServer) GenerateToken(userID, deviceID string, duration time.Duration) (string, error) {
-	return ts.JWTAuth.GenerateToken(userID, deviceID, duration)
+// GenerateToken generates a JWT token for testing.
+func (ts *TestServer) GenerateToken(userID string, duration time.Duration) (string, error) {
+	return ts.Auth.GenerateToken(userID, duration)
 }
 
 func (ts *TestServer) InjectFailure(endpoint string, statusCode, count int) {

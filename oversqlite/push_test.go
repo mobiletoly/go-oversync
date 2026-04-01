@@ -238,6 +238,7 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions":
+		requireAuthenticatedSyncHeaders(s.t, r, "")
 		var req oversync.PushSessionCreateRequest
 		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
 		if committed := s.committedBySource[req.SourceBundleID]; committed != nil {
@@ -254,7 +255,7 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 		pushID := "push-" + strconv.Itoa(s.nextPushID)
 		s.sessions[pushID] = &mockPushSession{
 			PushID:          pushID,
-			SourceID:        req.SourceID,
+			SourceID:        r.Header.Get(oversync.SourceIDHeader),
 			SourceBundleID:  req.SourceBundleID,
 			PlannedRowCount: req.PlannedRowCount,
 		}
@@ -266,6 +267,7 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 		}), nil
 
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/") && strings.HasSuffix(r.URL.Path, "/chunks"):
+		requireAuthenticatedSyncHeaders(s.t, r, "")
 		pushID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/sync/push-sessions/"), "/chunks")
 		session := s.sessions[pushID]
 		require.NotNil(s.t, session)
@@ -280,6 +282,7 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 		}), nil
 
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/") && strings.HasSuffix(r.URL.Path, "/commit"):
+		requireAuthenticatedSyncHeaders(s.t, r, "")
 		pushID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/sync/push-sessions/"), "/commit")
 		session := s.sessions[pushID]
 		require.NotNil(s.t, session)
@@ -289,6 +292,7 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 		return s.defaultCommitResponse(session), nil
 
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sync/committed-bundles/") && strings.HasSuffix(r.URL.Path, "/rows"):
+		requireAuthenticatedSyncHeaders(s.t, r, "")
 		trimmed := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/sync/committed-bundles/"), "/rows")
 		bundleSeq, err := strconv.ParseInt(trimmed, 10, 64)
 		require.NoError(s.t, err)
@@ -329,6 +333,7 @@ func (s *mockPushSessionServer) RoundTrip(r *http.Request) (*http.Response, erro
 		}), nil
 
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/"):
+		requireAuthenticatedSyncHeaders(s.t, r, "")
 		pushID := strings.TrimPrefix(r.URL.Path, "/sync/push-sessions/")
 		s.deletePushIDs = append(s.deletePushIDs, pushID)
 		return jsonResponse(map[string]any{"status": "deleted"}), nil

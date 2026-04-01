@@ -73,8 +73,8 @@ CREATE TABLE business.posts (
 ## Core Terms
 
 - `user_id`: one isolated sync stream
-- `current_source_id`: one app installation or device identity
-- `source_bundle_id`: per-device monotonically increasing push id
+- `current_source_id`: the caller-owned current sync source identity
+- `source_bundle_id`: per-source monotonically increasing push id
 - `bundle_seq`: server-side committed bundle sequence
 - `row_version`: authoritative row version used for optimistic concurrency
 - `snapshot_bundle_seq`: the frozen bundle ceiling attached to a snapshot rebuild
@@ -179,18 +179,28 @@ func main() {
 
     handlers := oversync.NewHTTPSyncHandlers(svc, logger)
 
+    syncActorMiddleware := oversync.ActorMiddleware(oversync.ActorMiddlewareConfig{
+        UserIDFromContext: func(ctx context.Context) (string, error) {
+            return yourUserIDFromContext(ctx)
+        },
+    })
+
+    withSyncActor := func(next http.Handler) http.Handler {
+        return yourAuthMiddleware(syncActorMiddleware(next))
+    }
+
     mux := http.NewServeMux()
-    mux.Handle("POST /sync/connect", yourAuthMiddleware(http.HandlerFunc(handlers.HandleConnect)))
-    mux.Handle("POST /sync/push-sessions", yourAuthMiddleware(http.HandlerFunc(handlers.HandleCreatePushSession)))
-    mux.Handle("POST /sync/push-sessions/{push_id}/chunks", yourAuthMiddleware(http.HandlerFunc(handlers.HandlePushSessionChunk)))
-    mux.Handle("POST /sync/push-sessions/{push_id}/commit", yourAuthMiddleware(http.HandlerFunc(handlers.HandleCommitPushSession)))
-    mux.Handle("DELETE /sync/push-sessions/{push_id}", yourAuthMiddleware(http.HandlerFunc(handlers.HandleDeletePushSession)))
-    mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", yourAuthMiddleware(http.HandlerFunc(handlers.HandleGetCommittedBundleRows)))
-    mux.Handle("GET /sync/pull", yourAuthMiddleware(http.HandlerFunc(handlers.HandlePull)))
-    mux.Handle("POST /sync/snapshot-sessions", yourAuthMiddleware(http.HandlerFunc(handlers.HandleCreateSnapshotSession)))
-    mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", yourAuthMiddleware(http.HandlerFunc(handlers.HandleGetSnapshotChunk)))
-    mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", yourAuthMiddleware(http.HandlerFunc(handlers.HandleDeleteSnapshotSession)))
-    mux.Handle("GET /sync/capabilities", yourAuthMiddleware(http.HandlerFunc(handlers.HandleCapabilities)))
+    mux.Handle("POST /sync/connect", withSyncActor(http.HandlerFunc(handlers.HandleConnect)))
+    mux.Handle("POST /sync/push-sessions", withSyncActor(http.HandlerFunc(handlers.HandleCreatePushSession)))
+    mux.Handle("POST /sync/push-sessions/{push_id}/chunks", withSyncActor(http.HandlerFunc(handlers.HandlePushSessionChunk)))
+    mux.Handle("POST /sync/push-sessions/{push_id}/commit", withSyncActor(http.HandlerFunc(handlers.HandleCommitPushSession)))
+    mux.Handle("DELETE /sync/push-sessions/{push_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeletePushSession)))
+    mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", withSyncActor(http.HandlerFunc(handlers.HandleGetCommittedBundleRows)))
+    mux.Handle("GET /sync/pull", withSyncActor(http.HandlerFunc(handlers.HandlePull)))
+    mux.Handle("POST /sync/snapshot-sessions", withSyncActor(http.HandlerFunc(handlers.HandleCreateSnapshotSession)))
+    mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleGetSnapshotChunk)))
+    mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeleteSnapshotSession)))
+    mux.Handle("GET /sync/capabilities", withSyncActor(http.HandlerFunc(handlers.HandleCapabilities)))
     mux.HandleFunc("GET /health", handlers.HandleHealth)
     mux.HandleFunc("GET /status", handlers.HandleStatus)
 
@@ -198,8 +208,9 @@ func main() {
 }
 ```
 
-`yourAuthMiddleware` must authenticate the request and inject
-`oversync.Actor{UserID, SourceID}` into request context. The server derives `_sync_scope_id` from
+`yourAuthMiddleware` must authenticate the request and expose trusted `user_id` in request context.
+`oversync.ActorMiddleware(...)` reads `Oversync-Source-ID` and combines it with that trusted user
+identity into `oversync.Actor{UserID, SourceID}`. The server derives `_sync_scope_id` from
 `Actor.UserID`, so clients must not send `_sync_scope_id` in push payloads.
 
 ## Step 4: Create The SQLite Client
@@ -268,7 +279,7 @@ func main() {
     }
     defer client.Close()
 
-    openResult, err := client.Open(ctx, "device-abc")
+    openResult, err := client.Open(ctx, "source-abc")
     if err != nil {
         log.Fatal(err)
     }
@@ -328,7 +339,7 @@ if err != nil {
 }
 log.Printf("rebuild outcome: %s", rebuildReport.Outcome)
 
-recoverReport, err := client.Rebuild(ctx, oversqlite.RebuildRotateSource, "device-rotated")
+recoverReport, err := client.Rebuild(ctx, oversqlite.RebuildRotateSource, "source-rotated")
 if err != nil {
     log.Fatal(err)
 }
@@ -382,6 +393,28 @@ The server exposes:
 - `GET /sync/capabilities`
 - `GET /health`
 - `GET /status`
+
+All authenticated `/sync/*` requests must send `Oversync-Source-ID: <current-source-id>`.
+
+## Echo Integration
+
+If your server uses Echo, you can still use the standard `net/http` middleware:
+
+```go
+func WrapHTTPMiddleware(mw func(http.Handler) http.Handler) echo.MiddlewareFunc {
+    return func(next echo.HandlerFunc) echo.HandlerFunc {
+        return func(c echo.Context) error {
+            var handlerErr error
+            h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                c.SetRequest(r)
+                handlerErr = next(c)
+            }))
+            h.ServeHTTP(c.Response(), c.Request())
+            return handlerErr
+        }
+    }
+}
+```
 
 Lifecycle-specific sync failures to expect on the HTTP surface:
 

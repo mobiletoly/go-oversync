@@ -230,7 +230,7 @@ func newSQLiteClient(
 
 	var client *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
-		return ts.GenerateToken(userID, client.SourceID, time.Hour)
+		return ts.GenerateToken(userID, time.Hour)
 	}
 
 	client, err = oversqlite.NewClient(db, ts.URL(), tokenFn, config)
@@ -269,7 +269,7 @@ func newSQLiteClientWithoutConnect(
 
 	var client *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
-		return ts.GenerateToken(userID, client.SourceID, time.Hour)
+		return ts.GenerateToken(userID, time.Hour)
 	}
 
 	client, err = oversqlite.NewClient(db, ts.URL(), tokenFn, config)

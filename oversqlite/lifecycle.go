@@ -594,7 +594,6 @@ func dropManagedTriggersForTableInTx(ctx context.Context, tx *sql.Tx, tableName 
 
 func (c *Client) connectRequest(ctx context.Context, userID, sourceID string, hasLocalPendingRows bool) (*oversync.ConnectResponse, error) {
 	reqBody, err := json.Marshal(&oversync.ConnectRequest{
-		SourceID:            sourceID,
 		HasLocalPendingRows: hasLocalPendingRows,
 	})
 	if err != nil {

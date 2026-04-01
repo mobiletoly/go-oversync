@@ -15,6 +15,11 @@ keys use canonical dashed lowercase UUID strings. Hidden server ownership column
 `_sync_scope_id` never appear in client-visible payloads, conflicts, committed bundle rows, or
 snapshot rows.
 
+All authenticated `/sync/*` requests must send:
+
+- `Authorization: Bearer <token>`
+- `Oversync-Source-ID: <current-source-id>`
+
 ## POST `/sync/connect`
 
 Resolve the first-connect lifecycle for the authenticated `(user_id, source_id)`.
@@ -23,7 +28,6 @@ Request:
 
 ```json
 {
-  "source_id": "device-1",
   "has_local_pending_rows": true
 }
 ```
@@ -63,7 +67,6 @@ Request:
 
 ```json
 {
-  "source_id": "device-1",
   "source_bundle_id": 7,
   "planned_row_count": 1
 }
@@ -150,7 +153,7 @@ Response:
 ```json
 {
   "bundle_seq": 143,
-  "source_id": "device-1",
+  "source_id": "source-1",
   "source_bundle_id": 7,
   "row_count": 1,
   "bundle_hash": "4c8d2d5f5d2c5a41d9aa6f4d2f3ac5d0d1d5d8bbf1d7a8c39f3b3a970f6af21a"
@@ -204,7 +207,7 @@ Response:
 ```json
 {
   "bundle_seq": 143,
-  "source_id": "device-1",
+  "source_id": "source-1",
   "source_bundle_id": 7,
   "row_count": 1,
   "bundle_hash": "4c8d2d5f5d2c5a41d9aa6f4d2f3ac5d0d1d5d8bbf1d7a8c39f3b3a970f6af21a",
@@ -253,7 +256,7 @@ Response:
   "bundles": [
     {
       "bundle_seq": 143,
-      "source_id": "device-2",
+      "source_id": "source-2",
       "source_bundle_id": 18,
       "rows": [
         {

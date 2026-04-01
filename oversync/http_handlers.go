@@ -32,6 +32,9 @@ func actorFromRequest(r *http.Request) (Actor, error) {
 	if !ok {
 		return Actor{}, errors.New("authenticated actor not found in request context")
 	}
+	if err := actor.validate(true); err != nil {
+		return Actor{}, err
+	}
 	return actor, nil
 }
 

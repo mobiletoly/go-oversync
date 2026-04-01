@@ -37,6 +37,16 @@ func errorJSONResponse(status int, v any) *http.Response {
 	}
 }
 
+func requireAuthenticatedSyncHeaders(t *testing.T, r *http.Request, sourceID string) {
+	t.Helper()
+	require.Equal(t, "Bearer token", r.Header.Get("Authorization"))
+	if sourceID == "" {
+		require.NotEmpty(t, r.Header.Get(oversync.SourceIDHeader))
+		return
+	}
+	require.Equal(t, sourceID, r.Header.Get(oversync.SourceIDHeader))
+}
+
 type staticResolver struct {
 	result MergeResult
 }

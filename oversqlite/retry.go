@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/mobiletoly/go-oversync/oversync"
 )
 
 // RetryPolicy configures bounded retry for transient sync I/O failures.
@@ -294,7 +296,7 @@ func (c *Client) doAuthenticatedRequest(ctx context.Context, method, endpoint st
 	if strings.TrimSpace(contentType) != "" {
 		httpReq.Header.Set("Content-Type", contentType)
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
+	c.applyAuthenticatedSyncHeaders(httpReq, token)
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
@@ -307,6 +309,17 @@ func (c *Client) doAuthenticatedRequest(ctx context.Context, method, endpoint st
 		return nil, 0, readErr
 	}
 	return responseBody, resp.StatusCode, nil
+}
+
+func (c *Client) applyAuthenticatedSyncHeaders(httpReq *http.Request, token string) {
+	if httpReq == nil {
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	sourceID := strings.TrimSpace(c.SourceID)
+	if sourceID != "" {
+		httpReq.Header.Set(oversync.SourceIDHeader, sourceID)
+	}
 }
 
 func (c *Client) doAuthenticatedRequestWithRetry(ctx context.Context, operation, method, endpoint string, body []byte, contentType string) ([]byte, int, error) {

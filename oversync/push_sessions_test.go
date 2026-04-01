@@ -86,7 +86,6 @@ func (f *pushSessionFixture) createSession(t *testing.T, ctx context.Context, so
 
 	initializationID := resolveConnectForPushSession(t, ctx, f.svc, f.writer, plannedRowCount > 0)
 	resp, err := f.svc.CreatePushSession(ctx, f.writer, &PushSessionCreateRequest{
-		SourceID:         f.writer.SourceID,
 		SourceBundleID:   sourceBundleID,
 		PlannedRowCount:  plannedRowCount,
 		InitializationID: initializationID,
@@ -672,7 +671,6 @@ func TestPushSessions_ConcurrentSessionCreationLeavesOneActiveStagingSession(t *
 	runCreate := func() {
 		defer wg.Done()
 		resp, err := fixture.svc.CreatePushSession(ctx, fixture.writer, &PushSessionCreateRequest{
-			SourceID:         fixture.writer.SourceID,
 			SourceBundleID:   1,
 			PlannedRowCount:  1,
 			InitializationID: initializationID,
@@ -769,7 +767,6 @@ func TestPushSessions_UnknownExpiredAndForeignIDsFailClosed(t *testing.T) {
 	expiredActor := Actor{UserID: "expired-user-" + uuid.NewString(), SourceID: "writer-expired"}
 	expiredInitializationID := resolveConnectForPushSession(t, ctx, fixture.svc, expiredActor, true)
 	expiredSession, err := fixture.svc.CreatePushSession(ctx, expiredActor, &PushSessionCreateRequest{
-		SourceID:         expiredActor.SourceID,
 		SourceBundleID:   1,
 		PlannedRowCount:  1,
 		InitializationID: expiredInitializationID,
@@ -929,7 +926,6 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	createSessionForActor := func(actor Actor, sourceBundleID, plannedRowCount int64) *PushSessionCreateResponse {
 		initializationID := resolveConnectForPushSession(t, ctx, fixture.svc, actor, plannedRowCount > 0)
 		resp, err := fixture.svc.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
-			SourceID:         actor.SourceID,
 			SourceBundleID:   sourceBundleID,
 			PlannedRowCount:  plannedRowCount,
 			InitializationID: initializationID,
@@ -998,7 +994,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions",
 			actor:          fixture.writer,
-			body:           PushSessionCreateRequest{SourceID: "wrong-source", SourceBundleID: 1, PlannedRowCount: 1},
+			body:           PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 0},
 			expectedStatus: http.StatusBadRequest,
 			expectedCode:   "push_session_invalid",
 		},
@@ -1072,7 +1068,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions",
 			actor:          prunedActor,
-			body:           PushSessionCreateRequest{SourceID: prunedActor.SourceID, SourceBundleID: 1, PlannedRowCount: 1},
+			body:           PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 1},
 			expectedStatus: http.StatusConflict,
 			expectedCode:   "history_pruned",
 		},
@@ -1082,7 +1078,7 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			method:         http.MethodPost,
 			path:           "/sync/push-sessions",
 			actor:          validActor,
-			body:           PushSessionCreateRequest{SourceID: validActor.SourceID, SourceBundleID: 2, PlannedRowCount: 1},
+			body:           PushSessionCreateRequest{SourceBundleID: 2, PlannedRowCount: 1},
 			expectedStatus: http.StatusConflict,
 			expectedCode:   "source_sequence_out_of_order",
 		},
@@ -1209,6 +1205,36 @@ func TestPushSessions_RejectsHiddenOwnerColumnInPayload(t *testing.T) {
 	var chunkErr *PushChunkInvalidError
 	require.ErrorAs(t, err, &chunkErr)
 	require.Contains(t, err.Error(), "must not include hidden scope column")
+}
+
+func TestHandleCreatePushSession_UsesActorSourceIDAsOnlyRequestLevelSourceOfTruth(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
+
+	initializationID := resolveConnectForPushSession(t, ctx, fixture.svc, fixture.writer, true)
+	req := httptest.NewRequest(http.MethodPost, "/sync/push-sessions", strings.NewReader(fmt.Sprintf(`{
+		"source_id":"wrong-source",
+		"source_bundle_id":1,
+		"planned_row_count":1,
+		"initialization_id":"%s"
+	}`, initializationID)))
+	req = req.WithContext(ContextWithActor(req.Context(), fixture.writer))
+	rec := httptest.NewRecorder()
+	handlers.HandleCreatePushSession(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp PushSessionCreateResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, "staging", resp.Status)
+
+	var sourceID string
+	require.NoError(t, fixture.pool.QueryRow(ctx, `
+		SELECT source_id
+		FROM sync.push_sessions
+		WHERE push_id = $1::uuid
+	`, resp.PushID).Scan(&sourceID))
+	require.Equal(t, fixture.writer.SourceID, sourceID)
 }
 
 func TestPushSessions_RejectsNonCanonicalUUIDVisibleKey(t *testing.T) {

@@ -26,10 +26,8 @@ Challenges to solve:
     - Guarantees isolation: one user’s changes never mix with another’s
 
 - source_id
-    - A stable, opaque identifier for one installation of your app on one device
-    - Lets the system attribute each pushed bundle to a device
-    - We often use `device_id` as the term for this on the client side, the both represent the same
-      concept
+    - A stable, opaque identifier for one local sync runtime
+    - Lets the system attribute each pushed bundle to one source stream
 
 - source_bundle_id
     - A per-device monotonically increasing sequence number assigned by the client to each logical
@@ -45,30 +43,24 @@ Challenges to solve:
     - A monotonically increasing version maintained by the server per logical row
     - Enables optimistic concurrency during push
 
-> Terminology note
->
-> source_id and device_id refer to the same concept. We use source_id on the service/server side; on
-> the client side it’s commonly called device id. It must be a stable, opaque identifier for one app
-> installation on one device.
-
-## Deep dive: identity, source_id (aka device_id), and idempotency
+## Deep dive: identity, source_id, and idempotency
 
 - What is source_id?
-    - A random, persistent identifier for one device/app instance (typically UUIDv4). Generate on
+    - A random, persistent identifier for one app runtime (typically UUIDv4). Generate on
       first launch and store in durable local storage.
-    - Unique per user: two active devices for the same user must not share a source_id.
+    - Unique per user: two active sources for the same user must not share a source_id.
 
 - Why it matters
     - The idempotency key (user_id, source_id, source_bundle_id) lets the server accept safe retries
       without duplicating committed bundles.
-    - If two devices share a source_id, their changes can collide and be treated as duplicates.
+    - If two sources share a source_id, their changes can collide and be treated as duplicates.
 
 - Lifecycle best practices
     - New install: generate a fresh source_id; initialize source_bundle_id = 1
     - Reinstall/restore: prefer a fresh source_id unless you can prove the old one is still safe to
       reuse
-    - Device replacement: prefer a new source_id; idempotency still holds because the key is per
-      device
+    - Device replacement or same-install recovery: prefer a new source_id when the old writer
+      stream is no longer safe to continue
     - Destructive reset-and-rebuild recovery: rotate to a fresh source_id and reset
       source_bundle_id = 1 before new local writes resume
     - Rotation: if rotated, reset source_bundle_id to 1; never reuse the same (source_id,

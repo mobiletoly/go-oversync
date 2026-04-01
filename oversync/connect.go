@@ -6,7 +6,6 @@ package oversync
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,15 +17,11 @@ func (s *SyncService) Connect(ctx context.Context, actor Actor, req *ConnectRequ
 		return nil, err
 	}
 	defer done()
-	if err := actor.validate(false); err != nil {
+	if err := actor.validate(true); err != nil {
 		return nil, err
 	}
 	if req == nil {
 		return nil, &ConnectInvalidError{Message: "connect request is required"}
-	}
-	req.SourceID = strings.TrimSpace(req.SourceID)
-	if req.SourceID == "" {
-		return nil, &ConnectInvalidError{Message: "source_id is required"}
 	}
 
 	conn, releaseConn, err := s.acquireUserUploadConn(ctx, actor.UserID)
@@ -55,7 +50,7 @@ func (s *SyncService) Connect(ctx context.Context, actor Actor, req *ConnectRequ
 			return nil
 		case scopeStateUninitialized:
 			if req.HasLocalPendingRows {
-				next, err := transitionScopeToInitializing(ctx, tx, actor.UserID, req.SourceID, s.initializationLeaseTTL())
+				next, err := transitionScopeToInitializing(ctx, tx, actor.UserID, actor.SourceID, s.initializationLeaseTTL())
 				if err != nil {
 					return err
 				}
@@ -66,15 +61,15 @@ func (s *SyncService) Connect(ctx context.Context, actor Actor, req *ConnectRequ
 				}
 				return nil
 			}
-			if err := transitionScopeToInitialized(ctx, tx, actor.UserID, req.SourceID); err != nil {
+			if err := transitionScopeToInitialized(ctx, tx, actor.UserID, actor.SourceID); err != nil {
 				return err
 			}
 			resp = &ConnectResponse{Resolution: "initialize_empty"}
 			return nil
 		case scopeStateInitializing:
-			if state.InitializerSourceID == req.SourceID {
+			if state.InitializerSourceID == actor.SourceID {
 				if !req.HasLocalPendingRows {
-					if err := transitionScopeToInitialized(ctx, tx, actor.UserID, req.SourceID); err != nil {
+					if err := transitionScopeToInitialized(ctx, tx, actor.UserID, actor.SourceID); err != nil {
 						return err
 					}
 					resp = &ConnectResponse{Resolution: "initialize_empty"}

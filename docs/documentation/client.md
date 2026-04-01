@@ -12,6 +12,10 @@ permalink: /documentation/client/
 not attach a user and it does not validate or persist a caller-owned source ID. Call
 `Open(ctx, sourceID)` on launch and `Attach(ctx, userID)` after sign-in.
 
+Authenticated sync requests sent by `oversqlite` carry the current `sourceID` through the
+`Oversync-Source-ID` header. The auth token remains host-owned and does not need to encode source
+identity.
+
 ## SQLite State
 
 - `_sync_dirty_rows`: one coalesced local dirty row per structured key
