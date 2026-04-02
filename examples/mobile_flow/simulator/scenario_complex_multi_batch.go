@@ -19,9 +19,9 @@ import (
 type ComplexMultiBatchScenario struct {
 	*BaseScenario
 	testData        *ComplexTestData
-	laptopApp       *MobileApp // For download testing with different source ID
-	phoneSourceID   string     // Generated once and reused
-	laptopSourceID  string     // Generated once and reused
+	laptopApp       *MobileApp // For download testing with a different device identity.
+	phoneDeviceID   string     // Generated once and reused.
+	laptopDeviceID  string     // Generated once and reused.
 	stableBundleSeq int64      // Durable server bundle checkpoint after laptop uploads
 }
 
@@ -47,7 +47,7 @@ type ComplexTestData struct {
 
 // AppConfig holds common configuration for creating mobile apps
 type AppConfig struct {
-	SourceID          string
+	DeviceID          string
 	DeviceName        string
 	UserID            string
 	PullLimit         int
@@ -130,11 +130,11 @@ func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 		logger.Info("🔧 Setting up mobile app with incremental pull limits for high-volume sync testing")
 	}
 
-	// Generate source IDs once and store for reuse throughout scenario
-	s.phoneSourceID = fmt.Sprintf("phone-%s", s.config.UserID)
-	s.laptopSourceID = fmt.Sprintf("laptop-%s", s.config.UserID)
+	// Generate device identities once and store them for reuse throughout the scenario.
+	s.phoneDeviceID = fmt.Sprintf("phone-%s", s.config.UserID)
+	s.laptopDeviceID = fmt.Sprintf("laptop-%s", s.config.UserID)
 	if verboseLog {
-		logger.Info("📱 Generated source IDs", "phone_source_id", s.phoneSourceID, "laptop_source_id", s.laptopSourceID)
+		logger.Info("📱 Generated device identities", "phone_device_id", s.phoneDeviceID, "laptop_device_id", s.laptopDeviceID)
 	}
 
 	// Create a mobile app tuned for a large local dirty set plus incremental pulls.
@@ -160,22 +160,22 @@ func (s *ComplexMultiBatchScenario) Setup(ctx context.Context) error {
 // createAppWithSmallBatches creates a mobile app with intentionally small push/pull chunk sizes.
 func (s *ComplexMultiBatchScenario) createAppWithSmallBatches(scenarioConfig *config.ScenarioConfig) (*MobileApp, error) {
 	appConfig := &AppConfig{
-		SourceID:          s.phoneSourceID,
+		DeviceID:          s.phoneDeviceID,
 		DeviceName:        "FK Test Device",
 		UserID:            scenarioConfig.UserID,
 		PullLimit:         pullLimit,
 		PushLimit:         pushLimit,
 		SnapshotChunkRows: snapshotChunkRows,
 	}
-	return s.createMobileApp(appConfig, s.phoneSourceID)
+	return s.createMobileApp(appConfig, s.phoneDeviceID)
 }
 
 // createMobileApp creates a mobile app with the given configuration (DRY helper)
-func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePrefix string) (*MobileApp, error) {
+func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, devicePrefix string) (*MobileApp, error) {
 	simCfg := s.simulator.GetConfig()
 
 	// Create unique database file path using user ID and timestamp to prevent collisions in parallel execution
-	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", sourcePrefix, config.UserID, time.Now().UnixNano()))
+	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", devicePrefix, config.UserID, time.Now().UnixNano()))
 
 	// Force both push-session chunking and incremental pull replay so the scenario exercises
 	// multi-chunk upload/download paths under a large FK-connected working set.
@@ -192,7 +192,7 @@ func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, sourcePre
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           config.UserID,
-		SourceID:         config.SourceID,
+		DeviceID:         config.DeviceID,
 		DeviceName:       config.DeviceName,
 		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: oversqliteConfig,
@@ -327,7 +327,7 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 		logger.Info("📊 Pending changes after upload", "count", pendingCountAfter)
 	}
 
-	// Step 5: Test download sync with "phone" source ID (should get 0 records)
+	// Step 5: Test download sync with the phone device identity (should get 0 records)
 	if client := s.app.currentClient(); client != nil {
 		client.ResumeDownloads()
 		if verboseLog {
@@ -336,13 +336,13 @@ func (s *ComplexMultiBatchScenario) Execute(ctx context.Context) error {
 	}
 	err = s.testDownloadWithPhoneSourceID(ctx, logger)
 	if err != nil {
-		return fmt.Errorf("failed to test download with phone source ID: %w", err)
+		return fmt.Errorf("failed to test download with phone device identity: %w", err)
 	}
 
-	// Step 6: Test download sync with "laptop" source ID (should get all data)
+	// Step 6: Test download sync with the laptop device identity (should get all data)
 	err = s.testDownloadWithLaptopSourceID(ctx, logger)
 	if err != nil {
-		return fmt.Errorf("failed to test download with laptop source ID: %w", err)
+		return fmt.Errorf("failed to test download with laptop device identity: %w", err)
 	}
 
 	// Multi-Stage Sync Testing
@@ -399,23 +399,23 @@ func (s *ComplexMultiBatchScenario) Verify(ctx context.Context, verifier *Databa
 	return nil
 }
 
-// testDownloadWithPhoneSourceID tests download sync with phone's source ID (should get 0 records)
+// testDownloadWithPhoneSourceID tests download sync with the phone device identity (should get 0 records).
 func (s *ComplexMultiBatchScenario) testDownloadWithPhoneSourceID(ctx context.Context, logger *slog.Logger) error {
 	if verboseLog {
-		logger.Info("📥 Testing download sync with phone source ID", "source_id", s.phoneSourceID)
-		logger.Info("📊 Expected result: 0 records (data already synced from this source)")
+		logger.Info("📥 Testing download sync with phone device identity", "device_id", s.phoneDeviceID)
+		logger.Info("📊 Expected result: 0 records (data already synced from this device)")
 	}
 
 	// Perform download sync - should get 0 records since we uploaded from this phone
 	applied, nextAfter, err := s.app.pullToStable(ctx)
 	if err != nil {
-		logger.Warn("❌ Download with phone source ID failed", "error", err.Error())
-		return fmt.Errorf("download sync with phone source ID failed: %w", err)
+		logger.Warn("❌ Download with phone device identity failed", "error", err.Error())
+		return fmt.Errorf("download sync with phone device identity failed: %w", err)
 	}
 
 	if verboseLog {
 		logger.Info("📊 Download results", "applied", applied, "next_after", nextAfter)
-		logger.Info("✅ Download sync with phone source ID completed", "source_id", s.phoneSourceID)
+		logger.Info("✅ Download sync with phone device identity completed", "device_id", s.phoneDeviceID)
 		logger.Info("📊 Result: No new records downloaded (expected behavior)")
 	}
 	return nil
@@ -424,11 +424,11 @@ func (s *ComplexMultiBatchScenario) testDownloadWithPhoneSourceID(ctx context.Co
 // testDownloadWithLaptopSourceID tests download sync with laptop downloading from phone's data
 func (s *ComplexMultiBatchScenario) testDownloadWithLaptopSourceID(ctx context.Context, logger *slog.Logger) error {
 	if verboseLog {
-		logger.Info("📥 Testing laptop download from phone's data", "laptop_source_id", s.laptopSourceID, "phone_source_id", s.phoneSourceID)
+		logger.Info("📥 Testing laptop download from phone data", "laptop_device_id", s.laptopDeviceID, "phone_device_id", s.phoneDeviceID)
 		logger.Info("📊 Expected result: All 105 records (5 users + 100 posts)")
 	}
 
-	// Create a new mobile app with laptop source ID for download testing
+	// Create a new mobile app with the laptop device identity for download testing.
 	err := s.createLaptopApp(ctx, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create laptop app: %w", err)
@@ -447,19 +447,19 @@ func (s *ComplexMultiBatchScenario) testDownloadWithLaptopSourceID(ctx context.C
 	}
 
 	if verboseLog {
-		logger.Info("✅ Laptop download from phone's data completed successfully", "laptop_source_id", s.laptopSourceID)
+		logger.Info("✅ Laptop download from phone data completed successfully", "laptop_device_id", s.laptopDeviceID)
 	}
 	return nil
 }
 
-// createLaptopApp creates a new mobile app with "laptop" source ID for download testing
+// createLaptopApp creates a new mobile app with the laptop device identity for download testing.
 func (s *ComplexMultiBatchScenario) createLaptopApp(ctx context.Context, logger *slog.Logger) error {
 	if verboseLog {
 		logger.Info("💻 Creating laptop app for download testing")
 	}
 
 	appConfig := &AppConfig{
-		SourceID:          s.laptopSourceID,
+		DeviceID:          s.laptopDeviceID,
 		DeviceName:        "Laptop Test Device",
 		UserID:            s.app.config.UserID,
 		PullLimit:         pullLimit,
@@ -467,7 +467,7 @@ func (s *ComplexMultiBatchScenario) createLaptopApp(ctx context.Context, logger 
 		SnapshotChunkRows: snapshotChunkRows,
 	}
 
-	laptopApp, err := s.createMobileApp(appConfig, s.laptopSourceID)
+	laptopApp, err := s.createMobileApp(appConfig, s.laptopDeviceID)
 	if err != nil {
 		return fmt.Errorf("failed to create laptop app: %w", err)
 	}
@@ -481,7 +481,7 @@ func (s *ComplexMultiBatchScenario) createLaptopApp(ctx context.Context, logger 
 	// Store the laptop app for later use
 	s.laptopApp = laptopApp
 	if verboseLog {
-		logger.Info("✅ Laptop app created successfully", "source_id", s.laptopSourceID)
+		logger.Info("✅ Laptop app created successfully", "device_id", s.laptopDeviceID)
 	}
 	return nil
 }

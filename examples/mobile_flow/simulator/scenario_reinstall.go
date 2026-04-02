@@ -53,7 +53,6 @@ func (s *ReinstallScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("failed to stabilize original app after seed push: %w", err)
 	}
 
-	originalSourceID := s.app.config.SourceID
 	if err := s.app.close(); err != nil {
 		return fmt.Errorf("failed to close original app before reinstall: %w", err)
 	}
@@ -65,10 +64,6 @@ func (s *ReinstallScenario) Execute(ctx context.Context) error {
 	}
 	s.app = reinstalled
 	s.simulator.currentApp = s.app
-	s.app.config.SourceID = originalSourceID
-	if s.app.session != nil {
-		s.app.session.SetSourceID(originalSourceID)
-	}
 
 	if err := s.app.onLaunch(ctx); err != nil {
 		return fmt.Errorf("failed to launch reinstalled app: %w", err)

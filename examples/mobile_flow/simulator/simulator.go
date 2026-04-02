@@ -194,9 +194,9 @@ func (s *Simulator) registerScenarios() {
 
 // CreateMobileApp creates a new mobile app instance for simulation
 func (s *Simulator) CreateMobileApp(scenarioConfig *config.ScenarioConfig) (*MobileApp, error) {
-	// Create database file path based on user and source ID
+	// Create database file path based on user and device identity.
 	safeUserID := strings.ReplaceAll(scenarioConfig.UserID, "-", "_")
-	safeSourceID := strings.ReplaceAll(scenarioConfig.SourceID, "-", "_")
+	safeDeviceID := strings.ReplaceAll(scenarioConfig.DeviceID, "-", "_")
 
 	var dbFile string
 	if scenarioConfig.CleanDatabase {
@@ -204,12 +204,12 @@ func (s *Simulator) CreateMobileApp(scenarioConfig *config.ScenarioConfig) (*Mob
 		safeName := strings.ReplaceAll(scenarioConfig.Name, " ", "_")
 		safeName = strings.ReplaceAll(safeName, "/", "_")
 		dbFile = filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db",
-			safeName, safeSourceID, time.Now().UnixNano()))
+			safeName, safeDeviceID, time.Now().UnixNano()))
 		s.logger.Debug("Creating clean database", "file", dbFile)
 	} else {
 		// Use persistent database file for scenario continuity
 		dbFile = filepath.Join("/tmp", fmt.Sprintf("mobile_flow_persistent_%s_%s.db",
-			safeUserID, safeSourceID))
+			safeUserID, safeDeviceID))
 		s.logger.Debug("Using persistent database for continuity", "file", dbFile)
 	}
 
@@ -228,7 +228,7 @@ func (s *Simulator) CreateMobileApp(scenarioConfig *config.ScenarioConfig) (*Mob
 		DatabaseFile:     dbFile,
 		ServerURL:        s.config.ServerURL,
 		UserID:           scenarioConfig.UserID,
-		SourceID:         scenarioConfig.SourceID,
+		DeviceID:         scenarioConfig.DeviceID,
 		DeviceName:       scenarioConfig.DeviceName,
 		JWTSecret:        s.config.JWTSecret,
 		OversqliteConfig: oversqliteConfig,
@@ -267,11 +267,11 @@ func (s *Simulator) GetReporter() *Reporter {
 }
 
 // SetUserConfig overrides user configuration for parallel testing
-func (s *Simulator) SetUserConfig(userID, sourceID string) {
-	// Update scenario configurations to use unique user/source IDs
+func (s *Simulator) SetUserConfig(userID, deviceID string) {
+	// Update scenario configurations to use unique user/device identities.
 	for _, scenario := range s.scenarios {
 		if configurable, ok := scenario.(interface{ SetUserConfig(string, string) }); ok {
-			configurable.SetUserConfig(userID, sourceID)
+			configurable.SetUserConfig(userID, deviceID)
 		}
 	}
 }

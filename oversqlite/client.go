@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -30,7 +31,6 @@ type Client struct {
 	DB         *sql.DB
 	BaseURL    string
 	Token      func(context.Context) (string, error) // returns JWT
-	SourceID   string
 	UserID     string
 	Resolver   Resolver
 	HTTP       *http.Client
@@ -54,6 +54,8 @@ type Client struct {
 	dbOwnershipKey          string
 	pendingInitializationID string
 	sessionConnected        bool
+	sourceID                string
+	sourceIDGenerator       func() string
 }
 
 // DatabaseAlreadyOwnedError indicates that another oversqlite client already owns the same SQLite DB.
@@ -398,7 +400,6 @@ func NewClient(db *sql.DB, baseURL string, tok func(ctx context.Context) (string
 		DB:             db,
 		BaseURL:        baseURL,
 		Token:          tok,
-		SourceID:       "",
 		UserID:         "",
 		Resolver:       &ServerWinsResolver{},
 		HTTP:           &http.Client{Timeout: 120 * time.Second}, // Increased for large batch uploads
@@ -409,6 +410,10 @@ func NewClient(db *sql.DB, baseURL string, tok func(ctx context.Context) (string
 		tableOrder:     validatedTables.tableOrder,
 		tableInfo:      tableInfoProvider,
 		dbOwnershipKey: identity.Key,
+		sourceID:       "",
+		sourceIDGenerator: func() string {
+			return uuid.NewString()
+		},
 	}
 
 	// Create triggers for all registered tables (after sync tables are created)
@@ -1011,16 +1016,8 @@ func (c *Client) Sync(ctx context.Context) (SyncReport, error) {
 	}, nil
 }
 
-// RebuildMode selects whether Rebuild keeps or rotates the caller-owned source identity.
-type RebuildMode string
-
-const (
-	RebuildKeepSource   RebuildMode = "keep_source"
-	RebuildRotateSource RebuildMode = "rotate_source"
-)
-
 // Rebuild rebuilds the managed tables from the current server snapshot.
-func (c *Client) Rebuild(ctx context.Context, mode RebuildMode, newSourceID string) (RemoteSyncReport, error) {
+func (c *Client) Rebuild(ctx context.Context) (RemoteSyncReport, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
 		return RemoteSyncReport{}, err
 	}
@@ -1029,27 +1026,10 @@ func (c *Client) Rebuild(ctx context.Context, mode RebuildMode, newSourceID stri
 	if err != nil {
 		return RemoteSyncReport{}, err
 	}
-	switch mode {
-	case RebuildKeepSource:
-		if sourceRecoveryErr != nil {
-			return RemoteSyncReport{}, sourceRecoveryErr
-		}
-		return c.rebuildKeepSourceLocked(ctx)
-	case RebuildRotateSource:
-		newSourceID = strings.TrimSpace(newSourceID)
-		if newSourceID == "" {
-			return RemoteSyncReport{}, fmt.Errorf("newSourceID must be provided for RebuildRotateSource")
-		}
-		if sourceRecoveryErr != nil {
-			return c.rebuildSourceRecoveryLocked(ctx, newSourceID)
-		}
-		if err := c.ensureRebuildPreconditionsLocked(ctx); err != nil {
-			return RemoteSyncReport{}, err
-		}
-		return c.rebuildFromSnapshotLocked(ctx, true, newSourceID)
-	default:
-		return RemoteSyncReport{}, fmt.Errorf("unsupported rebuild mode %q", mode)
+	if sourceRecoveryErr != nil {
+		return c.rebuildSourceRecoveryLocked(ctx)
 	}
+	return c.rebuildKeepSourceLocked(ctx)
 }
 
 // SerializeRow loads a row by (table, pk) and serializes it to JSON payload for upload

@@ -8,7 +8,7 @@ the CLI as partial scaffolds. This README distinguishes the two.
 
 ## What It Proves
 
-- implemented scenarios exercise `PushPending`, `PullToStable`, `Rebuild(ctx, RebuildKeepSource, "")`, and `Rebuild(ctx, RebuildRotateSource, newSourceID)`
+- implemented scenarios exercise `PushPending`, `PullToStable`, and `Rebuild(ctx)`
 - the simulator consumes rich `oversqlite` results instead of treating lifecycle/sync operations as
   error-only calls
 - dirty local state blocks pull instead of being silently rebased
@@ -75,9 +75,9 @@ Useful flags:
 - `bundle-fk-atomicity`
   - self-reference, cycle, and cascade visibility under committed bundle semantics
 - `reinstall`
-  - reinstall-style rebuild on the same source identity
+  - reinstall-style rebuild with internally managed source identity
 - `device-replacement`
-  - replacement-device rebuild on a fresh source identity for the same user
+  - replacement-device rebuild on a fresh app install for the same user
 - `complex-multi-batch`
   - forces multi-chunk push upload with a low per-chunk `UploadLimit`, then checks pre-commit and
     post-commit restart recovery across scalar and BLOB-bearing tables

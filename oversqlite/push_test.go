@@ -605,14 +605,11 @@ func TestPushPending_CreateHistoryPrunedRequiresSourceRecoveryAndRotatePreserves
 	require.ErrorAs(t, err, &recoveryErr)
 	require.Equal(t, SourceRecoveryHistoryPruned, recoveryErr.Code)
 
-	_, err = client.Rebuild(ctx, RebuildKeepSource, "")
-	require.ErrorAs(t, err, &recoveryErr)
-	require.Equal(t, SourceRecoveryHistoryPruned, recoveryErr.Code)
-
-	rotateReport, err := client.Rebuild(ctx, RebuildRotateSource, "rotated-device")
+	client.sourceIDGenerator = func() string { return "rotated-device" }
+	report, err := client.Rebuild(ctx)
 	require.NoError(t, err)
-	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, rotateReport.Outcome)
-	require.Equal(t, "rotated-device", rotateReport.RotatedSourceID)
+	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
+	require.Equal(t, "rotated-device", client.sourceID)
 
 	outbox = requireOutboxBundle(t, db)
 	require.Equal(t, outboxStatePrepared, outbox.State)
@@ -625,8 +622,8 @@ func TestPushPending_CreateHistoryPrunedRequiresSourceRecoveryAndRotatePreserves
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&localCount))
 	require.Equal(t, 1, localCount)
 
-	report := mustPushPending(t, client, ctx)
-	require.Equal(t, PushOutcomeCommitted, report.Outcome)
+	pushReport := mustPushPending(t, client, ctx)
+	require.Equal(t, PushOutcomeCommitted, pushReport.Outcome)
 	require.Len(t, base.chunkRequests, 1)
 
 	sourceID, nextSourceBundleID, lastBundleSeqSeen := requireBundleState(t, db)
@@ -683,7 +680,7 @@ func TestPushPending_CreateSourceSequenceOutOfOrderPersistsSourceRecoveryAcrossR
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 	restarted.HTTP = client.HTTP
-	mustOpen(t, restarted, ctx, "bundle-device")
+	mustOpen(t, restarted, ctx)
 	result, err := restarted.Attach(ctx, "bundle-user")
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, result.Status)
@@ -700,9 +697,36 @@ func TestPushPending_CreateSourceSequenceOutOfOrderPersistsSourceRecoveryAcrossR
 	require.ErrorAs(t, err, &recoveryErr)
 	require.Equal(t, SourceRecoverySequenceOutOfOrder, recoveryErr.Code)
 
-	_, err = restarted.Rebuild(ctx, RebuildKeepSource, "")
-	require.ErrorAs(t, err, &recoveryErr)
-	require.Equal(t, SourceRecoverySequenceOutOfOrder, recoveryErr.Code)
+	restarted.sourceIDGenerator = func() string { return "restarted-rotated-device" }
+	restarted.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sync/snapshot-sessions":
+			return jsonResponse(oversync.SnapshotSession{
+				SnapshotID:        "sequence-out-of-order-recovery",
+				SnapshotBundleSeq: 4,
+				RowCount:          0,
+				ExpiresAt:         "2030-01-01T00:00:00Z",
+			}), nil
+		case r.Method == http.MethodGet && r.URL.Path == "/sync/snapshot-sessions/sequence-out-of-order-recovery":
+			return jsonResponse(oversync.SnapshotChunkResponse{
+				SnapshotID:        "sequence-out-of-order-recovery",
+				SnapshotBundleSeq: 4,
+				Rows:              nil,
+				NextRowOrdinal:    0,
+				HasMore:           false,
+			}), nil
+		case r.Method == http.MethodDelete && r.URL.Path == "/sync/snapshot-sessions/sequence-out-of-order-recovery":
+			return jsonResponse(map[string]any{"status": "deleted"}), nil
+		default:
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	})}
+
+	report, err := restarted.Rebuild(ctx)
+	require.NoError(t, err)
+	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
+	require.Equal(t, "restarted-rotated-device", restarted.sourceID)
+	require.Equal(t, operationKindNone, requireOperationKind(t, db))
 }
 
 func TestPushPending_CommitSourceSequenceChangedRequiresSourceRecovery(t *testing.T) {
@@ -1369,7 +1393,7 @@ func TestPushPending_ReplaysAcceptedBundleAfterCrashBeforeDurableApply(t *testin
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	restarted.HTTP = &http.Client{Transport: server}
-	mustOpen(t, restarted, ctx, client.SourceID)
+	mustOpen(t, restarted, ctx)
 	result, err := restarted.Attach(ctx, "bundle-user")
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, result.Status)
@@ -1445,7 +1469,7 @@ func TestPushPending_ReuploadsFrozenOutboundSnapshotAfterCrashBeforeCommit(t *te
 	require.NoError(t, err)
 	restarted.config.UploadLimit = 2
 	restarted.HTTP = &http.Client{Transport: server}
-	mustOpen(t, restarted, ctx, client.SourceID)
+	mustOpen(t, restarted, ctx)
 	result, err := restarted.Attach(ctx, "bundle-user")
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, result.Status)
@@ -1653,7 +1677,7 @@ func TestPushPending_AuthoritativeReplayDoesNotGenerateDirtyRowsAndCapturesLater
 	}}
 	committed := &committedPushBundle{
 		BundleSeq:      1,
-		SourceID:       client.SourceID,
+		SourceID:       client.sourceID,
 		SourceBundleID: snapshot.SourceBundleID,
 		RowCount:       int64(len(committedRows)),
 		BundleHash:     mustBundleHash(t, committedRows),
@@ -1707,7 +1731,7 @@ func TestPushPending_AuthoritativeReplayRollbackDoesNotLeakApplyMode(t *testing.
 	}}
 	committed := &committedPushBundle{
 		BundleSeq:      1,
-		SourceID:       client.SourceID,
+		SourceID:       client.sourceID,
 		SourceBundleID: snapshot.SourceBundleID,
 		RowCount:       int64(len(committedRows)),
 		BundleHash:     mustBundleHash(t, committedRows),
@@ -1745,7 +1769,7 @@ func TestCompareCommittedBundleToCanonicalOutbox_IgnoresEquivalentRowOrder(t *te
 		UPDATE _sync_outbox_bundle
 		SET state = 'prepared', source_id = ?, source_bundle_id = 5, row_count = 2, canonical_request_hash = 'hash'
 		WHERE singleton_key = 1
-	`, client.SourceID)
+	`, client.sourceID)
 	require.NoError(t, err)
 	_, err = db.Exec(`
 		INSERT INTO _sync_outbox_rows (
@@ -1780,7 +1804,7 @@ func TestCompareCommittedBundleToCanonicalOutbox_IgnoresEquivalentRowOrder(t *te
 
 	err = client.compareCommittedBundleToCanonicalOutbox(ctx, tx, &committedPushBundle{
 		BundleSeq:        11,
-		SourceID:         client.SourceID,
+		SourceID:         client.sourceID,
 		SourceBundleID:   5,
 		RowCount:         2,
 		BundleHash:       mustBundleHash(t, committedRows),
@@ -1831,7 +1855,7 @@ func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T
 		}
 		committed := &committedPushBundle{
 			BundleSeq:      1,
-			SourceID:       client.SourceID,
+			SourceID:       client.sourceID,
 			SourceBundleID: snapshot.SourceBundleID,
 			RowCount:       int64(len(committedRows)),
 			BundleHash:     mustBundleHash(t, committedRows),
@@ -1899,7 +1923,7 @@ func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T
 		}
 		committed := &committedPushBundle{
 			BundleSeq:      1,
-			SourceID:       client.SourceID,
+			SourceID:       client.sourceID,
 			SourceBundleID: snapshot.SourceBundleID,
 			RowCount:       int64(len(committedRows)),
 			BundleHash:     mustBundleHash(t, committedRows),
@@ -1970,14 +1994,14 @@ func TestClient_RejectsOverlappingSyncOperations(t *testing.T) {
 		{
 			name: "hydrate rejects overlap",
 			op: func() error {
-				_, err := client.Rebuild(ctx, RebuildKeepSource, "")
+				_, err := client.Rebuild(ctx)
 				return err
 			},
 		},
 		{
 			name: "recover rejects overlap",
 			op: func() error {
-				_, err := client.Rebuild(ctx, RebuildRotateSource, newTestSourceID())
+				_, err := client.Rebuild(ctx)
 				return err
 			},
 		},
@@ -2449,7 +2473,7 @@ func TestPushPending_RebasesSameKeyLocalIntentAfterRestartBeforeReplay(t *testin
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 			restarted.HTTP = &http.Client{Transport: server}
-			mustOpen(t, restarted, ctx, client.SourceID)
+			mustOpen(t, restarted, ctx)
 			result, err := restarted.Attach(ctx, "bundle-user")
 			require.NoError(t, err)
 			require.Equal(t, AttachStatusConnected, result.Status)

@@ -71,8 +71,8 @@ func (s *ConflictsScenario) Setup(ctx context.Context) error {
 	}
 
 	sourceBase := fmt.Sprintf("device-%s", s.userID)
-	if s.config != nil && s.config.SourceID != "" && s.config.SourceID != "device-unknown-001" {
-		sourceBase = s.config.SourceID
+	if s.config != nil && s.config.DeviceID != "" && s.config.DeviceID != "device-unknown-001" {
+		sourceBase = s.config.DeviceID
 	}
 	s.device1ID = sourceBase + "-d1"
 	s.device2ID = sourceBase + "-d2"
@@ -121,7 +121,7 @@ func (s *ConflictsScenario) createDeviceApp(scenarioConfig *config.ScenarioConfi
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           scenarioConfig.UserID,
-		SourceID:         deviceID,
+		DeviceID:         deviceID,
 		DeviceName:       deviceName,
 		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: oversqliteConfig,

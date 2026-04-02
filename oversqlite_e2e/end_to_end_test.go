@@ -34,7 +34,7 @@ func TestEndToEnd_RebuildKeepSourcePullAndServerCascadeOnCategories(t *testing.T
 	require.NoError(t, err)
 
 	mustPushPendingE2E(t, clientA, ctx)
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -157,7 +157,7 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 	}, restartedConfig)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, restarted.Close()) }()
-	mustOpenE2E(t, restarted, ctx, clientB.SourceID)
+	mustOpenE2E(t, restarted, ctx, "")
 	restartedConnect, err := restarted.Attach(ctx, userID)
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.AttachStatusConnected, restartedConnect.Status)
@@ -254,7 +254,7 @@ func TestEndToEnd_PushSessionCreateTransportRetryLeavesClientRecoverable(t *test
 
 	clientA.HTTP = &http.Client{Transport: baseTransport}
 	mustPushPendingE2E(t, clientA, ctx)
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 }
 
 func TestEndToEnd_StaleFollowerConvergesAfterChunkedPushAndPruneFallback(t *testing.T) {
@@ -325,7 +325,7 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Grace", "grace@example.com")
 	require.NoError(t, err)
 	mustPushPendingE2E(t, clientA, ctx)
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -393,7 +393,7 @@ func TestEndToEnd_PullRetryPruneFallbackAndRebuild(t *testing.T) {
 
 	userOne := uuid.NewString()
 	insertUser(userOne, "Ada")
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 
 	userTwo := uuid.NewString()
 	insertUser(userTwo, "Grace")
@@ -432,7 +432,7 @@ func TestEndToEnd_PullRetryPruneFallbackAndRebuild(t *testing.T) {
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, lastBundleSeq, int64(3))
 
-	oldSourceID := clientB.SourceID
+	oldSourceID := requireCurrentSourceIDE2E(t, clientB, ctx)
 	tx := mustBeginTx(t, dbB)
 	_, err = tx.ExecContext(ctx, `UPDATE _sync_apply_state SET apply_mode = 1 WHERE singleton_key = 1`)
 	require.NoError(t, err)
@@ -442,8 +442,8 @@ func TestEndToEnd_PullRetryPruneFallbackAndRebuild(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildRotateSource, newE2ESourceID())
-	require.NotEqual(t, oldSourceID, clientB.SourceID)
+	mustRebuildE2E(t, clientB, ctx)
+	require.Equal(t, oldSourceID, requireCurrentSourceIDE2E(t, clientB, ctx))
 
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&localCount))
 	require.Equal(t, 3, localCount)
@@ -477,7 +477,7 @@ func TestEndToEnd_LargeFKConnectedHydrateUsesChunkedSnapshot(t *testing.T) {
 	mustPushPendingE2E(t, clientA, ctx)
 
 	clientB.ResetSnapshotTransferDiagnostics()
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 	stats := clientB.SnapshotTransferDiagnostics()
 	require.Greater(t, stats.SessionsCreated, int64(0))
 	require.Greater(t, stats.ChunksFetched, int64(1))
@@ -518,7 +518,7 @@ func TestEndToEnd_RebuildRetryClearsStaleStageAndStartsNewSession(t *testing.T) 
 		return baseTransport.RoundTrip(r)
 	})}
 
-	_, err := clientB.Rebuild(ctx, oversqlite.RebuildKeepSource, "")
+	_, err := clientB.Rebuild(ctx)
 	require.Error(t, err)
 	require.Greater(t, snapshotStageCount(t, dbB), 0)
 
@@ -528,7 +528,7 @@ func TestEndToEnd_RebuildRetryClearsStaleStageAndStartsNewSession(t *testing.T) 
 
 	clientB.HTTP = &http.Client{Timeout: 120 * time.Second}
 	clientB.ResetSnapshotTransferDiagnostics()
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 	require.Equal(t, 0, snapshotStageCount(t, dbB))
 
 	stats := clientB.SnapshotTransferDiagnostics()

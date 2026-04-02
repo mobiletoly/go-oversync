@@ -301,14 +301,14 @@ func TestPullAndRebuild_RejectWhilePushOutboundReplayIsPending(t *testing.T) {
 		{
 			name: "hydrate rejects pending outbound replay",
 			op: func(client *Client, ctx context.Context) error {
-				_, err := client.Rebuild(ctx, RebuildKeepSource, "")
+				_, err := client.Rebuild(ctx)
 				return err
 			},
 		},
 		{
 			name: "recover rejects pending outbound replay",
 			op: func(client *Client, ctx context.Context) error {
-				_, err := client.Rebuild(ctx, RebuildRotateSource, newTestSourceID())
+				_, err := client.Rebuild(ctx)
 				return err
 			},
 		},
@@ -328,7 +328,7 @@ func TestPullAndRebuild_RejectWhilePushOutboundReplayIsPending(t *testing.T) {
 				UPDATE _sync_outbox_bundle
 				SET state = 'prepared', source_id = ?, source_bundle_id = 1, row_count = 1, canonical_request_hash = 'hash'
 				WHERE singleton_key = 1
-			`, client.SourceID)
+			`, client.sourceID)
 			require.NoError(t, err)
 			_, err = db.Exec(`
 				INSERT INTO _sync_outbox_rows (
@@ -811,7 +811,7 @@ func TestRebuildKeepSource_RebuildsFromSnapshotWithDeferredFKs(t *testing.T) {
 		return nil, io.EOF
 	})}
 
-	mustRebuild(t, client, ctx, RebuildKeepSource, "")
+	mustRebuild(t, client, ctx)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
@@ -866,7 +866,7 @@ func TestRebuildKeepSource_RejectsMalformedSnapshotResponse(t *testing.T) {
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildKeepSource, "")
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to decode snapshot chunk response")
 
@@ -912,7 +912,7 @@ func TestRebuildKeepSource_RejectsSnapshotResponseMissingBundleSeq(t *testing.T)
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildKeepSource, "")
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "snapshot_bundle_seq")
 
@@ -925,7 +925,7 @@ func TestRebuildKeepSource_RejectsSnapshotResponseMissingBundleSeq(t *testing.T)
 	require.Equal(t, int64(0), lastBundleSeq)
 }
 
-func TestRebuildRotateSource_RotatesSourceIDAndResetsBundleState(t *testing.T) {
+func TestRebuild_KeepsManagedSourceAndBundleStateOutsideSourceRecovery(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -940,7 +940,7 @@ func TestRebuildRotateSource_RotatesSourceIDAndResetsBundleState(t *testing.T) {
 		)
 	`)
 
-	originalSourceID := client.SourceID
+	originalSourceID := client.sourceID
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "stale", "Stale", "stale@example.com")
 	require.NoError(t, err)
 	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
@@ -1030,14 +1030,14 @@ func TestRebuildRotateSource_RotatesSourceIDAndResetsBundleState(t *testing.T) {
 		return nil, io.EOF
 	})}
 
-	mustRebuild(t, client, ctx, RebuildRotateSource, newTestSourceID())
-	require.NotEqual(t, originalSourceID, client.SourceID)
+	mustRebuild(t, client, ctx)
+	require.Equal(t, originalSourceID, client.sourceID)
 
 	sourceID, nextSourceBundleID, lastBundleSeq := requireBundleState(t, db)
 	var rebuildRequired int
 	require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1`).Scan(&rebuildRequired))
-	require.Equal(t, client.SourceID, sourceID)
-	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, client.sourceID, sourceID)
+	require.Equal(t, int64(5), nextSourceBundleID)
 	require.Equal(t, int64(9), lastBundleSeq)
 	require.Equal(t, 0, rebuildRequired)
 
@@ -1075,17 +1075,16 @@ func TestRebuildRequired_NormalSyncRejectsUntilRebuildClearsIt(t *testing.T) {
 		{
 			name: "rebuild keep_source clears rebuild_required",
 			rebuild: func(client *Client, ctx context.Context) error {
-				_, err := client.Rebuild(ctx, RebuildKeepSource, "")
+				_, err := client.Rebuild(ctx)
 				return err
 			},
 		},
 		{
 			name: "rebuild rotate_source clears rebuild_required",
 			rebuild: func(client *Client, ctx context.Context) error {
-				_, err := client.Rebuild(ctx, RebuildRotateSource, newTestSourceID())
+				_, err := client.Rebuild(ctx)
 				return err
 			},
-			expectRotation: true,
 		},
 	}
 
@@ -1098,7 +1097,7 @@ func TestRebuildRequired_NormalSyncRejectsUntilRebuildClearsIt(t *testing.T) {
 					email TEXT NOT NULL
 				)
 			`)
-			originalSourceID := client.SourceID
+			originalSourceID := client.sourceID
 
 			_, err := db.Exec(`UPDATE _sync_attachment_state SET rebuild_required = 1 WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID)
 			require.NoError(t, err)
@@ -1162,11 +1161,7 @@ func TestRebuildRequired_NormalSyncRejectsUntilRebuildClearsIt(t *testing.T) {
 			require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID).Scan(&rebuildRequired))
 			require.Equal(t, 0, rebuildRequired)
 
-			if tc.expectRotation {
-				require.NotEqual(t, originalSourceID, client.SourceID)
-			} else {
-				require.Equal(t, originalSourceID, client.SourceID)
-			}
+			require.Equal(t, originalSourceID, client.sourceID)
 
 			_, err = client.Sync(ctx)
 			require.NoError(t, err)
@@ -1256,7 +1251,7 @@ func TestRebuildKeepSource_MultiChunkDownloadStagesRowsBeforeFinalApply(t *testi
 		return nil, io.EOF
 	})}
 
-	mustRebuild(t, client, ctx, RebuildKeepSource, "")
+	mustRebuild(t, client, ctx)
 	require.Equal(t, 0, snapshotStageCount(t, db))
 
 	var count int
@@ -1360,7 +1355,7 @@ func TestRebuildKeepSource_ClearsStaleSnapshotStageBeforeNewAttempt(t *testing.T
 		return nil, io.EOF
 	})}
 
-	mustRebuild(t, client, ctx, RebuildKeepSource, "")
+	mustRebuild(t, client, ctx)
 	require.Equal(t, 0, snapshotStageCount(t, db))
 }
 
@@ -1415,7 +1410,7 @@ func TestRebuildKeepSource_PartialDownloadRestartClearsStageAndStartsFromZero(t 
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildKeepSource, "")
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
 	require.Equal(t, 1, snapshotStageCount(t, db))
 
@@ -1454,7 +1449,7 @@ func TestRebuildKeepSource_PartialDownloadRestartClearsStageAndStartsFromZero(t 
 		return nil, io.EOF
 	})}
 
-	mustRebuild(t, client, ctx, RebuildKeepSource, "")
+	mustRebuild(t, client, ctx)
 	require.True(t, secondAttemptStarted)
 	require.Equal(t, 0, snapshotStageCount(t, db))
 }
@@ -1548,7 +1543,7 @@ func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T)
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildKeepSource, "")
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "snapshot_session_expired")
 	require.Equal(t, 1, snapshotStageCount(t, db))
@@ -1563,7 +1558,7 @@ func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), lastBundleSeq)
 
-	mustRebuild(t, client, ctx, RebuildKeepSource, "")
+	mustRebuild(t, client, ctx)
 	require.True(t, secondAttemptStarted)
 	require.Equal(t, 0, snapshotStageCount(t, db))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
@@ -1665,7 +1660,7 @@ func TestRebuildKeepSource_SnapshotSessionNotFoundRetryRestoresData(t *testing.T
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildKeepSource, "")
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "snapshot_session_not_found")
 	require.Equal(t, 1, snapshotStageCount(t, db))
@@ -1680,7 +1675,7 @@ func TestRebuildKeepSource_SnapshotSessionNotFoundRetryRestoresData(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, int64(0), lastBundleSeq)
 
-	mustRebuild(t, client, ctx, RebuildKeepSource, "")
+	mustRebuild(t, client, ctx)
 	require.True(t, secondAttemptStarted)
 	require.Equal(t, 0, snapshotStageCount(t, db))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
@@ -1693,7 +1688,7 @@ func TestRebuildKeepSource_SnapshotSessionNotFoundRetryRestoresData(t *testing.T
 	require.Equal(t, int64(6), lastBundleSeq)
 }
 
-func TestRebuildRotateSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T) {
+func TestRebuild_SnapshotSessionExpiredRetryRestoresData(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -1703,7 +1698,7 @@ func TestRebuildRotateSource_SnapshotSessionExpiredRetryRestoresData(t *testing.
 		)
 	`)
 
-	originalSourceID := client.SourceID
+	originalSourceID := client.sourceID
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('stale', 'Stale', 'stale@example.com')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
@@ -1784,11 +1779,11 @@ func TestRebuildRotateSource_SnapshotSessionExpiredRetryRestoresData(t *testing.
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildRotateSource, newTestSourceID())
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "snapshot_session_expired")
 	require.Equal(t, 1, snapshotStageCount(t, db))
-	require.Equal(t, originalSourceID, client.SourceID)
+	require.Equal(t, originalSourceID, client.sourceID)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
@@ -1801,22 +1796,22 @@ func TestRebuildRotateSource_SnapshotSessionExpiredRetryRestoresData(t *testing.
 	require.Equal(t, int64(5), nextSourceBundleID)
 	require.Equal(t, int64(4), lastBundleSeq)
 
-	mustRebuild(t, client, ctx, RebuildRotateSource, newTestSourceID())
+	mustRebuild(t, client, ctx)
 	require.True(t, secondAttemptStarted)
 	require.Equal(t, 0, snapshotStageCount(t, db))
-	require.NotEqual(t, originalSourceID, client.SourceID)
+	require.Equal(t, originalSourceID, client.sourceID)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
 	require.Equal(t, 1, count)
 
 	sourceID, nextSourceBundleID, lastBundleSeq = readBundleClientState(t, db, client.UserID)
-	require.Equal(t, client.SourceID, sourceID)
-	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, client.sourceID, sourceID)
+	require.Equal(t, int64(5), nextSourceBundleID)
 	require.Equal(t, int64(9), lastBundleSeq)
 }
 
-func TestRebuildRotateSource_SnapshotSessionNotFoundRetryRestoresData(t *testing.T) {
+func TestRebuild_SnapshotSessionNotFoundRetryRestoresData(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -1826,7 +1821,7 @@ func TestRebuildRotateSource_SnapshotSessionNotFoundRetryRestoresData(t *testing
 		)
 	`)
 
-	originalSourceID := client.SourceID
+	originalSourceID := client.sourceID
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('stale', 'Stale', 'stale@example.com')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
@@ -1907,11 +1902,11 @@ func TestRebuildRotateSource_SnapshotSessionNotFoundRetryRestoresData(t *testing
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildRotateSource, newTestSourceID())
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "snapshot_session_not_found")
 	require.Equal(t, 1, snapshotStageCount(t, db))
-	require.Equal(t, originalSourceID, client.SourceID)
+	require.Equal(t, originalSourceID, client.sourceID)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
@@ -1924,18 +1919,18 @@ func TestRebuildRotateSource_SnapshotSessionNotFoundRetryRestoresData(t *testing
 	require.Equal(t, int64(5), nextSourceBundleID)
 	require.Equal(t, int64(4), lastBundleSeq)
 
-	mustRebuild(t, client, ctx, RebuildRotateSource, newTestSourceID())
+	mustRebuild(t, client, ctx)
 	require.True(t, secondAttemptStarted)
 	require.Equal(t, 0, snapshotStageCount(t, db))
-	require.NotEqual(t, originalSourceID, client.SourceID)
+	require.Equal(t, originalSourceID, client.sourceID)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
 	require.Equal(t, 1, count)
 
 	sourceID, nextSourceBundleID, lastBundleSeq = readBundleClientState(t, db, client.UserID)
-	require.Equal(t, client.SourceID, sourceID)
-	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, client.sourceID, sourceID)
+	require.Equal(t, int64(5), nextSourceBundleID)
 	require.Equal(t, int64(10), lastBundleSeq)
 }
 
@@ -1984,7 +1979,7 @@ func TestRebuildKeepSource_CheckpointUnchangedOnFailedFinalApply(t *testing.T) {
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildKeepSource, "")
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
 	require.Equal(t, 1, snapshotStageCount(t, db))
 
@@ -2003,7 +1998,7 @@ func TestRebuildRotateSource_SourceIDDoesNotRotateOnFailedFinalApply(t *testing.
 		)
 	`)
 
-	originalSourceID := client.SourceID
+	originalSourceID := client.sourceID
 	_, err := db.Exec(`DELETE FROM _sync_dirty_rows`)
 	require.NoError(t, err)
 	setCurrentSourceBundleState(t, db, 5, 4)
@@ -2040,9 +2035,9 @@ func TestRebuildRotateSource_SourceIDDoesNotRotateOnFailedFinalApply(t *testing.
 		return nil, io.EOF
 	})}
 
-	_, err = client.Rebuild(ctx, RebuildRotateSource, newTestSourceID())
+	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
-	require.Equal(t, originalSourceID, client.SourceID)
+	require.Equal(t, originalSourceID, client.sourceID)
 
 	sourceID, nextSourceBundleID, lastBundleSeq := requireBundleState(t, db)
 	require.Equal(t, originalSourceID, sourceID)
@@ -2114,7 +2109,7 @@ func TestRebuildKeepSource_SelfReferentialRowsApplyAcrossChunkBoundaries(t *test
 		return nil, io.EOF
 	})}
 
-	mustRebuild(t, client, ctx, RebuildKeepSource, "")
+	mustRebuild(t, client, ctx)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM categories`).Scan(&count))
@@ -2198,7 +2193,7 @@ func TestRebuildKeepSource_CyclicRowsApplyAcrossChunkBoundaries(t *testing.T) {
 		return nil, io.EOF
 	})}
 
-	mustRebuild(t, client, ctx, RebuildKeepSource, "")
+	mustRebuild(t, client, ctx)
 
 	var captainID string
 	require.NoError(t, db.QueryRow(`SELECT captain_member_id FROM teams WHERE id = 'team-1'`).Scan(&captainID))

@@ -113,7 +113,7 @@ func TestInitializeDatabase_PreservesUnknownSyncPrefixedTables(t *testing.T) {
 	require.Equal(t, "keep-me", event)
 }
 
-func TestOpen_PersistsCallerOwnedSourceState(t *testing.T) {
+func TestOpen_PersistsManagedSourceState(t *testing.T) {
 	// Create in-memory SQLite database
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
@@ -132,8 +132,9 @@ func TestOpen_PersistsCallerOwnedSourceState(t *testing.T) {
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumns: []string{"id"}}}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	client.sourceIDGenerator = func() string { return "device-a" }
 
-	mustOpen(t, client, context.Background(), "device-a")
+	mustOpen(t, client, context.Background())
 
 	var storedSourceID string
 	var nextBundleID int64
@@ -194,7 +195,7 @@ func TestNewClient_RejectsUnsupportedIntegerSyncKeyColumn(t *testing.T) {
 	require.Contains(t, err.Error(), "supports only TEXT keys and UUID-backed BLOB keys")
 }
 
-func TestRotateSource_BlocksOnOutboxThenPreservesLocalRowsAndRequiresReattach(t *testing.T) {
+func TestOpen_PreservesLocalRowsAndManagedSourceAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -221,7 +222,7 @@ func TestRotateSource_BlocksOnOutboxThenPreservesLocalRowsAndRequiresReattach(t 
 		UPDATE _sync_outbox_bundle
 		SET state = 'prepared', source_id = ?, source_bundle_id = 5, row_count = 1, canonical_request_hash = 'hash'
 		WHERE singleton_key = 1
-	`, client.SourceID)
+	`, client.sourceID)
 	require.NoError(t, err)
 	_, err = db.Exec(`
 		INSERT INTO _sync_outbox_rows (
@@ -245,7 +246,7 @@ func TestRotateSource_BlocksOnOutboxThenPreservesLocalRowsAndRequiresReattach(t 
 		UPDATE _sync_source_state
 		SET next_source_bundle_id = 5
 		WHERE source_id = ?
-	`, client.SourceID)
+	`, client.sourceID)
 	require.NoError(t, err)
 	_, err = db.Exec(`
 		UPDATE _sync_attachment_state
@@ -273,24 +274,16 @@ func TestRotateSource_BlocksOnOutboxThenPreservesLocalRowsAndRequiresReattach(t 
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rebound.Close()) })
-	mustOpen(t, rebound, ctx, client.SourceID)
+	mustOpen(t, rebound, ctx)
 	result, err := rebound.Attach(ctx, client.UserID)
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, result.Status)
-
-	_, err = rebound.RotateSource(ctx, "replacement-device")
-	require.EqualError(t, err, "cannot rotate source while 1 outbox rows are pending")
-
-	_, err = db.Exec(`DELETE FROM _sync_outbox_rows`)
+	info, err := rebound.SourceInfo(ctx)
 	require.NoError(t, err)
-	require.NoError(t, clearOutboxBundle(ctx, db))
-
-	mustRotateSource(t, rebound, ctx, "replacement-device")
-	require.Equal(t, "replacement-device", rebound.SourceID)
-
-	var replacedBy string
-	require.NoError(t, db.QueryRow(`SELECT replaced_by_source_id FROM _sync_source_state WHERE source_id = ?`, client.SourceID).Scan(&replacedBy))
-	require.Equal(t, "replacement-device", replacedBy)
+	require.Equal(t, client.sourceID, rebound.sourceID)
+	require.Equal(t, client.sourceID, info.CurrentSourceID)
+	require.False(t, info.RebuildRequired)
+	require.False(t, info.SourceRecoveryRequired)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&count))
@@ -302,21 +295,14 @@ func TestRotateSource_BlocksOnOutboxThenPreservesLocalRowsAndRequiresReattach(t 
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
 	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&count))
-	require.Equal(t, 0, count)
+	require.Equal(t, 1, count)
 	var outboxState string
 	require.NoError(t, db.QueryRow(`SELECT state FROM _sync_outbox_bundle WHERE singleton_key = 1`).Scan(&outboxState))
-	require.Equal(t, outboxStateNone, outboxState)
+	require.Equal(t, outboxStatePrepared, outboxState)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&count))
 	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_snapshot_stage`).Scan(&count))
 	require.Equal(t, 1, count)
-
-	_, err = rebound.PushPending(ctx)
-	var connectErr *AttachRequiredError
-	require.ErrorAs(t, err, &connectErr)
-
-	_, err = rebound.PullToStable(ctx)
-	require.ErrorAs(t, err, &connectErr)
 }
 
 func TestDetach_ClearsHistoricallyManagedTablesRemovedFromCurrentConfig(t *testing.T) {
@@ -403,7 +389,7 @@ func TestCreateTriggersForTable(t *testing.T) {
 	}
 
 	// Test that triggers work by inserting data
-	mustOpen(t, client, context.Background(), "device-a")
+	mustOpen(t, client, context.Background())
 
 	// Insert a record
 	_, err = db.Exec("INSERT INTO test_table (id, name, value) VALUES (?, ?, ?)", "test-1", "Test Record", 42)
@@ -481,7 +467,7 @@ func TestNewClient(t *testing.T) {
 	require.Equal(t, db, client.DB)
 	require.Equal(t, "http://localhost:8080", client.BaseURL)
 	require.Empty(t, client.UserID)
-	require.Empty(t, client.SourceID)
+	require.Empty(t, client.sourceID)
 	require.NotNil(t, client.Token)
 	require.NotNil(t, client.Resolver)
 	require.NotNil(t, client.HTTP)
@@ -515,7 +501,7 @@ func TestNewClient_AttachRequiresOpenToEstablishSourceID(t *testing.T) {
 	var openErr *OpenRequiredError
 	require.ErrorAs(t, err, &openErr)
 	require.True(t, IsLifecyclePreconditionError(err))
-	require.Empty(t, client.SourceID)
+	require.Empty(t, client.sourceID)
 	require.Empty(t, client.UserID)
 }
 
@@ -537,10 +523,11 @@ func TestOpenAndAttachEstablishRuntimeIdentity(t *testing.T) {
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	client.sourceIDGenerator = func() string { return "device-a" }
 
-	openResult := mustOpen(t, client, context.Background(), "device-a")
+	openResult := mustOpen(t, client, context.Background())
 	require.Equal(t, OpenStateReadyAnonymous, openResult.State)
-	require.Equal(t, "device-a", client.SourceID)
+	require.Equal(t, "device-a", client.sourceID)
 	require.Empty(t, client.UserID)
 
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -562,7 +549,7 @@ func TestOpenAndAttachEstablishRuntimeIdentity(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, result.Status)
 	require.Equal(t, "test-user", client.UserID)
-	require.Equal(t, "device-a", client.SourceID)
+	require.Equal(t, "device-a", client.sourceID)
 }
 
 func TestOperationsRequireAttachAfterOpen(t *testing.T) {
@@ -584,7 +571,7 @@ func TestOperationsRequireAttachAfterOpen(t *testing.T) {
 	}, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	mustOpen(t, client, context.Background(), "device-a")
+	mustOpen(t, client, context.Background())
 
 	var requests int
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -599,11 +586,7 @@ func TestOperationsRequireAttachAfterOpen(t *testing.T) {
 		{name: "PushPending", run: func() error { _, err := client.PushPending(context.Background()); return err }},
 		{name: "PullToStable", run: func() error { _, err := client.PullToStable(context.Background()); return err }},
 		{name: "Sync", run: func() error { _, err := client.Sync(context.Background()); return err }},
-		{name: "RebuildKeepSource", run: func() error { _, err := client.Rebuild(context.Background(), RebuildKeepSource, ""); return err }},
-		{name: "RebuildRotateSource", run: func() error {
-			_, err := client.Rebuild(context.Background(), RebuildRotateSource, newTestSourceID())
-			return err
-		}},
+		{name: "Rebuild", run: func() error { _, err := client.Rebuild(context.Background()); return err }},
 	}
 
 	for _, tc := range operations {
@@ -643,7 +626,7 @@ func TestStartLoops_LogLifecycleMisuseWithoutTouchingNetwork(t *testing.T) {
 		)
 	`)
 	mustDetach(t, client, context.Background())
-	mustOpen(t, client, context.Background(), client.SourceID)
+	mustOpen(t, client, context.Background())
 
 	var requestCount atomic.Int64
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {

@@ -93,14 +93,14 @@ func (e *SourceRecoveryRequiredError) Error() string {
 	if e != nil {
 		switch e.Code {
 		case SourceRecoveryHistoryPruned:
-			return "source recovery is required because retained committed history for the frozen source tuple is no longer available; rebuild from snapshot with RebuildRotateSource(newSourceID)"
+			return "source recovery is required because retained committed history for the frozen source tuple is no longer available; run Rebuild()"
 		case SourceRecoverySequenceOutOfOrder:
-			return "source recovery is required because the frozen source bundle sequence is not the next expected value; rebuild from snapshot with RebuildRotateSource(newSourceID)"
+			return "source recovery is required because the frozen source bundle sequence is not the next expected value; run Rebuild()"
 		case SourceRecoverySequenceChanged:
-			return "source recovery is required because the frozen source bundle sequence changed before commit finalized; rebuild from snapshot with RebuildRotateSource(newSourceID)"
+			return "source recovery is required because the frozen source bundle sequence changed before commit finalized; run Rebuild()"
 		}
 	}
-	return "source recovery is required; rebuild from snapshot with RebuildRotateSource(newSourceID)"
+	return "source recovery is required; run Rebuild()"
 }
 
 func (e *sourceSequenceOutOfOrderError) Error() string {

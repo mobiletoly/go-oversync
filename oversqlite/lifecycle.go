@@ -47,23 +47,19 @@ type PendingSyncStatus struct {
 	BlocksDetach       bool
 }
 
-// Open validates or persists the caller-owned source ID and restores local lifecycle state.
-func (c *Client) Open(ctx context.Context, sourceID string) (OpenResult, error) {
+// Open restores local lifecycle state and bootstraps internal source identity if needed.
+func (c *Client) Open(ctx context.Context) (OpenResult, error) {
 	if err := c.tryBeginSyncOperation(); err != nil {
 		return OpenResult{}, err
 	}
 	defer c.writeMu.Unlock()
 
-	sourceID = strings.TrimSpace(sourceID)
-	if sourceID == "" {
-		return OpenResult{}, fmt.Errorf("sourceID must be provided")
-	}
-	state, err := c.openLocked(ctx, sourceID)
+	state, err := c.openLocked(ctx)
 	var pendingRemoteReplaceErr *RemoteReplacePendingError
 	if err != nil && !errors.As(err, &pendingRemoteReplaceErr) {
 		return OpenResult{}, err
 	}
-	c.SourceID = state.SourceID
+	c.sourceID = state.SourceID
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) != "" {
 		c.UserID = state.BindingScope
 	} else {
@@ -88,19 +84,19 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 	if userID == "" {
 		return AttachResult{}, fmt.Errorf("userID must be provided")
 	}
-	if strings.TrimSpace(c.SourceID) == "" {
+	if strings.TrimSpace(c.sourceID) == "" {
 		return AttachResult{}, &OpenRequiredError{Operation: "Attach(userID)"}
 	}
 
-	state, err := c.openLocked(ctx, c.SourceID)
+	state, err := c.openLocked(ctx)
 	var pendingRemoteReplaceErr *RemoteReplacePendingError
 	if err != nil && !errors.As(err, &pendingRemoteReplaceErr) {
 		return AttachResult{}, err
 	}
-	c.SourceID = state.SourceID
+	c.sourceID = state.SourceID
 
 	if state.PendingTransitionKind == lifecycleTransitionRemote {
-		if strings.TrimSpace(state.PendingTargetScope) != userID || strings.TrimSpace(state.SourceID) != c.SourceID {
+		if strings.TrimSpace(state.PendingTargetScope) != userID || strings.TrimSpace(state.SourceID) != c.sourceID {
 			return AttachResult{}, &AttachLocalStateConflictError{
 				Reason: fmt.Sprintf("pending remote_replace belongs to scope %q on source %q", state.PendingTargetScope, state.SourceID),
 			}
@@ -128,7 +124,7 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 	}
 
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) == userID && state.PendingTransitionKind == lifecycleTransitionNone {
-		hasAttachedState, err := c.hasAttachedClientStateLocked(ctx, userID, c.SourceID)
+		hasAttachedState, err := c.hasAttachedClientStateLocked(ctx, userID, c.sourceID)
 		if err != nil {
 			return AttachResult{}, err
 		}
@@ -161,7 +157,7 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 	if err != nil {
 		return AttachResult{}, err
 	}
-	resp, err := c.connectRequest(ctx, userID, c.SourceID, hasPendingRows > 0)
+	resp, err := c.connectRequest(ctx, userID, c.sourceID, hasPendingRows > 0)
 	if err != nil {
 		return AttachResult{}, err
 	}
@@ -172,7 +168,7 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 		c.sessionConnected = false
 		return AttachResult{Status: AttachStatusRetryLater, RetryAfter: retryAfter}, nil
 	case "initialize_empty":
-		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.SourceID); err != nil {
+		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.sourceID); err != nil {
 			return AttachResult{}, err
 		}
 		c.pendingInitializationID = ""
@@ -191,7 +187,7 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 			SyncStatus: status,
 		}, nil
 	case "initialize_local":
-		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.SourceID); err != nil {
+		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.sourceID); err != nil {
 			return AttachResult{}, err
 		}
 		c.pendingInitializationID = resp.InitializationID
@@ -211,7 +207,7 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 		}, nil
 	case "remote_authoritative":
 		c.UserID = userID
-		if err := c.beginRemoteReplaceLocked(ctx, userID, c.SourceID); err != nil {
+		if err := c.beginRemoteReplaceLocked(ctx, userID, c.sourceID); err != nil {
 			return AttachResult{}, err
 		}
 		state, err = c.loadLifecycleState(ctx)
@@ -375,6 +371,36 @@ func (c *Client) PendingSyncStatus(ctx context.Context) (PendingSyncStatus, erro
 	return c.pendingSyncStatusLocked(ctx)
 }
 
+// SourceInfo exposes debug-only source diagnostics from persisted local state.
+func (c *Client) SourceInfo(ctx context.Context) (SourceInfo, error) {
+	if err := c.tryBeginSyncOperation(); err != nil {
+		return SourceInfo{}, err
+	}
+	defer c.writeMu.Unlock()
+
+	if strings.TrimSpace(c.sourceID) == "" {
+		return SourceInfo{}, &OpenRequiredError{Operation: "SourceInfo()"}
+	}
+	attachment, err := loadAttachmentState(ctx, c.DB)
+	if err != nil {
+		return SourceInfo{}, err
+	}
+	operation, err := loadOperationState(ctx, c.DB)
+	if err != nil {
+		return SourceInfo{}, err
+	}
+
+	info := SourceInfo{
+		CurrentSourceID: attachment.CurrentSourceID,
+		RebuildRequired: attachment.RebuildRequired,
+	}
+	if operation.Kind == operationKindSourceRecovery {
+		info.SourceRecoveryRequired = true
+		info.SourceRecoveryReason = sourceRecoveryCodeFromReason(operation.Reason)
+	}
+	return info, nil
+}
+
 func (c *Client) pendingSyncStatusLocked(ctx context.Context) (PendingSyncStatus, error) {
 	dirtyCount, err := c.pendingChangeCount(ctx)
 	if err != nil {
@@ -408,70 +434,6 @@ func (c *Client) SyncStatus(ctx context.Context) (SyncStatus, error) {
 	return c.syncStatusLocked(ctx)
 }
 
-// RotateSource switches the client to a caller-provided source ID without minting one internally.
-func (c *Client) RotateSource(ctx context.Context, sourceID string) (SourceRotationResult, error) {
-	if err := c.tryBeginSyncOperation(); err != nil {
-		return SourceRotationResult{}, err
-	}
-	defer c.writeMu.Unlock()
-
-	sourceID = strings.TrimSpace(sourceID)
-	if sourceID == "" {
-		return SourceRotationResult{}, fmt.Errorf("sourceID must be provided")
-	}
-
-	outboxCount, err := c.pendingPushOutboundCount(ctx)
-	if err != nil {
-		return SourceRotationResult{}, err
-	}
-	if outboxCount > 0 {
-		return SourceRotationResult{}, fmt.Errorf("cannot rotate source while %d outbox rows are pending", outboxCount)
-	}
-	state, err := c.loadLifecycleState(ctx)
-	if err != nil {
-		return SourceRotationResult{}, err
-	}
-	if strings.TrimSpace(state.PendingInitializationID) != "" {
-		return SourceRotationResult{}, fmt.Errorf("cannot rotate source while initialization is pending")
-	}
-	if state.PendingTransitionKind != lifecycleTransitionNone {
-		return SourceRotationResult{}, fmt.Errorf("cannot rotate source while lifecycle operation %q is pending", state.PendingTransitionKind)
-	}
-	tx, err := c.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return SourceRotationResult{}, fmt.Errorf("failed to begin source reset transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	if err := ensureSourceState(ctx, tx, sourceID); err != nil {
-		return SourceRotationResult{}, err
-	}
-	if strings.TrimSpace(c.SourceID) != "" && c.SourceID != sourceID {
-		if err := markSourceReplaced(ctx, tx, c.SourceID, sourceID); err != nil {
-			return SourceRotationResult{}, err
-		}
-	}
-	attachment, err := loadAttachmentState(ctx, tx)
-	if err != nil {
-		return SourceRotationResult{}, err
-	}
-	attachment.CurrentSourceID = sourceID
-	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
-		return SourceRotationResult{}, err
-	}
-	if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
-		return SourceRotationResult{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return SourceRotationResult{}, fmt.Errorf("failed to commit source reset: %w", err)
-	}
-	c.SourceID = sourceID
-	c.pendingInitializationID = ""
-	c.UserID = ""
-	c.sessionConnected = false
-	return SourceRotationResult{SourceID: sourceID}, nil
-}
-
 // UninstallSync removes oversqlite-owned metadata tables and managed-table triggers from the database.
 func (c *Client) UninstallSync(ctx context.Context) error {
 	if err := c.tryBeginSyncOperation(); err != nil {
@@ -503,7 +465,7 @@ func (c *Client) UninstallSync(ctx context.Context) error {
 		return fmt.Errorf("failed to commit uninstall transaction: %w", err)
 	}
 
-	c.SourceID = ""
+	c.sourceID = ""
 	c.UserID = ""
 	c.pendingInitializationID = ""
 	c.sessionConnected = false
@@ -623,14 +585,14 @@ func (c *Client) persistConnectedLifecycleState(ctx context.Context, userID, ini
 	if err != nil {
 		return err
 	}
-	attachment.CurrentSourceID = c.SourceID
+	attachment.CurrentSourceID = c.sourceID
 	attachment.BindingState = attachmentBindingAttached
 	attachment.AttachedUserID = userID
 	attachment.PendingInitializationID = initializationID
 	if strings.TrimSpace(attachment.SchemaName) == "" {
 		attachment.SchemaName = c.config.Schema
 	}
-	if err := ensureSourceState(ctx, c.DB, c.SourceID); err != nil {
+	if err := ensureSourceState(ctx, c.DB, c.sourceID); err != nil {
 		return err
 	}
 	if err := persistAttachmentState(ctx, c.DB, attachment); err != nil {

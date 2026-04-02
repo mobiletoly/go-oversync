@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,6 +61,9 @@ func (r *staticResolver) Resolve(conflict ConflictContext) MergeResult {
 
 func attachTestClient(t *testing.T, client *Client, userID, sourceID string) AttachResult {
 	t.Helper()
+	if strings.TrimSpace(sourceID) != "" {
+		client.sourceIDGenerator = func() string { return sourceID }
+	}
 
 	prevHTTP := client.HTTP
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -78,7 +82,7 @@ func attachTestClient(t *testing.T, client *Client, userID, sourceID string) Att
 		client.HTTP = prevHTTP
 	})
 
-	mustOpen(t, client, context.Background(), sourceID)
+	mustOpen(t, client, context.Background())
 	result, err := client.Attach(context.Background(), userID)
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, result.Status)

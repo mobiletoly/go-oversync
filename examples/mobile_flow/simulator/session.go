@@ -11,10 +11,9 @@ import (
 
 // Session manages user authentication and example JWT tokens.
 type Session struct {
-	userID   string
-	sourceID string
-	auth     *exampleauth.TokenAuth
-	logger   *slog.Logger
+	userID string
+	auth   *exampleauth.TokenAuth
+	logger *slog.Logger
 
 	// Current session state
 	token     string
@@ -24,32 +23,30 @@ type Session struct {
 	mu sync.RWMutex
 }
 
-// NewSession creates a new session manager
-func NewSession(userID, sourceID, jwtSecret string, logger *slog.Logger) *Session {
+// NewSession creates a new session manager.
+func NewSession(userID, jwtSecret string, logger *slog.Logger) *Session {
 	return &Session{
-		userID:   userID,
-		sourceID: sourceID,
-		auth:     exampleauth.New(jwtSecret),
-		logger:   logger,
+		userID: userID,
+		auth:   exampleauth.New(jwtSecret),
+		logger: logger,
 	}
 }
 
-// SignIn creates a new authenticated session
-func (s *Session) SignIn(userID, sourceID string) error {
+// SignIn creates a new authenticated session.
+func (s *Session) SignIn(userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if verboseLog {
-		s.logger.Info("Creating new session", "user_id", userID, "source_id", sourceID)
+		s.logger.Info("Creating new session", "user_id", userID)
 	}
 
-	token, expiresAt, err := s.generateToken(userID, sourceID)
+	token, expiresAt, err := s.generateToken(userID)
 	if err != nil {
 		return fmt.Errorf("failed to generate token: %w", err)
 	}
 
 	s.userID = userID
-	s.sourceID = sourceID
 	s.token = token
 	s.expiresAt = expiresAt
 	s.isActive = true
@@ -57,19 +54,10 @@ func (s *Session) SignIn(userID, sourceID string) error {
 	if verboseLog {
 		s.logger.Info("Session created successfully",
 			"user_id", userID,
-			"source_id", sourceID,
 			"expires_at", expiresAt.Format(time.RFC3339))
 	}
 
 	return nil
-}
-
-// SetSourceID updates the current sync source identity without rotating auth state.
-func (s *Session) SetSourceID(sourceID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.sourceID = sourceID
 }
 
 // Detach clears the current authenticated app session state.
@@ -130,7 +118,7 @@ func (s *Session) GetToken() (string, error) {
 	if time.Now().Add(5 * time.Minute).After(s.expiresAt) {
 		s.logger.Info("Refreshing token", "user_id", s.userID)
 
-		token, expiresAt, err := s.generateToken(s.userID, s.sourceID)
+		token, expiresAt, err := s.generateToken(s.userID)
 		if err != nil {
 			return "", fmt.Errorf("failed to refresh token: %w", err)
 		}
@@ -151,13 +139,6 @@ func (s *Session) GetUserID() string {
 	return s.userID
 }
 
-// GetSourceID returns the current source ID
-func (s *Session) GetSourceID() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.sourceID
-}
-
 // CanRestore returns whether a session can be restored (simulates persistent storage)
 func (s *Session) CanRestore() bool {
 	s.mu.RLock()
@@ -175,10 +156,10 @@ func (s *Session) Restore() error {
 	}
 
 	if verboseLog {
-		s.logger.Info("Restoring session", "user_id", s.userID, "source_id", s.sourceID)
+		s.logger.Info("Restoring session", "user_id", s.userID)
 	}
 
-	token, expiresAt, err := s.generateToken(s.userID, s.sourceID)
+	token, expiresAt, err := s.generateToken(s.userID)
 	if err != nil {
 		return fmt.Errorf("failed to generate token during restore: %w", err)
 	}
@@ -194,8 +175,8 @@ func (s *Session) Restore() error {
 	return nil
 }
 
-// generateToken creates a new JWT token using server's auth logic
-func (s *Session) generateToken(userID, sourceID string) (string, time.Time, error) {
+// generateToken creates a new JWT token using server's auth logic.
+func (s *Session) generateToken(userID string) (string, time.Time, error) {
 	duration := 24 * time.Hour
 
 	token, err := s.auth.GenerateToken(userID, duration)

@@ -94,10 +94,9 @@ const (
 
 // RemoteSyncReport reports the public result of PullToStable and Rebuild.
 type RemoteSyncReport struct {
-	Outcome         RemoteSyncOutcome
-	Status          SyncStatus
-	Restore         *RestoreSummary
-	RotatedSourceID string
+	Outcome RemoteSyncOutcome
+	Status  SyncStatus
+	Restore *RestoreSummary
 }
 
 // SyncReport reports the public result of Sync.
@@ -121,7 +120,11 @@ func (r SyncThenDetachResult) IsSuccess() bool {
 	return r.Detach.Outcome == DetachOutcomeDetached
 }
 
-// SourceRotationResult reports the final caller-owned source identity after RotateSource.
-type SourceRotationResult struct {
-	SourceID string
+// SourceInfo exposes debug-only source diagnostics for the current local runtime state.
+// CurrentSourceID is opaque and must not be treated as a host-controlled lifecycle surface.
+type SourceInfo struct {
+	CurrentSourceID        string
+	RebuildRequired        bool
+	SourceRecoveryRequired bool
+	SourceRecoveryReason   SourceRecoveryCode
 }

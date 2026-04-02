@@ -70,11 +70,7 @@ func TestEndToEnd_SyncOperationsBeforeConnectReturnTypedLifecycleErrors(t *testi
 		{name: "PushPending", run: func() error { _, err := client.PushPending(ctx); return err }},
 		{name: "PullToStable", run: func() error { _, err := client.PullToStable(ctx); return err }},
 		{name: "Sync", run: func() error { _, err := client.Sync(ctx); return err }},
-		{name: "RebuildKeepSource", run: func() error { _, err := client.Rebuild(ctx, oversqlite.RebuildKeepSource, ""); return err }},
-		{name: "RebuildRotateSource", run: func() error {
-			_, err := client.Rebuild(ctx, oversqlite.RebuildRotateSource, newE2ESourceID())
-			return err
-		}},
+		{name: "Rebuild", run: func() error { _, err := client.Rebuild(ctx); return err }},
 	}
 	for _, tc := range operations {
 		t.Run(tc.name, func(t *testing.T) {
@@ -507,23 +503,101 @@ func TestEndToEnd_DetachedOfflineWritesSurviveReopenWithoutDuplicateCapture(t *t
 	require.Equal(t, 1, dirtyCount)
 }
 
-func TestEndToEnd_OpenSourceMismatchThenRotateSourceRecovers(t *testing.T) {
+func TestEndToEnd_OpenRestoresManagedSourceAcrossRestart(t *testing.T) {
 	ctx := context.Background()
-	schema := "e2e_open_reset_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	schema := "e2e_open_restore_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 
-	userID := "e2e-open-reset-user-" + uuid.NewString()
-	client, _ := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	userID := "e2e-open-restore-user-" + uuid.NewString()
+	dbPath := filepath.Join(t.TempDir(), "managed-source.db")
 
-	mustOpenE2E(t, client, ctx, "device-a")
+	openPersistentClient := func() (*oversqlite.Client, *sql.DB) {
+		db, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
 
-	_, err := client.Open(ctx, "device-b")
-	var mismatchErr *oversqlite.SourceMismatchError
-	require.ErrorAs(t, err, &mismatchErr)
+		var tableCount int
+		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'users'`).Scan(&tableCount))
+		if tableCount == 0 {
+			_, err = db.Exec(usersDDL)
+			require.NoError(t, err)
+		}
 
-	mustRotateSourceE2E(t, client, ctx, "device-b")
-	mustOpenE2E(t, client, ctx, "device-b")
-	require.Equal(t, "device-b", client.SourceID)
+		tokenFn := func(ctx context.Context) (string, error) {
+			return server.GenerateToken(userID, time.Hour)
+		}
+		client, err := oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
+		require.NoError(t, err)
+		return client, db
+	}
+
+	firstClient, firstDB := openPersistentClient()
+	mustOpenE2E(t, firstClient, ctx, "")
+	originalSourceID := requireCurrentSourceIDE2E(t, firstClient, ctx)
+	require.NoError(t, firstClient.Close())
+	require.NoError(t, firstDB.Close())
+
+	restartedClient, restartedDB := openPersistentClient()
+	defer restartedClient.Close()
+	defer restartedDB.Close()
+	mustOpenE2E(t, restartedClient, ctx, "")
+	restartedSourceID := requireCurrentSourceIDE2E(t, restartedClient, ctx)
+	require.Equal(t, originalSourceID, restartedSourceID)
+}
+
+func TestEndToEnd_DetachAfterOpenOverDurableAttachedStateSucceedsWithoutReattach(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_detach_after_open_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newExampleServer(t, schema)
+
+	currentUserID := "e2e-detach-after-open-user-a-" + uuid.NewString()
+	nextUserID := "e2e-detach-after-open-user-b-" + uuid.NewString()
+	dbPath := filepath.Join(t.TempDir(), "detach-after-open.db")
+
+	openPersistentClient := func() (*oversqlite.Client, *sql.DB) {
+		db, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+
+		var tableCount int
+		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'users'`).Scan(&tableCount))
+		if tableCount == 0 {
+			_, err = db.Exec(usersDDL)
+			require.NoError(t, err)
+		}
+
+		tokenFn := func(ctx context.Context) (string, error) {
+			return server.GenerateToken(currentUserID, time.Hour)
+		}
+		client, err := oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
+		require.NoError(t, err)
+		return client, db
+	}
+
+	firstClient, firstDB := openPersistentClient()
+	mustOpenE2E(t, firstClient, ctx, "")
+	connectResult, err := firstClient.Attach(ctx, currentUserID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
+	require.NoError(t, firstClient.Close())
+	require.NoError(t, firstDB.Close())
+
+	restartedClient, restartedDB := openPersistentClient()
+	defer restartedClient.Close()
+	defer restartedDB.Close()
+	mustOpenE2E(t, restartedClient, ctx, "")
+
+	detachResult, err := restartedClient.Detach(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.DetachOutcomeDetached, detachResult.Outcome)
+
+	currentUserID = nextUserID
+	reconnectResult, err := restartedClient.Attach(ctx, currentUserID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, reconnectResult.Status)
+	require.Equal(t, currentUserID, restartedClient.UserID)
 }
 
 func TestEndToEnd_UninstallSyncThenReinstallOpenAndConnectOnSameDatabase(t *testing.T) {
@@ -696,7 +770,183 @@ func TestEndToEnd_ExpiredInitializerReconnectCanSeedAgain(t *testing.T) {
 	require.Equal(t, "Seed", name)
 }
 
-func TestEndToEnd_RebuildRotateSourceSurvivesRestart(t *testing.T) {
+func TestEndToEnd_RebuildRequiredBlocksSyncUntilExplicitRebuild(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_rebuild_required_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newExampleServer(t, schema)
+
+	userID := "e2e-rebuild-required-user-" + uuid.NewString()
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+
+	rowOne := uuid.NewString()
+	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowOne, "Remote One", "remote-one@example.com")
+	require.NoError(t, err)
+	mustPushPendingE2E(t, clientA, ctx)
+	mustRebuildE2E(t, clientB, ctx)
+
+	rowTwo := uuid.NewString()
+	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowTwo, "Remote Two", "remote-two@example.com")
+	require.NoError(t, err)
+	mustPushPendingE2E(t, clientA, ctx)
+
+	_, err = dbB.Exec(`UPDATE _sync_attachment_state SET rebuild_required = 1 WHERE singleton_key = 1`)
+	require.NoError(t, err)
+
+	info := mustSourceInfoE2E(t, clientB, ctx)
+	require.True(t, info.RebuildRequired)
+	require.False(t, info.SourceRecoveryRequired)
+
+	var requestCount atomic.Int64
+	clientB.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requestCount.Add(1)
+		return nil, context.DeadlineExceeded
+	})}
+
+	for _, op := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "PushPending", run: func() error { _, err := clientB.PushPending(ctx); return err }},
+		{name: "PullToStable", run: func() error { _, err := clientB.PullToStable(ctx); return err }},
+		{name: "Sync", run: func() error { _, err := clientB.Sync(ctx); return err }},
+	} {
+		t.Run(op.name, func(t *testing.T) {
+			err := op.run()
+			var rebuildErr *oversqlite.RebuildRequiredError
+			require.ErrorAs(t, err, &rebuildErr)
+		})
+	}
+	require.Zero(t, requestCount.Load())
+
+	clientB.HTTP = &http.Client{Transport: http.DefaultTransport}
+	mustRebuildE2E(t, clientB, ctx)
+
+	info = mustSourceInfoE2E(t, clientB, ctx)
+	require.False(t, info.RebuildRequired)
+	require.False(t, info.SourceRecoveryRequired)
+
+	var count int
+	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users WHERE id IN (?, ?)`, rowOne, rowTwo).Scan(&count))
+	require.Equal(t, 2, count)
+}
+
+func TestEndToEnd_SourceRecoveryPersistsAcrossRestartAndFailsClosedUntilRebuild(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_source_recovery_restart_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newExampleServer(t, schema)
+
+	userID := "e2e-source-recovery-restart-user-" + uuid.NewString()
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+
+	rowID := uuid.NewString()
+	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Remote", "remote@example.com")
+	require.NoError(t, err)
+	mustPushPendingE2E(t, clientA, ctx)
+
+	dbPath := filepath.Join(t.TempDir(), "source-recovery-restart.db")
+	openPersistentClient := func() (*oversqlite.Client, *sql.DB) {
+		db, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+
+		var tableCount int
+		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'users'`).Scan(&tableCount))
+		if tableCount == 0 {
+			_, err = db.Exec(usersDDL)
+			require.NoError(t, err)
+		}
+
+		tokenFn := func(ctx context.Context) (string, error) {
+			return server.GenerateToken(userID, time.Hour)
+		}
+		client, err := oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users")))
+		require.NoError(t, err)
+		return client, db
+	}
+
+	clientB, dbB := openPersistentClient()
+	mustOpenE2E(t, clientB, ctx, "")
+	connectResult, err := clientB.Attach(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
+
+	originalSourceID := requireCurrentSourceIDE2E(t, clientB, ctx)
+	localPendingID := uuid.NewString()
+	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, localPendingID, "Pending", "pending@example.com")
+	require.NoError(t, err)
+
+	clientB.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
+			return errorJSONResponse(http.StatusConflict, map[string]any{
+				"error":   "source_sequence_out_of_order",
+				"message": "expected source_bundle_id 2",
+			}), nil
+		}
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+
+	_, err = clientB.PushPending(ctx)
+	var recoveryErr *oversqlite.SourceRecoveryRequiredError
+	require.ErrorAs(t, err, &recoveryErr)
+	require.Equal(t, oversqlite.SourceRecoverySequenceOutOfOrder, recoveryErr.Code)
+	require.NoError(t, clientB.Close())
+	require.NoError(t, dbB.Close())
+
+	restartedClient, restartedDB := openPersistentClient()
+	defer restartedClient.Close()
+	defer restartedDB.Close()
+	mustOpenE2E(t, restartedClient, ctx, "")
+
+	info := mustSourceInfoE2E(t, restartedClient, ctx)
+	require.True(t, info.RebuildRequired)
+	require.True(t, info.SourceRecoveryRequired)
+	require.Equal(t, oversqlite.SourceRecoverySequenceOutOfOrder, info.SourceRecoveryReason)
+
+	restartedResult, err := restartedClient.Attach(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, restartedResult.Status)
+
+	var requestCount atomic.Int64
+	restartedClient.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requestCount.Add(1)
+		return nil, context.DeadlineExceeded
+	})}
+
+	for _, op := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "PushPending", run: func() error { _, err := restartedClient.PushPending(ctx); return err }},
+		{name: "PullToStable", run: func() error { _, err := restartedClient.PullToStable(ctx); return err }},
+		{name: "Sync", run: func() error { _, err := restartedClient.Sync(ctx); return err }},
+	} {
+		t.Run(op.name, func(t *testing.T) {
+			err := op.run()
+			var recoveryErr *oversqlite.SourceRecoveryRequiredError
+			require.ErrorAs(t, err, &recoveryErr)
+			require.Equal(t, oversqlite.SourceRecoverySequenceOutOfOrder, recoveryErr.Code)
+		})
+	}
+	require.Zero(t, requestCount.Load())
+
+	restartedClient.HTTP = &http.Client{Transport: http.DefaultTransport}
+	mustRebuildE2E(t, restartedClient, ctx)
+
+	info = mustSourceInfoE2E(t, restartedClient, ctx)
+	require.False(t, info.RebuildRequired)
+	require.False(t, info.SourceRecoveryRequired)
+	require.NotEqual(t, originalSourceID, info.CurrentSourceID)
+
+	var name string
+	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
+	require.Equal(t, "Remote", name)
+	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id = ?`, localPendingID).Scan(&name))
+	require.Equal(t, "Pending", name)
+}
+
+func TestEndToEnd_SourceRecoveryRebuildRotatesManagedSourceAndSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_recover_restart_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
@@ -738,24 +988,49 @@ func TestEndToEnd_RebuildRotateSourceSurvivesRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
-	originalSourceID := clientB.SourceID
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildRotateSource, newE2ESourceID())
-	rotatedSourceID := clientB.SourceID
+	originalSourceID := requireCurrentSourceIDE2E(t, clientB, ctx)
+	localPendingID := uuid.NewString()
+	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, localPendingID, "Pending", "pending@example.com")
+	require.NoError(t, err)
+
+	baseTransport := http.DefaultTransport
+	failCreate := true
+	clientB.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if failCreate && r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
+			failCreate = false
+			return errorJSONResponse(http.StatusConflict, map[string]any{
+				"error":   "history_pruned",
+				"message": "source tuple is below retained history floor",
+			}), nil
+		}
+		return baseTransport.RoundTrip(r)
+	})}
+
+	_, err = clientB.PushPending(ctx)
+	var recoveryErr *oversqlite.SourceRecoveryRequiredError
+	require.ErrorAs(t, err, &recoveryErr)
+	require.Equal(t, oversqlite.SourceRecoveryHistoryPruned, recoveryErr.Code)
+
+	info := mustSourceInfoE2E(t, clientB, ctx)
+	require.True(t, info.RebuildRequired)
+	require.True(t, info.SourceRecoveryRequired)
+	require.Equal(t, oversqlite.SourceRecoveryHistoryPruned, info.SourceRecoveryReason)
+
+	clientB.HTTP = &http.Client{Transport: baseTransport}
+	mustRebuildE2E(t, clientB, ctx)
+	info = mustSourceInfoE2E(t, clientB, ctx)
+	rotatedSourceID := info.CurrentSourceID
 	require.NotEqual(t, originalSourceID, rotatedSourceID)
+	require.False(t, info.RebuildRequired)
+	require.False(t, info.SourceRecoveryRequired)
 	require.NoError(t, clientB.Close())
 	require.NoError(t, dbB.Close())
-
-	mismatchClient, mismatchDB := openPersistentClient()
-	_, err = mismatchClient.Open(ctx, originalSourceID)
-	var mismatchErr *oversqlite.SourceMismatchError
-	require.ErrorAs(t, err, &mismatchErr)
-	require.NoError(t, mismatchClient.Close())
-	require.NoError(t, mismatchDB.Close())
 
 	restartedClient, restartedDB := openPersistentClient()
 	defer restartedClient.Close()
 	defer restartedDB.Close()
-	mustOpenE2E(t, restartedClient, ctx, rotatedSourceID)
+	mustOpenE2E(t, restartedClient, ctx, "")
+	require.Equal(t, rotatedSourceID, requireCurrentSourceIDE2E(t, restartedClient, ctx))
 
 	restartedResult, err := restartedClient.Attach(ctx, userID)
 	require.NoError(t, err)
@@ -764,4 +1039,6 @@ func TestEndToEnd_RebuildRotateSourceSurvivesRestart(t *testing.T) {
 	var name string
 	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
 	require.Equal(t, "Remote", name)
+	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id = ?`, localPendingID).Scan(&name))
+	require.Equal(t, "Pending", name)
 }

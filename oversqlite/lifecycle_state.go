@@ -32,17 +32,6 @@ type lifecycleState struct {
 	PendingInitializationID  string
 }
 
-// SourceMismatchError reports that Open was called with a different source ID than the one already persisted locally.
-type SourceMismatchError struct {
-	PersistedSourceID string
-	RequestedSourceID string
-}
-
-// Error implements error.
-func (e *SourceMismatchError) Error() string {
-	return fmt.Sprintf("persisted source_id %q does not match requested source_id %q; call RotateSource first", e.PersistedSourceID, e.RequestedSourceID)
-}
-
 // AttachLifecycleUnsupportedError reports that the server does not support the attach lifecycle contract.
 type AttachLifecycleUnsupportedError struct {
 	Reason string
@@ -64,7 +53,7 @@ type AttachBindingConflictError struct {
 
 // Error implements error.
 func (e *AttachBindingConflictError) Error() string {
-	return fmt.Sprintf("local database is already attached to user %q; detach or rotate source before attaching user %q", e.AttachedUserID, e.RequestedUserID)
+	return fmt.Sprintf("local database is already attached to user %q; detach before attaching user %q", e.AttachedUserID, e.RequestedUserID)
 }
 
 // AttachLocalStateConflictError reports that local durable sync state is incompatible with the requested attach flow.
@@ -106,7 +95,7 @@ func (e *DestructiveTransitionInProgressError) Error() string {
 	return fmt.Sprintf("destructive local lifecycle transition %q is in progress", e.TransitionKind)
 }
 
-// OpenRequiredError reports that an operation requires Open(sourceID) first.
+// OpenRequiredError reports that an operation requires Open() first.
 type OpenRequiredError struct {
 	Operation string
 }
@@ -114,9 +103,9 @@ type OpenRequiredError struct {
 // Error implements error.
 func (e *OpenRequiredError) Error() string {
 	if e == nil || strings.TrimSpace(e.Operation) == "" {
-		return "Open(sourceID) must be called before this oversqlite operation"
+		return "Open() must be called before this oversqlite operation"
 	}
-	return fmt.Sprintf("Open(sourceID) must be called before %s", e.Operation)
+	return fmt.Sprintf("Open() must be called before %s", e.Operation)
 }
 
 // AttachRequiredError reports that an operation requires a successful Attach(userID).
@@ -256,7 +245,28 @@ func (c *Client) clearPersistedPendingInitializationID(ctx context.Context) erro
 	return persistAttachmentState(ctx, c.DB, attachment)
 }
 
-func (c *Client) openLocked(ctx context.Context, sourceID string) (*lifecycleState, error) {
+func (c *Client) generateFreshSourceID(ctx context.Context, q queryRower, currentSourceID string) (string, error) {
+	if c == nil || c.sourceIDGenerator == nil {
+		return "", fmt.Errorf("source-id generator is not configured")
+	}
+	currentSourceID = strings.TrimSpace(currentSourceID)
+	for attempt := 0; attempt < 100; attempt++ {
+		candidate := strings.TrimSpace(c.sourceIDGenerator())
+		if candidate == "" || candidate == currentSourceID {
+			continue
+		}
+		state, err := loadSourceState(ctx, q, candidate)
+		if err != nil {
+			return "", err
+		}
+		if state == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("failed to generate a fresh internal source id")
+}
+
+func (c *Client) openLocked(ctx context.Context) (*lifecycleState, error) {
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin lifecycle open transaction: %w", err)
@@ -275,12 +285,11 @@ func (c *Client) openLocked(ctx context.Context, sourceID string) (*lifecycleSta
 	persistedSourceID := strings.TrimSpace(attachment.CurrentSourceID)
 	needsBootstrapAnonymousCapture := persistedSourceID == "" && attachment.BindingState == attachmentBindingAnonymous
 	if persistedSourceID == "" {
-		attachment.CurrentSourceID = sourceID
-	} else if persistedSourceID != sourceID {
-		return nil, &SourceMismatchError{
-			PersistedSourceID: persistedSourceID,
-			RequestedSourceID: sourceID,
+		generatedSourceID, err := c.generateFreshSourceID(ctx, tx, "")
+		if err != nil {
+			return nil, err
 		}
+		attachment.CurrentSourceID = generatedSourceID
 	}
 	if strings.TrimSpace(attachment.SchemaName) == "" {
 		attachment.SchemaName = c.config.Schema
@@ -450,7 +459,7 @@ func (c *Client) ensureNoDestructiveTransitionLocked(ctx context.Context) error 
 }
 
 func (c *Client) ensureConnectedSessionLocked(ctx context.Context, operation string) error {
-	if strings.TrimSpace(c.SourceID) == "" {
+	if strings.TrimSpace(c.sourceID) == "" {
 		return &OpenRequiredError{Operation: operation}
 	}
 	userID := strings.TrimSpace(c.UserID)
@@ -463,7 +472,7 @@ func (c *Client) ensureConnectedSessionLocked(ctx context.Context, operation str
 	}
 	if attachment.BindingState != attachmentBindingAttached ||
 		attachment.AttachedUserID != userID ||
-		attachment.CurrentSourceID != c.SourceID ||
+		attachment.CurrentSourceID != c.sourceID ||
 		!c.sessionConnected {
 		return &AttachRequiredError{Operation: operation}
 	}

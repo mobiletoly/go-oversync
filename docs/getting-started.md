@@ -73,7 +73,7 @@ CREATE TABLE business.posts (
 ## Core Terms
 
 - `user_id`: one isolated sync stream
-- `current_source_id`: the caller-owned current sync source identity
+- `current_source_id`: the internally managed current sync source identity
 - `source_bundle_id`: per-source monotonically increasing push id
 - `bundle_seq`: server-side committed bundle sequence
 - `row_version`: authoritative row version used for optimistic concurrency
@@ -279,7 +279,7 @@ func main() {
     }
     defer client.Close()
 
-    openResult, err := client.Open(ctx, "source-abc")
+    openResult, err := client.Open(ctx)
     if err != nil {
         log.Fatal(err)
     }
@@ -330,20 +330,14 @@ if detachResult.Outcome == oversqlite.DetachOutcomeBlockedUnsyncedData {
 }
 ```
 
-Rebuild operations:
+Rebuild operation:
 
 ```go
-rebuildReport, err := client.Rebuild(ctx, oversqlite.RebuildKeepSource, "")
+rebuildReport, err := client.Rebuild(ctx)
 if err != nil {
     log.Fatal(err)
 }
 log.Printf("rebuild outcome: %s", rebuildReport.Outcome)
-
-recoverReport, err := client.Rebuild(ctx, oversqlite.RebuildRotateSource, "source-rotated")
-if err != nil {
-    log.Fatal(err)
-}
-log.Printf("recover outcome: %s rotated_source_id=%s", recoverReport.Outcome, recoverReport.RotatedSourceID)
 ```
 
 Behavior to expect:
@@ -358,8 +352,8 @@ Behavior to expect:
 - `PullToStable()` drains complete bundles until the frozen `stable_bundle_seq` is reached.
 - `PullToStable()` rebuilds automatically through snapshot sessions if the server returns
   `history_pruned`.
-- `Rebuild(ctx, oversqlite.RebuildKeepSource, "")` rebuilds through chunked snapshot sessions without rotating source identity.
-- `Rebuild(ctx, oversqlite.RebuildRotateSource, newSourceID)` rebuilds through chunked snapshot sessions and rotates to the caller-provided source ID.
+- `Rebuild(ctx)` rebuilds through chunked snapshot sessions.
+- if durable source recovery is active, `Rebuild(ctx)` internally chooses the rebuild-plus-rotate path.
 - `Detach()` clears synced local cache/state after a successful attached detach, restores dirty-row
   capture before returning, and reports blocked detach as a normal `DetachResult`.
 - local writes made after `Detach()` are captured immediately as anonymous pending rows and can be synced after a later `Attach()`.
@@ -370,7 +364,7 @@ Behavior to expect:
 
 - every managed table must declare its sync key explicitly
 - managed tables must be FK-closed
-- `PullToStable()`, `Rebuild(ctx, oversqlite.RebuildKeepSource, "")`, and `Rebuild(ctx, oversqlite.RebuildRotateSource, newSourceID)` fail closed while `_sync_outbox_*` exists
+- `PullToStable()` and `Rebuild(ctx)` fail closed while `_sync_outbox_*` exists
 - `Sync()` fails closed while `_sync_attachment_state.rebuild_required = 1`
 - the durable read checkpoint is `_sync_attachment_state.last_bundle_seq_seen`
 - the next outgoing client bundle id is `_sync_source_state.next_source_bundle_id`

@@ -60,8 +60,8 @@ func (s *BundleFKAtomicityScenario) Setup(ctx context.Context) error {
 	}
 
 	sourceBase := fmt.Sprintf("bundle-fk-%s", s.userID)
-	if s.config != nil && s.config.SourceID != "" && s.config.SourceID != "device-unknown-001" {
-		sourceBase = s.config.SourceID
+	if s.config != nil && s.config.DeviceID != "" && s.config.DeviceID != "device-unknown-001" {
+		sourceBase = s.config.DeviceID
 	}
 	s.device1ID = sourceBase + "-d1"
 	s.device2ID = sourceBase + "-d2"
@@ -110,7 +110,7 @@ func (s *BundleFKAtomicityScenario) createDeviceApp(deviceID, deviceName string)
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           s.userID,
-		SourceID:         deviceID,
+		DeviceID:         deviceID,
 		DeviceName:       deviceName,
 		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: oversqliteConfig,

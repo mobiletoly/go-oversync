@@ -22,7 +22,7 @@ The current architecture has four main pieces:
 
 1. Your server registers the PostgreSQL tables that participate in sync.
 2. `Bootstrap()` validates the server schema and prepares the sync metadata/runtime topology.
-3. The SQLite client runs `Open(sourceID)` on launch, then `Attach(userID)` after sign-in.
+3. The SQLite client runs `Open()` on launch, then `Attach(userID)` after sign-in.
 4. The SQLite client tracks local writes in `_sync_dirty_rows` with triggers.
    After `Detach()`, those triggers stay active so offline anonymous writes continue to enqueue
    local dirty state immediately.
@@ -32,10 +32,10 @@ The current architecture has four main pieces:
    a new local bundle.
 6. `PullToStable()` reads complete committed bundles from `/sync/pull` and advances the local
    checkpoint only after durable local apply.
-7. `Rebuild(ctx, RebuildKeepSource, "")` and `Rebuild(ctx, RebuildRotateSource, newSourceID)`
-   rebuild managed tables from `/sync/snapshot-sessions` when a client is new or falls behind
-   retained history. The server materializes those frozen snapshots inside PostgreSQL session
-   tables and serves chunk reads statelessly by `snapshot_id`.
+7. `Rebuild(ctx)` rebuilds managed tables from `/sync/snapshot-sessions` when a client is new or
+   falls behind retained history. For stale/out-of-order source recovery, `oversqlite` chooses the
+   rebuild-plus-rotate path internally. The server materializes those frozen snapshots inside
+   PostgreSQL session tables and serves chunk reads statelessly by `snapshot_id`.
 
 ```mermaid
 flowchart LR

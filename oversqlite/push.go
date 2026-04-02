@@ -1003,7 +1003,7 @@ func (c *Client) freezePushOutboundSnapshotInTx(ctx context.Context, tx *sql.Tx)
 	}
 	if err := persistOutboxBundle(ctx, tx, &outboxBundleRecord{
 		State:                outboxStatePrepared,
-		SourceID:             c.SourceID,
+		SourceID:             c.sourceID,
 		SourceBundleID:       sourceBundleID,
 		CanonicalRequestHash: canonicalRequestHash,
 		RowCount:             int64(len(dirtyRows)),
@@ -1298,7 +1298,7 @@ func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedR
 	if err := json.Unmarshal(body, &session); err != nil {
 		return nil, fmt.Errorf("failed to decode push session response: %w", err)
 	}
-	if err := validatePushSessionCreateResponse(&session, sourceBundleID, plannedRowCount, c.SourceID); err != nil {
+	if err := validatePushSessionCreateResponse(&session, sourceBundleID, plannedRowCount, c.sourceID); err != nil {
 		return nil, err
 	}
 	if session.Status == "staging" {
@@ -1373,7 +1373,7 @@ func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversyn
 	if err := json.Unmarshal(body, &commitResp); err != nil {
 		return nil, fmt.Errorf("failed to decode push commit response: %w", err)
 	}
-	if err := validatePushSessionCommitResponse(&commitResp, c.SourceID); err != nil {
+	if err := validatePushSessionCommitResponse(&commitResp, c.sourceID); err != nil {
 		return nil, err
 	}
 	return &commitResp, nil

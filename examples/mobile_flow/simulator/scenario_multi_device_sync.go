@@ -52,7 +52,7 @@ func (s *MultiDeviceSyncScenario) Setup(ctx context.Context) error {
 	logger := s.simulator.GetLogger()
 	logger.Info("🔧 Setting up multi-device sync scenario for SAME user")
 
-	// Prefer simulator-provided user/source IDs (used by parallel runner), but keep a random fallback for
+	// Prefer simulator-provided user/device identities (used by parallel runner), but keep a random fallback for
 	// interactive runs where this scenario doesn't have a dedicated ScenarioConfig entry.
 	if s.config != nil && s.config.UserID != "" && s.config.UserID != "user-unknown" {
 		s.userA = s.config.UserID
@@ -64,8 +64,8 @@ func (s *MultiDeviceSyncScenario) Setup(ctx context.Context) error {
 
 	// Generate device identifiers (both for the same user)
 	sourceBase := fmt.Sprintf("device-%s", s.userA)
-	if s.config != nil && s.config.SourceID != "" && s.config.SourceID != "device-unknown-001" {
-		sourceBase = s.config.SourceID
+	if s.config != nil && s.config.DeviceID != "" && s.config.DeviceID != "device-unknown-001" {
+		sourceBase = s.config.DeviceID
 	}
 	s.device1ID = sourceBase + "-d1"
 	s.device2ID = sourceBase + "-d2"
@@ -120,7 +120,7 @@ func (s *MultiDeviceSyncScenario) createDeviceApp(scenarioConfig *config.Scenari
 		DatabaseFile:     dbFile,
 		ServerURL:        simCfg.ServerURL,
 		UserID:           scenarioConfig.UserID,
-		SourceID:         deviceID,
+		DeviceID:         deviceID,
 		DeviceName:       deviceName,
 		JWTSecret:        simCfg.JWTSecret,
 		OversqliteConfig: oversqliteConfig,

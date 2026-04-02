@@ -16,7 +16,7 @@ import (
 func TestResultContract_OpenStates(t *testing.T) {
 	t.Run("ready anonymous", func(t *testing.T) {
 		client, _ := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
-		openResult := mustOpen(t, client, context.Background(), "device-a")
+		openResult := mustOpen(t, client, context.Background())
 		require.Equal(t, OpenStateReadyAnonymous, openResult.State)
 		require.Empty(t, openResult.AttachedUserID)
 		require.Empty(t, openResult.TargetUserID)
@@ -33,7 +33,7 @@ func TestResultContract_OpenStates(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 
-		openResult := mustOpen(t, restarted, ctx, "device-a")
+		openResult := mustOpen(t, restarted, ctx)
 		require.Equal(t, OpenStateReadyAttached, openResult.State)
 		require.Equal(t, "result-user", openResult.AttachedUserID)
 		require.Empty(t, openResult.TargetUserID)
@@ -43,7 +43,7 @@ func TestResultContract_OpenStates(t *testing.T) {
 		client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 		setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindRemoteReplace, TargetUserID: "result-user"})
 
-		openResult := mustOpen(t, client, context.Background(), "device-a")
+		openResult := mustOpen(t, client, context.Background())
 		require.Equal(t, OpenStateAttachRecoveryRequired, openResult.State)
 		require.Equal(t, "result-user", openResult.TargetUserID)
 	})
@@ -131,7 +131,7 @@ func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 		var openErr *OpenRequiredError
 		require.ErrorAs(t, err, &openErr)
 
-		mustOpen(t, client, context.Background(), "device-a")
+		mustOpen(t, client, context.Background())
 		_, err = client.SyncStatus(context.Background())
 		var attachErr *AttachRequiredError
 		require.ErrorAs(t, err, &attachErr)
@@ -230,7 +230,7 @@ func TestResultContract_RemoteSyncAndRotationOutcomes(t *testing.T) {
 		require.Equal(t, RemoteSyncOutcomeSkippedPaused, report.Outcome)
 	})
 
-	t.Run("rebuild snapshot and rotate source", func(t *testing.T) {
+	t.Run("rebuild snapshot keeps managed source outside source recovery", func(t *testing.T) {
 		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, lifecycleUsersDDL)
 		client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			switch r.URL.Path {
@@ -264,18 +264,43 @@ func TestResultContract_RemoteSyncAndRotationOutcomes(t *testing.T) {
 			return nil, fmt.Errorf("unexpected path: %s", r.URL.Path)
 		})}
 
-		report := mustRebuild(t, client, ctx, RebuildRotateSource, "rotated-device")
+		report := mustRebuild(t, client, ctx)
 		require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
 		require.NotNil(t, report.Restore)
-		require.Equal(t, "rotated-device", report.RotatedSourceID)
-		require.Equal(t, "rotated-device", client.SourceID)
-
-		rotationResult := mustRotateSource(t, client, ctx, "second-rotated-device")
-		require.Equal(t, "second-rotated-device", rotationResult.SourceID)
+		require.Equal(t, "bundle-device", client.sourceID)
 
 		var count int
 		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
 		require.Equal(t, 1, count)
+	})
+}
+
+func TestResultContract_SourceInfo(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("diagnostic surface exposes opaque source and recovery flags", func(t *testing.T) {
+		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, lifecycleUsersDDL)
+
+		info, err := client.SourceInfo(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "bundle-device", info.CurrentSourceID)
+		require.False(t, info.RebuildRequired)
+		require.False(t, info.SourceRecoveryRequired)
+		require.Equal(t, SourceRecoveryCode(""), info.SourceRecoveryReason)
+
+		_, err = db.Exec(`UPDATE _sync_attachment_state SET rebuild_required = 1 WHERE singleton_key = 1`)
+		require.NoError(t, err)
+		require.NoError(t, persistOperationState(ctx, db, &operationStateRecord{
+			Kind:   operationKindSourceRecovery,
+			Reason: string(SourceRecoverySequenceChanged),
+		}))
+
+		info, err = client.SourceInfo(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "bundle-device", info.CurrentSourceID)
+		require.True(t, info.RebuildRequired)
+		require.True(t, info.SourceRecoveryRequired)
+		require.Equal(t, SourceRecoverySequenceChanged, info.SourceRecoveryReason)
 	})
 }
 

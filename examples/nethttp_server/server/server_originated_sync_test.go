@@ -26,7 +26,6 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 	ctx := context.Background()
 	suffix := uuid.NewString()
 	userID := "e2e-server-originated-user-" + suffix
-	deviceID := "device-e2e-a-" + suffix
 
 	token, err := ts.GenerateToken(userID, time.Hour)
 	require.NoError(t, err)
@@ -62,7 +61,7 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 		require.NoError(t, client.Close())
 	}()
 
-	_, err = client.Open(ctx, deviceID)
+	_, err = client.Open(ctx)
 	require.NoError(t, err)
 
 	connectResult, err := client.Attach(ctx, userID)

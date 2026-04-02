@@ -278,7 +278,7 @@ func (c *Client) rebuildKeepSourceLocked(ctx context.Context) (RemoteSyncReport,
 	return c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{})
 }
 
-func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context, newSourceID string) (RemoteSyncReport, error) {
+func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context) (RemoteSyncReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "Rebuild()"); err != nil {
 		return RemoteSyncReport{}, err
 	}
@@ -298,6 +298,10 @@ func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context, newSourceID st
 			Outcome: RemoteSyncOutcomeSkippedPaused,
 			Status:  status,
 		}, nil
+	}
+	newSourceID, err := c.generateFreshSourceID(ctx, c.DB, c.sourceID)
+	if err != nil {
+		return RemoteSyncReport{}, err
 	}
 	return c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{
 		RotateSource:              true,
@@ -355,13 +359,6 @@ func (c *Client) ensureRebuildPreconditionsLocked(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) rebuildFromSnapshotLocked(ctx context.Context, rotateSource bool, newSourceID string) (RemoteSyncReport, error) {
-	return c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{
-		RotateSource: rotateSource,
-		NewSourceID:  newSourceID,
-	})
-}
-
 func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, options snapshotApplyOptions) (RemoteSyncReport, error) {
 	if err := c.setRebuildRequired(ctx, true); err != nil {
 		return RemoteSyncReport{}, err
@@ -398,10 +395,6 @@ func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, optio
 	if err != nil {
 		return RemoteSyncReport{}, err
 	}
-	rotatedSourceID := ""
-	if options.RotateSource {
-		rotatedSourceID = strings.TrimSpace(options.NewSourceID)
-	}
 	return RemoteSyncReport{
 		Outcome: RemoteSyncOutcomeAppliedSnapshot,
 		Status:  status,
@@ -409,7 +402,6 @@ func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, optio
 			BundleSeq: session.SnapshotBundleSeq,
 			RowCount:  session.RowCount,
 		},
-		RotatedSourceID: rotatedSourceID,
 	}, nil
 }
 
@@ -705,7 +697,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 		}
 	}
 
-	targetSourceID := c.SourceID
+	targetSourceID := c.sourceID
 	if options.RotateSource {
 		targetSourceID = strings.TrimSpace(options.NewSourceID)
 		if options.RequireFreshRotatedSource {
@@ -715,8 +707,8 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 		} else if err := ensureSourceState(ctx, tx, targetSourceID); err != nil {
 			return err
 		}
-		if strings.TrimSpace(c.SourceID) != "" && c.SourceID != targetSourceID {
-			if err := markSourceReplaced(ctx, tx, c.SourceID, targetSourceID); err != nil {
+		if strings.TrimSpace(c.sourceID) != "" && c.sourceID != targetSourceID {
+			if err := markSourceReplaced(ctx, tx, c.sourceID, targetSourceID); err != nil {
 				return err
 			}
 		}
@@ -753,7 +745,7 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 		return fmt.Errorf("failed to commit staged snapshot apply: %w", err)
 	}
 	if options.RotateSource {
-		c.SourceID = targetSourceID
+		c.sourceID = targetSourceID
 	}
 	return nil
 }

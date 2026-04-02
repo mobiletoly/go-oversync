@@ -108,7 +108,7 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 
 	mustPushPendingE2E(t, activeClient, ctx)
 	mustPullToStableE2E(t, activeClient, ctx)
-	mustRebuildE2E(t, hydrateClient, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, hydrateClient, ctx)
 
 	assertTableCount(t, activeDB, "typed_rows", 3)
 	assertTableCount(t, hydrateDB, "typed_rows", 3)

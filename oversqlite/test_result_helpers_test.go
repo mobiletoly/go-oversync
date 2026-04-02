@@ -7,9 +7,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func mustOpen(t *testing.T, client *Client, ctx context.Context, sourceID string) OpenResult {
+func mustOpen(t *testing.T, client *Client, ctx context.Context) OpenResult {
 	t.Helper()
-	result, err := client.Open(ctx, sourceID)
+	result, err := client.Open(ctx)
 	require.NoError(t, err)
 	return result
 }
@@ -49,16 +49,9 @@ func mustSyncThenDetach(t *testing.T, client *Client, ctx context.Context) SyncT
 	return result
 }
 
-func mustRebuild(t *testing.T, client *Client, ctx context.Context, mode RebuildMode, newSourceID string) RemoteSyncReport {
+func mustRebuild(t *testing.T, client *Client, ctx context.Context) RemoteSyncReport {
 	t.Helper()
-	report, err := client.Rebuild(ctx, mode, newSourceID)
+	report, err := client.Rebuild(ctx)
 	require.NoError(t, err)
 	return report
-}
-
-func mustRotateSource(t *testing.T, client *Client, ctx context.Context, sourceID string) SourceRotationResult {
-	t.Helper()
-	result, err := client.RotateSource(ctx, sourceID)
-	require.NoError(t, err)
-	return result
 }

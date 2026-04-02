@@ -649,8 +649,9 @@ components:
       schema:
         type: string
       description: |
-        Caller-owned current sync source identity for this authenticated request. This header is
-        sync transport metadata, not authentication.
+        Current sync source identity for this authenticated request. This header is sync transport
+        metadata, not authentication. Direct protocol callers provide it explicitly; higher-level
+        clients such as oversqlite may manage it internally.
   securitySchemes:
     BearerAuth:
       type: http

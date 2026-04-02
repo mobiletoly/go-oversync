@@ -72,7 +72,7 @@ type ScenarioConfig struct {
 
 	// User and device settings
 	UserID     string
-	SourceID   string
+	DeviceID   string
 	DeviceName string
 
 	// Scenario-specific settings
@@ -97,7 +97,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Fresh Install",
 			Description:      "Simulates a fresh app installation with offline usage and first sync",
 			UserID:           "user-fresh-install",
-			SourceID:         "device-fresh-001",
+			DeviceID:         "device-fresh-001",
 			DeviceName:       "iPhone Fresh",
 			OfflineMode:      true,
 			CleanDatabase:    true,
@@ -109,7 +109,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Normal Usage",
 			Description:      "Simulates normal app usage with established sync",
 			UserID:           "user-normal-usage",
-			SourceID:         "device-normal-001",
+			DeviceID:         "device-normal-001",
 			DeviceName:       "iPhone Normal",
 			OfflineMode:      false,
 			CleanDatabase:    true,
@@ -121,7 +121,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Reinstall/Recovery",
 			Description:      "Simulates app reinstall with destructive snapshot rebuild recovery",
 			UserID:           "user-reinstall",
-			SourceID:         "device-reinstall-001",
+			DeviceID:         "device-reinstall-001",
 			DeviceName:       "iPhone Reinstall",
 			OfflineMode:      false,
 			CleanDatabase:    true,
@@ -133,7 +133,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Device Replacement",
 			Description:      "Simulates user switching to a new device",
 			UserID:           "user-device-replacement",
-			SourceID:         "device-replacement-001",
+			DeviceID:         "device-replacement-001",
 			DeviceName:       "iPhone New",
 			OfflineMode:      false,
 			CleanDatabase:    true,
@@ -145,7 +145,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Offline/Online Transitions",
 			Description:      "Simulates network connectivity changes and pending sync",
 			UserID:           "user-offline-online",
-			SourceID:         "device-offline-001",
+			DeviceID:         "device-offline-001",
 			DeviceName:       "iPhone Offline",
 			OfflineMode:      true,
 			CleanDatabase:    true, // Use clean database for this scenario
@@ -157,7 +157,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Multi-Device Conflicts",
 			Description:      "Exercises structured conflict recovery under chunked multi-device load with server-wins, client-wins, and latest-updated_at merge rules",
 			UserID:           "user-conflicts",
-			SourceID:         "device-conflicts-001",
+			DeviceID:         "device-conflicts-001",
 			DeviceName:       "iPhone Conflicts",
 			OfflineMode:      false,
 			ConflictMode:     true,
@@ -171,7 +171,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "User Switch",
 			Description:      "Simulates multiple users using the same device",
 			UserID:           "user-switch-a",
-			SourceID:         "device-switch-001",
+			DeviceID:         "device-switch-001",
 			DeviceName:       "Shared iPhone",
 			OfflineMode:      false,
 			CleanDatabase:    true,
@@ -183,7 +183,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Bundle FK Atomicity",
 			Description:      "Verifies bundle checkpoint correctness, dirty-pull rejection, and self-ref/cycle/cascade FK atomicity across devices",
 			UserID:           "user-bundle-fk-atomicity",
-			SourceID:         "device-bundle-fk",
+			DeviceID:         "device-bundle-fk",
 			DeviceName:       "iPhone Bundle FK",
 			OfflineMode:      false,
 			CleanDatabase:    true,
@@ -195,7 +195,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Complex Multi-Batch",
 			Description:      "Comprehensive stress test with complex offline operations, multi-batch uploads, FK constraints, and full hydration validation",
 			UserID:           "user-complex-multi-batch",
-			SourceID:         "device-complex-001",
+			DeviceID:         "device-complex-001",
 			DeviceName:       "iPhone Complex Test",
 			OfflineMode:      true,
 			CleanDatabase:    true,
@@ -207,7 +207,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:             "Files Sync",
 			Description:      "Tests synchronization of files and file_reviews tables with BLOB primary keys and foreign key relationships",
 			UserID:           "user-files-sync",
-			SourceID:         "device-files-001",
+			DeviceID:         "device-files-001",
 			DeviceName:       "iPhone Files Test",
 			OfflineMode:      false,
 			CleanDatabase:    true,
@@ -224,7 +224,7 @@ func GetScenarioConfig(scenarioName string) *ScenarioConfig {
 			Name:        "Unknown",
 			Description: "Unknown scenario",
 			UserID:      "user-unknown",
-			SourceID:    "device-unknown-001",
+			DeviceID:    "device-unknown-001",
 			DeviceName:  "Unknown Device",
 		}
 	}

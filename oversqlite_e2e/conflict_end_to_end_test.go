@@ -27,7 +27,7 @@ func TestEndToEnd_ConflictServerWinsResolverRecoversAutomatically(t *testing.T) 
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Ada", "ada@example.com")
 	require.NoError(t, err)
 	mustPushPendingE2E(t, clientA, ctx)
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -71,7 +71,7 @@ func TestEndToEnd_ConflictClientWinsResolverStillConvergesWithUnseenPeerBundle(t
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Grace", "grace@example.com")
 	require.NoError(t, err)
 	mustPushPendingE2E(t, clientA, ctx)
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 
 	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, peerUserID, "Peer", "peer@example.com")
 	require.NoError(t, err)
@@ -122,7 +122,7 @@ func TestEndToEnd_ConflictKeepMergedResolverRetriesMergedPayload(t *testing.T) {
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Ada", "ada@example.com")
 	require.NoError(t, err)
 	mustPushPendingE2E(t, clientA, ctx)
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -173,7 +173,7 @@ func TestEndToEnd_ConflictKeepLocalResolverAutoRetriesAndWins(t *testing.T) {
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Linus", "linus@example.com")
 	require.NoError(t, err)
 	mustPushPendingE2E(t, clientA, ctx)
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{
@@ -213,7 +213,7 @@ func TestEndToEnd_ConflictRetryExhaustionLeavesReplayableDirtyState(t *testing.T
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, conflictUserID, "Ada", "ada@example.com")
 	require.NoError(t, err)
 	mustPushPendingE2E(t, clientA, ctx)
-	mustRebuildE2E(t, clientB, ctx, oversqlite.RebuildKeepSource, "")
+	mustRebuildE2E(t, clientB, ctx)
 
 	_, err = dbB.Exec(`UPDATE users SET name = ? WHERE id = ?`, "Ada Local", conflictUserID)
 	require.NoError(t, err)

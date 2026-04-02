@@ -24,7 +24,6 @@ func TestMobileApp_OnLaunch_PersistsOpenLifecycleStateWithoutAttachedRestore(t *
 		DatabaseFile: dbFile,
 		ServerURL:    "http://example.invalid",
 		UserID:       "user-test",
-		SourceID:     "device-test",
 		DeviceName:   "Test Device",
 		JWTSecret:    "test-secret",
 		OversqliteConfig: &oversqlite.Config{
@@ -63,8 +62,8 @@ func TestMobileApp_OnLaunch_PersistsOpenLifecycleStateWithoutAttachedRestore(t *
 	`).Scan(&sourceID, &bindingState); err != nil {
 		t.Fatalf("expected lifecycle state row after launch: %v", err)
 	}
-	if sourceID != app.config.SourceID {
-		t.Fatalf("unexpected source_id: got %q want %q", sourceID, app.config.SourceID)
+	if sourceID == "" {
+		t.Fatalf("expected non-empty internal source_id after launch")
 	}
 	if bindingState != "anonymous" {
 		t.Fatalf("unexpected binding_state: got %q want anonymous", bindingState)
@@ -90,7 +89,6 @@ func TestMobileApp_Close_ReleasesClientOwnershipForRestart(t *testing.T) {
 		DatabaseFile: dbFile,
 		ServerURL:    "http://example.invalid",
 		UserID:       "user-test",
-		SourceID:     "device-test",
 		DeviceName:   "Test Device",
 		JWTSecret:    "test-secret",
 		OversqliteConfig: &oversqlite.Config{
@@ -118,30 +116,15 @@ func TestMobileApp_Close_ReleasesClientOwnershipForRestart(t *testing.T) {
 	defer restarted.close()
 }
 
-func TestMobileApp_SyncRotatedSourceIdentityUpdatesConfigAndSession(t *testing.T) {
+func TestMobileApp_SessionTokensDoNotDependOnSourceIdentity(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	app := &MobileApp{
-		config: &mobileAppConfig{
-			SourceID: "device-original",
-		},
-		session: NewSession("user-test", "device-original", "test-secret", logger),
-		logger:  logger,
-	}
-
-	if err := app.session.SignIn("user-test", "device-original"); err != nil {
+	session := NewSession("user-test", "test-secret", logger)
+	if err := session.SignIn("user-test"); err != nil {
 		t.Fatalf("SignIn: %v", err)
 	}
-	app.syncRotatedSourceIdentity("device-rotated")
-
-	if got := app.config.SourceID; got != "device-rotated" {
-		t.Fatalf("unexpected config source_id: got %q want %q", got, "device-rotated")
-	}
-	if got := app.session.GetSourceID(); got != "device-rotated" {
-		t.Fatalf("unexpected session source_id: got %q want %q", got, "device-rotated")
-	}
-	if token, err := app.session.GetToken(); err != nil || token == "" {
+	if token, err := session.GetToken(); err != nil || token == "" {
 		t.Fatalf("expected token refresh to remain available after source rotation, token=%q err=%v", token, err)
 	}
 }
@@ -171,7 +154,6 @@ func TestMobileApp_OnDetach_KeepsOfflineWritesPending(t *testing.T) {
 		DatabaseFile: dbFile,
 		ServerURL:    server.URL,
 		UserID:       "user-test",
-		SourceID:     "device-test",
 		DeviceName:   "Test Device",
 		JWTSecret:    "test-secret",
 		OversqliteConfig: &oversqlite.Config{

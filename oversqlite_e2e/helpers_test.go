@@ -235,7 +235,8 @@ func newSQLiteClient(
 
 	client, err = oversqlite.NewClient(db, ts.URL(), tokenFn, config)
 	require.NoError(t, err)
-	openResult, err := client.Open(context.Background(), sourceID)
+	_ = sourceID
+	openResult, err := client.Open(context.Background())
 	require.NoError(t, err)
 	require.NotEmpty(t, openResult.State)
 	connectResult, err := client.Attach(context.Background(), userID)
@@ -274,7 +275,8 @@ func newSQLiteClientWithoutConnect(
 
 	client, err = oversqlite.NewClient(db, ts.URL(), tokenFn, config)
 	require.NoError(t, err)
-	openResult, err := client.Open(context.Background(), sourceID)
+	_ = sourceID
+	openResult, err := client.Open(context.Background())
 	require.NoError(t, err)
 	require.NotEmpty(t, openResult.State)
 

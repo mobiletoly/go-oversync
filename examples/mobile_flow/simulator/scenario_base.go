@@ -33,10 +33,10 @@ func NewBaseScenario(simulator *Simulator, scenarioName string) *BaseScenario {
 }
 
 // SetUserConfig overrides user configuration for parallel testing
-func (bs *BaseScenario) SetUserConfig(userID, sourceID string) {
+func (bs *BaseScenario) SetUserConfig(userID, deviceID string) {
 	if bs.config != nil {
 		bs.config.UserID = userID
-		bs.config.SourceID = sourceID
+		bs.config.DeviceID = deviceID
 	}
 }
 

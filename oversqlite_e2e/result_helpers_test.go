@@ -10,7 +10,8 @@ import (
 
 func mustOpenE2E(t *testing.T, client *oversqlite.Client, ctx context.Context, sourceID string) oversqlite.OpenResult {
 	t.Helper()
-	result, err := client.Open(ctx, sourceID)
+	_ = sourceID
+	result, err := client.Open(ctx)
 	require.NoError(t, err)
 	return result
 }
@@ -29,9 +30,9 @@ func mustPullToStableE2E(t *testing.T, client *oversqlite.Client, ctx context.Co
 	return report
 }
 
-func mustRebuildE2E(t *testing.T, client *oversqlite.Client, ctx context.Context, mode oversqlite.RebuildMode, newSourceID string) oversqlite.RemoteSyncReport {
+func mustRebuildE2E(t *testing.T, client *oversqlite.Client, ctx context.Context) oversqlite.RemoteSyncReport {
 	t.Helper()
-	report, err := client.Rebuild(ctx, mode, newSourceID)
+	report, err := client.Rebuild(ctx)
 	require.NoError(t, err)
 	return report
 }
@@ -43,11 +44,18 @@ func mustDetachE2E(t *testing.T, client *oversqlite.Client, ctx context.Context)
 	return result
 }
 
-func mustRotateSourceE2E(t *testing.T, client *oversqlite.Client, ctx context.Context, sourceID string) oversqlite.SourceRotationResult {
+func requireCurrentSourceIDE2E(t *testing.T, client *oversqlite.Client, ctx context.Context) string {
 	t.Helper()
-	result, err := client.RotateSource(ctx, sourceID)
+	info := mustSourceInfoE2E(t, client, ctx)
+	require.NotEmpty(t, info.CurrentSourceID)
+	return info.CurrentSourceID
+}
+
+func mustSourceInfoE2E(t *testing.T, client *oversqlite.Client, ctx context.Context) oversqlite.SourceInfo {
+	t.Helper()
+	info, err := client.SourceInfo(ctx)
 	require.NoError(t, err)
-	return result
+	return info
 }
 
 func mustSyncThenDetachE2E(t *testing.T, client *oversqlite.Client, ctx context.Context) oversqlite.SyncThenDetachResult {

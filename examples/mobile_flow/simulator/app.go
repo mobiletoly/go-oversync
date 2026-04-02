@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +22,7 @@ type mobileAppConfig struct {
 	DatabaseFile     string
 	ServerURL        string
 	UserID           string
-	SourceID         string
+	DeviceID         string
 	DeviceName       string
 	JWTSecret        string
 	OversqliteConfig *oversqlite.Config
@@ -71,7 +70,7 @@ func newMobileApp(config *mobileAppConfig) (*MobileApp, error) {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
 
-	app.session = NewSession(config.UserID, config.SourceID, config.JWTSecret, logger)
+	app.session = NewSession(config.UserID, config.JWTSecret, logger)
 	app.ui = NewUISimulator(logger)
 	app.sync = NewSyncManager(app, logger)
 
@@ -119,8 +118,7 @@ func (app *MobileApp) initializeDatabase() error {
 	if verboseLog {
 		app.logger.Info("Database initialized successfully",
 			"file", app.config.DatabaseFile,
-			"user_id", app.config.UserID,
-			"source_id", app.config.SourceID)
+			"user_id", app.config.UserID)
 	}
 
 	return nil
@@ -302,7 +300,7 @@ func (app *MobileApp) onLaunch(ctx context.Context) error {
 	}
 	app.ui.SetBanner("Starting up...")
 
-	openResult, err := app.client.Open(ctx, app.config.SourceID)
+	openResult, err := app.client.Open(ctx)
 	if err != nil {
 		app.logger.Error("Failed to open local oversqlite lifecycle", "error", err)
 		app.ui.SetBanner("Setup failed")
@@ -362,7 +360,7 @@ func (app *MobileApp) onSignIn(ctx context.Context, userID string) error {
 	}
 
 	// Create new session
-	if err := app.session.SignIn(userID, app.config.SourceID); err != nil {
+	if err := app.session.SignIn(userID); err != nil {
 		app.ui.SetBanner("Sign in failed")
 		return fmt.Errorf("sign in failed: %w", err)
 	}
@@ -370,7 +368,7 @@ func (app *MobileApp) onSignIn(ctx context.Context, userID string) error {
 	if verboseLog {
 		app.ui.SetBanner("Setting up sync...")
 	}
-	openResult, err := app.client.Open(ctx, app.config.SourceID)
+	openResult, err := app.client.Open(ctx)
 	if err != nil {
 		app.logger.Error("Failed to open local oversqlite lifecycle", "error", err)
 		app.ui.SetBanner("Setup failed")
@@ -730,7 +728,7 @@ func (app *MobileApp) startSync(ctx context.Context) error {
 	return nil
 }
 
-// rebuildKeepSource rebuilds local state from the authoritative server snapshot without rotating source identity.
+// rebuildKeepSource rebuilds local state from the authoritative server snapshot.
 func (app *MobileApp) rebuildKeepSource(ctx context.Context) error {
 	if app.client == nil {
 		return fmt.Errorf("no oversqlite client available")
@@ -739,7 +737,7 @@ func (app *MobileApp) rebuildKeepSource(ctx context.Context) error {
 	app.logger.Info("🔄 Starting rebuild")
 	app.ui.SetBanner("Downloading data...")
 
-	report, err := app.client.Rebuild(ctx, oversqlite.RebuildKeepSource, "")
+	report, err := app.client.Rebuild(ctx)
 	if err != nil {
 		app.ui.SetBanner("Download failed")
 		return fmt.Errorf("rebuild failed: %w", err)
@@ -753,51 +751,6 @@ func (app *MobileApp) rebuildKeepSource(ctx context.Context) error {
 
 	return nil
 }
-
-// rebuildRotateSource rebuilds local state and rotates to an explicit replacement source ID.
-func (app *MobileApp) rebuildRotateSource(ctx context.Context, newSourceID string) error {
-	if app.client == nil {
-		return fmt.Errorf("no oversqlite client available")
-	}
-	newSourceID = strings.TrimSpace(newSourceID)
-	if newSourceID == "" {
-		return fmt.Errorf("newSourceID must be provided")
-	}
-
-	app.logger.Info("🔄 Starting recovery rebuild")
-	app.ui.SetBanner("Recovering data...")
-
-	report, err := app.client.Rebuild(ctx, oversqlite.RebuildRotateSource, newSourceID)
-	if err != nil {
-		app.ui.SetBanner("Recovery failed")
-		return fmt.Errorf("recovery rebuild failed: %w", err)
-	}
-
-	if report.RotatedSourceID != "" {
-		app.syncRotatedSourceIdentity(report.RotatedSourceID)
-	} else {
-		app.syncRotatedSourceIdentity(newSourceID)
-	}
-
-	app.ui.SetBanner("Data recovered")
-	app.logger.Info("✅ Recovery rebuild completed successfully")
-
-	return nil
-}
-
-func (app *MobileApp) syncRotatedSourceIdentity(sourceID string) {
-	sourceID = strings.TrimSpace(sourceID)
-	if sourceID == "" {
-		return
-	}
-	if app.config != nil {
-		app.config.SourceID = sourceID
-	}
-	if app.session != nil {
-		app.session.SetSourceID(sourceID)
-	}
-}
-
 func (app *MobileApp) resetSnapshotTransferDiagnostics() {
 	if app.client != nil {
 		app.client.ResetSnapshotTransferDiagnostics()

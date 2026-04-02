@@ -10,7 +10,7 @@ import (
 	"github.com/mobiletoly/go-oversync/oversqlite"
 )
 
-// DeviceReplacementScenario simulates a user moving to a new device/source identity.
+// DeviceReplacementScenario simulates a user moving to a new device identity.
 type DeviceReplacementScenario struct {
 	*BaseScenario
 	replacementApp *MobileApp
@@ -52,14 +52,14 @@ func (s *DeviceReplacementScenario) Execute(ctx context.Context) error {
 		return fmt.Errorf("failed to stabilize original device after seed push: %w", err)
 	}
 
-	originalSourceID := s.config.SourceID
-	replacementSourceID := fmt.Sprintf("%s-replacement", originalSourceID)
+	originalDeviceID := s.config.DeviceID
+	replacementDeviceID := fmt.Sprintf("%s-replacement", originalDeviceID)
 	logger.Info(
 		"Preparing replacement device",
-		"original_source_id", originalSourceID,
-		"replacement_source_id", replacementSourceID,
+		"original_device_id", originalDeviceID,
+		"replacement_device_id", replacementDeviceID,
 	)
-	replacementApp, err := s.createReplacementApp(replacementSourceID)
+	replacementApp, err := s.createReplacementApp(replacementDeviceID)
 	if err != nil {
 		return err
 	}
@@ -139,14 +139,14 @@ func (s *DeviceReplacementScenario) Cleanup(ctx context.Context) error {
 	return s.BaseScenario.Cleanup(ctx)
 }
 
-func (s *DeviceReplacementScenario) createReplacementApp(sourceID string) (*MobileApp, error) {
+func (s *DeviceReplacementScenario) createReplacementApp(deviceID string) (*MobileApp, error) {
 	simCfg := s.simulator.GetConfig()
-	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", sourceID, s.config.UserID, time.Now().UnixNano()))
+	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, s.config.UserID, time.Now().UnixNano()))
 	appConfig := &mobileAppConfig{
 		DatabaseFile: dbFile,
 		ServerURL:    simCfg.ServerURL,
 		UserID:       s.config.UserID,
-		SourceID:     sourceID,
+		DeviceID:     deviceID,
 		DeviceName:   "Replacement Device",
 		JWTSecret:    simCfg.JWTSecret,
 		OversqliteConfig: &oversqlite.Config{
