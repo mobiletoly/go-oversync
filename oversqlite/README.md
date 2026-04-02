@@ -29,7 +29,7 @@ The durable source/runtime state lives in:
 
 Lifecycle:
 
-- `Open(ctx) (OpenResult, error)`
+- `Open(ctx) error`
 - `Attach(ctx, userID) (AttachResult, error)`
 - `Detach(ctx) (DetachResult, error)`
 - `PendingSyncStatus(ctx) (PendingSyncStatus, error)`
@@ -113,11 +113,9 @@ if err != nil {
 }
 defer client.Close()
 
-openResult, err := client.Open(context.Background())
-if err != nil {
+if err := client.Open(context.Background()); err != nil {
 	log.Fatal(err)
 }
-log.Printf("open state: %s", openResult.State)
 
 attachResult, err := client.Attach(context.Background(), "user-123")
 if err != nil {

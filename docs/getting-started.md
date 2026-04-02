@@ -279,11 +279,9 @@ func main() {
     }
     defer client.Close()
 
-    openResult, err := client.Open(ctx)
-    if err != nil {
+    if err := client.Open(ctx); err != nil {
         log.Fatal(err)
     }
-    log.Printf("open state: %s", openResult.State)
 
     connectResult, err := client.Attach(ctx, "user-123")
     if err != nil {

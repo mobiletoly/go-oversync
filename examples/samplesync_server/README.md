@@ -46,7 +46,7 @@ Client settings
 - Base URL: `http://localhost:8080` (desktop/iOS) or `http://10.0.2.2:8080` (Android emulator)
 - Schema: `business`
 - Send `Oversync-Source-ID: <current-source-id>` on authenticated `/sync/*` requests
-- Call `POST /sync/connect` after local `Open(sourceID)` to resolve
+- Call `POST /sync/connect` after local `Open()` to resolve
   `remote_authoritative`, `initialize_local`, `initialize_empty`, or `retry_later`
 - Expect lifecycle-related sync failures:
   - `scope_uninitialized`

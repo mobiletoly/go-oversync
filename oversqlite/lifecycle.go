@@ -48,16 +48,16 @@ type PendingSyncStatus struct {
 }
 
 // Open restores local lifecycle state and bootstraps internal source identity if needed.
-func (c *Client) Open(ctx context.Context) (OpenResult, error) {
+func (c *Client) Open(ctx context.Context) error {
 	if err := c.tryBeginSyncOperation(); err != nil {
-		return OpenResult{}, err
+		return err
 	}
 	defer c.writeMu.Unlock()
 
 	state, err := c.openLocked(ctx)
 	var pendingRemoteReplaceErr *RemoteReplacePendingError
 	if err != nil && !errors.As(err, &pendingRemoteReplaceErr) {
-		return OpenResult{}, err
+		return err
 	}
 	c.sourceID = state.SourceID
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) != "" {
@@ -67,7 +67,7 @@ func (c *Client) Open(ctx context.Context) (OpenResult, error) {
 	}
 	c.pendingInitializationID = state.PendingInitializationID
 	c.sessionConnected = false
-	return openResultFromLifecycleState(state), nil
+	return nil
 }
 
 // Attach resolves account attachment through the server connect lifecycle.

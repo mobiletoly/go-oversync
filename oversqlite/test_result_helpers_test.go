@@ -7,11 +7,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func mustOpen(t *testing.T, client *Client, ctx context.Context) OpenResult {
+func mustOpen(t *testing.T, client *Client, ctx context.Context) {
 	t.Helper()
-	result, err := client.Open(ctx)
+	err := client.Open(ctx)
 	require.NoError(t, err)
-	return result
 }
 
 func mustAttach(t *testing.T, client *Client, ctx context.Context, userID string) AttachResult {

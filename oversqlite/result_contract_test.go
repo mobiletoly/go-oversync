@@ -13,16 +13,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestResultContract_OpenStates(t *testing.T) {
-	t.Run("ready anonymous", func(t *testing.T) {
+func TestResultContract_Open(t *testing.T) {
+	t.Run("succeeds from anonymous state", func(t *testing.T) {
 		client, _ := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
-		openResult := mustOpen(t, client, context.Background())
-		require.Equal(t, OpenStateReadyAnonymous, openResult.State)
-		require.Empty(t, openResult.AttachedUserID)
-		require.Empty(t, openResult.TargetUserID)
+		mustOpen(t, client, context.Background())
 	})
 
-	t.Run("ready attached after restart", func(t *testing.T) {
+	t.Run("restores durable attached local state", func(t *testing.T) {
 		ctx := context.Background()
 		client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 		_, err := client.Attach(ctx, "result-user")
@@ -33,19 +30,15 @@ func TestResultContract_OpenStates(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 
-		openResult := mustOpen(t, restarted, ctx)
-		require.Equal(t, OpenStateReadyAttached, openResult.State)
-		require.Equal(t, "result-user", openResult.AttachedUserID)
-		require.Empty(t, openResult.TargetUserID)
+		mustOpen(t, restarted, ctx)
+		require.Equal(t, "result-user", restarted.UserID)
 	})
 
-	t.Run("attach recovery required", func(t *testing.T) {
+	t.Run("succeeds while attach recovery is pending", func(t *testing.T) {
 		client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 		setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindRemoteReplace, TargetUserID: "result-user"})
 
-		openResult := mustOpen(t, client, context.Background())
-		require.Equal(t, OpenStateAttachRecoveryRequired, openResult.State)
-		require.Equal(t, "result-user", openResult.TargetUserID)
+		mustOpen(t, client, context.Background())
 	})
 }
 

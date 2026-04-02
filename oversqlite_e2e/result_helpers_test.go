@@ -8,12 +8,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func mustOpenE2E(t *testing.T, client *oversqlite.Client, ctx context.Context, sourceID string) oversqlite.OpenResult {
+func mustOpenE2E(t *testing.T, client *oversqlite.Client, ctx context.Context, sourceID string) {
 	t.Helper()
 	_ = sourceID
-	result, err := client.Open(ctx)
+	err := client.Open(ctx)
 	require.NoError(t, err)
-	return result
 }
 
 func mustPushPendingE2E(t *testing.T, client *oversqlite.Client, ctx context.Context) oversqlite.PushReport {

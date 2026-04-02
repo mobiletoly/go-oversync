@@ -6,25 +6,6 @@ import (
 	"strings"
 )
 
-func openResultFromLifecycleState(state *lifecycleState) OpenResult {
-	if state == nil {
-		return OpenResult{State: OpenStateReadyAnonymous}
-	}
-	if state.PendingTransitionKind == lifecycleTransitionRemote {
-		return OpenResult{
-			State:        OpenStateAttachRecoveryRequired,
-			TargetUserID: state.PendingTargetScope,
-		}
-	}
-	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) != "" {
-		return OpenResult{
-			State:          OpenStateReadyAttached,
-			AttachedUserID: state.BindingScope,
-		}
-	}
-	return OpenResult{State: OpenStateReadyAnonymous}
-}
-
 func (c *Client) syncStatusLocked(ctx context.Context) (SyncStatus, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "SyncStatus()"); err != nil {
 		return SyncStatus{}, err

@@ -61,7 +61,7 @@ func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
 		require.NoError(t, client.Close())
 	}()
 
-	_, err = client.Open(ctx)
+	err = client.Open(ctx)
 	require.NoError(t, err)
 
 	connectResult, err := client.Attach(ctx, userID)

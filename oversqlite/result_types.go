@@ -1,24 +1,5 @@
 package oversqlite
 
-// OpenState describes the lifecycle state restored by Open.
-type OpenState string
-
-const (
-	// OpenStateReadyAnonymous means the client is open with no attached user scope.
-	OpenStateReadyAnonymous OpenState = "ready_anonymous"
-	// OpenStateReadyAttached means durable attached local state exists, but Attach(userID) must still reconnect the session.
-	OpenStateReadyAttached OpenState = "ready_attached"
-	// OpenStateAttachRecoveryRequired means a pending remote-authoritative replace must be finalized by Attach(targetUserID).
-	OpenStateAttachRecoveryRequired OpenState = "attach_recovery_required"
-)
-
-// OpenResult reports the lifecycle state restored by Open.
-type OpenResult struct {
-	State          OpenState
-	AttachedUserID string
-	TargetUserID   string
-}
-
 // DetachOutcome describes the lifecycle outcome of Detach.
 type DetachOutcome string
 

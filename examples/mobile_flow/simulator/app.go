@@ -300,14 +300,14 @@ func (app *MobileApp) onLaunch(ctx context.Context) error {
 	}
 	app.ui.SetBanner("Starting up...")
 
-	openResult, err := app.client.Open(ctx)
+	err := app.client.Open(ctx)
 	if err != nil {
 		app.logger.Error("Failed to open local oversqlite lifecycle", "error", err)
 		app.ui.SetBanner("Setup failed")
 		return fmt.Errorf("open lifecycle failed: %w", err)
 	}
 	if verboseLog {
-		app.logger.Info("Opened local oversqlite lifecycle", "state", openResult.State)
+		app.logger.Info("Opened local oversqlite lifecycle")
 	}
 
 	// Try to restore session
@@ -368,14 +368,14 @@ func (app *MobileApp) onSignIn(ctx context.Context, userID string) error {
 	if verboseLog {
 		app.ui.SetBanner("Setting up sync...")
 	}
-	openResult, err := app.client.Open(ctx)
+	err := app.client.Open(ctx)
 	if err != nil {
 		app.logger.Error("Failed to open local oversqlite lifecycle", "error", err)
 		app.ui.SetBanner("Setup failed")
 		return fmt.Errorf("open lifecycle failed: %w", err)
 	}
 	if verboseLog {
-		app.logger.Info("Opened local oversqlite lifecycle", "state", openResult.State)
+		app.logger.Info("Opened local oversqlite lifecycle")
 	}
 	if err := app.connectLifecycle(ctx, userID); err != nil {
 		app.logger.Error("Failed to connect oversqlite lifecycle", "error", err)

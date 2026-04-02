@@ -38,7 +38,7 @@ Authenticated sync requests still carry the runtime's current source through
 
 ## Public Operations
 
-- `Open(ctx) (OpenResult, error)`
+- `Open(ctx) error`
 - `Attach(ctx, userID) (AttachResult, error)`
 - `Detach(ctx) (DetachResult, error)`
 - `PendingSyncStatus(ctx) (PendingSyncStatus, error)`

@@ -525,8 +525,7 @@ func TestOpenAndAttachEstablishRuntimeIdentity(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	client.sourceIDGenerator = func() string { return "device-a" }
 
-	openResult := mustOpen(t, client, context.Background())
-	require.Equal(t, OpenStateReadyAnonymous, openResult.State)
+	mustOpen(t, client, context.Background())
 	require.Equal(t, "device-a", client.sourceID)
 	require.Empty(t, client.UserID)
 

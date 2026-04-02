@@ -47,8 +47,7 @@ func newLifecycleTestClientWithTransport(t *testing.T, transport roundTripFunc) 
 	}, config)
 	require.NoError(t, err)
 	client.sourceIDGenerator = func() string { return "device-a" }
-	openResult := mustOpen(t, client, context.Background())
-	require.Equal(t, OpenStateReadyAnonymous, openResult.State)
+	mustOpen(t, client, context.Background())
 	client.HTTP = &http.Client{Transport: transport}
 
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
@@ -578,7 +577,7 @@ func TestOpen_DoesNotRequireCallerProvidedSourceID(t *testing.T) {
 		Resolution: "initialize_empty",
 	})
 
-	_, err := client.Open(ctx)
+	err := client.Open(ctx)
 	require.NoError(t, err)
 
 	_, err = client.Attach(ctx, "lifecycle-user")
@@ -763,14 +762,12 @@ func TestConnect_ResumesSameAttachedUserWithoutNetwork(t *testing.T) {
 	require.Equal(t, int32(0), atomic.LoadInt32(&requestCount))
 }
 
-func TestOpen_ReportsPendingRemoteReplaceRecovery(t *testing.T) {
+func TestOpen_AllowsPendingRemoteReplaceRecoveryState(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{Resolution: "initialize_empty"})
 
 	setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindRemoteReplace, TargetUserID: "lifecycle-user"})
 
-	openResult := mustOpen(t, client, context.Background())
-	require.Equal(t, OpenStateAttachRecoveryRequired, openResult.State)
-	require.Equal(t, "lifecycle-user", openResult.TargetUserID)
+	mustOpen(t, client, context.Background())
 }
 
 func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemovedFromConfig(t *testing.T) {
@@ -1031,7 +1028,7 @@ func TestUninstallSync_RemovesMetadataAndTriggersButPreservesBusinessTables(t *t
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&userCount))
 	require.Equal(t, 2, userCount)
 
-	_, err = client.Open(context.Background())
+	err = client.Open(context.Background())
 	var closedErr *ClientClosedError
 	require.ErrorAs(t, err, &closedErr)
 }
