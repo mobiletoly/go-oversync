@@ -671,7 +671,7 @@ func (c *Client) ensureRemoteReplaceSnapshotStagedLocked(ctx context.Context, st
 		}
 	}
 
-	session, err := c.createSnapshotSession(ctx)
+	session, err := c.createSnapshotSession(ctx, nil)
 	if err != nil {
 		return nil, err
 	}

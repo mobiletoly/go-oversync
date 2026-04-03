@@ -23,6 +23,7 @@ type DirtyStateRejectedError struct {
 type snapshotApplyOptions struct {
 	RotateSource              bool
 	NewSourceID               string
+	ReplacementReason         string
 	PreserveOutbox            bool
 	ClearSourceRecovery       bool
 	RequireFreshRotatedSource bool
@@ -299,13 +300,21 @@ func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context) (RemoteSyncRep
 			Status:  status,
 		}, nil
 	}
-	newSourceID, err := c.generateFreshSourceID(ctx, c.DB, c.sourceID)
+	operation, err := loadOperationState(ctx, c.DB)
 	if err != nil {
 		return RemoteSyncReport{}, err
+	}
+	newSourceID := strings.TrimSpace(operation.ReplacementSourceID)
+	if newSourceID == "" {
+		newSourceID, err = c.generateFreshSourceID(ctx, c.DB, c.sourceID)
+		if err != nil {
+			return RemoteSyncReport{}, err
+		}
 	}
 	return c.rebuildFromSnapshotWithOptionsLocked(ctx, snapshotApplyOptions{
 		RotateSource:              true,
 		NewSourceID:               newSourceID,
+		ReplacementReason:         strings.TrimSpace(operation.Reason),
 		PreserveOutbox:            true,
 		ClearSourceRecovery:       true,
 		RequireFreshRotatedSource: true,
@@ -367,7 +376,8 @@ func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, optio
 		return RemoteSyncReport{}, err
 	}
 
-	session, err := c.createSnapshotSession(ctx)
+	sessionReq := snapshotSessionCreateRequestFromOptions(c.sourceID, options)
+	session, err := c.createSnapshotSession(ctx, sessionReq)
 	if err != nil {
 		return RemoteSyncReport{}, err
 	}
@@ -412,12 +422,45 @@ func (c *Client) snapshotChunkRows() int {
 	return 1000
 }
 
-func (c *Client) createSnapshotSession(ctx context.Context) (*oversync.SnapshotSession, error) {
-	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "snapshot_session_create", http.MethodPost, buildSnapshotSessionCreateURL(c.BaseURL), nil, "")
+func snapshotSessionCreateRequestFromOptions(currentSourceID string, options snapshotApplyOptions) *oversync.SnapshotSessionCreateRequest {
+	if !options.RotateSource {
+		return nil
+	}
+	return &oversync.SnapshotSessionCreateRequest{
+		SourceReplacement: &oversync.SnapshotSourceReplacement{
+			PreviousSourceID: currentSourceID,
+			NewSourceID:      strings.TrimSpace(options.NewSourceID),
+			Reason:           strings.TrimSpace(options.ReplacementReason),
+		},
+	}
+}
+
+func (c *Client) createSnapshotSession(ctx context.Context, req *oversync.SnapshotSessionCreateRequest) (*oversync.SnapshotSession, error) {
+	var reqBody []byte
+	var err error
+	if req != nil {
+		reqBody, err = json.Marshal(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal snapshot session request: %w", err)
+		}
+	}
+	contentType := ""
+	if len(reqBody) > 0 {
+		contentType = "application/json"
+	}
+	body, statusCode, err := c.doAuthenticatedRequestWithRetry(ctx, "snapshot_session_create", http.MethodPost, buildSnapshotSessionCreateURL(c.BaseURL), reqBody, contentType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send snapshot session request: %w", err)
 	}
 	if statusCode != http.StatusOK {
+		if statusCode == http.StatusConflict && req != nil && req.SourceReplacement != nil {
+			if retiredResp, ok := decodeSourceRetiredResponse(body); ok {
+				return nil, &SourceReplacementDivergedError{
+					LocalReplacement:  strings.TrimSpace(req.SourceReplacement.NewSourceID),
+					RemoteReplacement: strings.TrimSpace(retiredResp.ReplacedBySourceID),
+				}
+			}
+		}
 		return nil, fmt.Errorf("server returned status %d: %s", statusCode, decodeServerErrorBody(body))
 	}
 
@@ -937,6 +980,17 @@ func decodeServerErrorResponse(body []byte) (oversync.ErrorResponse, bool) {
 		return resp, true
 	}
 	return oversync.ErrorResponse{}, false
+}
+
+func decodeSourceRetiredResponse(body []byte) (oversync.SourceRetiredResponse, bool) {
+	if len(body) == 0 {
+		return oversync.SourceRetiredResponse{}, false
+	}
+	var resp oversync.SourceRetiredResponse
+	if err := json.Unmarshal(body, &resp); err == nil && strings.TrimSpace(resp.Error) == "source_retired" {
+		return resp, true
+	}
+	return oversync.SourceRetiredResponse{}, false
 }
 
 func buildPullURL(base string, afterBundleSeq int64, maxBundles int, targetBundleSeq int64) string {

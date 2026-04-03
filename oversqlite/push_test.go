@@ -551,6 +551,7 @@ func TestPushPending_CreateHistoryPrunedRequiresSourceRecoveryAndRotatePreserves
 
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
 	require.NoError(t, err)
+	client.sourceIDGenerator = func() string { return "rotated-device" }
 
 	base := newMockPushSessionServer(t)
 	createPruned := true
@@ -563,6 +564,12 @@ func TestPushPending_CreateHistoryPrunedRequiresSourceRecoveryAndRotatePreserves
 				Message: "source tuple is below retained history floor",
 			}), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/sync/snapshot-sessions":
+			var req oversync.SnapshotSessionCreateRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			require.NotNil(t, req.SourceReplacement)
+			require.Equal(t, "bundle-device", req.SourceReplacement.PreviousSourceID)
+			require.Equal(t, "rotated-device", req.SourceReplacement.NewSourceID)
+			require.Equal(t, "history_pruned", req.SourceReplacement.Reason)
 			return jsonResponse(oversync.SnapshotSession{
 				SnapshotID:        "source-recovery-snapshot",
 				SnapshotBundleSeq: 9,
@@ -596,6 +603,7 @@ func TestPushPending_CreateHistoryPrunedRequiresSourceRecoveryAndRotatePreserves
 	require.Equal(t, int64(1), outbox.RowCount)
 	require.Equal(t, operationKindSourceRecovery, requireOperationKind(t, db))
 	require.Equal(t, string(SourceRecoveryHistoryPruned), requireOperationReason(t, db))
+	require.Equal(t, "rotated-device", requireOperationReplacementSourceID(t, db))
 
 	_, err = client.PullToStable(ctx)
 	require.ErrorAs(t, err, &recoveryErr)
@@ -605,7 +613,6 @@ func TestPushPending_CreateHistoryPrunedRequiresSourceRecoveryAndRotatePreserves
 	require.ErrorAs(t, err, &recoveryErr)
 	require.Equal(t, SourceRecoveryHistoryPruned, recoveryErr.Code)
 
-	client.sourceIDGenerator = func() string { return "rotated-device" }
 	report, err := client.Rebuild(ctx)
 	require.NoError(t, err)
 	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
@@ -654,6 +661,7 @@ func TestPushPending_CreateSourceSequenceOutOfOrderPersistsSourceRecoveryAcrossR
 
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
 	require.NoError(t, err)
+	client.sourceIDGenerator = func() string { return "restarted-rotated-device" }
 
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
@@ -671,6 +679,7 @@ func TestPushPending_CreateSourceSequenceOutOfOrderPersistsSourceRecoveryAcrossR
 	require.Equal(t, SourceRecoverySequenceOutOfOrder, recoveryErr.Code)
 	require.Equal(t, operationKindSourceRecovery, requireOperationKind(t, db))
 	require.Equal(t, string(SourceRecoverySequenceOutOfOrder), requireOperationReason(t, db))
+	require.Equal(t, "restarted-rotated-device", requireOperationReplacementSourceID(t, db))
 
 	require.NoError(t, client.Close())
 
@@ -697,10 +706,15 @@ func TestPushPending_CreateSourceSequenceOutOfOrderPersistsSourceRecoveryAcrossR
 	require.ErrorAs(t, err, &recoveryErr)
 	require.Equal(t, SourceRecoverySequenceOutOfOrder, recoveryErr.Code)
 
-	restarted.sourceIDGenerator = func() string { return "restarted-rotated-device" }
 	restarted.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/sync/snapshot-sessions":
+			var req oversync.SnapshotSessionCreateRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			require.NotNil(t, req.SourceReplacement)
+			require.Equal(t, "bundle-device", req.SourceReplacement.PreviousSourceID)
+			require.Equal(t, "restarted-rotated-device", req.SourceReplacement.NewSourceID)
+			require.Equal(t, "source_sequence_out_of_order", req.SourceReplacement.Reason)
 			return jsonResponse(oversync.SnapshotSession{
 				SnapshotID:        "sequence-out-of-order-recovery",
 				SnapshotBundleSeq: 4,
@@ -741,6 +755,7 @@ func TestPushPending_CommitSourceSequenceChangedRequiresSourceRecovery(t *testin
 
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
 	require.NoError(t, err)
+	client.sourceIDGenerator = func() string { return "commit-rotated-device" }
 
 	base := newMockPushSessionServer(t)
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -763,6 +778,114 @@ func TestPushPending_CommitSourceSequenceChangedRequiresSourceRecovery(t *testin
 	require.Equal(t, int64(1), outbox.SourceBundleID)
 	require.Equal(t, operationKindSourceRecovery, requireOperationKind(t, db))
 	require.Equal(t, string(SourceRecoverySequenceChanged), requireOperationReason(t, db))
+	require.Equal(t, "commit-rotated-device", requireOperationReplacementSourceID(t, db))
+}
+
+func TestPushPending_CreateSourceRetiredEntersSourceRecoveryAndAdoptsReplacement(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
+			return errorJSONResponse(http.StatusConflict, oversync.SourceRetiredResponse{
+				Error:              "source_retired",
+				Message:            "source bundle-device was retired for user bundle-user and replaced by server-rotated-device",
+				SourceID:           "bundle-device",
+				ReplacedBySourceID: "server-rotated-device",
+			}), nil
+		}
+		return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	})}
+
+	_, err = client.PushPending(ctx)
+	var recoveryErr *SourceRecoveryRequiredError
+	require.ErrorAs(t, err, &recoveryErr)
+	require.Equal(t, SourceRecoveryRetired, recoveryErr.Code)
+	require.Equal(t, operationKindSourceRecovery, requireOperationKind(t, db))
+	require.Equal(t, string(SourceRecoveryRetired), requireOperationReason(t, db))
+	require.Equal(t, "server-rotated-device", requireOperationReplacementSourceID(t, db))
+}
+
+func TestPushPending_CommitSourceRetiredEntersSourceRecoveryAndAdoptsReplacement(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+
+	base := newMockPushSessionServer(t)
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/") && strings.HasSuffix(r.URL.Path, "/commit") {
+			return errorJSONResponse(http.StatusConflict, oversync.SourceRetiredResponse{
+				Error:              "source_retired",
+				Message:            "source bundle-device was retired for user bundle-user and replaced by server-commit-rotated-device",
+				SourceID:           "bundle-device",
+				ReplacedBySourceID: "server-commit-rotated-device",
+			}), nil
+		}
+		return base.RoundTrip(r)
+	})}
+
+	_, err = client.PushPending(ctx)
+	var recoveryErr *SourceRecoveryRequiredError
+	require.ErrorAs(t, err, &recoveryErr)
+	require.Equal(t, SourceRecoveryRetired, recoveryErr.Code)
+	require.Equal(t, operationKindSourceRecovery, requireOperationKind(t, db))
+	require.Equal(t, string(SourceRecoveryRetired), requireOperationReason(t, db))
+	require.Equal(t, "server-commit-rotated-device", requireOperationReplacementSourceID(t, db))
+}
+
+func TestPushPending_CreateSourceRetiredReplacementDivergenceFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+	setOperationStateForTest(t, db, &operationStateRecord{
+		Kind:                operationKindNone,
+		ReplacementSourceID: "local-rotated-device",
+	})
+
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions" {
+			return errorJSONResponse(http.StatusConflict, oversync.SourceRetiredResponse{
+				Error:              "source_retired",
+				Message:            "source bundle-device was retired for user bundle-user and replaced by server-rotated-device",
+				SourceID:           "bundle-device",
+				ReplacedBySourceID: "server-rotated-device",
+			}), nil
+		}
+		return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	})}
+
+	_, err = client.PushPending(ctx)
+	var divergedErr *SourceReplacementDivergedError
+	require.ErrorAs(t, err, &divergedErr)
+	require.Equal(t, "local-rotated-device", divergedErr.LocalReplacement)
+	require.Equal(t, "server-rotated-device", divergedErr.RemoteReplacement)
+	require.Equal(t, operationKindNone, requireOperationKind(t, db))
+	require.Equal(t, "local-rotated-device", requireOperationReplacementSourceID(t, db))
 }
 
 func TestPushPending_CommittedRemoteReplayPrunedFallsBackToKeepSourceRebuild(t *testing.T) {

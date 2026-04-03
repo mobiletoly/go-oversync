@@ -62,6 +62,15 @@ func TestBootstrap_CreatesExplicitLayoutMarkerAndExactTableCatalog(t *testing.T)
 		scopeStateTextColumnCount        int
 		scopeStateCodeColumnCount        int
 		sourceStatePKCount               int
+		sourceStateStateColumnCount      int
+		sourceStateMaxColumnCount        int
+		sourceStateReplacedColumnCount   int
+		sourceStateReasonColumnCount     int
+		sourceStateStateChkCount         int
+		sourceStateMaxChkCount           int
+		sourceStateActiveChkCount        int
+		sourceStateReservedChkCount      int
+		sourceStateRetiredChkCount       int
 		layoutProtocolLabel              string
 		layoutName                       string
 	)
@@ -210,6 +219,97 @@ func TestBootstrap_CreatesExplicitLayoutMarkerAndExactTableCatalog(t *testing.T)
 		  AND constraint_type = 'PRIMARY KEY'
 	`).Scan(&sourceStatePKCount))
 	require.Equal(t, 1, sourceStatePKCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'sync'
+		  AND table_name = 'source_state'
+		  AND column_name = 'state'
+	`).Scan(&sourceStateStateColumnCount))
+	require.Equal(t, 1, sourceStateStateColumnCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'sync'
+		  AND table_name = 'source_state'
+		  AND column_name = 'max_committed_source_bundle_id'
+	`).Scan(&sourceStateMaxColumnCount))
+	require.Equal(t, 1, sourceStateMaxColumnCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'sync'
+		  AND table_name = 'source_state'
+		  AND column_name = 'replaced_by_source_id'
+	`).Scan(&sourceStateReplacedColumnCount))
+	require.Equal(t, 1, sourceStateReplacedColumnCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'sync'
+		  AND table_name = 'source_state'
+		  AND column_name = 'retirement_reason'
+	`).Scan(&sourceStateReasonColumnCount))
+	require.Equal(t, 1, sourceStateReasonColumnCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = 'sync'
+		  AND t.relname = 'source_state'
+		  AND c.conname = 'source_state_state_chk'
+	`).Scan(&sourceStateStateChkCount))
+	require.Equal(t, 1, sourceStateStateChkCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = 'sync'
+		  AND t.relname = 'source_state'
+		  AND c.conname = 'source_state_max_committed_chk'
+	`).Scan(&sourceStateMaxChkCount))
+	require.Equal(t, 1, sourceStateMaxChkCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = 'sync'
+		  AND t.relname = 'source_state'
+		  AND c.conname = 'source_state_active_chk'
+	`).Scan(&sourceStateActiveChkCount))
+	require.Equal(t, 1, sourceStateActiveChkCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = 'sync'
+		  AND t.relname = 'source_state'
+		  AND c.conname = 'source_state_reserved_chk'
+	`).Scan(&sourceStateReservedChkCount))
+	require.Equal(t, 1, sourceStateReservedChkCount)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = 'sync'
+		  AND t.relname = 'source_state'
+		  AND c.conname = 'source_state_retired_chk'
+	`).Scan(&sourceStateRetiredChkCount))
+	require.Equal(t, 1, sourceStateRetiredChkCount)
 }
 
 func TestBootstrap_FailsClosedWhenRegisteredTableCatalogDiffers(t *testing.T) {

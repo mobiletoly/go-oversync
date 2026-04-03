@@ -562,6 +562,307 @@ func TestSnapshotSessions_CreateEmptySnapshot(t *testing.T) {
 	require.Zero(t, chunk.NextRowOrdinal)
 }
 
+func TestSnapshotSessions_RotatedCreateRetiresPreviousAndReservesReplacement(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_rotate_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-rotate-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "snapshot-rotate-user-" + suffix
+	oldSourceID := "writer-old"
+	newSourceID := "writer-new"
+	writer := Actor{UserID: userID, SourceID: oldSourceID}
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+
+	session, err := svc.CreateSnapshotSessionWithRequest(ctx, writer, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldSourceID,
+			NewSourceID:      newSourceID,
+			Reason:           "history_pruned",
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, session.SnapshotID)
+
+	userPK, err := lookupUserPK(ctx, pool, userID)
+	require.NoError(t, err)
+
+	var (
+		oldState                string
+		oldMaxCommittedBundleID int64
+		oldReplacedBySourceID   string
+		oldRetirementReason     string
+		newState                string
+		newMaxCommittedBundleID int64
+		newReplacedBySourceID   string
+		newRetirementReason     string
+	)
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT state, max_committed_source_bundle_id, replaced_by_source_id, retirement_reason
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, oldSourceID).Scan(&oldState, &oldMaxCommittedBundleID, &oldReplacedBySourceID, &oldRetirementReason))
+	require.Equal(t, sourceStateRetired, oldState)
+	require.Equal(t, int64(1), oldMaxCommittedBundleID)
+	require.Equal(t, newSourceID, oldReplacedBySourceID)
+	require.Equal(t, "history_pruned", oldRetirementReason)
+
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT state, max_committed_source_bundle_id, replaced_by_source_id, retirement_reason
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, newSourceID).Scan(&newState, &newMaxCommittedBundleID, &newReplacedBySourceID, &newRetirementReason))
+	require.Equal(t, sourceStateReserved, newState)
+	require.Zero(t, newMaxCommittedBundleID)
+	require.Empty(t, newReplacedBySourceID)
+	require.Empty(t, newRetirementReason)
+}
+
+func TestSnapshotSessions_RotatedCreateForNeverCommittedSourceCreatesRetiredZeroFloor(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_rotate_empty_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-rotate-empty-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "snapshot-rotate-empty-user-" + suffix
+	oldSourceID := "writer-empty-old"
+	newSourceID := "writer-empty-new"
+	mustInitializeEmptyScope(t, ctx, svc, userID, oldSourceID)
+
+	_, err := svc.CreateSnapshotSessionWithRequest(ctx, Actor{UserID: userID, SourceID: oldSourceID}, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldSourceID,
+			NewSourceID:      newSourceID,
+			Reason:           "source_sequence_changed",
+		},
+	})
+	require.NoError(t, err)
+
+	userPK, err := lookupUserPK(ctx, pool, userID)
+	require.NoError(t, err)
+
+	var oldState string
+	var oldMaxCommittedBundleID int64
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT state, max_committed_source_bundle_id
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, oldSourceID).Scan(&oldState, &oldMaxCommittedBundleID))
+	require.Equal(t, sourceStateRetired, oldState)
+	require.Zero(t, oldMaxCommittedBundleID)
+
+	var newState string
+	var newMaxCommittedBundleID int64
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT state, max_committed_source_bundle_id
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, newSourceID).Scan(&newState, &newMaxCommittedBundleID))
+	require.Equal(t, sourceStateReserved, newState)
+	require.Zero(t, newMaxCommittedBundleID)
+}
+
+func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_rotate_repeat_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-rotate-repeat-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "snapshot-rotate-repeat-user-" + suffix
+	oldSourceID := "writer-repeat-old"
+	newSourceID := "writer-repeat-new"
+	writer := Actor{UserID: userID, SourceID: oldSourceID}
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+
+	req := &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldSourceID,
+			NewSourceID:      newSourceID,
+			Reason:           "history_pruned",
+		},
+	}
+	session1, err := svc.CreateSnapshotSessionWithRequest(ctx, writer, req)
+	require.NoError(t, err)
+	session2, err := svc.CreateSnapshotSessionWithRequest(ctx, writer, req)
+	require.NoError(t, err)
+	require.NotEqual(t, session1.SnapshotID, session2.SnapshotID)
+
+	userPK, err := lookupUserPK(ctx, pool, userID)
+	require.NoError(t, err)
+
+	var sourceStateCount int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.source_state
+		WHERE user_pk = $1
+	`, userPK).Scan(&sourceStateCount))
+	require.Equal(t, 2, sourceStateCount)
+
+	var oldState, oldReplacedBySourceID string
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT state, replaced_by_source_id
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, oldSourceID).Scan(&oldState, &oldReplacedBySourceID))
+	require.Equal(t, sourceStateRetired, oldState)
+	require.Equal(t, newSourceID, oldReplacedBySourceID)
+
+	var newState string
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT state
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, newSourceID).Scan(&newState))
+	require.Equal(t, sourceStateReserved, newState)
+}
+
+func TestSnapshotSessions_RotatedCreateRejectsConflictingReplacementTargets(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_rotate_conflict_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-rotate-conflict-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "snapshot-rotate-conflict-user-" + suffix
+	oldSourceID := "writer-conflict-old"
+	firstNewSourceID := "writer-conflict-new-a"
+	secondNewSourceID := "writer-conflict-new-b"
+	otherOldSourceID := "writer-conflict-old-b"
+	writer := Actor{UserID: userID, SourceID: oldSourceID}
+	otherWriter := Actor{UserID: userID, SourceID: otherOldSourceID}
+	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+	mustPushUserBundle(t, ctx, svc, otherWriter, schemaName, 1, uuid.New(), "Bravo")
+
+	_, err := svc.CreateSnapshotSessionWithRequest(ctx, writer, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldSourceID,
+			NewSourceID:      firstNewSourceID,
+			Reason:           "history_pruned",
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = svc.CreateSnapshotSessionWithRequest(ctx, writer, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldSourceID,
+			NewSourceID:      secondNewSourceID,
+			Reason:           "history_pruned",
+		},
+	})
+	var retiredErr *SourceRetiredError
+	require.ErrorAs(t, err, &retiredErr)
+	require.Equal(t, oldSourceID, retiredErr.SourceID)
+	require.Equal(t, firstNewSourceID, retiredErr.ReplacedBySourceID)
+
+	_, err = svc.CreateSnapshotSessionWithRequest(ctx, otherWriter, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: otherOldSourceID,
+			NewSourceID:      firstNewSourceID,
+			Reason:           "history_pruned",
+		},
+	})
+	var replacementErr *SourceReplacementInvalidError
+	require.ErrorAs(t, err, &replacementErr)
+	require.Contains(t, replacementErr.Error(), firstNewSourceID)
+}
+
+func TestSnapshotSessions_FirstCommitUnderReservedReplacementActivatesSource(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_rotate_activate_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-rotate-activate-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "snapshot-rotate-activate-user-" + suffix
+	oldSourceID := "writer-activate-old"
+	newSourceID := "writer-activate-new"
+	oldWriter := Actor{UserID: userID, SourceID: oldSourceID}
+	newWriter := Actor{UserID: userID, SourceID: newSourceID}
+	mustPushUserBundle(t, ctx, svc, oldWriter, schemaName, 1, uuid.New(), "Alpha")
+
+	_, err := svc.CreateSnapshotSessionWithRequest(ctx, oldWriter, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldSourceID,
+			NewSourceID:      newSourceID,
+			Reason:           "history_pruned",
+		},
+	})
+	require.NoError(t, err)
+
+	mustPushUserBundle(t, ctx, svc, newWriter, schemaName, 1, uuid.New(), "Bravo")
+
+	userPK, err := lookupUserPK(ctx, pool, userID)
+	require.NoError(t, err)
+
+	var state string
+	var maxCommittedSourceBundleID int64
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT state, max_committed_source_bundle_id
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, newSourceID).Scan(&state, &maxCommittedSourceBundleID))
+	require.Equal(t, sourceStateActive, state)
+	require.Equal(t, int64(1), maxCommittedSourceBundleID)
+}
+
 func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)

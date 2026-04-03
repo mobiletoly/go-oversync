@@ -247,7 +247,7 @@ func (s *SyncService) CreatePushSession(ctx context.Context, actor Actor, req *P
 				return nil
 			}
 
-			expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleID(ctx, tx, scopeState.UserPK, actor.SourceID)
+			expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleID(ctx, tx, scopeState.UserPK, actor.UserID, actor.SourceID)
 			if err != nil {
 				return err
 			}
@@ -490,7 +490,7 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 				}
 			}
 
-			expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, session.UserPK, session.SourceID)
+			expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, session.UserPK, session.UserID, session.SourceID)
 			if err != nil {
 				return err
 			}
@@ -543,14 +543,8 @@ func (s *SyncService) CommitPushSession(ctx context.Context, actor Actor, pushID
 				return &PushCommitInvalidError{Message: "push session produced no captured business-table effects"}
 			}
 
-			if _, err := tx.Exec(ctx, `
-			INSERT INTO sync.source_state (
-				user_pk, source_id, max_committed_source_bundle_id
-			) VALUES ($1, $2, $3)
-			ON CONFLICT (user_pk, source_id) DO UPDATE
-			SET max_committed_source_bundle_id = EXCLUDED.max_committed_source_bundle_id
-		`, session.UserPK, session.SourceID, session.SourceBundleID); err != nil {
-				return fmt.Errorf("upsert source_state row: %w", err)
+			if err := activateSourceState(ctx, tx, session.UserPK, session.UserID, session.SourceID, session.SourceBundleID); err != nil {
+				return err
 			}
 			if err := s.applyRetentionPolicyForUser(ctx, tx, session.UserPK); err != nil {
 				return err
@@ -793,39 +787,40 @@ func loadCommittedPushMetadataBySourceTuple(ctx context.Context, tx pgx.Tx, user
 	return &meta, nil
 }
 
-func loadNextExpectedSourceBundleID(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string) (int64, int64, error) {
-	var maxCommittedSourceBundleID int64
-	err := tx.QueryRow(ctx, `
-		SELECT max_committed_source_bundle_id
-		FROM sync.source_state
-		WHERE user_pk = $1
-		  AND source_id = $2
-	`, userPK, sourceID).Scan(&maxCommittedSourceBundleID)
+func loadNextExpectedSourceBundleID(ctx context.Context, tx pgx.Tx, userPK int64, userID, sourceID string) (int64, int64, error) {
+	state, err := loadSourceStateRow(ctx, tx, userPK, sourceID, false)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 1, 0, nil
-		}
 		return 0, 0, fmt.Errorf("query source_state next expected bundle for %s: %w", sourceID, err)
 	}
-	return maxCommittedSourceBundleID + 1, maxCommittedSourceBundleID, nil
+	if state == nil {
+		return 1, 0, nil
+	}
+	if state.State == sourceStateRetired {
+		return 0, 0, &SourceRetiredError{
+			UserID:             userID,
+			SourceID:           sourceID,
+			ReplacedBySourceID: state.ReplacedBySourceID,
+		}
+	}
+	return state.MaxCommittedSourceBundleID + 1, state.MaxCommittedSourceBundleID, nil
 }
 
-func loadNextExpectedSourceBundleIDForUpdate(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string) (int64, int64, error) {
-	var maxCommittedSourceBundleID int64
-	err := tx.QueryRow(ctx, `
-		SELECT max_committed_source_bundle_id
-		FROM sync.source_state
-		WHERE user_pk = $1
-		  AND source_id = $2
-		FOR UPDATE
-	`, userPK, sourceID).Scan(&maxCommittedSourceBundleID)
+func loadNextExpectedSourceBundleIDForUpdate(ctx context.Context, tx pgx.Tx, userPK int64, userID, sourceID string) (int64, int64, error) {
+	state, err := loadSourceStateRow(ctx, tx, userPK, sourceID, true)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 1, 0, nil
-		}
 		return 0, 0, fmt.Errorf("query source_state next expected bundle for update %s: %w", sourceID, err)
 	}
-	return maxCommittedSourceBundleID + 1, maxCommittedSourceBundleID, nil
+	if state == nil {
+		return 1, 0, nil
+	}
+	if state.State == sourceStateRetired {
+		return 0, 0, &SourceRetiredError{
+			UserID:             userID,
+			SourceID:           sourceID,
+			ReplacedBySourceID: state.ReplacedBySourceID,
+		}
+	}
+	return state.MaxCommittedSourceBundleID + 1, state.MaxCommittedSourceBundleID, nil
 }
 
 func loadCommittedBundleMeta(ctx context.Context, tx pgx.Tx, userID string, bundleSeq int64) (*committedBundleMeta, error) {

@@ -49,6 +49,17 @@ func requireOperationState(t *testing.T, db *sql.DB) (string, string, string, in
 	return kind, targetUserID, stagedSnapshotID, bundleSeq, rowCount
 }
 
+func requireOperationReplacementSourceID(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var replacementSourceID string
+	require.NoError(t, db.QueryRow(`
+		SELECT replacement_source_id
+		FROM _sync_operation_state
+		WHERE singleton_key = 1
+	`).Scan(&replacementSourceID))
+	return replacementSourceID
+}
+
 func requireOperationReason(t *testing.T, db *sql.DB) string {
 	t.Helper()
 	var reason string

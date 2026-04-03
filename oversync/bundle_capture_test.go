@@ -246,6 +246,51 @@ func TestWithinSyncBundle_DoesNotRetryCallbackOnRetryableTransactionError(t *tes
 	require.Zero(t, sourceStateCount)
 }
 
+func TestWithinSyncBundle_RetiredSourceFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "bundle_retired_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "bundle-retired-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+
+	userID := "bundle-retired-user-" + suffix
+	oldSourceID := "server-old"
+	newSourceID := "server-new"
+	mustInitializeEmptyScope(t, ctx, svc, userID, oldSourceID)
+
+	_, err := svc.CreateSnapshotSessionWithRequest(ctx, Actor{UserID: userID, SourceID: oldSourceID}, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldSourceID,
+			NewSourceID:      newSourceID,
+			Reason:           "history_pruned",
+		},
+	})
+	require.NoError(t, err)
+
+	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: oldSourceID, SourceBundleID: 1}, func(tx pgx.Tx) error {
+		_, execErr := tx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s.users (id, name, email)
+			VALUES ($1, $2, $3)
+		`, pgx.Identifier{schemaName}.Sanitize()), uuid.New(), "Alice", "alice@example.com")
+		return execErr
+	})
+	var retiredErr *SourceRetiredError
+	require.ErrorAs(t, err, &retiredErr)
+	require.Equal(t, oldSourceID, retiredErr.SourceID)
+	require.Equal(t, newSourceID, retiredErr.ReplacedBySourceID)
+}
+
 func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)

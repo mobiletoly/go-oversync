@@ -186,7 +186,7 @@ func (s *SyncService) WithinSyncBundle(
 		if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
 			return err
 		}
-		expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, source.SourceID)
+		expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID)
 		if err != nil {
 			return err
 		}
@@ -223,14 +223,8 @@ func (s *SyncService) WithinSyncBundle(
 			return err
 		}
 		if bundle != nil {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO sync.source_state (
-					user_pk, source_id, max_committed_source_bundle_id
-				) VALUES ($1, $2, $3)
-				ON CONFLICT (user_pk, source_id) DO UPDATE
-				SET max_committed_source_bundle_id = EXCLUDED.max_committed_source_bundle_id
-			`, scopeState.UserPK, source.SourceID, source.SourceBundleID); err != nil {
-				return fmt.Errorf("upsert source_state row: %w", err)
+			if err := activateSourceState(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID, source.SourceBundleID); err != nil {
+				return err
 			}
 			if err := s.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
 				return err

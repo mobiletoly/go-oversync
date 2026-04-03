@@ -94,6 +94,9 @@ Notes:
 Create failure contract:
 
 - `400 push_session_invalid`
+- `409 history_pruned`
+- `409 source_sequence_out_of_order`
+- `409 source_retired`
 - `409 scope_uninitialized`
 - `409 scope_initializing`
 - `409 initialization_stale`
@@ -166,6 +169,8 @@ Failure contract:
 - `403 push_session_forbidden`
 - `404 push_session_not_found`
 - `409 push_conflict`
+- `409 source_sequence_changed`
+- `409 source_retired`
 - `409 initialization_stale`
 - `410 push_session_expired`
 - `410 initialization_expired`
@@ -296,6 +301,38 @@ Failure contract:
 
 Create one frozen snapshot session for hydration or destructive recovery.
 
+The request body is optional.
+
+Keep-source rebuild request:
+
+```json
+{}
+```
+
+Rotated rebuild request:
+
+```json
+{
+  "source_replacement": {
+    "previous_source_id": "device-old",
+    "new_source_id": "device-new",
+    "reason": "history_pruned"
+  }
+}
+```
+
+Notes:
+
+- omitting `source_replacement` means keep-source hydrate/rebuild
+- including `source_replacement` means rotated rebuild; the server reserves `new_source_id` and
+  retires `previous_source_id` atomically with snapshot-session creation
+- `previous_source_id` must match the authenticated `Oversync-Source-ID`
+- supported `reason` values are:
+  - `history_pruned`
+  - `source_sequence_out_of_order`
+  - `source_sequence_changed`
+  - `source_retired`
+
 Response:
 
 ```json
@@ -310,8 +347,22 @@ Response:
 
 Failure contract:
 
+- `400 snapshot_session_invalid`
+- `409 source_replacement_invalid`
+- `409 source_retired`
 - `409 scope_uninitialized`
 - `409 scope_initializing`
+
+Structured `source_retired` response:
+
+```json
+{
+  "error": "source_retired",
+  "message": "source device-old was retired for user user-123 and replaced by device-new",
+  "source_id": "device-old",
+  "replaced_by_source_id": "device-new"
+}
+```
 
 ## GET `/sync/snapshot-sessions/{snapshot_id}`
 

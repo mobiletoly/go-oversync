@@ -346,11 +346,11 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 						Message: prunedErr.Message,
 					}
 			}
-			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryHistoryPruned, prunedErr.Message)
+			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryHistoryPruned, prunedErr.Message, "")
 		}
 		var outOfOrderErr *sourceSequenceOutOfOrderError
 		if errors.As(err, &outOfOrderErr) {
-			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoverySequenceOutOfOrder, outOfOrderErr.Message)
+			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoverySequenceOutOfOrder, outOfOrderErr.Message, "")
 		}
 		return nil, err
 	}
@@ -415,7 +415,7 @@ func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushO
 	if err != nil {
 		var sequenceErr *sourceSequenceChangedError
 		if errors.As(err, &sequenceErr) {
-			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoverySequenceChanged, sequenceErr.Message)
+			return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoverySequenceChanged, sequenceErr.Message, "")
 		}
 		return nil, err
 	}
@@ -1281,6 +1281,10 @@ func (c *Client) createPushSession(ctx context.Context, sourceBundleID, plannedR
 						Status:  statusCode,
 						Message: errorResp.Message,
 					}
+				case "source_retired":
+					if retiredResp, ok := decodeSourceRetiredResponse(body); ok {
+						return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryRetired, retiredResp.Message, retiredResp.ReplacedBySourceID)
+					}
 				}
 			}
 		}
@@ -1352,10 +1356,17 @@ func (c *Client) commitPushSession(ctx context.Context, pushID string) (*oversyn
 			return nil, initErr
 		}
 		if statusCode == http.StatusConflict {
-			if errorResp, ok := decodeServerErrorResponse(body); ok && errorResp.Error == "source_sequence_changed" {
-				return nil, &sourceSequenceChangedError{
-					Status:  statusCode,
-					Message: errorResp.Message,
+			if errorResp, ok := decodeServerErrorResponse(body); ok {
+				switch errorResp.Error {
+				case "source_sequence_changed":
+					return nil, &sourceSequenceChangedError{
+						Status:  statusCode,
+						Message: errorResp.Message,
+					}
+				case "source_retired":
+					if retiredResp, ok := decodeSourceRetiredResponse(body); ok {
+						return nil, c.beginSourceRecoveryLocked(ctx, SourceRecoveryRetired, retiredResp.Message, retiredResp.ReplacedBySourceID)
+					}
 				}
 			}
 		}

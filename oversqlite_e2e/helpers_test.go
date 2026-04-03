@@ -380,6 +380,17 @@ func requireServerScopeRowCount(t *testing.T, server *exampleserver.TestServer, 
 	return count
 }
 
+func lookupUserPKE2E(t *testing.T, server *exampleserver.TestServer, userID string) int64 {
+	t.Helper()
+	var userPK int64
+	require.NoError(t, server.Pool.QueryRow(context.Background(), `
+		SELECT user_pk
+		FROM sync.user_state
+		WHERE user_id = $1
+	`, userID).Scan(&userPK))
+	return userPK
+}
+
 func snapshotStageCount(t *testing.T, db *sql.DB) int {
 	t.Helper()
 	var count int

@@ -1,10 +1,13 @@
 package oversqlite_e2e
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -18,6 +21,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
 	"github.com/mobiletoly/go-oversync/oversqlite"
+	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1041,4 +1045,105 @@ func TestEndToEnd_SourceRecoveryRebuildRotatesManagedSourceAndSurvivesRestart(t 
 	require.Equal(t, "Remote", name)
 	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id = ?`, localPendingID).Scan(&name))
 	require.Equal(t, "Pending", name)
+}
+
+func TestEndToEnd_SourceRetirementIsVisibleOverHTTPAndReplacementBecomesActive(t *testing.T) {
+	ctx := context.Background()
+	schema := "e2e_source_retired_http_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newExampleServer(t, schema)
+
+	userID := "e2e-source-retired-http-user-" + uuid.NewString()
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+
+	seedRowID := uuid.NewString()
+	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, seedRowID, "Remote", "remote@example.com")
+	require.NoError(t, err)
+	mustPushPendingE2E(t, clientA, ctx)
+
+	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	originalSourceID := requireCurrentSourceIDE2E(t, clientB, ctx)
+
+	localPendingID := uuid.NewString()
+	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, localPendingID, "Pending", "pending@example.com")
+	require.NoError(t, err)
+
+	baseTransport := http.DefaultTransport
+	failCreate := true
+	var replacementReq oversync.SnapshotSessionCreateRequest
+	clientB.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case failCreate && r.Method == http.MethodPost && r.URL.Path == "/sync/push-sessions":
+			failCreate = false
+			return errorJSONResponse(http.StatusConflict, map[string]any{
+				"error":   "history_pruned",
+				"message": "source tuple is below retained history floor",
+			}), nil
+		case r.Method == http.MethodPost && r.URL.Path == "/sync/snapshot-sessions":
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			if len(body) > 0 {
+				require.NoError(t, json.Unmarshal(body, &replacementReq))
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
+			return baseTransport.RoundTrip(r)
+		default:
+			return baseTransport.RoundTrip(r)
+		}
+	})}
+
+	_, err = clientB.PushPending(ctx)
+	var recoveryErr *oversqlite.SourceRecoveryRequiredError
+	require.ErrorAs(t, err, &recoveryErr)
+	require.Equal(t, oversqlite.SourceRecoveryHistoryPruned, recoveryErr.Code)
+
+	report, err := clientB.Rebuild(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
+
+	info := mustSourceInfoE2E(t, clientB, ctx)
+	require.False(t, info.RebuildRequired)
+	require.False(t, info.SourceRecoveryRequired)
+	require.NotEqual(t, originalSourceID, info.CurrentSourceID)
+
+	require.NotNil(t, replacementReq.SourceReplacement)
+	require.Equal(t, originalSourceID, replacementReq.SourceReplacement.PreviousSourceID)
+	require.Equal(t, info.CurrentSourceID, replacementReq.SourceReplacement.NewSourceID)
+	require.Equal(t, "history_pruned", replacementReq.SourceReplacement.Reason)
+
+	userPK := lookupUserPKE2E(t, server, userID)
+	var oldState, oldReplacedBy string
+	require.NoError(t, server.Pool.QueryRow(ctx, `
+		SELECT state, replaced_by_source_id
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, originalSourceID).Scan(&oldState, &oldReplacedBy))
+	require.Equal(t, "retired", oldState)
+	require.Equal(t, info.CurrentSourceID, oldReplacedBy)
+
+	var retiredResp oversync.SourceRetiredResponse
+	rawDoSyncJSON(t, server, http.MethodPost, "/sync/push-sessions", userID, originalSourceID, http.StatusConflict, oversync.PushSessionCreateRequest{
+		SourceBundleID:  1,
+		PlannedRowCount: 1,
+	}, &retiredResp)
+	require.Equal(t, "source_retired", retiredResp.Error)
+	require.Equal(t, originalSourceID, retiredResp.SourceID)
+	require.Equal(t, info.CurrentSourceID, retiredResp.ReplacedBySourceID)
+
+	rotatedPendingID := uuid.NewString()
+	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rotatedPendingID, "Rotated", "rotated@example.com")
+	require.NoError(t, err)
+	pushReport, err := clientB.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeCommitted, pushReport.Outcome)
+
+	var newState string
+	var newMaxCommitted int64
+	require.NoError(t, server.Pool.QueryRow(ctx, `
+		SELECT state, max_committed_source_bundle_id
+		FROM sync.source_state
+		WHERE user_pk = $1 AND source_id = $2
+	`, userPK, info.CurrentSourceID).Scan(&newState, &newMaxCommitted))
+	require.Equal(t, "active", newState)
+	require.Equal(t, int64(1), newMaxCommitted)
 }

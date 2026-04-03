@@ -323,9 +323,25 @@ func (s *SyncService) initializeSchemaInTx(ctx context.Context, tx pgx.Tx) error
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.source_state (
 			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
 			source_id TEXT NOT NULL,
-			max_committed_source_bundle_id BIGINT NOT NULL,
+			state TEXT NOT NULL,
+			max_committed_source_bundle_id BIGINT NOT NULL DEFAULT 0,
+			replaced_by_source_id TEXT NOT NULL DEFAULT '',
+			retirement_reason TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (user_pk, source_id),
-			CONSTRAINT source_state_max_committed_chk CHECK (max_committed_source_bundle_id >= 1)
+			CONSTRAINT source_state_state_chk CHECK (state IN ('active', 'reserved', 'retired')),
+			CONSTRAINT source_state_max_committed_chk CHECK (max_committed_source_bundle_id >= 0),
+			CONSTRAINT source_state_active_chk CHECK (
+				(state <> 'active')
+				OR (replaced_by_source_id = '' AND retirement_reason = '')
+			),
+			CONSTRAINT source_state_reserved_chk CHECK (
+				(state <> 'reserved')
+				OR (replaced_by_source_id = '' AND retirement_reason = '' AND max_committed_source_bundle_id = 0)
+			),
+			CONSTRAINT source_state_retired_chk CHECK (
+				(state <> 'retired')
+				OR (replaced_by_source_id <> '' AND retirement_reason <> '')
+			)
 		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.row_state (
 			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,

@@ -115,6 +115,16 @@ type SnapshotRow struct {
 	Payload    json.RawMessage `json:"payload"`
 }
 
+type SnapshotSessionCreateRequest struct {
+	SourceReplacement *SnapshotSourceReplacement `json:"source_replacement,omitempty"`
+}
+
+type SnapshotSourceReplacement struct {
+	PreviousSourceID string `json:"previous_source_id"`
+	NewSourceID      string `json:"new_source_id"`
+	Reason           string `json:"reason"`
+}
+
 // SnapshotSession describes one frozen server-side snapshot session.
 type SnapshotSession struct {
 	SnapshotID        string `json:"snapshot_id"`
@@ -177,6 +187,13 @@ type RegisteredTableSpec struct {
 type ErrorResponse struct {
 	Error   string `json:"error"`
 	Message string `json:"message"`
+}
+
+type SourceRetiredResponse struct {
+	Error              string `json:"error"`
+	Message            string `json:"message"`
+	SourceID           string `json:"source_id"`
+	ReplacedBySourceID string `json:"replaced_by_source_id,omitempty"`
 }
 
 // PushConflictDetails describes one authoritative row state that rejected a push commit.

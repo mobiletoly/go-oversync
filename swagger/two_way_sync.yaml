@@ -94,7 +94,9 @@ paths:
         creating a new staging session. If the tuple is already known but retained replay metadata
         for that tuple has been pruned, the server returns `409 history_pruned` instead of
         reopening staging. If `source_bundle_id` is not the next expected contiguous value for the
-        current source, the server returns `409 source_sequence_out_of_order`.
+        current source, the server returns `409 source_sequence_out_of_order`. If the current
+        source was explicitly retired during rotated rebuild, the server returns
+        `409 source_retired` with replacement lineage.
       security:
         - BearerAuth: []
       parameters:
@@ -119,11 +121,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Scope not ready, retained replay for the requested source tuple is pruned, or the source bundle sequence is not the next expected value (`scope_uninitialized`, `scope_initializing`, `initialization_stale`, `history_pruned`, or `source_sequence_out_of_order`)
+          description: Scope not ready, retained replay for the requested source tuple is pruned, the source bundle sequence is not the next expected value, or the source was explicitly retired (`scope_uninitialized`, `scope_initializing`, `initialization_stale`, `history_pruned`, `source_sequence_out_of_order`, or `source_retired`)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                oneOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - $ref: '#/components/schemas/SourceRetiredResponse'
         '410':
           description: Initialization lease expired before push create (`initialization_expired`)
           content:
@@ -220,7 +224,8 @@ paths:
         authoritative business-table effects atomically. On success, the response returns the
         authoritative committed bundle metadata; the client fetches committed rows separately. If
         the per-source bundle sequence changes between create-time validation and commit-time
-        finalization, the server returns `409 source_sequence_changed`.
+        finalization, the server returns `409 source_sequence_changed`. If the source was retired
+        after staging began, the server returns `409 source_retired`.
       security:
         - BearerAuth: []
       parameters:
@@ -258,13 +263,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Whole-bundle conflict rejection, stale initialization lease, or commit-time source sequence revalidation failure (`push_conflict`, `initialization_stale`, or `source_sequence_changed`)
+          description: Whole-bundle conflict rejection, stale initialization lease, commit-time source sequence revalidation failure, or explicit source retirement (`push_conflict`, `initialization_stale`, `source_sequence_changed`, or `source_retired`)
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: '#/components/schemas/PushConflictResponse'
                   - $ref: '#/components/schemas/ErrorResponse'
+                  - $ref: '#/components/schemas/SourceRetiredResponse'
         '410':
           description: Push session expired or initialization lease expired (`push_session_expired` or `initialization_expired`)
           content:
@@ -478,11 +484,20 @@ paths:
     post:
       summary: Create frozen snapshot session
       description: |
-        Creates one frozen current-state snapshot session for chunked hydration or recovery.
+        Creates one frozen current-state snapshot session for chunked hydration or recovery. The
+        request body is optional. When `source_replacement` is present, the server treats the
+        request as rotated rebuild intent, reserves the replacement source in `reserved` state, and
+        retires the authenticated previous source atomically with snapshot-session creation.
       security:
         - BearerAuth: []
       parameters:
         - $ref: '#/components/parameters/SourceIDHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SnapshotSessionCreateRequest'
       responses:
         '200':
           description: Snapshot session created successfully
@@ -490,12 +505,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SnapshotSession'
-        '409':
-          description: Scope is not initialized enough for snapshot creation (`scope_uninitialized` or `scope_initializing`)
+        '400':
+          description: Invalid snapshot-session create request (`snapshot_session_invalid`)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Scope is not initialized enough for snapshot creation, the replacement source conflicts with durable state, or the previous source was already retired (`scope_uninitialized`, `scope_initializing`, `source_replacement_invalid`, or `source_retired`)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - $ref: '#/components/schemas/SourceRetiredResponse'
         '401':
           description: Authentication required
         '503':
@@ -892,6 +915,26 @@ components:
           additionalProperties: true
           description: Full-row after-image for one current row. Hidden server columns such as _sync_scope_id are excluded. Non-key binary payload fields use standard base64 on the wire.
 
+    SnapshotSessionCreateRequest:
+      type: object
+      properties:
+        source_replacement:
+          $ref: '#/components/schemas/SnapshotSourceReplacement'
+
+    SnapshotSourceReplacement:
+      type: object
+      required: [previous_source_id, new_source_id, reason]
+      properties:
+        previous_source_id:
+          type: string
+          description: Must match the authenticated `Oversync-Source-ID`.
+        new_source_id:
+          type: string
+          description: Fresh replacement writer identity reserved for the rotated rebuild.
+        reason:
+          type: string
+          enum: [history_pruned, source_sequence_out_of_order, source_sequence_changed, source_retired]
+
     CommittedBundleRowsResponse:
       type: object
       required: [bundle_seq, source_id, source_bundle_id, row_count, bundle_hash, rows, next_row_ordinal, has_more]
@@ -1061,6 +1104,21 @@ components:
           type: string
         message:
           type: string
+
+    SourceRetiredResponse:
+      type: object
+      required: [error, message, source_id]
+      properties:
+        error:
+          type: string
+          enum: [source_retired]
+        message:
+          type: string
+        source_id:
+          type: string
+        replaced_by_source_id:
+          type: string
+          description: Replacement source reserved or activated for the retired source when known.
 
     PushConflictResponse:
       type: object

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -95,6 +96,11 @@ func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *htt
 		var sequenceErr *SourceSequenceOutOfOrderError
 		if errors.As(err, &sequenceErr) {
 			h.writeError(w, http.StatusConflict, "source_sequence_out_of_order", sequenceErr.Error())
+			return
+		}
+		var retiredErr *SourceRetiredError
+		if errors.As(err, &retiredErr) {
+			h.writeSourceRetired(w, retiredErr)
 			return
 		}
 		h.logger.Error("Failed to create push session", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
@@ -236,6 +242,11 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 		var sequenceErr *SourceSequenceChangedError
 		if errors.As(err, &sequenceErr) {
 			h.writeError(w, http.StatusConflict, "source_sequence_changed", sequenceErr.Error())
+			return
+		}
+		var retiredErr *SourceRetiredError
+		if errors.As(err, &retiredErr) {
+			h.writeSourceRetired(w, retiredErr)
 			return
 		}
 		h.logger.Error("Failed to commit push session", "error", err, "user_id", actor.UserID, "push_id", pushID)
@@ -505,10 +516,46 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 		return
 	}
 
-	response, err := h.service.CreateSnapshotSession(r.Context(), actor)
+	var req *SnapshotSessionCreateRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		var parsed SnapshotSessionCreateRequest
+		if err := decoder.Decode(&parsed); err != nil {
+			if !errors.Is(err, io.EOF) {
+				h.writeError(w, http.StatusBadRequest, "snapshot_session_invalid", "Failed to parse snapshot session request")
+				return
+			}
+		} else {
+			var trailing any
+			if err := decoder.Decode(&trailing); err != nil && !errors.Is(err, io.EOF) {
+				h.writeError(w, http.StatusBadRequest, "snapshot_session_invalid", "Failed to parse snapshot session request")
+				return
+			}
+			req = &parsed
+		}
+	}
+
+	response, err := h.service.CreateSnapshotSessionWithRequest(r.Context(), actor, req)
 	if err != nil {
 		if errors.Is(err, errServiceShuttingDown) {
 			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+			return
+		}
+		var invalidErr *SnapshotSessionInvalidError
+		if errors.As(err, &invalidErr) {
+			h.writeError(w, http.StatusBadRequest, "snapshot_session_invalid", invalidErr.Error())
+			return
+		}
+		var replacementErr *SourceReplacementInvalidError
+		if errors.As(err, &replacementErr) {
+			h.writeError(w, http.StatusConflict, "source_replacement_invalid", replacementErr.Error())
+			return
+		}
+		var retiredErr *SourceRetiredError
+		if errors.As(err, &retiredErr) {
+			h.writeSourceRetired(w, retiredErr)
 			return
 		}
 		var uninitializedErr *ScopeUninitializedError
@@ -530,6 +577,31 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 	if err = json.NewEncoder(w).Encode(response); err != nil {
 		h.logger.Error("Failed to encode snapshot session response", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
 	}
+}
+
+func (h *HTTPSyncHandlers) writeSourceRetired(w http.ResponseWriter, retiredErr *SourceRetiredError) {
+	if retiredErr == nil {
+		h.writeError(w, http.StatusConflict, "source_retired", "source is retired")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+
+	response := SourceRetiredResponse{
+		Error:              "source_retired",
+		Message:            retiredErr.Error(),
+		SourceID:           retiredErr.SourceID,
+		ReplacedBySourceID: retiredErr.ReplacedBySourceID,
+	}
+	_ = json.NewEncoder(w).Encode(response)
+
+	h.logger.Debug("HTTP source retired response",
+		"status_code", http.StatusConflict,
+		"error_code", "source_retired",
+		"source_id", retiredErr.SourceID,
+		"replaced_by_source_id", retiredErr.ReplacedBySourceID,
+	)
 }
 
 // HandleGetSnapshotChunk returns one chunk of rows from a frozen snapshot session.

@@ -592,6 +592,10 @@ func NewTestServer(config *ServerConfig) (*TestServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := resetExampleDatabase(context.Background(), components.Pool, components.SyncService, components.Logger, components.BusinessSchema); err != nil {
+		components.Close()
+		return nil, err
+	}
 
 	// Create test HTTP server
 	httpServer := httptest.NewServer(components.Handler)

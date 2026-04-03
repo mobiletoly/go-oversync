@@ -2,12 +2,18 @@ package oversync
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSyncService_GetCapabilities(t *testing.T) {
@@ -189,4 +195,92 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionRequiresAuthenticatedActor(
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected status 401, got %d", rec.Code)
 	}
+}
+
+func TestHTTPSyncHandlers_HandleCreateSnapshotSessionRejectsMalformedBody(t *testing.T) {
+	svc := &SyncService{
+		config: &ServiceConfig{AppName: "snapshot-invalid-body-test"},
+		logger: slog.Default(),
+	}
+	h := NewHTTPSyncHandlers(svc, slog.Default())
+
+	req := httptest.NewRequest(http.MethodPost, "/sync/snapshot-sessions", bytes.NewBufferString(`{"source_replacement":`))
+	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "snapshot-invalid-body-user", SourceID: "device-a"}))
+	rec := httptest.NewRecorder()
+	h.HandleCreateSnapshotSession(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	errResp := decodeErrorResponse(t, rec)
+	require.Equal(t, "snapshot_session_invalid", errResp.Error)
+}
+
+func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T) {
+	ctx := context.Background()
+	logger := integrationTestLogger(slog.LevelWarn)
+	pool := newIntegrationTestPool(t, ctx)
+
+	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
+	schemaName := "snapshot_handler_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		MaxSupportedSchemaVersion: 1,
+		AppName:                   "snapshot-handler-test",
+		RegisteredTables: []RegisteredTable{
+			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		},
+	}, logger)
+	h := NewHTTPSyncHandlers(svc, slog.Default())
+
+	userID := "snapshot-handler-user-" + suffix
+	oldSourceID := "writer-handler-old"
+	firstNewSourceID := "writer-handler-new-a"
+	secondNewSourceID := "writer-handler-new-b"
+	otherOldSourceID := "writer-handler-old-b"
+
+	oldWriter := Actor{UserID: userID, SourceID: oldSourceID}
+	otherWriter := Actor{UserID: userID, SourceID: otherOldSourceID}
+	mustPushUserBundle(t, ctx, svc, oldWriter, schemaName, 1, uuid.New(), "Alpha")
+	mustPushUserBundle(t, ctx, svc, otherWriter, schemaName, 1, uuid.New(), "Bravo")
+
+	initialReq := httptest.NewRequest(http.MethodPost, "/sync/snapshot-sessions", bytes.NewBufferString(fmt.Sprintf(`{
+		"source_replacement": {
+			"previous_source_id": %q,
+			"new_source_id": %q,
+			"reason": "history_pruned"
+		}
+	}`, oldSourceID, firstNewSourceID)))
+	initialReq = initialReq.WithContext(ContextWithActor(initialReq.Context(), oldWriter))
+	initialRec := httptest.NewRecorder()
+	h.HandleCreateSnapshotSession(initialRec, initialReq)
+	require.Equal(t, http.StatusOK, initialRec.Code)
+
+	retiredReq := httptest.NewRequest(http.MethodPost, "/sync/snapshot-sessions", bytes.NewBufferString(fmt.Sprintf(`{
+		"source_replacement": {
+			"previous_source_id": %q,
+			"new_source_id": %q,
+			"reason": "history_pruned"
+		}
+	}`, oldSourceID, secondNewSourceID)))
+	retiredReq = retiredReq.WithContext(ContextWithActor(retiredReq.Context(), oldWriter))
+	retiredRec := httptest.NewRecorder()
+	h.HandleCreateSnapshotSession(retiredRec, retiredReq)
+	require.Equal(t, http.StatusConflict, retiredRec.Code)
+	retiredResp := decodeErrorResponse(t, retiredRec)
+	require.Equal(t, "source_retired", retiredResp.Error)
+
+	replacementReq := httptest.NewRequest(http.MethodPost, "/sync/snapshot-sessions", bytes.NewBufferString(fmt.Sprintf(`{
+		"source_replacement": {
+			"previous_source_id": %q,
+			"new_source_id": %q,
+			"reason": "history_pruned"
+		}
+	}`, otherOldSourceID, firstNewSourceID)))
+	replacementReq = replacementReq.WithContext(ContextWithActor(replacementReq.Context(), otherWriter))
+	replacementRec := httptest.NewRecorder()
+	h.HandleCreateSnapshotSession(replacementRec, replacementReq)
+	require.Equal(t, http.StatusConflict, replacementRec.Code)
+	replacementResp := decodeErrorResponse(t, replacementRec)
+	require.Equal(t, "source_replacement_invalid", replacementResp.Error)
 }

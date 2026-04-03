@@ -1988,6 +1988,102 @@ func TestRebuildKeepSource_CheckpointUnchangedOnFailedFinalApply(t *testing.T) {
 	require.Equal(t, int64(0), lastBundleSeq)
 }
 
+func TestRebuildRotateSource_ReusesDurableReplacementSourceAcrossRetry(t *testing.T) {
+	ctx := context.Background()
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL
+		)
+	`)
+
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
+	require.NoError(t, err)
+	client.sourceIDGenerator = func() string { return "reserved-rotated-device" }
+
+	var requestedReplacementSourceIDs []string
+	createPruned := true
+	sessionCreates := 0
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/push-sessions":
+			if createPruned {
+				createPruned = false
+				return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{
+					Error:   "history_pruned",
+					Message: "source tuple is below retained history floor",
+				}), nil
+			}
+			return nil, io.EOF
+		case "/sync/snapshot-sessions":
+			var req oversync.SnapshotSessionCreateRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			require.NotNil(t, req.SourceReplacement)
+			requestedReplacementSourceIDs = append(requestedReplacementSourceIDs, req.SourceReplacement.NewSourceID)
+			sessionCreates++
+			if sessionCreates == 1 {
+				return jsonResponse(oversync.SnapshotSession{
+					SnapshotID:        "retry-rotate-a",
+					SnapshotBundleSeq: 9,
+					RowCount:          1,
+					ExpiresAt:         "2030-01-01T00:00:00Z",
+				}), nil
+			}
+			return jsonResponse(oversync.SnapshotSession{
+				SnapshotID:        "retry-rotate-b",
+				SnapshotBundleSeq: 9,
+				RowCount:          0,
+				ExpiresAt:         "2030-01-01T00:00:00Z",
+			}), nil
+		case "/sync/snapshot-sessions/retry-rotate-a":
+			switch r.Method {
+			case http.MethodGet:
+				return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{
+					Error:   "snapshot_session_not_found",
+					Message: "snapshot session retry-rotate-a was not found",
+				}), nil
+			case http.MethodDelete:
+				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+			}
+		case "/sync/snapshot-sessions/retry-rotate-b":
+			switch r.Method {
+			case http.MethodGet:
+				return jsonResponse(oversync.SnapshotChunkResponse{
+					SnapshotID:        "retry-rotate-b",
+					SnapshotBundleSeq: 9,
+					Rows:              nil,
+					NextRowOrdinal:    0,
+					HasMore:           false,
+				}), nil
+			case http.MethodDelete:
+				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+			}
+		}
+		return nil, io.EOF
+	})}
+
+	_, err = client.PushPending(ctx)
+	var recoveryErr *SourceRecoveryRequiredError
+	require.ErrorAs(t, err, &recoveryErr)
+	require.Equal(t, SourceRecoveryHistoryPruned, recoveryErr.Code)
+	require.Equal(t, "reserved-rotated-device", requireOperationReplacementSourceID(t, db))
+
+	_, err = client.Rebuild(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "snapshot_session_not_found")
+	require.Equal(t, "bundle-device", client.sourceID)
+	require.Equal(t, "reserved-rotated-device", requireOperationReplacementSourceID(t, db))
+
+	report, err := client.Rebuild(ctx)
+	require.NoError(t, err)
+	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
+	require.Equal(t, "reserved-rotated-device", client.sourceID)
+	require.Equal(t, operationKindNone, requireOperationKind(t, db))
+	require.Equal(t, "", requireOperationReplacementSourceID(t, db))
+	require.Equal(t, []string{"reserved-rotated-device", "reserved-rotated-device"}, requestedReplacementSourceIDs)
+}
+
 func TestRebuildRotateSource_SourceIDDoesNotRotateOnFailedFinalApply(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `

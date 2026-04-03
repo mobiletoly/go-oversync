@@ -35,7 +35,9 @@ The current architecture has four main pieces:
 7. `Rebuild(ctx)` rebuilds managed tables from `/sync/snapshot-sessions` when a client is new or
    falls behind retained history. For stale/out-of-order source recovery, `oversqlite` chooses the
    rebuild-plus-rotate path internally. The server materializes those frozen snapshots inside
-   PostgreSQL session tables and serves chunk reads statelessly by `snapshot_id`.
+   PostgreSQL session tables and serves chunk reads statelessly by `snapshot_id`. During rotated
+   recovery the client persists one replacement source id durably, the server reserves that
+   replacement source explicitly, and the old source is retired fail-closed until rebuild finishes.
 
 ```mermaid
 flowchart LR

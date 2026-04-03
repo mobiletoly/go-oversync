@@ -918,6 +918,8 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	prunedActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-pruned"}
 	expiredActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-expired"}
 	sequenceChangedActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-sequence-changed"}
+	retiredCreateActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-retired-create"}
+	retiredCommitActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-retired-commit"}
 
 	bootstrapSession := fixture.createSession(t, ctx, 1, 1)
 	fixture.uploadChunk(t, ctx, bootstrapSession.PushID, 0, fixture.userRow(uuid.New(), "Bootstrap"))
@@ -945,6 +947,9 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	sequenceChangedSession := createSessionForActor(sequenceChangedActor, 1, 1)
 	fixture.uploadChunk(t, ctx, sequenceChangedSession.PushID, 0, fixture.userRow(uuid.New(), "SequenceChanged"))
 
+	retiredCommitSession := createSessionForActor(retiredCommitActor, 1, 1)
+	fixture.uploadChunk(t, ctx, retiredCommitSession.PushID, 0, fixture.userRow(uuid.New(), "RetiredCommit"))
+
 	committedSession := createSessionForActor(committedActor, 1, 1)
 	fixture.uploadChunk(t, ctx, committedSession.PushID, 0, fixture.userRow(uuid.New(), "Charlie"))
 	fixture.commitSession(t, ctx, committedSession.PushID)
@@ -966,11 +971,30 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 	`, prunedActor.UserID, prunedActor.SourceID, prunedCommit.SourceBundleID)
 	require.NoError(t, err)
 	_, err = fixture.pool.Exec(ctx, `
-		INSERT INTO sync.source_state (user_pk, source_id, max_committed_source_bundle_id)
-		VALUES ((SELECT user_pk FROM sync.user_state WHERE user_id = $1), $2, 1)
+		INSERT INTO sync.source_state (
+			user_pk, source_id, state, max_committed_source_bundle_id, replaced_by_source_id, retirement_reason
+		)
+		VALUES ((SELECT user_pk FROM sync.user_state WHERE user_id = $1), $2, 'active', 1, '', '')
 		ON CONFLICT (user_pk, source_id) DO UPDATE
-		SET max_committed_source_bundle_id = EXCLUDED.max_committed_source_bundle_id
+		SET state = EXCLUDED.state,
+			max_committed_source_bundle_id = EXCLUDED.max_committed_source_bundle_id,
+			replaced_by_source_id = EXCLUDED.replaced_by_source_id,
+			retirement_reason = EXCLUDED.retirement_reason
 	`, sequenceChangedActor.UserID, sequenceChangedActor.SourceID)
+	require.NoError(t, err)
+	_, err = fixture.pool.Exec(ctx, `
+		INSERT INTO sync.source_state (
+			user_pk, source_id, state, max_committed_source_bundle_id, replaced_by_source_id, retirement_reason
+		)
+		VALUES
+			((SELECT user_pk FROM sync.user_state WHERE user_id = $1), $2, 'retired', 0, $3, 'history_pruned'),
+			((SELECT user_pk FROM sync.user_state WHERE user_id = $1), $4, 'retired', 0, $5, 'history_pruned')
+		ON CONFLICT (user_pk, source_id) DO UPDATE
+		SET state = EXCLUDED.state,
+			max_committed_source_bundle_id = EXCLUDED.max_committed_source_bundle_id,
+			replaced_by_source_id = EXCLUDED.replaced_by_source_id,
+			retirement_reason = EXCLUDED.retirement_reason
+	`, retiredCreateActor.UserID, retiredCreateActor.SourceID, "writer-retired-create-next", retiredCommitActor.SourceID, "writer-retired-commit-next")
 	require.NoError(t, err)
 
 	postPruneCommittedSession := createSessionForActor(committedActor, 2, 1)
@@ -1061,6 +1085,26 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			pathValues:     map[string]string{"push_id": sequenceChangedSession.PushID},
 			expectedStatus: http.StatusConflict,
 			expectedCode:   "source_sequence_changed",
+		},
+		{
+			name:           "create source retired",
+			handler:        handlers.HandleCreatePushSession,
+			method:         http.MethodPost,
+			path:           "/sync/push-sessions",
+			actor:          retiredCreateActor,
+			body:           PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 1},
+			expectedStatus: http.StatusConflict,
+			expectedCode:   "source_retired",
+		},
+		{
+			name:           "commit source retired",
+			handler:        handlers.HandleCommitPushSession,
+			method:         http.MethodPost,
+			path:           "/sync/push-sessions/" + retiredCommitSession.PushID + "/commit",
+			actor:          retiredCommitActor,
+			pathValues:     map[string]string{"push_id": retiredCommitSession.PushID},
+			expectedStatus: http.StatusConflict,
+			expectedCode:   "source_retired",
 		},
 		{
 			name:           "create history pruned",
@@ -1180,6 +1224,43 @@ func TestHTTPSyncHandlers_PushSessionErrorMappings(t *testing.T) {
 			require.Equal(t, "push_session_expired", errResp.Error)
 		})
 	}
+}
+
+func TestPushSessions_StaleOutstandingCommitFailsClosedAfterSourceRetirement(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{maxRowsPerPushChunk: 2})
+
+	oldActor := Actor{UserID: fixture.writer.UserID, SourceID: "writer-stale-old"}
+	newSourceID := "writer-stale-new"
+
+	mustPushUserBundle(t, ctx, fixture.svc, oldActor, fixture.schemaName, 1, uuid.New(), "Bootstrap")
+
+	session, err := fixture.svc.CreatePushSession(ctx, oldActor, &PushSessionCreateRequest{
+		SourceBundleID:  2,
+		PlannedRowCount: 1,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	_, err = fixture.svc.UploadPushChunk(ctx, oldActor, session.PushID, &PushSessionChunkRequest{
+		StartRowOrdinal: 0,
+		Rows:            []PushRequestRow{fixture.userRow(uuid.New(), "StaleBeforeRetire")},
+	})
+	require.NoError(t, err)
+
+	_, err = fixture.svc.CreateSnapshotSessionWithRequest(ctx, oldActor, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldActor.SourceID,
+			NewSourceID:      newSourceID,
+			Reason:           "history_pruned",
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = fixture.svc.CommitPushSession(ctx, oldActor, session.PushID)
+	var retiredErr *SourceRetiredError
+	require.ErrorAs(t, err, &retiredErr)
+	require.Equal(t, oldActor.SourceID, retiredErr.SourceID)
+	require.Equal(t, newSourceID, retiredErr.ReplacedBySourceID)
 }
 
 func TestPushSessions_RejectsHiddenOwnerColumnInPayload(t *testing.T) {

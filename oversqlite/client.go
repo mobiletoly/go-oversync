@@ -815,6 +815,7 @@ func initializeDatabase(db *sql.DB) error {
 				kind                 TEXT NOT NULL DEFAULT 'none' CHECK (kind IN ('none', 'remote_replace', 'source_recovery')),
 				target_user_id       TEXT NOT NULL DEFAULT '',
 				reason               TEXT NOT NULL DEFAULT '',
+				replacement_source_id TEXT NOT NULL DEFAULT '',
 				staged_snapshot_id   TEXT NOT NULL DEFAULT '',
 				snapshot_bundle_seq  INTEGER NOT NULL DEFAULT 0,
 				snapshot_row_count   INTEGER NOT NULL DEFAULT 0
@@ -919,8 +920,8 @@ func initializeDatabase(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`
 			INSERT INTO _sync_operation_state (
-				singleton_key, kind, target_user_id, reason, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count
-			) VALUES (1, 'none', '', '', '', 0, 0)
+				singleton_key, kind, target_user_id, reason, replacement_source_id, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count
+			) VALUES (1, 'none', '', '', '', '', 0, 0)
 			ON CONFLICT(singleton_key) DO NOTHING
 		`); err != nil {
 		return fmt.Errorf("failed to initialize operation state row: %w", err)

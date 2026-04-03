@@ -89,6 +89,15 @@ Use it for:
 - destructive recovery
 - rebuild after `history_pruned`
 
+When rebuild requires source rotation:
+
+- the client reserves one durable `replacement_source_id` locally and reuses it across restart or
+  retry
+- the rotated `POST /sync/snapshot-sessions` request tells the server to retire the old source and
+  reserve the replacement source atomically
+- the client keeps the old local `current_source_id` until authoritative snapshot apply succeeds
+- normal source-sequenced sync stays fail-closed while recovery is pending
+
 ## Fail-closed contract
 
 The supported envelope is intentionally strict.

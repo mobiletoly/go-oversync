@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -75,6 +76,10 @@ func snapshotLogicalRowKey(tableID int32, keyBytes []byte) string {
 }
 
 func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor) (_ *SnapshotSession, err error) {
+	return s.CreateSnapshotSessionWithRequest(ctx, actor, nil)
+}
+
+func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, actor Actor, req *SnapshotSessionCreateRequest) (_ *SnapshotSession, err error) {
 	done, err := s.beginOperation()
 	if err != nil {
 		return nil, err
@@ -99,6 +104,9 @@ func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor) (_
 		}
 		if retainedState == nil {
 			return fmt.Errorf("missing retained history state for %q", actor.UserID)
+		}
+		if err := s.applySnapshotSourceReplacementInTx(ctx, tx, actor, retainedState.UserPK, req); err != nil {
+			return err
 		}
 
 		snapshotBundleSeq := retainedState.highestBundleSeq()
@@ -146,6 +154,80 @@ func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor) (_
 		return nil, err
 	}
 	return resp, nil
+}
+
+func validateSnapshotSourceReplacement(actor Actor, replacement *SnapshotSourceReplacement) (*SnapshotSourceReplacement, error) {
+	if replacement == nil {
+		return nil, nil
+	}
+	clean := &SnapshotSourceReplacement{
+		PreviousSourceID: strings.TrimSpace(replacement.PreviousSourceID),
+		NewSourceID:      strings.TrimSpace(replacement.NewSourceID),
+		Reason:           strings.TrimSpace(replacement.Reason),
+	}
+	if clean.PreviousSourceID != actor.SourceID {
+		return nil, &SnapshotSessionInvalidError{Message: "previous_source_id must match authenticated source_id"}
+	}
+	if clean.NewSourceID == "" {
+		return nil, &SnapshotSessionInvalidError{Message: "new_source_id is required for source replacement"}
+	}
+	if clean.NewSourceID == clean.PreviousSourceID {
+		return nil, &SnapshotSessionInvalidError{Message: "new_source_id must differ from previous_source_id"}
+	}
+	switch clean.Reason {
+	case "history_pruned", "source_sequence_out_of_order", "source_sequence_changed", "source_retired":
+	default:
+		return nil, &SnapshotSessionInvalidError{Message: "source replacement reason is unsupported"}
+	}
+	return clean, nil
+}
+
+func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, req *SnapshotSessionCreateRequest) error {
+	if req == nil || req.SourceReplacement == nil {
+		return nil
+	}
+	replacement, err := validateSnapshotSourceReplacement(actor, req.SourceReplacement)
+	if err != nil {
+		return err
+	}
+
+	previousState, err := loadSourceStateRow(ctx, tx, userPK, replacement.PreviousSourceID, true)
+	if err != nil {
+		return err
+	}
+	newState, err := loadSourceStateRow(ctx, tx, userPK, replacement.NewSourceID, true)
+	if err != nil {
+		return err
+	}
+
+	if previousState != nil && previousState.State == sourceStateRetired {
+		if previousState.ReplacedBySourceID != replacement.NewSourceID {
+			return &SourceRetiredError{
+				UserID:             actor.UserID,
+				SourceID:           replacement.PreviousSourceID,
+				ReplacedBySourceID: previousState.ReplacedBySourceID,
+			}
+		}
+		if newState == nil {
+			if err := reserveSourceState(ctx, tx, userPK, replacement.NewSourceID); err != nil {
+				return err
+			}
+		} else if newState.State != sourceStateReserved && newState.State != sourceStateActive {
+			return &SourceReplacementInvalidError{Message: fmt.Sprintf("replacement source %s is not available for rotated rebuild", replacement.NewSourceID)}
+		}
+	} else {
+		if newState != nil {
+			return &SourceReplacementInvalidError{Message: fmt.Sprintf("replacement source %s is already known for user %s", replacement.NewSourceID, actor.UserID)}
+		}
+		if err := reserveSourceState(ctx, tx, userPK, replacement.NewSourceID); err != nil {
+			return err
+		}
+		if err := retireSourceState(ctx, tx, userPK, replacement.PreviousSourceID, replacement.NewSourceID, replacement.Reason); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, userID string, userPK int64) ([]snapshotMaterializedRow, int64, error) {

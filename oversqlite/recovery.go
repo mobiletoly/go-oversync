@@ -20,6 +20,7 @@ const (
 	SourceRecoveryHistoryPruned      SourceRecoveryCode = "history_pruned"
 	SourceRecoverySequenceOutOfOrder SourceRecoveryCode = "source_sequence_out_of_order"
 	SourceRecoverySequenceChanged    SourceRecoveryCode = "source_sequence_changed"
+	SourceRecoveryRetired            SourceRecoveryCode = "source_retired"
 )
 
 // SourceRecoveryRequiredError reports that the frozen outbox cannot be safely replayed under the
@@ -37,6 +38,11 @@ type sourceSequenceOutOfOrderError struct {
 type sourceSequenceChangedError struct {
 	Status  int
 	Message string
+}
+
+type SourceReplacementDivergedError struct {
+	LocalReplacement  string
+	RemoteReplacement string
 }
 
 // RebuildRequiredError reports that normal sync is blocked until the client completes Rebuild.
@@ -98,6 +104,8 @@ func (e *SourceRecoveryRequiredError) Error() string {
 			return "source recovery is required because the frozen source bundle sequence is not the next expected value; run Rebuild()"
 		case SourceRecoverySequenceChanged:
 			return "source recovery is required because the frozen source bundle sequence changed before commit finalized; run Rebuild()"
+		case SourceRecoveryRetired:
+			return "source recovery is required because the current source was explicitly retired and replaced; run Rebuild()"
 		}
 	}
 	return "source recovery is required; run Rebuild()"
@@ -117,9 +125,20 @@ func (e *sourceSequenceChangedError) Error() string {
 	return "source bundle sequence changed before commit"
 }
 
+func (e *SourceReplacementDivergedError) Error() string {
+	if e == nil {
+		return "replacement source diverged between local and server recovery state"
+	}
+	return fmt.Sprintf(
+		"replacement source diverged between local and server recovery state: local=%q remote=%q",
+		e.LocalReplacement,
+		e.RemoteReplacement,
+	)
+}
+
 func sourceRecoveryCodeFromReason(reason string) SourceRecoveryCode {
 	switch SourceRecoveryCode(strings.TrimSpace(reason)) {
-	case SourceRecoveryHistoryPruned, SourceRecoverySequenceOutOfOrder, SourceRecoverySequenceChanged:
+	case SourceRecoveryHistoryPruned, SourceRecoverySequenceOutOfOrder, SourceRecoverySequenceChanged, SourceRecoveryRetired:
 		return SourceRecoveryCode(strings.TrimSpace(reason))
 	default:
 		return SourceRecoveryHistoryPruned
@@ -137,7 +156,42 @@ func (c *Client) sourceRecoveryRequiredErrorLocked(ctx context.Context) (*Source
 	return &SourceRecoveryRequiredError{Code: sourceRecoveryCodeFromReason(operation.Reason)}, nil
 }
 
-func (c *Client) markSourceRecoveryRequiredLocked(ctx context.Context, code SourceRecoveryCode, message string) error {
+func (c *Client) reserveReplacementSourceIDInTx(ctx context.Context, tx *sql.Tx, preferred string) (string, error) {
+	operation, err := loadOperationState(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	replacementSourceID := strings.TrimSpace(operation.ReplacementSourceID)
+	preferred = strings.TrimSpace(preferred)
+	switch {
+	case replacementSourceID != "" && preferred != "" && replacementSourceID != preferred:
+		return "", &SourceReplacementDivergedError{
+			LocalReplacement:  replacementSourceID,
+			RemoteReplacement: preferred,
+		}
+	case replacementSourceID != "":
+		if err := ensureSourceState(ctx, tx, replacementSourceID); err != nil {
+			return "", err
+		}
+		return replacementSourceID, nil
+	case preferred != "":
+		if err := ensureSourceState(ctx, tx, preferred); err != nil {
+			return "", err
+		}
+		return preferred, nil
+	default:
+		generatedSourceID, err := c.generateFreshSourceID(ctx, tx, c.sourceID)
+		if err != nil {
+			return "", err
+		}
+		if err := ensureSourceState(ctx, tx, generatedSourceID); err != nil {
+			return "", err
+		}
+		return generatedSourceID, nil
+	}
+}
+
+func (c *Client) markSourceRecoveryRequiredLocked(ctx context.Context, code SourceRecoveryCode, message string, replacementSourceID string) error {
 	_ = message
 	tx, err := c.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -153,9 +207,14 @@ func (c *Client) markSourceRecoveryRequiredLocked(ctx context.Context, code Sour
 	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
 		return err
 	}
+	reservedReplacementSourceID, err := c.reserveReplacementSourceIDInTx(ctx, tx, replacementSourceID)
+	if err != nil {
+		return err
+	}
 	if err := persistOperationState(ctx, tx, &operationStateRecord{
-		Kind:   operationKindSourceRecovery,
-		Reason: string(code),
+		Kind:                operationKindSourceRecovery,
+		Reason:              string(code),
+		ReplacementSourceID: reservedReplacementSourceID,
 	}); err != nil {
 		return err
 	}
@@ -165,8 +224,8 @@ func (c *Client) markSourceRecoveryRequiredLocked(ctx context.Context, code Sour
 	return nil
 }
 
-func (c *Client) beginSourceRecoveryLocked(ctx context.Context, code SourceRecoveryCode, message string) error {
-	if err := c.markSourceRecoveryRequiredLocked(ctx, code, message); err != nil {
+func (c *Client) beginSourceRecoveryLocked(ctx context.Context, code SourceRecoveryCode, message string, replacementSourceID string) error {
+	if err := c.markSourceRecoveryRequiredLocked(ctx, code, message, replacementSourceID); err != nil {
 		return err
 	}
 	return &SourceRecoveryRequiredError{
@@ -176,7 +235,7 @@ func (c *Client) beginSourceRecoveryLocked(ctx context.Context, code SourceRecov
 }
 
 func (c *Client) clearSourceRecoveryRequiredInTx(ctx context.Context, tx *sql.Tx) error {
-	if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
+	if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone, ReplacementSourceID: ""}); err != nil {
 		return err
 	}
 	return nil

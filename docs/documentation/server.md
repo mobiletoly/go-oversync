@@ -94,6 +94,9 @@ registered schema is outside the supported envelope.
 - `GET /sync/snapshot-sessions/{snapshot_id}` returns deterministic chunks from that frozen
   snapshot without holding one long-lived database transaction across client round trips
 - snapshot session creation may be bounded by optional row and byte caps in `ServiceConfig`
+- rotated snapshot creation may carry explicit `source_replacement`; when present, the server
+  reserves the replacement source in `sync.source_state` as `reserved` and retires the previous
+  source with explicit lineage
 - if a client checkpoint falls behind the retained bundle floor, the server returns
   `history_pruned`
 - pull and snapshot creation fail closed before the scope reaches `INITIALIZED`
