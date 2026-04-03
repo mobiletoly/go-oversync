@@ -35,7 +35,14 @@ Transport/session state:
 - clients commit the staged push with `POST /sync/push-sessions/{push_id}/commit`
 - accepted-push recovery fetches authoritative rows through
   `GET /sync/committed-bundles/{bundle_seq}/rows`
-- server-originated registered-table writes should run inside `WithinSyncBundle(...)`
+- server-originated registered-table writes should usually run through `ScopeManager.ExecWrite(...)`
+- `ScopeManager.ExecWrite(...)` is the convenience API for one scope-aware server-originated write:
+  it auto-initializes an `UNINITIALIZED` scope as remote-authoritative empty, allocates the next
+  expected per-scope writer sequence, and commits one bundle on success
+- that auto-initialization is a first-authority decision for the scope: after it happens, a later
+  first device can no longer win the `initialize_local` path for that scope
+- `WithinSyncBundle(...)` remains the strict low-level primitive for advanced callers that already
+  manage scope lifecycle and exact `(user_id, source_id, source_bundle_id)` tuples themselves
 - registered-table writes are captured by bundle triggers and finalized atomically with the
   business-table transaction
 - `WithinSyncBundle(...)` does not auto-retry callback code on serialization/deadlock/lock-timeout
@@ -45,6 +52,79 @@ Transport/session state:
 One push session, one committed bundle, and one `WithinSyncBundle(...)` transaction belong to
 exactly one `user_id`. If application logic needs to affect multiple users, split that work into
 separate per-user transactions or bundles.
+
+### `ScopeManager` callback rules
+
+`ScopeManager.ExecWrite(...)` runs direct PostgreSQL SQL inside one captured transaction.
+
+Important rules:
+
+- arbitrary SQL shape is allowed: multiple statements, joins, CTEs, trigger-driven writes, and
+  writes across multiple tables
+- ownership is enforced at row-execution time by the registered-table owner-guard triggers, not by
+  static inspection of SQL text
+- for `INSERT` into registered tables, omit `_sync_scope_id` unless you are setting it explicitly
+  to the target scope
+- for `UPDATE` and `DELETE` against registered tables, explicitly constrain affected rows to the
+  target scope; `_sync_scope_id = ...` is the recommended default
+- callbacks that produce no visible registered-table effects, including unregistered-only
+  transactions, are rejected by `ScopeManager.ExecWrite(...)`
+
+`ScopeManager.ExecWrite(...)` is meant for writes that must later become visible through sync. It is
+not a generic helper for arbitrary unregistered business transactions.
+
+Safe pattern examples:
+
+```go
+_, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
+	WriterID: "admin-panel",
+}, func(tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO business.users (id, name, email)
+		VALUES ($1, $2, $3)
+	`, userID, "Ada", "ada@example.com")
+	return err
+})
+```
+
+```go
+_, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
+	WriterID: "admin-panel",
+}, func(tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE business.users
+		SET name = $3
+		WHERE _sync_scope_id = $1
+		  AND id = $2
+	`, scopeID, userID, "Ada Updated")
+	return err
+})
+```
+
+### Writer IDs
+
+`ScopeManager` takes a host-provided `WriterID`, which maps directly to the existing per-scope
+`source_id` sequencing model.
+
+Guidance:
+
+- use one stable writer id per logical producer such as `admin-panel`, `billing-worker`, or
+  `backoffice-tool`
+- avoid collisions with client-managed source ids for the same scope
+- prefixes such as `server:`, `worker:`, `tool:`, or `admin:` can help operational clarity, but
+  the runtime does not require a specific format
+
+### Business idempotency
+
+`ScopeManager` owns sync-stream correctness, not business-command idempotency.
+
+If the host app needs exactly-once semantics for domain operations such as:
+
+- grant credit once
+- append one audit event once
+- apply one external command idempotently
+
+that idempotency must be implemented by the application, not by `oversync`.
 
 ## First-connect lifecycle
 

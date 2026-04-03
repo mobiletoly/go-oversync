@@ -136,19 +136,6 @@ func (s *SyncService) WithinSyncBundle(
 	source BundleSource,
 	fn func(tx pgx.Tx) error,
 ) (err error) {
-	if err := actor.validate(false); err != nil {
-		return err
-	}
-	if strings.TrimSpace(source.SourceID) == "" {
-		return fmt.Errorf("bundle source_id is required")
-	}
-	if source.SourceBundleID <= 0 {
-		return fmt.Errorf("bundle source_bundle_id must be > 0")
-	}
-	if fn == nil {
-		return fmt.Errorf("bundle callback is required")
-	}
-
 	done, err := s.beginOperation()
 	if err != nil {
 		return err
@@ -162,76 +149,100 @@ func (s *SyncService) WithinSyncBundle(
 	defer releaseConn()
 
 	return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
-			return err
-		}
-		scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
-		if err != nil {
-			return err
-		}
-		scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
-		if err != nil {
-			return err
-		}
-		switch scopeState.State {
-		case scopeStateInitialized:
-		case scopeStateInitializing:
-			return &ScopeInitializingError{UserID: actor.UserID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
-		default:
-			return &ScopeUninitializedError{UserID: actor.UserID}
-		}
-		if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
-			return fmt.Errorf("defer bundle constraints: %w", err)
-		}
-		if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
-			return err
-		}
-		expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID)
-		if err != nil {
-			return err
-		}
-		switch {
-		case source.SourceBundleID < expectedSourceBundleID:
-			return &SourceTupleHistoryPrunedError{
-				UserID:                         actor.UserID,
-				SourceID:                       source.SourceID,
-				SourceBundleID:                 source.SourceBundleID,
-				MaxCommittedSourceBundleIDHint: maxCommittedSourceBundleID,
-			}
-		case source.SourceBundleID > expectedSourceBundleID:
-			return &SourceSequenceOutOfOrderError{
-				UserID:   actor.UserID,
-				SourceID: source.SourceID,
-				Expected: expectedSourceBundleID,
-				Actual:   source.SourceBundleID,
-			}
-		}
-		if err := setBundleTxContext(ctx, tx, bundleTxContext{
-			UserID:         actor.UserID,
-			UserPK:         scopeState.UserPK,
-			SourceID:       source.SourceID,
-			SourceBundleID: source.SourceBundleID,
-		}); err != nil {
-			return err
-		}
-
-		if err := fn(tx); err != nil {
-			return err
-		}
-		bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, scopeState.UserPK, source)
-		if err != nil {
-			return err
-		}
-		if bundle != nil {
-			if err := activateSourceState(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID, source.SourceBundleID); err != nil {
-				return err
-			}
-			if err := s.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
-				return err
-			}
-		}
-		return nil
+		_, err := s.withinSyncBundleTx(ctx, tx, actor, source, fn)
+		return err
 	})
+}
+
+func (s *SyncService) withinSyncBundleTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	actor Actor,
+	source BundleSource,
+	fn func(tx pgx.Tx) error,
+) (*Bundle, error) {
+	if err := actor.validate(false); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(source.SourceID) == "" {
+		return nil, fmt.Errorf("bundle source_id is required")
+	}
+	if source.SourceBundleID <= 0 {
+		return nil, fmt.Errorf("bundle source_bundle_id must be > 0")
+	}
+	if fn == nil {
+		return nil, fmt.Errorf("bundle callback is required")
+	}
+
+	if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
+		return nil, err
+	}
+	scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
+	if err != nil {
+		return nil, err
+	}
+	scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
+	if err != nil {
+		return nil, err
+	}
+	switch scopeState.State {
+	case scopeStateInitialized:
+	case scopeStateInitializing:
+		return nil, &ScopeInitializingError{UserID: actor.UserID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
+	default:
+		return nil, &ScopeUninitializedError{UserID: actor.UserID}
+	}
+	if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
+		return nil, fmt.Errorf("defer bundle constraints: %w", err)
+	}
+	if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
+		return nil, err
+	}
+	expectedSourceBundleID, maxCommittedSourceBundleID, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case source.SourceBundleID < expectedSourceBundleID:
+		return nil, &SourceTupleHistoryPrunedError{
+			UserID:                         actor.UserID,
+			SourceID:                       source.SourceID,
+			SourceBundleID:                 source.SourceBundleID,
+			MaxCommittedSourceBundleIDHint: maxCommittedSourceBundleID,
+		}
+	case source.SourceBundleID > expectedSourceBundleID:
+		return nil, &SourceSequenceOutOfOrderError{
+			UserID:   actor.UserID,
+			SourceID: source.SourceID,
+			Expected: expectedSourceBundleID,
+			Actual:   source.SourceBundleID,
+		}
+	}
+	if err := setBundleTxContext(ctx, tx, bundleTxContext{
+		UserID:         actor.UserID,
+		UserPK:         scopeState.UserPK,
+		SourceID:       source.SourceID,
+		SourceBundleID: source.SourceBundleID,
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := fn(tx); err != nil {
+		return nil, err
+	}
+	bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, scopeState.UserPK, source)
+	if err != nil {
+		return nil, err
+	}
+	if bundle != nil {
+		if err := activateSourceState(ctx, tx, scopeState.UserPK, actor.UserID, source.SourceID, source.SourceBundleID); err != nil {
+			return nil, err
+		}
+		if err := s.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
+			return nil, err
+		}
+	}
+	return bundle, nil
 }
 
 func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, source BundleSource) (*Bundle, error) {

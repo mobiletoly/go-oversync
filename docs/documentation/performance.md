@@ -11,7 +11,8 @@ bundle replay, and snapshot rebuilds.
 
 ## Server hotspots
 
-- writes to registered business tables inside `WithinSyncBundle(...)`
+- writes to registered business tables inside `ScopeManager.ExecWrite(...)` or
+  `WithinSyncBundle(...)`
 - trigger capture into `sync.bundle_capture_stage`
 - bundle finalization into `sync.bundle_log` and `sync.bundle_rows`
 - `GET /sync/pull` pagination by bundle count

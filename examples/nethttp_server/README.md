@@ -25,6 +25,8 @@ This example shows a bundle-based go-oversync server built with the standard Go 
 
 - Business tables are authoritative.
 - Sync history is captured from committed business-table effects.
+- For server-originated writes, prefer `oversync.ScopeManager.ExecWrite(...)` as the convenience
+  API; `WithinSyncBundle(...)` remains available for lower-level callers.
 - The supported push transport is staged push sessions plus authoritative committed-bundle fetch.
 - Clients still push one logical dirty-set bundle and pull complete committed bundles.
 - Hydration and destructive recovery rebuild through chunked snapshot sessions.
@@ -32,6 +34,32 @@ This example shows a bundle-based go-oversync server built with the standard Go 
   scope-inclusive keys/FKs on PostgreSQL.
 - The example schema exercises cascades, self-references, and a two-table cycle inside the
   supported FK envelope.
+
+## Server-originated write pattern
+
+The example test suite includes real client-visible coverage for admin/backoffice-style writes in
+`server/scope_manager_sync_test.go`.
+
+Typical usage:
+
+```go
+scopeMgr := oversync.NewScopeManager(syncService, oversync.ScopeManagerConfig{})
+
+_, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
+	WriterID: "admin-panel",
+}, func(tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE business.users
+		SET name = $3
+		WHERE _sync_scope_id = $1
+		  AND id = $2
+	`, scopeID, userID, "Updated By Admin")
+	return err
+})
+```
+
+That write is captured into the normal committed-bundle history and later reaches clients through
+ordinary pull or snapshot flows. There is no separate admin-only delivery path.
 
 ## Run
 

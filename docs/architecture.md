@@ -78,8 +78,9 @@ Important runtime tables include:
 ## Server-Originated Writes
 
 If your application writes registered PostgreSQL tables outside client push handling, it should do
-so through `WithinSyncBundle(...)`. That ensures the committed business transaction is captured as
-one sync bundle visible to other clients.
+so through `ScopeManager.ExecWrite(...)` in the common case, or `WithinSyncBundle(...)` if your
+application needs the lower-level primitive directly. Both paths ensure the committed business
+transaction is captured as one sync bundle visible to other clients.
 
 ## Core Concepts
 
