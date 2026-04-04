@@ -6,6 +6,11 @@ gem "github-pages", group: :jekyll_plugins
 # Ruby 3 ships without WEBrick by default; add it for `jekyll serve`
 gem "webrick"
 
+# Newer Ruby releases no longer bundle some stdlib gems by default, but the
+# legacy GitHub Pages / Jekyll 3 stack still requires them at runtime.
+gem "csv"
+gem "bigdecimal"
+
 # Ensure remote theme plugin is available locally
 gem "jekyll-remote-theme"
 

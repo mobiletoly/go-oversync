@@ -39,7 +39,7 @@ jobs:
       - name: Build with Jekyll
         run: |
           cd docs
-          bundle exec jekyll build --baseurl "${{ steps.pages.outputs.base_path }}"
+          RUBYOPT="${RUBYOPT:+$RUBYOPT }-r./_plugins/ruby_compat.rb" bundle exec jekyll build --baseurl "${{ steps.pages.outputs.base_path }}"
         env:
           JEKYLL_ENV: production
 
