@@ -101,8 +101,8 @@ mux.Handle("POST /sync/snapshot-sessions", auth(http.HandlerFunc(handlers.Handle
 mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", auth(http.HandlerFunc(handlers.HandleGetSnapshotChunk)))
 mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", auth(http.HandlerFunc(handlers.HandleDeleteSnapshotSession)))
 mux.Handle("GET /sync/capabilities", auth(http.HandlerFunc(handlers.HandleCapabilities)))
-mux.HandleFunc("GET /health", handlers.HandleHealth)
-mux.HandleFunc("GET /status", handlers.HandleStatus)
+mux.HandleFunc("GET /syncx/health", handlers.HandleHealth)
+mux.HandleFunc("GET /syncx/status", handlers.HandleStatus)
 ```
 
 Your auth middleware must authenticate the request and inject `oversync.Actor` into request

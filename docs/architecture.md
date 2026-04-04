@@ -80,7 +80,9 @@ Important runtime tables include:
 If your application writes registered PostgreSQL tables outside client push handling, it should do
 so through `ScopeManager.ExecWrite(...)` in the common case, or `WithinSyncBundle(...)` if your
 application needs the lower-level primitive directly. Both paths ensure the committed business
-transaction is captured as one sync bundle visible to other clients.
+transaction is captured as one sync bundle visible to other clients. See
+[Server-Originated Writes]({{ site.baseurl }}/documentation/server-originated-writes/) for the
+runtime contract and examples.
 
 ## Core Concepts
 

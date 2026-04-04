@@ -1,12 +1,27 @@
 ---
-layout: default
+layout: doc
 title: Server
 permalink: /documentation/server/
+parent: Architecture
 ---
 
-# Server
+This page is the PostgreSQL/server runtime overview. It explains what the server owns, which sync
+flows it serves, and which contracts host applications must satisfy. Detailed guidance for
+server-originated writes lives on the separate
+[Server-Originated Writes]({{ site.baseurl }}/documentation/server-originated-writes/) page.
+
+## What The Server Owns
 
 The server treats registered PostgreSQL business tables as authoritative state.
+
+`oversync.SyncService` is the low-level PostgreSQL sync runtime. It owns:
+
+- schema bootstrap and validation for the supported registered-table envelope
+- first-connect lifecycle state
+- staged push-session creation, chunk upload, and commit
+- committed bundle capture from business-table transactions
+- pull and snapshot serving
+- source sequencing, retirement, and retained-history enforcement
 
 ## Runtime Tables
 
@@ -18,7 +33,7 @@ Authoritative replication state:
 - `sync.bundle_rows`: normalized row effects for each committed bundle
 - `sync.applied_pushes`: accepted-push replay table keyed by `(user_id, source_id, source_bundle_id)`
 
-Transport/session state:
+Transport and lifecycle state:
 
 - `sync.scope_state`: durable first-connect authority state (`UNINITIALIZED`, `INITIALIZING`,
   `INITIALIZED`)
@@ -27,125 +42,58 @@ Transport/session state:
 - `sync.snapshot_sessions`: active frozen snapshot session metadata
 - `sync.snapshot_session_rows`: materialized rows for each snapshot session
 
-## Write Path
+## Main Flows
 
-- clients resolve account attachment and first-connect authority with `POST /sync/connect`
-- clients create staged push sessions with `POST /sync/push-sessions`
-- clients upload ordered chunks with `POST /sync/push-sessions/{push_id}/chunks`
-- clients commit the staged push with `POST /sync/push-sessions/{push_id}/commit`
-- accepted-push recovery fetches authoritative rows through
-  `GET /sync/committed-bundles/{bundle_seq}/rows`
-- server-originated registered-table writes should usually run through `ScopeManager.ExecWrite(...)`
-- `ScopeManager.ExecWrite(...)` is the convenience API for one scope-aware server-originated write:
-  it auto-initializes an `UNINITIALIZED` scope as remote-authoritative empty, allocates the next
-  expected per-scope writer sequence, and commits one bundle on success
-- that auto-initialization is a first-authority decision for the scope: after it happens, a later
-  first device can no longer win the `initialize_local` path for that scope
-- `WithinSyncBundle(...)` remains the strict low-level primitive for advanced callers that already
-  manage scope lifecycle and exact `(user_id, source_id, source_bundle_id)` tuples themselves
-- registered-table writes are captured by bundle triggers and finalized atomically with the
-  business-table transaction
-- `WithinSyncBundle(...)` does not auto-retry callback code on serialization/deadlock/lock-timeout
-  failures; if your application wants retry, it must wrap the call explicitly and keep the
-  callback transaction-safe
+### First Connect
 
-One push session, one committed bundle, and one `WithinSyncBundle(...)` transaction belong to
-exactly one `user_id`. If application logic needs to affect multiple users, split that work into
-separate per-user transactions or bundles.
+Clients call `POST /sync/connect` to resolve first authority for one scope.
 
-### `ScopeManager` callback rules
+Possible outcomes:
 
-`ScopeManager.ExecWrite(...)` runs direct PostgreSQL SQL inside one captured transaction.
-
-Important rules:
-
-- arbitrary SQL shape is allowed: multiple statements, joins, CTEs, trigger-driven writes, and
-  writes across multiple tables
-- ownership is enforced at row-execution time by the registered-table owner-guard triggers, not by
-  static inspection of SQL text
-- for `INSERT` into registered tables, omit `_sync_scope_id` unless you are setting it explicitly
-  to the target scope
-- for `UPDATE` and `DELETE` against registered tables, explicitly constrain affected rows to the
-  target scope; `_sync_scope_id = ...` is the recommended default
-- callbacks that produce no visible registered-table effects, including unregistered-only
-  transactions, are rejected by `ScopeManager.ExecWrite(...)`
-
-`ScopeManager.ExecWrite(...)` is meant for writes that must later become visible through sync. It is
-not a generic helper for arbitrary unregistered business transactions.
-
-Safe pattern examples:
-
-```go
-_, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-	WriterID: "admin-panel",
-}, func(tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO business.users (id, name, email)
-		VALUES ($1, $2, $3)
-	`, userID, "Ada", "ada@example.com")
-	return err
-})
-```
-
-```go
-_, err := scopeMgr.ExecWrite(ctx, scopeID, oversync.ScopeWriteOptions{
-	WriterID: "admin-panel",
-}, func(tx pgx.Tx) error {
-	_, err := tx.Exec(ctx, `
-		UPDATE business.users
-		SET name = $3
-		WHERE _sync_scope_id = $1
-		  AND id = $2
-	`, scopeID, userID, "Ada Updated")
-	return err
-})
-```
-
-### Writer IDs
-
-`ScopeManager` takes a host-provided `WriterID`, which maps directly to the existing per-scope
-`source_id` sequencing model.
-
-Guidance:
-
-- use one stable writer id per logical producer such as `admin-panel`, `billing-worker`, or
-  `backoffice-tool`
-- avoid collisions with client-managed source ids for the same scope
-- prefixes such as `server:`, `worker:`, `tool:`, or `admin:` can help operational clarity, but
-  the runtime does not require a specific format
-
-### Business idempotency
-
-`ScopeManager` owns sync-stream correctness, not business-command idempotency.
-
-If the host app needs exactly-once semantics for domain operations such as:
-
-- grant credit once
-- append one audit event once
-- apply one external command idempotently
-
-that idempotency must be implemented by the application, not by `oversync`.
-
-## First-connect lifecycle
-
-`POST /sync/connect` resolves the client lifecycle without asking the app to choose between
-"upload local" and "replace local":
-
-- `remote_authoritative`: the scope was initialized previously, even if it is currently empty
-- `initialize_local`: this source won the exclusive initialization lease and may seed from local
+- `remote_authoritative`: the scope was already initialized, even if it is currently empty
+- `initialize_local`: this source won the initialization lease and may seed server state from local
   pending rows
 - `initialize_empty`: the scope was uninitialized and the server established authoritative empty
   state
 - `retry_later`: another initializer currently owns the lease, or the server is applying a bounded
   empty-first deferral optimization
 
-`retry_later` is a normal connect outcome, not an auth failure. Clients should retry after the
-server-provided backoff.
+`retry_later` is a normal lifecycle result, not an auth failure.
 
-Once a scope reaches `INITIALIZED`, remote remains authoritative for this feature set until some
-future explicit reset feature exists.
+### Push
 
-## Registered Table DDL Requirements
+The normal client write flow is:
+
+- `POST /sync/push-sessions`
+- `POST /sync/push-sessions/{push_id}/chunks`
+- `POST /sync/push-sessions/{push_id}/commit`
+
+Accepted-push recovery fetches authoritative bundle rows through
+`GET /sync/committed-bundles/{bundle_seq}/rows`.
+
+### Pull And Snapshot
+
+- `GET /sync/pull` returns complete committed bundles only
+- `POST /sync/snapshot-sessions` materializes one frozen current after-image inside PostgreSQL
+- `GET /sync/snapshot-sessions/{snapshot_id}` returns deterministic chunks from that frozen
+  snapshot
+- if a client checkpoint falls behind the retained bundle floor, the server returns
+  `history_pruned`
+
+Pull and snapshot creation fail closed before the scope reaches `INITIALIZED`.
+
+## Server-Originated Writes
+
+If your application writes registered PostgreSQL tables outside client push handling, use:
+
+- `ScopeManager.ExecWrite(...)` in the common case
+- `WithinSyncBundle(...)` only when your application already manages exact
+  `(user_id, source_id, source_bundle_id)` tuples directly
+
+That topic has enough runtime detail to deserve its own page. See
+[Server-Originated Writes]({{ site.baseurl }}/documentation/server-originated-writes/).
+
+## Registered Table Requirements
 
 Registered PostgreSQL tables must satisfy these rules before bootstrap:
 
@@ -163,30 +111,24 @@ Registered PostgreSQL tables must satisfy these rules before bootstrap:
 - `DEFERRABLE INITIALLY IMMEDIATE` is accepted
 - partial, predicate, and expression unique indexes are unsupported on registered tables
 
-Bootstrap validates these requirements and fails closed with an `UnsupportedSchemaError` if the
-registered schema is outside the supported envelope.
-
-## Read Path
-
-- `GET /sync/pull` returns complete committed bundles only
-- `POST /sync/snapshot-sessions` materializes one frozen current after-image inside PostgreSQL and
-  returns a snapshot session id
-- `GET /sync/snapshot-sessions/{snapshot_id}` returns deterministic chunks from that frozen
-  snapshot without holding one long-lived database transaction across client round trips
-- snapshot session creation may be bounded by optional row and byte caps in `ServiceConfig`
-- rotated snapshot creation may carry explicit `source_replacement`; when present, the server
-  reserves the replacement source in `sync.source_state` as `reserved` and retires the previous
-  source with explicit lineage
-- if a client checkpoint falls behind the retained bundle floor, the server returns
-  `history_pruned`
-- pull and snapshot creation fail closed before the scope reaches `INITIALIZED`
+Bootstrap fails closed with `UnsupportedSchemaError` when the registered schema is outside the
+supported envelope.
 
 ## Auth Contract
 
-The handlers expect the caller to authenticate first and place
-`oversync.Actor{UserID, SourceID}` into request context. The runtime does not require any specific
-auth stack. The built-in transport helper is `oversync.ActorMiddleware(...)`, which reads
-`Oversync-Source-ID` after host authentication has already established trusted `user_id` in
-request context. `_sync_scope_id` is derived from `Actor.UserID`, enforced only on the
-authoritative PostgreSQL side, and excluded from client-visible payloads, conflicts, pulls, and
-snapshots.
+The handlers expect the host application to authenticate first and place
+`oversync.Actor{UserID, SourceID}` into request context.
+
+The built-in transport helper is `oversync.ActorMiddleware(...)`, which reads
+`Oversync-Source-ID` after the host auth layer has already established trusted `user_id` in
+request context.
+
+`_sync_scope_id` is derived from `Actor.UserID`, enforced only on the authoritative PostgreSQL
+side, and excluded from client-visible payloads, conflicts, pulls, and snapshots.
+
+## Related Guides
+
+- [Core Concepts]({{ site.baseurl }}/documentation/core-concepts/)
+- [Server-Originated Writes]({{ site.baseurl }}/documentation/server-originated-writes/)
+- [HTTP API]({{ site.baseurl }}/documentation/api/)
+- [Performance]({{ site.baseurl }}/documentation/performance/)

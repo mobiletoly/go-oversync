@@ -19,8 +19,8 @@ Endpoints
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
 - `GET /sync/capabilities`
-- `GET /health`
-- `GET /status`
+- `GET /syncx/health`
+- `GET /syncx/status`
 
 Database
 

@@ -10,6 +10,8 @@ main:
         url: "/documentation/core-concepts/"
       - title: "Server"
         url: "/documentation/server/"
+      - title: "Server-Originated Writes"
+        url: "/documentation/server-originated-writes/"
       - title: "Client"
         url: "/documentation/client/"
       - title: "HTTP API"

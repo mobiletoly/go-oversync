@@ -18,8 +18,8 @@ This example shows a bundle-based go-oversync server built with the standard Go 
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
 - `GET /sync/capabilities`
-- `GET /status`
-- `GET /health`
+- `GET /syncx/status`
+- `GET /syncx/health`
 
 ## Architecture
 

@@ -129,8 +129,8 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	syncHandlers := oversync.NewHTTPSyncHandlers(syncService, logger)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", syncHandlers.HandleHealth)
-	mux.HandleFunc("GET /status", syncHandlers.HandleStatus)
+	mux.HandleFunc("GET /syncx/health", syncHandlers.HandleHealth)
+	mux.HandleFunc("GET /syncx/status", syncHandlers.HandleStatus)
 	mux.HandleFunc("POST /dummy-signin", func(w http.ResponseWriter, r *http.Request) {
 		type req struct{ User, Password string }
 		type resp struct {

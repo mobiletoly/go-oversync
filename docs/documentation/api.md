@@ -7,8 +7,8 @@ permalink: /documentation/api/
 # HTTP API
 
 All `/sync/*` endpoints are expected to be mounted behind authentication. The handlers require an
-authenticated `oversync.Actor{UserID, SourceID}` in request context. `GET /health` and
-`GET /status` do not require an authenticated actor.
+authenticated `oversync.Actor{UserID, SourceID}` in request context. Auxiliary `GET /syncx/health`
+and `GET /syncx/status` do not require an authenticated actor.
 
 All visible sync keys are structured JSON objects whose values are strings on the wire. UUID-valued
 keys use canonical dashed lowercase UUID strings. Hidden server ownership columns such as
@@ -434,12 +434,12 @@ Important bundle limit fields:
 - `max_rows_per_snapshot_session`
 - `max_bytes_per_snapshot_session`
 
-## GET `/health`
+## GET `/syncx/health`
 
 Readiness-oriented health response. Returns HTTP `200` when the service is `healthy`, and HTTP
 `503` when the service is `unhealthy`.
 
-## GET `/status`
+## GET `/syncx/status`
 
 Returns a lifecycle and operability snapshot including lifecycle, registered tables, feature flags,
 bundle visibility, retained-floor visibility, and error counters.

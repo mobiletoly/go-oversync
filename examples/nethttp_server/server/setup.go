@@ -232,9 +232,9 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	// Create HTTP handler
 	mux := http.NewServeMux()
 
-	// Add health/status endpoints
-	mux.HandleFunc("GET /health", syncHandlers.HandleHealth)
-	mux.HandleFunc("GET /status", syncHandlers.HandleStatus)
+	// Add unauthenticated auxiliary syncx endpoints
+	mux.HandleFunc("GET /syncx/health", syncHandlers.HandleHealth)
+	mux.HandleFunc("GET /syncx/status", syncHandlers.HandleStatus)
 	mux.HandleFunc("POST /test/reset", func(w http.ResponseWriter, r *http.Request) {
 		if err := resetExampleDatabase(r.Context(), pool, syncService, logger, businessSchema); err != nil {
 			logger.Error("failed to reset example database", "error", err)

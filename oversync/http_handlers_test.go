@@ -131,7 +131,7 @@ func TestHTTPSyncHandlers_HandleHealthUsesStatusCodeForUnhealthyService(t *testi
 	}
 	h := NewHTTPSyncHandlers(svc, slog.Default())
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/syncx/health", nil)
 	rec := httptest.NewRecorder()
 	h.HandleHealth(rec, req)
 
@@ -161,7 +161,7 @@ func TestHTTPSyncHandlers_HandleStatusReturnsLifecycleSnapshot(t *testing.T) {
 	}
 	h := NewHTTPSyncHandlers(svc, slog.Default())
 
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req := httptest.NewRequest(http.MethodGet, "/syncx/status", nil)
 	rec := httptest.NewRecorder()
 	h.HandleStatus(rec, req)
 

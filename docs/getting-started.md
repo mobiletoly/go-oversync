@@ -201,8 +201,8 @@ func main() {
     mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleGetSnapshotChunk)))
     mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeleteSnapshotSession)))
     mux.Handle("GET /sync/capabilities", withSyncActor(http.HandlerFunc(handlers.HandleCapabilities)))
-    mux.HandleFunc("GET /health", handlers.HandleHealth)
-    mux.HandleFunc("GET /status", handlers.HandleStatus)
+    mux.HandleFunc("GET /syncx/health", handlers.HandleHealth)
+    mux.HandleFunc("GET /syncx/status", handlers.HandleStatus)
 
     log.Fatal(http.ListenAndServe(":8080", mux))
 }
@@ -383,8 +383,8 @@ The server exposes:
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
 - `GET /sync/capabilities`
-- `GET /health`
-- `GET /status`
+- `GET /syncx/health`
+- `GET /syncx/status`
 
 All authenticated `/sync/*` requests must send `Oversync-Source-ID: <current-source-id>`.
 

@@ -34,7 +34,8 @@ http://localhost:4000/go-oversync/
 - `getting-started.md`: current setup guide
 - `architecture.md`: bundle-based architecture overview
 - `documentation/core-concepts.md`: vocabulary and end-to-end model
-- `documentation/server.md`: PostgreSQL/server runtime contract
+- `documentation/server.md`: PostgreSQL/server runtime overview
+- `documentation/server-originated-writes.md`: `ScopeManager` / `WithinSyncBundle` guidance
 - `documentation/client.md`: SQLite client runtime contract
 - `documentation/api.md`: HTTP API reference
 - `documentation/advanced-concepts.md`: deeper contract notes
