@@ -65,15 +65,27 @@ business-table effects and stored under the `sync` schema.
 
 Important runtime tables include:
 
+- `sync.meta`
+- `sync.table_catalog`
 - `sync.user_state`
+- `sync.scope_state`
+- `sync.source_state`
 - `sync.row_state`
 - `sync.bundle_log`
 - `sync.bundle_rows`
-- `sync.applied_pushes`
 - `sync.push_sessions`
 - `sync.push_session_rows`
 - `sync.snapshot_sessions`
 - `sync.snapshot_session_rows`
+
+The server uses compact internal identities in hot sync tables: `user_pk` for users, `table_id`
+for registered tables, `key_bytes` for row keys, and `op_code` for operations. Visible protocol
+fields such as `schema`, `table`, `key`, `op`, `row_version`, and payload JSON are reconstructed
+at the HTTP boundary.
+
+`sync.bundle_log` is the durable committed-bundle metadata and accepted-push replay source. Bundle
+history is retained only above each user's `retained_bundle_floor`; below that floor, clients
+recover through snapshot rebuild rather than best-effort historical replay.
 
 ## Server-Originated Writes
 

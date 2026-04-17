@@ -34,9 +34,12 @@ wire, and UUID-valued keys must use canonical dashed lowercase UUID text.
 `sync.row_state` stores the authoritative per-row replicated state for conflict detection,
 idempotent replay, and snapshot rebuilds.
 
-- `row_version` is the authoritative version seen by clients.
+- the server stores the current version as `bundle_seq`
+- `row_version` is the wire name clients see for that authoritative `bundle_seq`
 - `deleted` distinguishes live rows from tombstoned rows.
-- the key is `(user_id, schema_name, table_name, key_json)`
+- the internal key is `(user_pk, table_id, key_bytes)`
+- visible `schema`, `table`, and structured `key` fields are reconstructed from `sync.table_catalog`
+  when the server emits API responses
 
 ## Timestamp encoding
 
@@ -55,6 +58,11 @@ Push is all-or-nothing at bundle level.
 - The server validates the whole request and either rejects it or commits one bundle.
 - Retrying the same accepted `(user_id, source_id, source_bundle_id)` returns the same committed
   bundle.
+- The server stores accepted-push replay metadata in `sync.bundle_log`.
+- `sync.source_state` keeps a monotonic committed source-bundle watermark so stale or duplicate
+  source bundle ids cannot be accepted again after older bundle history is pruned.
+- Source bundle ids must be contiguous per source; stale/pruned, out-of-order, changed, or retired
+  source failures require source recovery instead of generic retry.
 
 ### Structured conflict recovery
 
@@ -78,6 +86,9 @@ Pull is frozen to a stable ceiling.
 - The first `GET /sync/pull` response returns `stable_bundle_seq`.
 - Follow-up requests must keep using that ceiling until it is reached.
 - Clients advance `last_bundle_seq_seen` only after durable local bundle apply.
+- Bundle history is retained only above the user's `retained_bundle_floor`.
+- Pull or accepted-push replay at or below the retained floor returns `history_pruned`; snapshot
+  rebuild is the recovery path.
 
 ## Snapshot rebuilds
 

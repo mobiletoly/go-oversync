@@ -81,13 +81,28 @@ Require successful `Open(ctx)` plus successful `Attach(ctx, userID)`:
 
 ## Recovery
 
-- `PullToStable()` may rebuild from snapshots while keeping the current source
-- committed-remote replay pruned below the retained floor also uses keep-source rebuild behavior
-- stale/out-of-order upload cases enter durable source-recovery-required mode
+- `PullToStable()` may rebuild from snapshots while keeping the current source when incremental
+  history is below the retained floor
+- committed-remote replay pruned below the retained floor uses keep-source rebuild behavior,
+  advances local source sequencing past the already committed tuple, and clears committed-remote
+  outbox state only after recovery succeeds
+- stale/pruned, out-of-order, changed, or retired source upload cases enter durable
+  source-recovery-required mode
 - `PushPending()`, `PullToStable()`, and `Sync()` fail closed while source recovery is active
 - `Rebuild(ctx)` is the explicit recovery entry point
 - when source recovery is active, `Rebuild(ctx)` internally chooses rebuild-plus-rotate and
   preserves frozen outbox intent across that recovery
+
+Source recovery can be entered for:
+
+- `history_pruned`
+- `source_sequence_out_of_order`
+- `source_sequence_changed`
+- `source_retired`
+
+Host code should treat `SourceRecoveryRequiredError` as a durable recovery gate: surface that sync
+requires rebuild, call `Rebuild(ctx)` while authenticated, and let `oversqlite` manage the
+replacement source identity internally.
 
 ## Diagnostic Surface
 

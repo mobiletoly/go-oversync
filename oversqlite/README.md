@@ -82,12 +82,26 @@ Require successful `Open(ctx)` plus successful `Attach(ctx, userID)`:
 ## Recovery
 
 - `PullToStable()` still falls back to snapshot rebuild for pull-side `history_pruned`
-- committed-remote replay pruned below the retained floor still uses keep-source rebuild behavior
-- stale/out-of-order source cases still enter durable fail-closed source-recovery mode
+- committed-remote replay pruned below the retained floor still uses keep-source rebuild behavior,
+  advances local source sequencing past the already committed tuple, and clears committed-remote
+  outbox state only after recovery succeeds
+- stale/pruned, out-of-order, changed, and retired source cases still enter durable fail-closed
+  source-recovery mode
 - `PushPending()`, `PullToStable()`, and `Sync()` fail closed while source recovery is required
 - `Rebuild(ctx)` remains explicit and attached/authenticated
 - when source recovery is active, `Rebuild(ctx)` internally generates a fresh replacement source and
   preserves frozen outbox intent across the rotated rebuild
+
+Source recovery reasons map to server errors:
+
+- `history_pruned`
+- `source_sequence_out_of_order`
+- `source_sequence_changed`
+- `source_retired`
+
+Applications should not clear this state manually. Call `Rebuild(ctx)` after authentication and
+let the client preserve pending outbox intent, rotate source identity when required, and resume
+upload under the fresh source after snapshot recovery completes.
 
 ## Quick Start
 

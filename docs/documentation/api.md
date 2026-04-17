@@ -15,6 +15,13 @@ keys use canonical dashed lowercase UUID strings. Hidden server ownership column
 `_sync_scope_id` never appear in client-visible payloads, conflicts, committed bundle rows, or
 snapshot rows.
 
+Wire-facing `row_version` and `base_row_version` fields are bundle sequence values. The server
+stores the current version internally as `sync.row_state.bundle_seq` and returns it through the
+existing wire field names.
+
+`bundle_hash` is rendered as lowercase hex SHA-256 text on the wire. The hash and `byte_count` are
+computed from the canonical wire JSON produced by the server encoder.
+
 All authenticated `/sync/*` requests must send:
 
 - `Authorization: Bearer <token>`
@@ -90,6 +97,9 @@ Notes:
 - repeating the same tuple after the server has already committed returns
   `status = "already_committed"` plus the committed bundle metadata
 - session creation is serialized by `(user_id, source_id, source_bundle_id)`
+- source bundle ids must be contiguous per source
+- if the exact tuple is no longer retained but the server can prove it was already committed,
+  session creation returns `history_pruned`
 
 Create failure contract:
 
@@ -289,6 +299,8 @@ Notes:
 - follow-up requests in the same pull session must pass that value back as `target_bundle_seq`
 - if the provided checkpoint is older than the retained bundle floor, the server returns HTTP `409`
   with `error=history_pruned`
+- rows at or below the retained floor are outside the retained-history contract even if physical
+  pruning has not deleted them yet
 
 Failure contract:
 

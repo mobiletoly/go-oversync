@@ -83,15 +83,22 @@ CREATE TABLE business.posts (
 
 The server keeps sync metadata in the `sync` schema. The main runtime tables are:
 
+- `sync.meta`
+- `sync.table_catalog`
 - `sync.user_state`
+- `sync.scope_state`
+- `sync.source_state`
 - `sync.row_state`
 - `sync.bundle_log`
 - `sync.bundle_rows`
-- `sync.applied_pushes`
 - `sync.push_sessions`
 - `sync.push_session_rows`
 - `sync.snapshot_sessions`
 - `sync.snapshot_session_rows`
+
+The large server-side sync tables use compact internal identifiers such as `user_pk`, `table_id`,
+`key_bytes`, and `op_code`. The HTTP API still exposes readable `schema`, `table`, structured
+`key`, `op`, and `row_version` fields.
 
 ## Step 1: Start PostgreSQL
 
@@ -350,8 +357,11 @@ Behavior to expect:
 - `PullToStable()` drains complete bundles until the frozen `stable_bundle_seq` is reached.
 - `PullToStable()` rebuilds automatically through snapshot sessions if the server returns
   `history_pruned`.
+- committed-push replay that falls below the retained floor rebuilds from a snapshot while keeping
+  the current source and acknowledging the already committed source tuple locally.
 - `Rebuild(ctx)` rebuilds through chunked snapshot sessions.
-- if durable source recovery is active, `Rebuild(ctx)` internally chooses the rebuild-plus-rotate path.
+- if stale/pruned, out-of-order, changed, or retired source recovery is active, `Rebuild(ctx)`
+  internally chooses the rebuild-plus-rotate path and preserves frozen local intent.
 - `Detach()` clears synced local cache/state after a successful attached detach, restores dirty-row
   capture before returning, and reports blocked detach as a normal `DetachResult`.
 - local writes made after `Detach()` are captured immediately as anonymous pending rows and can be synced after a later `Attach()`.

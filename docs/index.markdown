@@ -16,7 +16,8 @@ The verified contract in this repository is:
 - clients push one logical dirty set through staged push sessions
 - clients replay the authoritative committed bundle returned by the server
 - clients pull complete committed bundles only
-- fresh installs and prune recovery rebuild through frozen snapshot sessions
+- retained-history gaps, fresh installs, and source recovery rebuild through frozen snapshot
+  sessions
 
 ## Repository Surface
 
@@ -38,6 +39,8 @@ The runtime is intentionally fail-closed.
 - unsupported key shapes and unsupported FK shapes fail during bootstrap
 - one `oversqlite.Client` owns one SQLite database at a time
 - one SQLite database maps to one configured remote schema
+- retained bundle history is bounded; clients below the retained floor recover through snapshot
+  rebuild
 
 ## Start Here
 

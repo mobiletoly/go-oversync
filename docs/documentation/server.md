@@ -25,22 +25,38 @@ The server treats registered PostgreSQL business tables as authoritative state.
 
 ## Runtime Tables
 
+Layout ownership and registered-table catalog:
+
+- `sync.meta`: one-row layout marker; startup fails closed if the layout name does not match the
+  running build
+- `sync.table_catalog`: deterministic registered-table catalog with compact `table_id`,
+  visible sync-key column, and key kind
+
 Authoritative replication state:
 
-- `sync.user_state`: per-user bundle sequencing and retained-floor tracking
-- `sync.row_state`: authoritative per-row row-version and tombstone state
-- `sync.bundle_log`: one row per committed sync bundle
-- `sync.bundle_rows`: normalized row effects for each committed bundle
-- `sync.applied_pushes`: accepted-push replay table keyed by `(user_id, source_id, source_bundle_id)`
+- `sync.user_state`: external `user_id`, internal `user_pk`, per-user bundle sequencing, and
+  retained-floor tracking
+- `sync.source_state`: durable per-source committed `source_bundle_id` watermark and source
+  retirement/replacement state
+- `sync.row_state`: authoritative current row version and tombstone state keyed by
+  `(user_pk, table_id, key_bytes)`
+- `sync.bundle_log`: one row per retained committed sync bundle, with the unique
+  `(user_pk, source_id, source_bundle_id)` replay/idempotency key
+- `sync.bundle_rows`: retained committed row effects using compact `table_id`, `key_bytes`, and
+  `op_code`
 
 Transport and lifecycle state:
 
-- `sync.scope_state`: durable first-connect authority state (`UNINITIALIZED`, `INITIALIZING`,
-  `INITIALIZED`)
-- `sync.push_sessions`: active staged push sessions
-- `sync.push_session_rows`: staged rows for each push session
+- `sync.scope_state`: durable first-connect authority state keyed by `user_pk`
+- `sync.push_sessions`: active staging-only push sessions
+- `sync.push_session_rows`: compact staged rows for each push session
 - `sync.snapshot_sessions`: active frozen snapshot session metadata
-- `sync.snapshot_session_rows`: materialized rows for each snapshot session
+- `sync.snapshot_session_rows`: materialized rows for each snapshot session, ordered by compact
+  table/key identity
+
+Row-bearing server tables store compact internal identifiers (`user_pk`, `table_id`, `key_bytes`,
+and `op_code`). Wire responses reconstruct visible `schema`, `table`, structured `key`, operation
+strings, and payloads from `sync.table_catalog` and the stored row data.
 
 ## Main Flows
 
@@ -71,6 +87,12 @@ The normal client write flow is:
 Accepted-push recovery fetches authoritative bundle rows through
 `GET /sync/committed-bundles/{bundle_seq}/rows`.
 
+Retained duplicate replay is resolved through `sync.bundle_log`, not through push-session state.
+If the exact source tuple is older than retained bundle history but `sync.source_state` proves that
+the source bundle id was already committed, the server returns `history_pruned` instead of
+accepting it again. If a source sends a future bundle id, the server returns
+`source_sequence_out_of_order`; commit revalidation can return `source_sequence_changed`.
+
 ### Pull And Snapshot
 
 - `GET /sync/pull` returns complete committed bundles only
@@ -80,7 +102,10 @@ Accepted-push recovery fetches authoritative bundle rows through
 - if a client checkpoint falls behind the retained bundle floor, the server returns
   `history_pruned`
 
-Pull and snapshot creation fail closed before the scope reaches `INITIALIZED`.
+Pull and committed-bundle replay are only guaranteed above `retained_bundle_floor`. Rows at or
+below that floor are outside the retained-history contract even if physical pruning has not deleted
+them yet. Snapshot creation reads live business tables plus `sync.row_state` from one PostgreSQL
+transaction snapshot and fails closed if they disagree.
 
 ## Server-Originated Writes
 

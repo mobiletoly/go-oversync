@@ -46,8 +46,9 @@ Challenges to solve:
 ## Deep dive: identity, source_id, and idempotency
 
 - What is source_id?
-    - A random, persistent identifier for one app runtime (typically UUIDv4). Generate on
-      first launch and store in durable local storage.
+    - A random, persistent identifier for one app runtime (typically UUIDv4). The `oversqlite`
+      client runtime generates and stores it internally; compatible clients must keep the same
+      durable property.
     - Unique per user: two active sources for the same user must not share a source_id.
 
 - Why it matters
@@ -56,13 +57,12 @@ Challenges to solve:
     - If two sources share a source_id, their changes can collide and be treated as duplicates.
 
 - Lifecycle best practices
-    - New install: generate a fresh source_id; initialize source_bundle_id = 1
-    - Reinstall/restore: prefer a fresh source_id unless you can prove the old one is still safe to
-      reuse
-    - Device replacement or same-install recovery: prefer a new source_id when the old writer
+    - New install: use a fresh source_id; initialize source_bundle_id = 1
+    - Reinstall/restore: use a fresh source_id unless the old source stream is still provably safe
+    - Device replacement or same-install recovery: rotate to a new source_id when the old writer
       stream is no longer safe to continue
-    - Destructive reset-and-rebuild recovery: rotate to a fresh source_id and reset
-      source_bundle_id = 1 before new local writes resume
+    - Source recovery: rebuild with a fresh replacement source when the server reports stale,
+      out-of-order, changed, or retired source sequencing
     - Rotation: if rotated, reset source_bundle_id to 1; never reuse the same (source_id,
       source_bundle_id) pair
 
@@ -156,6 +156,8 @@ sequenceDiagram
 - The client applies bundles in order and advances its checkpoint only after durable local apply
 - `last_bundle_seq_seen` means the highest contiguous durably applied bundle, not merely the highest
   seen sequence
+- If the checkpoint falls at or below the server's retained bundle floor, the server returns
+  `history_pruned` and the client recovers by snapshot rebuild
 
 ### Server Truth
 
