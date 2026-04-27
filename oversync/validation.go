@@ -5,19 +5,15 @@ package oversync
 
 // isValidSchemaName checks if schema name matches ^[a-z0-9_]+$
 func isValidSchemaName(name string) bool {
-	if len(name) == 0 {
-		return false
-	}
-	for _, r := range name {
-		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-			return false
-		}
-	}
-	return true
+	return isValidIdentifierName(name)
 }
 
 // isValidTableName checks if table name matches ^[a-z0-9_]+$
 func isValidTableName(name string) bool {
+	return isValidIdentifierName(name)
+}
+
+func isValidIdentifierName(name string) bool {
 	if len(name) == 0 {
 		return false
 	}

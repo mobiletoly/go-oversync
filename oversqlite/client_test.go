@@ -174,25 +174,41 @@ func TestConnect_PersistsConfiguredSchemaIdentity(t *testing.T) {
 	require.Equal(t, "business", schemaName)
 }
 
-func TestNewClient_RejectsUnsupportedIntegerSyncKeyColumn(t *testing.T) {
+func requireNewClientConfigError(
+	t *testing.T,
+	schemaName string,
+	tables []SyncTable,
+	ddl []string,
+	expectedSubstrings ...string,
+) {
+	t.Helper()
+
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	defer db.Close()
 
-	_, err = db.Exec(`
+	for _, stmt := range ddl {
+		_, err = db.Exec(stmt)
+		require.NoError(t, err)
+	}
+
+	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
+	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig(schemaName, tables))
+	require.Error(t, err)
+	for _, expected := range expectedSubstrings {
+		require.Contains(t, err.Error(), expected)
+	}
+}
+
+func TestNewClient_RejectsUnsupportedIntegerSyncKeyColumn(t *testing.T) {
+	requireNewClientConfigError(t, "main", []SyncTable{
+		{TableName: "users", SyncKeyColumns: []string{"id"}},
+	}, []string{`
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT NOT NULL
 		)
-	`)
-	require.NoError(t, err)
-
-	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
-		{TableName: "users", SyncKeyColumns: []string{"id"}},
-	}))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "supports only TEXT keys and UUID-backed BLOB keys")
+	`}, "supports only TEXT keys and UUID-backed BLOB keys")
 }
 
 func TestOpen_PreservesLocalRowsAndManagedSourceAcrossRestart(t *testing.T) {
@@ -651,33 +667,20 @@ func TestStartLoops_LogLifecycleMisuseWithoutTouchingNetwork(t *testing.T) {
 }
 
 func TestNewClient_FailsWhenManagedTablesAreNotFKClosed(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err)
-	defer db.Close()
-
-	_, err = db.Exec(`
+	requireNewClientConfigError(t, "main", []SyncTable{
+		{TableName: "posts", SyncKeyColumns: []string{"id"}},
+	}, []string{`
 		CREATE TABLE users (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL
 		)
-	`)
-	require.NoError(t, err)
-	_, err = db.Exec(`
+	`, `
 		CREATE TABLE posts (
 			id TEXT PRIMARY KEY,
 			author_id TEXT NOT NULL REFERENCES users(id),
 			title TEXT NOT NULL
 		)
-	`)
-	require.NoError(t, err)
-
-	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
-		{TableName: "posts", SyncKeyColumns: []string{"id"}},
-	}))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "not FK-closed")
-	require.Contains(t, err.Error(), "posts.author_id -> users.id")
+	`}, "not FK-closed", "posts.author_id -> users.id")
 }
 
 func TestNewClient_RejectsSecondActiveClientForSameSQLiteDB(t *testing.T) {
@@ -808,78 +811,45 @@ func TestNewClient_AllowsSelfReferencingManagedTable(t *testing.T) {
 }
 
 func TestNewClient_FailsWhenTableNameIsSchemaQualified(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err)
-	defer db.Close()
-
-	_, err = db.Exec(`
+	requireNewClientConfigError(t, "business", []SyncTable{
+		{TableName: "main.users", SyncKeyColumns: []string{"id"}},
+	}, []string{`
 		CREATE TABLE users (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL
 		)
-	`)
-	require.NoError(t, err)
-
-	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("business", []SyncTable{
-		{TableName: "main.users", SyncKeyColumns: []string{"id"}},
-	}))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "must not include a schema qualifier")
+	`}, "must not include a schema qualifier")
 }
 
 func TestNewClient_FailsWhenCompositeSyncKeyColumnsConfigured(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err)
-	defer db.Close()
-
-	_, err = db.Exec(`
+	requireNewClientConfigError(t, "main", []SyncTable{
+		{TableName: "pairs", SyncKeyColumns: []string{"left_id", "right_id"}},
+	}, []string{`
 		CREATE TABLE pairs (
 			left_id TEXT NOT NULL,
 			right_id TEXT NOT NULL,
 			PRIMARY KEY (left_id, right_id)
 		)
-	`)
-	require.NoError(t, err)
-
-	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
-		{TableName: "pairs", SyncKeyColumns: []string{"left_id", "right_id"}},
-	}))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "exactly one sync key column")
+	`}, "exactly one sync key column")
 }
 
 func TestNewClient_FailsWhenManagedTablesContainCompositeFK(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err)
-	defer db.Close()
-
-	_, err = db.Exec(`
+	requireNewClientConfigError(t, "main", []SyncTable{
+		{TableName: "parents", SyncKeyColumns: []string{"id"}},
+		{TableName: "children", SyncKeyColumns: []string{"id"}},
+	}, []string{`
 		CREATE TABLE parents (
 			id TEXT PRIMARY KEY,
 			code_a TEXT NOT NULL,
 			code_b TEXT NOT NULL,
 			UNIQUE (code_a, code_b)
 		)
-	`)
-	require.NoError(t, err)
-
-	_, err = db.Exec(`
+	`, `
 		CREATE TABLE children (
 			id TEXT PRIMARY KEY,
 			parent_code_a TEXT NOT NULL,
 			parent_code_b TEXT NOT NULL,
 			FOREIGN KEY (parent_code_a, parent_code_b) REFERENCES parents(code_a, code_b)
 		)
-	`)
-	require.NoError(t, err)
-
-	tokenFunc := func(ctx context.Context) (string, error) { return "test-token", nil }
-	_, err = NewClient(db, "http://localhost", tokenFunc, DefaultConfig("main", []SyncTable{
-		{TableName: "parents", SyncKeyColumns: []string{"id"}},
-		{TableName: "children", SyncKeyColumns: []string{"id"}},
-	}))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "unsupported composite foreign keys")
+	`}, "unsupported composite foreign keys")
 }

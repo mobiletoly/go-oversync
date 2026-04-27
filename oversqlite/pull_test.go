@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -27,6 +28,92 @@ func mustBundlePayload(t *testing.T, id, name, email string) []byte {
 	})
 	require.NoError(t, err)
 	return raw
+}
+
+func setPullResponses(t *testing.T, client *Client, responses ...any) {
+	t.Helper()
+	requests := 0
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if requests >= len(responses) {
+			return nil, io.EOF
+		}
+		response := responses[requests]
+		requests++
+		return jsonResponse(response), nil
+	})}
+}
+
+func pullBundle(seq int64, sourceID string, sourceBundleID int64, rows ...oversync.BundleRow) oversync.Bundle {
+	return oversync.Bundle{
+		BundleSeq:      seq,
+		SourceID:       sourceID,
+		SourceBundleID: sourceBundleID,
+		Rows:           rows,
+	}
+}
+
+func validUserInsertRow(t *testing.T, id string, rowVersion int64, name, email string) oversync.BundleRow {
+	t.Helper()
+	return rawUserInsertRow(id, rowVersion, mustBundlePayload(t, id, name, email))
+}
+
+func rawUserInsertRow(id string, rowVersion int64, payload []byte) oversync.BundleRow {
+	return oversync.BundleRow{
+		Schema:     "main",
+		Table:      "users",
+		Key:        mustBundleKey(id),
+		Op:         oversync.OpInsert,
+		RowVersion: rowVersion,
+		Payload:    payload,
+	}
+}
+
+func requireTotalUserCount(t *testing.T, db *sql.DB, expected int) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
+	require.Equal(t, expected, count)
+}
+
+func requireUserCount(t *testing.T, db *sql.DB, id string, expected int) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, id).Scan(&count))
+	require.Equal(t, expected, count)
+}
+
+func requireLastBundleSeqSeen(t *testing.T, client *Client, ctx context.Context, expected int64) {
+	t.Helper()
+	lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
+	require.NoError(t, err)
+	require.Equal(t, expected, lastBundleSeq)
+}
+
+func requireFailedBundleApplyCheckpoint(t *testing.T, response oversync.PullResponse, expectedLastBundleSeq int64, requireUsers func(*testing.T, *sql.DB)) {
+	t.Helper()
+	ctx := context.Background()
+	client, db := newUsersBundleClient(t)
+	setPullResponses(t, client, response)
+
+	_, err := client.PullToStable(ctx)
+	require.Error(t, err)
+
+	requireUsers(t, db)
+	requireLastBundleSeqSeen(t, client, ctx, expectedLastBundleSeq)
+}
+
+func requirePullToStableErrorAfterUserApplied(t *testing.T, expectedError string, responses ...any) {
+	t.Helper()
+	ctx := context.Background()
+	client, db := newUsersBundleClient(t)
+	setPullResponses(t, client, responses...)
+
+	_, err := client.PullToStable(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), expectedError)
+
+	requireUserCount(t, db, "user-1", 1)
+	requireLastBundleSeqSeen(t, client, ctx, 1)
 }
 
 func snapshotStageCount(t *testing.T, db *sql.DB) int {
@@ -392,56 +479,56 @@ func TestApplyStagedSnapshot_FailsClosedWhenAttachedStateIsMissing(t *testing.T)
 	require.Equal(t, 0, count)
 }
 
-func TestPullToStable_FailedBundleApplyLeavesCheckpointUnchanged(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)
-	`)
-
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return jsonResponse(oversync.PullResponse{
-			StableBundleSeq: 1,
-			HasMore:         false,
-			Bundles: []oversync.Bundle{{
-				BundleSeq:      1,
-				SourceID:       "peer-a",
-				SourceBundleID: 9,
-				Rows: []oversync.BundleRow{
-					{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-1"),
-						Op:         oversync.OpInsert,
-						RowVersion: 1,
-						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-					},
-					{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-2"),
-						Op:         oversync.OpInsert,
-						RowVersion: 1,
-						Payload:    []byte(`{"id":"user-2","name":"Broken"}`),
-					},
+func TestPullToStable_FailedBundleApplyCheckpointBehavior(t *testing.T) {
+	tests := []struct {
+		name                  string
+		response              oversync.PullResponse
+		expectedLastBundleSeq int64
+		requireUsers          func(*testing.T, *sql.DB)
+	}{
+		{
+			name: "leaves checkpoint unchanged when first bundle fails",
+			response: oversync.PullResponse{
+				StableBundleSeq: 1,
+				HasMore:         false,
+				Bundles: []oversync.Bundle{
+					pullBundle(
+						1,
+						"peer-a",
+						9,
+						validUserInsertRow(t, "user-1", 1, "Ada", "ada@example.com"),
+						rawUserInsertRow("user-2", 1, []byte(`{"id":"user-2","name":"Broken"}`)),
+					),
 				},
-			}},
-		}), nil
-	})}
+			},
+			expectedLastBundleSeq: 0,
+			requireUsers: func(t *testing.T, db *sql.DB) {
+				requireTotalUserCount(t, db, 0)
+			},
+		},
+		{
+			name: "keeps earlier checkpoint when later bundle fails",
+			response: oversync.PullResponse{
+				StableBundleSeq: 2,
+				HasMore:         false,
+				Bundles: []oversync.Bundle{
+					pullBundle(1, "peer-a", 11, validUserInsertRow(t, "user-1", 1, "Ada", "ada@example.com")),
+					pullBundle(2, "peer-b", 12, rawUserInsertRow("user-2", 2, []byte(`{"id":"user-2","name":"Broken"}`))),
+				},
+			},
+			expectedLastBundleSeq: 1,
+			requireUsers: func(t *testing.T, db *sql.DB) {
+				requireUserCount(t, db, "user-1", 1)
+				requireUserCount(t, db, "user-2", 0)
+			},
+		},
+	}
 
-	_, err := client.PullToStable(ctx)
-	require.Error(t, err)
-
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
-	require.Equal(t, 0, count)
-
-	var lastBundleSeq int64
-	require.NoError(t, db.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_attachment_state WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID).Scan(&lastBundleSeq))
-	require.Equal(t, int64(0), lastBundleSeq)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireFailedBundleApplyCheckpoint(t, tt.response, tt.expectedLastBundleSeq, tt.requireUsers)
+		})
+	}
 }
 
 func TestPullToStable_HistoryPrunedFallsBackToSnapshot(t *testing.T) {
@@ -509,121 +596,6 @@ func TestPullToStable_HistoryPrunedFallsBackToSnapshot(t *testing.T) {
 	require.Equal(t, int64(9), lastBundleSeq)
 }
 
-func TestPullToStable_FailureBetweenBundlesKeepsEarlierCheckpoint(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)
-	`)
-
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return jsonResponse(oversync.PullResponse{
-			StableBundleSeq: 2,
-			HasMore:         false,
-			Bundles: []oversync.Bundle{
-				{
-					BundleSeq:      1,
-					SourceID:       "peer-a",
-					SourceBundleID: 11,
-					Rows: []oversync.BundleRow{{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-1"),
-						Op:         oversync.OpInsert,
-						RowVersion: 1,
-						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-					}},
-				},
-				{
-					BundleSeq:      2,
-					SourceID:       "peer-b",
-					SourceBundleID: 12,
-					Rows: []oversync.BundleRow{{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-2"),
-						Op:         oversync.OpInsert,
-						RowVersion: 2,
-						Payload:    []byte(`{"id":"user-2","name":"Broken"}`),
-					}},
-				},
-			},
-		}), nil
-	})}
-
-	_, err := client.PullToStable(ctx)
-	require.Error(t, err)
-
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 1, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-2'`).Scan(&count))
-	require.Equal(t, 0, count)
-
-	lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
-	require.NoError(t, err)
-	require.Equal(t, int64(1), lastBundleSeq)
-}
-
-func TestPullToStable_RejectsChangingStableBundleSeq(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)
-	`)
-
-	requests := 0
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		requests++
-		switch requests {
-		case 1:
-			return jsonResponse(oversync.PullResponse{
-				StableBundleSeq: 2,
-				HasMore:         true,
-				Bundles: []oversync.Bundle{{
-					BundleSeq:      1,
-					SourceID:       "peer-a",
-					SourceBundleID: 11,
-					Rows: []oversync.BundleRow{{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-1"),
-						Op:         oversync.OpInsert,
-						RowVersion: 1,
-						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-					}},
-				}},
-			}), nil
-		case 2:
-			return jsonResponse(oversync.PullResponse{
-				StableBundleSeq: 3,
-				HasMore:         false,
-				Bundles:         nil,
-			}), nil
-		default:
-			return nil, io.EOF
-		}
-	})}
-
-	_, err := client.PullToStable(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "stable bundle seq changed")
-
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 1, count)
-
-	lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
-	require.NoError(t, err)
-	require.Equal(t, int64(1), lastBundleSeq)
-}
-
 func TestPullToStable_RejectsMalformedPullResponse(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
@@ -657,91 +629,80 @@ func TestPullToStable_RejectsMalformedPullResponse(t *testing.T) {
 
 func TestPullToStable_RejectsPullResponseMissingStableBundleSeq(t *testing.T) {
 	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)
-	`)
-
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return jsonResponse(map[string]any{
-			"has_more": false,
-			"bundles": []map[string]any{{
-				"bundle_seq":       1,
-				"source_id":        "peer-a",
-				"source_bundle_id": 11,
-				"rows": []map[string]any{{
-					"schema":      "main",
-					"table":       "users",
-					"key":         map[string]any{"id": "user-1"},
-					"op":          oversync.OpInsert,
-					"row_version": 1,
-					"payload": map[string]any{
-						"id":    "user-1",
-						"name":  "Ada",
-						"email": "ada@example.com",
-					},
-				}},
+	client, db := newUsersBundleClient(t)
+	setPullResponses(t, client, map[string]any{
+		"has_more": false,
+		"bundles": []map[string]any{{
+			"bundle_seq":       1,
+			"source_id":        "peer-a",
+			"source_bundle_id": 11,
+			"rows": []map[string]any{{
+				"schema":      "main",
+				"table":       "users",
+				"key":         map[string]any{"id": "user-1"},
+				"op":          oversync.OpInsert,
+				"row_version": 1,
+				"payload": map[string]any{
+					"id":    "user-1",
+					"name":  "Ada",
+					"email": "ada@example.com",
+				},
 			}},
-		}), nil
-	})}
+		}},
+	})
 
 	_, err := client.PullToStable(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "missing stable_bundle_seq")
 
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
-	require.Equal(t, 0, count)
-
-	lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
-	require.NoError(t, err)
-	require.Equal(t, int64(0), lastBundleSeq)
+	requireTotalUserCount(t, db, 0)
+	requireLastBundleSeqSeen(t, client, ctx, 0)
 }
 
-func TestPullToStable_RejectsIncompletePullBeforeFrozenCeiling(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)
-	`)
+func TestPullToStable_RejectsInvalidPullResponsesAfterApplyingBundle(t *testing.T) {
+	tests := []struct {
+		name          string
+		expectedError string
+		responses     []any
+	}{
+		{
+			name:          "stable bundle seq changed",
+			expectedError: "stable bundle seq changed",
+			responses: []any{
+				oversync.PullResponse{
+					StableBundleSeq: 2,
+					HasMore:         true,
+					Bundles: []oversync.Bundle{
+						pullBundle(1, "peer-a", 11, validUserInsertRow(t, "user-1", 1, "Ada", "ada@example.com")),
+					},
+				},
+				oversync.PullResponse{
+					StableBundleSeq: 3,
+					HasMore:         false,
+					Bundles:         nil,
+				},
+			},
+		},
+		{
+			name:          "pull ended before frozen ceiling",
+			expectedError: "pull ended early",
+			responses: []any{
+				oversync.PullResponse{
+					StableBundleSeq: 2,
+					HasMore:         false,
+					Bundles: []oversync.Bundle{
+						pullBundle(1, "peer-a", 11, validUserInsertRow(t, "user-1", 1, "Ada", "ada@example.com")),
+					},
+				},
+			},
+		},
+	}
 
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return jsonResponse(oversync.PullResponse{
-			StableBundleSeq: 2,
-			HasMore:         false,
-			Bundles: []oversync.Bundle{{
-				BundleSeq:      1,
-				SourceID:       "peer-a",
-				SourceBundleID: 11,
-				Rows: []oversync.BundleRow{{
-					Schema:     "main",
-					Table:      "users",
-					Key:        mustBundleKey("user-1"),
-					Op:         oversync.OpInsert,
-					RowVersion: 1,
-					Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-				}},
-			}},
-		}), nil
-	})}
-
-	_, err := client.PullToStable(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "pull ended early")
-
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 1, count)
-
-	lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
-	require.NoError(t, err)
-	require.Equal(t, int64(1), lastBundleSeq)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requirePullToStableErrorAfterUserApplied(t, tt.expectedError, tt.responses...)
+		})
+	}
 }
 
 func TestRebuildKeepSource_RebuildsFromSnapshotWithDeferredFKs(t *testing.T) {
@@ -1454,7 +1415,20 @@ func TestRebuildKeepSource_PartialDownloadRestartClearsStageAndStartsFromZero(t 
 	require.Equal(t, 0, snapshotStageCount(t, db))
 }
 
-func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T) {
+type snapshotSessionRetryCase struct {
+	snapshotPrefix   string
+	bundleSeq        int64
+	firstRowVersion  int64
+	secondRowVersion int64
+	failureStatus    int
+	failureCode      string
+	failureMessage   string
+	keepSource       bool
+}
+
+func runSnapshotSessionRetryRestoresData(t *testing.T, tc snapshotSessionRetryCase) {
+	t.Helper()
+
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -1464,12 +1438,18 @@ func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T)
 		)
 	`)
 
+	originalSourceID := client.sourceID
 	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('stale', 'Stale', 'stale@example.com')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
 	require.NoError(t, err)
+	if !tc.keepSource {
+		setCurrentSourceBundleState(t, db, 5, 4)
+	}
 	client.config.SnapshotChunkRows = 1
 
+	firstSnapshotID := tc.snapshotPrefix + "-a"
+	secondSnapshotID := tc.snapshotPrefix + "-b"
 	sessionCreates := 0
 	secondAttemptStarted := false
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -1479,8 +1459,8 @@ func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T)
 			sessionCreates++
 			if sessionCreates == 1 {
 				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID:        "snapshot-expired-a",
-					SnapshotBundleSeq: 8,
+					SnapshotID:        firstSnapshotID,
+					SnapshotBundleSeq: tc.bundleSeq,
 					RowCount:          2,
 					ExpiresAt:         "2030-01-01T00:00:00Z",
 				}), nil
@@ -1488,49 +1468,49 @@ func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T)
 			secondAttemptStarted = true
 			require.Equal(t, 0, snapshotStageCount(t, db))
 			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-expired-b",
-				SnapshotBundleSeq: 8,
+				SnapshotID:        secondSnapshotID,
+				SnapshotBundleSeq: tc.bundleSeq,
 				RowCount:          1,
 				ExpiresAt:         "2030-01-01T00:00:00Z",
 			}), nil
-		case "/sync/snapshot-sessions/snapshot-expired-a":
+		case "/sync/snapshot-sessions/" + firstSnapshotID:
 			switch r.Method {
 			case http.MethodGet:
 				switch r.URL.Query().Get("after_row_ordinal") {
 				case "0":
 					return jsonResponse(oversync.SnapshotChunkResponse{
-						SnapshotID:        "snapshot-expired-a",
-						SnapshotBundleSeq: 8,
+						SnapshotID:        firstSnapshotID,
+						SnapshotBundleSeq: tc.bundleSeq,
 						Rows: []oversync.SnapshotRow{{
 							Schema:     "main",
 							Table:      "users",
 							Key:        mustBundleKey("user-1"),
-							RowVersion: 7,
+							RowVersion: tc.firstRowVersion,
 							Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
 						}},
 						NextRowOrdinal: 1,
 						HasMore:        true,
 					}), nil
 				case "1":
-					return errorJSONResponse(http.StatusGone, oversync.ErrorResponse{
-						Error:   "snapshot_session_expired",
-						Message: "snapshot session snapshot-expired-a has expired; start a new snapshot session",
+					return errorJSONResponse(tc.failureStatus, oversync.ErrorResponse{
+						Error:   tc.failureCode,
+						Message: tc.failureMessage,
 					}), nil
 				}
 			case http.MethodDelete:
 				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 			}
-		case "/sync/snapshot-sessions/snapshot-expired-b":
+		case "/sync/snapshot-sessions/" + secondSnapshotID:
 			switch r.Method {
 			case http.MethodGet:
 				return jsonResponse(oversync.SnapshotChunkResponse{
-					SnapshotID:        "snapshot-expired-b",
-					SnapshotBundleSeq: 8,
+					SnapshotID:        secondSnapshotID,
+					SnapshotBundleSeq: tc.bundleSeq,
 					Rows: []oversync.SnapshotRow{{
 						Schema:     "main",
 						Table:      "users",
 						Key:        mustBundleKey("user-1"),
-						RowVersion: 8,
+						RowVersion: tc.secondRowVersion,
 						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
 					}},
 					NextRowOrdinal: 1,
@@ -1545,8 +1525,11 @@ func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T)
 
 	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "snapshot_session_expired")
+	require.Contains(t, err.Error(), tc.failureCode)
 	require.Equal(t, 1, snapshotStageCount(t, db))
+	if !tc.keepSource {
+		require.Equal(t, originalSourceID, client.sourceID)
+	}
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
@@ -1554,384 +1537,88 @@ func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
 	require.Equal(t, 0, count)
 
-	lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
-	require.NoError(t, err)
-	require.Equal(t, int64(0), lastBundleSeq)
+	if tc.keepSource {
+		lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
+		require.NoError(t, err)
+		require.Equal(t, int64(0), lastBundleSeq)
+	} else {
+		sourceID, nextSourceBundleID, lastBundleSeq := readBundleClientState(t, db, client.UserID)
+		require.Equal(t, originalSourceID, sourceID)
+		require.Equal(t, int64(5), nextSourceBundleID)
+		require.Equal(t, int64(4), lastBundleSeq)
+	}
 
 	mustRebuild(t, client, ctx)
 	require.True(t, secondAttemptStarted)
 	require.Equal(t, 0, snapshotStageCount(t, db))
+	if !tc.keepSource {
+		require.Equal(t, originalSourceID, client.sourceID)
+	}
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
 	require.Equal(t, 1, count)
 
-	lastBundleSeq, err = client.LastBundleSeqSeen(ctx)
-	require.NoError(t, err)
-	require.Equal(t, int64(8), lastBundleSeq)
+	if tc.keepSource {
+		lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
+		require.NoError(t, err)
+		require.Equal(t, tc.bundleSeq, lastBundleSeq)
+	} else {
+		sourceID, nextSourceBundleID, lastBundleSeq := readBundleClientState(t, db, client.UserID)
+		require.Equal(t, client.sourceID, sourceID)
+		require.Equal(t, int64(5), nextSourceBundleID)
+		require.Equal(t, tc.bundleSeq, lastBundleSeq)
+	}
+}
+
+func TestRebuildKeepSource_SnapshotSessionExpiredRetryRestoresData(t *testing.T) {
+	runSnapshotSessionRetryRestoresData(t, snapshotSessionRetryCase{
+		snapshotPrefix:   "snapshot-expired",
+		bundleSeq:        8,
+		firstRowVersion:  7,
+		secondRowVersion: 8,
+		failureStatus:    http.StatusGone,
+		failureCode:      "snapshot_session_expired",
+		failureMessage:   "snapshot session snapshot-expired-a has expired; start a new snapshot session",
+		keepSource:       true,
+	})
 }
 
 func TestRebuildKeepSource_SnapshotSessionNotFoundRetryRestoresData(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)
-	`)
-
-	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('stale', 'Stale', 'stale@example.com')`)
-	require.NoError(t, err)
-	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
-	require.NoError(t, err)
-	client.config.SnapshotChunkRows = 1
-
-	sessionCreates := 0
-	secondAttemptStarted := false
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		switch r.URL.Path {
-		case "/sync/snapshot-sessions":
-			require.Equal(t, http.MethodPost, r.Method)
-			sessionCreates++
-			if sessionCreates == 1 {
-				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID:        "snapshot-not-found-a",
-					SnapshotBundleSeq: 6,
-					RowCount:          2,
-					ExpiresAt:         "2030-01-01T00:00:00Z",
-				}), nil
-			}
-			secondAttemptStarted = true
-			require.Equal(t, 0, snapshotStageCount(t, db))
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-not-found-b",
-				SnapshotBundleSeq: 6,
-				RowCount:          1,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
-		case "/sync/snapshot-sessions/snapshot-not-found-a":
-			switch r.Method {
-			case http.MethodGet:
-				switch r.URL.Query().Get("after_row_ordinal") {
-				case "0":
-					return jsonResponse(oversync.SnapshotChunkResponse{
-						SnapshotID:        "snapshot-not-found-a",
-						SnapshotBundleSeq: 6,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "users",
-							Key:        mustBundleKey("user-1"),
-							RowVersion: 5,
-							Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-						}},
-						NextRowOrdinal: 1,
-						HasMore:        true,
-					}), nil
-				case "1":
-					return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{
-						Error:   "snapshot_session_not_found",
-						Message: "snapshot session snapshot-not-found-a was not found",
-					}), nil
-				}
-			case http.MethodDelete:
-				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-			}
-		case "/sync/snapshot-sessions/snapshot-not-found-b":
-			switch r.Method {
-			case http.MethodGet:
-				return jsonResponse(oversync.SnapshotChunkResponse{
-					SnapshotID:        "snapshot-not-found-b",
-					SnapshotBundleSeq: 6,
-					Rows: []oversync.SnapshotRow{{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-1"),
-						RowVersion: 6,
-						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-					}},
-					NextRowOrdinal: 1,
-					HasMore:        false,
-				}), nil
-			case http.MethodDelete:
-				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-			}
-		}
-		return nil, io.EOF
-	})}
-
-	_, err = client.Rebuild(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "snapshot_session_not_found")
-	require.Equal(t, 1, snapshotStageCount(t, db))
-
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
-	require.Equal(t, 1, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 0, count)
-
-	lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
-	require.NoError(t, err)
-	require.Equal(t, int64(0), lastBundleSeq)
-
-	mustRebuild(t, client, ctx)
-	require.True(t, secondAttemptStarted)
-	require.Equal(t, 0, snapshotStageCount(t, db))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
-	require.Equal(t, 0, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 1, count)
-
-	lastBundleSeq, err = client.LastBundleSeqSeen(ctx)
-	require.NoError(t, err)
-	require.Equal(t, int64(6), lastBundleSeq)
+	runSnapshotSessionRetryRestoresData(t, snapshotSessionRetryCase{
+		snapshotPrefix:   "snapshot-not-found",
+		bundleSeq:        6,
+		firstRowVersion:  5,
+		secondRowVersion: 6,
+		failureStatus:    http.StatusNotFound,
+		failureCode:      "snapshot_session_not_found",
+		failureMessage:   "snapshot session snapshot-not-found-a was not found",
+		keepSource:       true,
+	})
 }
 
 func TestRebuild_SnapshotSessionExpiredRetryRestoresData(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)
-	`)
-
-	originalSourceID := client.sourceID
-	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('stale', 'Stale', 'stale@example.com')`)
-	require.NoError(t, err)
-	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
-	require.NoError(t, err)
-	setCurrentSourceBundleState(t, db, 5, 4)
-	client.config.SnapshotChunkRows = 1
-
-	sessionCreates := 0
-	secondAttemptStarted := false
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		switch r.URL.Path {
-		case "/sync/snapshot-sessions":
-			require.Equal(t, http.MethodPost, r.Method)
-			sessionCreates++
-			if sessionCreates == 1 {
-				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID:        "recover-expired-a",
-					SnapshotBundleSeq: 9,
-					RowCount:          2,
-					ExpiresAt:         "2030-01-01T00:00:00Z",
-				}), nil
-			}
-			secondAttemptStarted = true
-			require.Equal(t, 0, snapshotStageCount(t, db))
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "recover-expired-b",
-				SnapshotBundleSeq: 9,
-				RowCount:          1,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
-		case "/sync/snapshot-sessions/recover-expired-a":
-			switch r.Method {
-			case http.MethodGet:
-				switch r.URL.Query().Get("after_row_ordinal") {
-				case "0":
-					return jsonResponse(oversync.SnapshotChunkResponse{
-						SnapshotID:        "recover-expired-a",
-						SnapshotBundleSeq: 9,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "users",
-							Key:        mustBundleKey("user-1"),
-							RowVersion: 8,
-							Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-						}},
-						NextRowOrdinal: 1,
-						HasMore:        true,
-					}), nil
-				case "1":
-					return errorJSONResponse(http.StatusGone, oversync.ErrorResponse{
-						Error:   "snapshot_session_expired",
-						Message: "snapshot session recover-expired-a has expired; start a new snapshot session",
-					}), nil
-				}
-			case http.MethodDelete:
-				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-			}
-		case "/sync/snapshot-sessions/recover-expired-b":
-			switch r.Method {
-			case http.MethodGet:
-				return jsonResponse(oversync.SnapshotChunkResponse{
-					SnapshotID:        "recover-expired-b",
-					SnapshotBundleSeq: 9,
-					Rows: []oversync.SnapshotRow{{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-1"),
-						RowVersion: 9,
-						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-					}},
-					NextRowOrdinal: 1,
-					HasMore:        false,
-				}), nil
-			case http.MethodDelete:
-				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-			}
-		}
-		return nil, io.EOF
-	})}
-
-	_, err = client.Rebuild(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "snapshot_session_expired")
-	require.Equal(t, 1, snapshotStageCount(t, db))
-	require.Equal(t, originalSourceID, client.sourceID)
-
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
-	require.Equal(t, 1, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 0, count)
-
-	sourceID, nextSourceBundleID, lastBundleSeq := readBundleClientState(t, db, client.UserID)
-	require.Equal(t, originalSourceID, sourceID)
-	require.Equal(t, int64(5), nextSourceBundleID)
-	require.Equal(t, int64(4), lastBundleSeq)
-
-	mustRebuild(t, client, ctx)
-	require.True(t, secondAttemptStarted)
-	require.Equal(t, 0, snapshotStageCount(t, db))
-	require.Equal(t, originalSourceID, client.sourceID)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
-	require.Equal(t, 0, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 1, count)
-
-	sourceID, nextSourceBundleID, lastBundleSeq = readBundleClientState(t, db, client.UserID)
-	require.Equal(t, client.sourceID, sourceID)
-	require.Equal(t, int64(5), nextSourceBundleID)
-	require.Equal(t, int64(9), lastBundleSeq)
+	runSnapshotSessionRetryRestoresData(t, snapshotSessionRetryCase{
+		snapshotPrefix:   "recover-expired",
+		bundleSeq:        9,
+		firstRowVersion:  8,
+		secondRowVersion: 9,
+		failureStatus:    http.StatusGone,
+		failureCode:      "snapshot_session_expired",
+		failureMessage:   "snapshot session recover-expired-a has expired; start a new snapshot session",
+	})
 }
 
 func TestRebuild_SnapshotSessionNotFoundRetryRestoresData(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)
-	`)
-
-	originalSourceID := client.sourceID
-	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('stale', 'Stale', 'stale@example.com')`)
-	require.NoError(t, err)
-	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
-	require.NoError(t, err)
-	setCurrentSourceBundleState(t, db, 5, 4)
-	client.config.SnapshotChunkRows = 1
-
-	sessionCreates := 0
-	secondAttemptStarted := false
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		switch r.URL.Path {
-		case "/sync/snapshot-sessions":
-			require.Equal(t, http.MethodPost, r.Method)
-			sessionCreates++
-			if sessionCreates == 1 {
-				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID:        "recover-not-found-a",
-					SnapshotBundleSeq: 10,
-					RowCount:          2,
-					ExpiresAt:         "2030-01-01T00:00:00Z",
-				}), nil
-			}
-			secondAttemptStarted = true
-			require.Equal(t, 0, snapshotStageCount(t, db))
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "recover-not-found-b",
-				SnapshotBundleSeq: 10,
-				RowCount:          1,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
-		case "/sync/snapshot-sessions/recover-not-found-a":
-			switch r.Method {
-			case http.MethodGet:
-				switch r.URL.Query().Get("after_row_ordinal") {
-				case "0":
-					return jsonResponse(oversync.SnapshotChunkResponse{
-						SnapshotID:        "recover-not-found-a",
-						SnapshotBundleSeq: 10,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "users",
-							Key:        mustBundleKey("user-1"),
-							RowVersion: 9,
-							Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-						}},
-						NextRowOrdinal: 1,
-						HasMore:        true,
-					}), nil
-				case "1":
-					return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{
-						Error:   "snapshot_session_not_found",
-						Message: "snapshot session recover-not-found-a was not found",
-					}), nil
-				}
-			case http.MethodDelete:
-				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-			}
-		case "/sync/snapshot-sessions/recover-not-found-b":
-			switch r.Method {
-			case http.MethodGet:
-				return jsonResponse(oversync.SnapshotChunkResponse{
-					SnapshotID:        "recover-not-found-b",
-					SnapshotBundleSeq: 10,
-					Rows: []oversync.SnapshotRow{{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-1"),
-						RowVersion: 10,
-						Payload:    mustBundlePayload(t, "user-1", "Ada", "ada@example.com"),
-					}},
-					NextRowOrdinal: 1,
-					HasMore:        false,
-				}), nil
-			case http.MethodDelete:
-				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-			}
-		}
-		return nil, io.EOF
-	})}
-
-	_, err = client.Rebuild(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "snapshot_session_not_found")
-	require.Equal(t, 1, snapshotStageCount(t, db))
-	require.Equal(t, originalSourceID, client.sourceID)
-
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
-	require.Equal(t, 1, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 0, count)
-
-	sourceID, nextSourceBundleID, lastBundleSeq := readBundleClientState(t, db, client.UserID)
-	require.Equal(t, originalSourceID, sourceID)
-	require.Equal(t, int64(5), nextSourceBundleID)
-	require.Equal(t, int64(4), lastBundleSeq)
-
-	mustRebuild(t, client, ctx)
-	require.True(t, secondAttemptStarted)
-	require.Equal(t, 0, snapshotStageCount(t, db))
-	require.Equal(t, originalSourceID, client.sourceID)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
-	require.Equal(t, 0, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 1, count)
-
-	sourceID, nextSourceBundleID, lastBundleSeq = readBundleClientState(t, db, client.UserID)
-	require.Equal(t, client.sourceID, sourceID)
-	require.Equal(t, int64(5), nextSourceBundleID)
-	require.Equal(t, int64(10), lastBundleSeq)
+	runSnapshotSessionRetryRestoresData(t, snapshotSessionRetryCase{
+		snapshotPrefix:   "recover-not-found",
+		bundleSeq:        10,
+		firstRowVersion:  9,
+		secondRowVersion: 10,
+		failureStatus:    http.StatusNotFound,
+		failureCode:      "snapshot_session_not_found",
+		failureMessage:   "snapshot session recover-not-found-a was not found",
+	})
 }
 
 func TestRebuildKeepSource_CheckpointUnchangedOnFailedFinalApply(t *testing.T) {
@@ -2141,162 +1828,165 @@ func TestRebuildRotateSource_SourceIDDoesNotRotateOnFailedFinalApply(t *testing.
 	require.Equal(t, int64(4), lastBundleSeq)
 }
 
-func TestRebuildKeepSource_SelfReferentialRowsApplyAcrossChunkBoundaries(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "categories", SyncKeyColumnName: "id"}}, `
-		CREATE TABLE categories (
-			id TEXT PRIMARY KEY,
-			parent_id TEXT,
-			name TEXT NOT NULL,
-			FOREIGN KEY (parent_id) REFERENCES categories(id) DEFERRABLE INITIALLY DEFERRED
-		)
-	`)
+func TestRebuildKeepSource_DeferredFKRowsApplyAcrossChunkBoundaries(t *testing.T) {
+	tests := []struct {
+		name       string
+		tables     []SyncTable
+		ddl        []string
+		snapshotID string
+		bundleSeq  int64
+		chunks     [][]oversync.SnapshotRow
+		verify     func(t *testing.T, db *sql.DB)
+	}{
+		{
+			name:       "self referential rows",
+			tables:     []SyncTable{{TableName: "categories", SyncKeyColumnName: "id"}},
+			snapshotID: "snapshot-self-ref",
+			bundleSeq:  3,
+			ddl: []string{`
+				CREATE TABLE categories (
+					id TEXT PRIMARY KEY,
+					parent_id TEXT,
+					name TEXT NOT NULL,
+					FOREIGN KEY (parent_id) REFERENCES categories(id) DEFERRABLE INITIALLY DEFERRED
+				)
+			`},
+			chunks: [][]oversync.SnapshotRow{
+				{{
+					Schema:     "main",
+					Table:      "categories",
+					Key:        mustBundleKey("child"),
+					RowVersion: 2,
+					Payload:    []byte(`{"id":"child","parent_id":"root","name":"Child"}`),
+				}},
+				{{
+					Schema:     "main",
+					Table:      "categories",
+					Key:        mustBundleKey("root"),
+					RowVersion: 1,
+					Payload:    []byte(`{"id":"root","parent_id":null,"name":"Root"}`),
+				}},
+			},
+			verify: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+				var count int
+				require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM categories`).Scan(&count))
+				require.Equal(t, 2, count)
+				var parentID string
+				require.NoError(t, db.QueryRow(`SELECT parent_id FROM categories WHERE id = 'child'`).Scan(&parentID))
+				require.Equal(t, "root", parentID)
+			},
+		},
+		{
+			name: "cyclic rows",
+			tables: []SyncTable{
+				{TableName: "teams", SyncKeyColumnName: "id"},
+				{TableName: "team_members", SyncKeyColumnName: "id"},
+			},
+			snapshotID: "snapshot-cycle",
+			bundleSeq:  5,
+			ddl: []string{`
+				CREATE TABLE teams (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					captain_member_id TEXT,
+					FOREIGN KEY (captain_member_id) REFERENCES team_members(id) DEFERRABLE INITIALLY DEFERRED
+				)
+			`, `
+				CREATE TABLE team_members (
+					id TEXT PRIMARY KEY,
+					team_id TEXT NOT NULL,
+					name TEXT NOT NULL,
+					FOREIGN KEY (team_id) REFERENCES teams(id) DEFERRABLE INITIALLY DEFERRED
+				)
+			`},
+			chunks: [][]oversync.SnapshotRow{
+				{{
+					Schema:     "main",
+					Table:      "team_members",
+					Key:        mustBundleKey("member-1"),
+					RowVersion: 4,
+					Payload:    []byte(`{"id":"member-1","team_id":"team-1","name":"Captain"}`),
+				}},
+				{{
+					Schema:     "main",
+					Table:      "teams",
+					Key:        mustBundleKey("team-1"),
+					RowVersion: 5,
+					Payload:    []byte(`{"id":"team-1","name":"Ops","captain_member_id":"member-1"}`),
+				}},
+			},
+			verify: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+				var captainID string
+				require.NoError(t, db.QueryRow(`SELECT captain_member_id FROM teams WHERE id = 'team-1'`).Scan(&captainID))
+				require.Equal(t, "member-1", captainID)
+				var teamID string
+				require.NoError(t, db.QueryRow(`SELECT team_id FROM team_members WHERE id = 'member-1'`).Scan(&teamID))
+				require.Equal(t, "team-1", teamID)
+			},
+		},
+	}
 
-	client.config.SnapshotChunkRows = 1
-	_, err := db.Exec(`DELETE FROM _sync_dirty_rows`)
-	require.NoError(t, err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			client, db := newBundleClient(t, "main", tc.tables, tc.ddl...)
+			client.config.SnapshotChunkRows = 1
+			_, err := db.Exec(`DELETE FROM _sync_dirty_rows`)
+			require.NoError(t, err)
 
-	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		switch r.URL.Path {
-		case "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-self-ref",
-				SnapshotBundleSeq: 3,
-				RowCount:          2,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
-		case "/sync/snapshot-sessions/snapshot-self-ref":
-			switch r.Method {
-			case http.MethodGet:
-				switch r.URL.Query().Get("after_row_ordinal") {
-				case "0":
-					return jsonResponse(oversync.SnapshotChunkResponse{
-						SnapshotID:        "snapshot-self-ref",
-						SnapshotBundleSeq: 3,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "categories",
-							Key:        mustBundleKey("child"),
-							RowVersion: 2,
-							Payload:    []byte(`{"id":"child","parent_id":"root","name":"Child"}`),
-						}},
-						NextRowOrdinal: 1,
-						HasMore:        true,
-					}), nil
-				case "1":
-					return jsonResponse(oversync.SnapshotChunkResponse{
-						SnapshotID:        "snapshot-self-ref",
-						SnapshotBundleSeq: 3,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "categories",
-							Key:        mustBundleKey("root"),
-							RowVersion: 1,
-							Payload:    []byte(`{"id":"root","parent_id":null,"name":"Root"}`),
-						}},
-						NextRowOrdinal: 2,
-						HasMore:        false,
-					}), nil
-				}
-			case http.MethodDelete:
-				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-			}
-		}
-		return nil, io.EOF
-	})}
-
-	mustRebuild(t, client, ctx)
-
-	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM categories`).Scan(&count))
-	require.Equal(t, 2, count)
-	var parentID string
-	require.NoError(t, db.QueryRow(`SELECT parent_id FROM categories WHERE id = 'child'`).Scan(&parentID))
-	require.Equal(t, "root", parentID)
+			setChunkedSnapshotSession(t, client, tc.snapshotID, tc.bundleSeq, tc.chunks)
+			mustRebuild(t, client, ctx)
+			tc.verify(t, db)
+		})
+	}
 }
 
-func TestRebuildKeepSource_CyclicRowsApplyAcrossChunkBoundaries(t *testing.T) {
-	ctx := context.Background()
-	client, db := newBundleClient(t, "main", []SyncTable{
-		{TableName: "teams", SyncKeyColumnName: "id"},
-		{TableName: "team_members", SyncKeyColumnName: "id"},
-	}, `
-		CREATE TABLE teams (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			captain_member_id TEXT,
-			FOREIGN KEY (captain_member_id) REFERENCES team_members(id) DEFERRABLE INITIALLY DEFERRED
-		)
-	`, `
-		CREATE TABLE team_members (
-			id TEXT PRIMARY KEY,
-			team_id TEXT NOT NULL,
-			name TEXT NOT NULL,
-			FOREIGN KEY (team_id) REFERENCES teams(id) DEFERRABLE INITIALLY DEFERRED
-		)
-	`)
-
-	client.config.SnapshotChunkRows = 1
-	_, err := db.Exec(`DELETE FROM _sync_dirty_rows`)
-	require.NoError(t, err)
-
+func setChunkedSnapshotSession(t *testing.T, client *Client, snapshotID string, bundleSeq int64, chunks [][]oversync.SnapshotRow) {
+	t.Helper()
+	sessionPath := "/sync/snapshot-sessions/" + snapshotID
+	var rowCount int64
+	for _, rows := range chunks {
+		rowCount += int64(len(rows))
+	}
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
+			require.Equal(t, http.MethodPost, r.Method)
 			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-cycle",
-				SnapshotBundleSeq: 5,
-				RowCount:          2,
+				SnapshotID:        snapshotID,
+				SnapshotBundleSeq: bundleSeq,
+				RowCount:          rowCount,
 				ExpiresAt:         "2030-01-01T00:00:00Z",
 			}), nil
-		case "/sync/snapshot-sessions/snapshot-cycle":
+		case sessionPath:
 			switch r.Method {
 			case http.MethodGet:
-				switch r.URL.Query().Get("after_row_ordinal") {
-				case "0":
-					return jsonResponse(oversync.SnapshotChunkResponse{
-						SnapshotID:        "snapshot-cycle",
-						SnapshotBundleSeq: 5,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "team_members",
-							Key:        mustBundleKey("member-1"),
-							RowVersion: 4,
-							Payload:    []byte(`{"id":"member-1","team_id":"team-1","name":"Captain"}`),
-						}},
-						NextRowOrdinal: 1,
-						HasMore:        true,
-					}), nil
-				case "1":
-					return jsonResponse(oversync.SnapshotChunkResponse{
-						SnapshotID:        "snapshot-cycle",
-						SnapshotBundleSeq: 5,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "teams",
-							Key:        mustBundleKey("team-1"),
-							RowVersion: 5,
-							Payload:    []byte(`{"id":"team-1","name":"Ops","captain_member_id":"member-1"}`),
-						}},
-						NextRowOrdinal: 2,
-						HasMore:        false,
-					}), nil
+				afterOrdinal, err := strconv.Atoi(r.URL.Query().Get("after_row_ordinal"))
+				require.NoError(t, err)
+
+				nextOrdinal := 0
+				for i, rows := range chunks {
+					currentOrdinal := nextOrdinal
+					nextOrdinal += len(rows)
+					if currentOrdinal == afterOrdinal {
+						return jsonResponse(oversync.SnapshotChunkResponse{
+							SnapshotID:        snapshotID,
+							SnapshotBundleSeq: bundleSeq,
+							Rows:              rows,
+							NextRowOrdinal:    int64(nextOrdinal),
+							HasMore:           i < len(chunks)-1,
+						}), nil
+					}
 				}
+				return nil, io.EOF
 			case http.MethodDelete:
 				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 			}
 		}
 		return nil, io.EOF
 	})}
-
-	mustRebuild(t, client, ctx)
-
-	var captainID string
-	require.NoError(t, db.QueryRow(`SELECT captain_member_id FROM teams WHERE id = 'team-1'`).Scan(&captainID))
-	require.Equal(t, "member-1", captainID)
-	var teamID string
-	require.NoError(t, db.QueryRow(`SELECT team_id FROM team_members WHERE id = 'member-1'`).Scan(&teamID))
-	require.Equal(t, "team-1", teamID)
 }
 
 func TestSnapshotStageRows_AreIsolatedBySnapshotID(t *testing.T) {

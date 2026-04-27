@@ -98,6 +98,38 @@ func newLifecycleTestClient(t *testing.T, connectResponse *oversync.ConnectRespo
 	})
 }
 
+func requireLifecycleUserAttached(t *testing.T, client *Client) {
+	t.Helper()
+
+	result, err := client.Attach(context.Background(), "lifecycle-user")
+	require.NoError(t, err)
+	require.Equal(t, AttachStatusConnected, result.Status)
+}
+
+func requireDetachBlockedUnsyncedData(t *testing.T, client *Client) {
+	t.Helper()
+
+	detachResult, err := client.Detach(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, DetachOutcomeBlockedUnsyncedData, detachResult.Outcome)
+	require.EqualValues(t, 1, detachResult.PendingRowCount)
+	require.Equal(t, "lifecycle-user", client.UserID)
+}
+
+func requireDetachBlocksWithSeededOutbox(t *testing.T, rec outboxBundleRecord) {
+	t.Helper()
+
+	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
+		Resolution: "initialize_empty",
+	})
+	requireLifecycleUserAttached(t, client)
+
+	rec.SourceID = client.sourceID
+	seedOutboxBundleForTest(t, db, rec)
+	seedOutboxUserInsertForTest(t, db, rec.SourceBundleID, "1", "Ada", "ada@example.com")
+	requireDetachBlockedUnsyncedData(t, client)
+}
+
 func TestConnect_RetryLaterSurfacesRetryAfter(t *testing.T) {
 	client, _ := newLifecycleTestClient(t, &oversync.ConnectResponse{
 		Resolution:    "retry_later",
@@ -265,83 +297,32 @@ func TestDetach_BlocksWhenAttachedDirtyRowsExist(t *testing.T) {
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
 		Resolution: "initialize_empty",
 	})
+	requireLifecycleUserAttached(t, client)
 
-	result, err := client.Attach(context.Background(), "lifecycle-user")
-	require.NoError(t, err)
-	require.Equal(t, AttachStatusConnected, result.Status)
-
-	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "1", "Ada", "ada@example.com")
 	require.NoError(t, err)
 
-	detachResult, err := client.Detach(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, DetachOutcomeBlockedUnsyncedData, detachResult.Outcome)
-	require.EqualValues(t, 1, detachResult.PendingRowCount)
-	require.Equal(t, "lifecycle-user", client.UserID)
+	requireDetachBlockedUnsyncedData(t, client)
 }
 
 func TestDetach_BlocksWhenPreparedOutboxExists(t *testing.T) {
-	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
-		Resolution: "initialize_empty",
+	requireDetachBlocksWithSeededOutbox(t, outboxBundleRecord{
+		State:                outboxStatePrepared,
+		SourceBundleID:       1,
+		CanonicalRequestHash: "hash",
+		RowCount:             1,
 	})
-
-	result, err := client.Attach(context.Background(), "lifecycle-user")
-	require.NoError(t, err)
-	require.Equal(t, AttachStatusConnected, result.Status)
-
-	_, err = db.Exec(`
-		UPDATE _sync_outbox_bundle
-		SET state = 'prepared', source_id = ?, source_bundle_id = 1, row_count = 1, canonical_request_hash = 'hash'
-		WHERE singleton_key = 1
-	`, client.sourceID)
-	require.NoError(t, err)
-	_, err = db.Exec(`
-		INSERT INTO _sync_outbox_rows (
-			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
-		) VALUES (1, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?)
-	`, rowKeyJSON("1"), rowKeyJSON("1"), `{"id":"1","name":"Ada","email":"ada@example.com"}`, `{"id":"1","name":"Ada","email":"ada@example.com"}`)
-	require.NoError(t, err)
-
-	detachResult, err := client.Detach(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, DetachOutcomeBlockedUnsyncedData, detachResult.Outcome)
-	require.EqualValues(t, 1, detachResult.PendingRowCount)
-	require.Equal(t, "lifecycle-user", client.UserID)
 }
 
 func TestDetach_BlocksWhenCommittedRemoteOutboxExists(t *testing.T) {
-	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
-		Resolution: "initialize_empty",
+	requireDetachBlocksWithSeededOutbox(t, outboxBundleRecord{
+		State:                outboxStateCommittedRemote,
+		SourceBundleID:       1,
+		CanonicalRequestHash: "hash",
+		RowCount:             1,
+		RemoteBundleHash:     "remote-hash",
+		RemoteBundleSeq:      7,
 	})
-
-	result, err := client.Attach(context.Background(), "lifecycle-user")
-	require.NoError(t, err)
-	require.Equal(t, AttachStatusConnected, result.Status)
-
-	_, err = db.Exec(`
-		UPDATE _sync_outbox_bundle
-		SET state = 'committed_remote',
-			source_id = ?,
-			source_bundle_id = 1,
-			row_count = 1,
-			canonical_request_hash = 'hash',
-			remote_bundle_hash = 'remote-hash',
-			remote_bundle_seq = 7
-		WHERE singleton_key = 1
-	`, client.sourceID)
-	require.NoError(t, err)
-	_, err = db.Exec(`
-		INSERT INTO _sync_outbox_rows (
-			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
-		) VALUES (1, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?)
-	`, rowKeyJSON("1"), rowKeyJSON("1"), `{"id":"1","name":"Ada","email":"ada@example.com"}`, `{"id":"1","name":"Ada","email":"ada@example.com"}`)
-	require.NoError(t, err)
-
-	detachResult, err := client.Detach(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, DetachOutcomeBlockedUnsyncedData, detachResult.Outcome)
-	require.EqualValues(t, 1, detachResult.PendingRowCount)
-	require.Equal(t, "lifecycle-user", client.UserID)
 }
 
 func TestDetach_ReenablesDirtyRowCaptureForAnonymousWrites(t *testing.T) {
@@ -485,29 +466,17 @@ func TestSourceInfo_ReportsManagedSourceWithCommittedRemoteOutbox(t *testing.T) 
 	client, db := newLifecycleTestClient(t, &oversync.ConnectResponse{
 		Resolution: "initialize_empty",
 	})
-
-	result, err := client.Attach(context.Background(), "lifecycle-user")
-	require.NoError(t, err)
-	require.Equal(t, AttachStatusConnected, result.Status)
-
-	_, err = db.Exec(`
-		UPDATE _sync_outbox_bundle
-		SET state = 'committed_remote',
-			source_id = ?,
-			source_bundle_id = 1,
-			row_count = 1,
-			canonical_request_hash = 'hash',
-			remote_bundle_hash = 'remote-hash',
-			remote_bundle_seq = 7
-		WHERE singleton_key = 1
-	`, client.sourceID)
-	require.NoError(t, err)
-	_, err = db.Exec(`
-		INSERT INTO _sync_outbox_rows (
-			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
-		) VALUES (1, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?)
-	`, rowKeyJSON("1"), rowKeyJSON("1"), `{"id":"1","name":"Ada","email":"ada@example.com"}`, `{"id":"1","name":"Ada","email":"ada@example.com"}`)
-	require.NoError(t, err)
+	requireLifecycleUserAttached(t, client)
+	seedOutboxBundleForTest(t, db, outboxBundleRecord{
+		State:                outboxStateCommittedRemote,
+		SourceID:             client.sourceID,
+		SourceBundleID:       1,
+		CanonicalRequestHash: "hash",
+		RowCount:             1,
+		RemoteBundleHash:     "remote-hash",
+		RemoteBundleSeq:      7,
+	})
+	seedOutboxUserInsertForTest(t, db, 1, "1", "Ada", "ada@example.com")
 
 	info, err := client.SourceInfo(context.Background())
 	require.NoError(t, err)

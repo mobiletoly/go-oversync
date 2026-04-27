@@ -3,11 +3,8 @@ package simulator
 import (
 	"context"
 	"fmt"
-	"path/filepath"
-	"time"
 
 	"github.com/google/uuid"
-	"github.com/mobiletoly/go-oversync/oversqlite"
 )
 
 // DeviceReplacementScenario simulates a user moving to a new device identity.
@@ -140,25 +137,11 @@ func (s *DeviceReplacementScenario) Cleanup(ctx context.Context) error {
 }
 
 func (s *DeviceReplacementScenario) createReplacementApp(deviceID string) (*MobileApp, error) {
-	simCfg := s.simulator.GetConfig()
-	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, s.config.UserID, time.Now().UnixNano()))
-	appConfig := &mobileAppConfig{
-		DatabaseFile: dbFile,
-		ServerURL:    simCfg.ServerURL,
-		UserID:       s.config.UserID,
-		DeviceID:     deviceID,
-		DeviceName:   "Replacement Device",
-		JWTSecret:    simCfg.JWTSecret,
-		OversqliteConfig: &oversqlite.Config{
-			Schema:        "business",
-			Tables:        managedSyncTables(),
-			UploadLimit:   100,
-			DownloadLimit: 100,
-		},
-		PreserveDB: simCfg.PreserveDB,
-		Logger:     s.simulator.GetLogger(),
-	}
-	app, err := newMobileApp(appConfig)
+	app, err := s.simulator.newScenarioMobileApp(scenarioMobileAppOptions{
+		UserID:     s.config.UserID,
+		DeviceID:   deviceID,
+		DeviceName: "Replacement Device",
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create replacement device app: %w", err)
 	}

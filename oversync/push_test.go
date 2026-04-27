@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,251 +38,332 @@ func requireBundlesSemanticallyEqual(t *testing.T, expected, actual *Bundle) {
 	}
 }
 
-func TestPushSessions_ConflictRejectsWholeBundle(t *testing.T) {
+func runPushCycleInsertTest(t *testing.T, scenario string, tables []string) {
+	t.Helper()
+	require.GreaterOrEqual(t, len(tables), 2)
+
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
 
 	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "push_conflict_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	schemaName := "push_" + scenario + "_" + suffix
+	createPushCycleSchema(t, ctx, pool, schemaName, tables)
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
+	registeredTables := make([]RegisteredTable, 0, len(tables))
+	for _, table := range tables {
+		registeredTables = append(registeredTables, RegisteredTable{
+			Schema:         schemaName,
+			Table:          table,
+			SyncKeyColumns: []string{"id"},
+		})
+	}
 	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-conflict-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
+		AppName:                   "push-" + strings.ReplaceAll(scenario, "_", "-") + "-test",
+		RegisteredTables:          registeredTables,
 	}, logger)
 
-	userID := "push-conflict-user-" + suffix
-	actor := Actor{UserID: userID, SourceID: "device-a"}
-	rowID := uuid.New()
+	actor := Actor{UserID: "push-" + scenario + "-user-" + suffix, SourceID: "device-a"}
+	ids := make(map[string]uuid.UUID, len(tables))
+	for _, table := range tables {
+		ids[table] = uuid.New()
+	}
 
-	_, err := pushRowsViaSession(t, ctx, svc, actor, 1, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpInsert,
-		BaseRowVersion: 0,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alice","email":"alice@example.com"}`, rowID)),
-	}})
+	rows := make([]PushRequestRow, 0, len(tables))
+	for i, table := range tables {
+		nextTable := tables[(i+1)%len(tables)]
+		rows = append(rows, pushCycleInsertRow(t, schemaName, table, ids[table], nextTable+"_id", ids[nextTable]))
+	}
+	bundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, rows)
 	require.NoError(t, err)
+	require.Len(t, bundle.Rows, len(tables))
 
-	_, err = pushRowsViaSession(t, ctx, svc, actor, 2, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpUpdate,
-		BaseRowVersion: 999,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alice 2","email":"alice2@example.com"}`, rowID)),
-	}})
-	var conflictErr *PushConflictError
-	require.ErrorAs(t, err, &conflictErr)
-	require.NotNil(t, conflictErr.Conflict)
-	require.NotContains(t, string(conflictErr.Conflict.ServerRow), `"_sync_scope_id"`)
-
-	var bundleCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleCount))
-	require.Equal(t, 1, bundleCount)
-
-	var name string
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id = $1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&name))
-	require.Equal(t, "Alice", name)
+	for i, table := range tables {
+		nextTable := tables[(i+1)%len(tables)]
+		requirePushCycleLink(t, ctx, pool, schemaName, table, ids[table], nextTable+"_id", ids[nextTable])
+	}
 }
 
-func TestPushSessions_AllowsSameVisibleSyncKeyForDifferentUsers(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+func createPushCycleSchema(t *testing.T, ctx context.Context, pool *pgxpool.Pool, schemaName string, tables []string) {
+	t.Helper()
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "push_same_key_users_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-same-key-users-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	rowID := uuid.New()
-	actorA := Actor{UserID: "push-same-key-user-a-" + suffix, SourceID: "device-a"}
-	actorB := Actor{UserID: "push-same-key-user-b-" + suffix, SourceID: "device-b"}
-
-	_, err := pushRowsViaSession(t, ctx, svc, actorA, 1, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpInsert,
-		BaseRowVersion: 0,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alice","email":"alice@example.com"}`, rowID)),
-	}})
+	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
 	require.NoError(t, err)
 
-	_, err = pushRowsViaSession(t, ctx, svc, actorB, 1, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpInsert,
-		BaseRowVersion: 0,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Bob","email":"bob@example.com"}`, rowID)),
-	}})
-	require.NoError(t, err)
+	for i, table := range tables {
+		nextTable := tables[(i+1)%len(tables)]
+		tableIdent := pgx.Identifier{schemaName, table}.Sanitize()
+		nextColumnIdent := pgx.Identifier{nextTable + "_id"}.Sanitize()
+		_, err = pool.Exec(ctx, fmt.Sprintf(`
+			CREATE TABLE %s (
+				_sync_scope_id TEXT NOT NULL,
+				id UUID NOT NULL,
+				%s UUID NOT NULL,
+				PRIMARY KEY (_sync_scope_id, id)
+			)`, tableIdent, nextColumnIdent))
+		require.NoError(t, err)
+	}
 
-	var rowCount int
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.users WHERE id = $1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&rowCount))
-	require.Equal(t, 2, rowCount)
-
-	var nameA string
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
-		SELECT name
-		FROM %s.users
-		WHERE _sync_scope_id = $1 AND id = $2
-	`, pgx.Identifier{schemaName}.Sanitize()), actorA.UserID, rowID).Scan(&nameA))
-	require.Equal(t, "Alice", nameA)
-
-	var nameB string
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
-		SELECT name
-		FROM %s.users
-		WHERE _sync_scope_id = $1 AND id = $2
-	`, pgx.Identifier{schemaName}.Sanitize()), actorB.UserID, rowID).Scan(&nameB))
-	require.Equal(t, "Bob", nameB)
+	for i, table := range tables {
+		nextTable := tables[(i+1)%len(tables)]
+		tableIdent := pgx.Identifier{schemaName, table}.Sanitize()
+		nextTableIdent := pgx.Identifier{schemaName, nextTable}.Sanitize()
+		nextColumnIdent := pgx.Identifier{nextTable + "_id"}.Sanitize()
+		constraintIdent := pgx.Identifier{table + "_" + nextTable + "_id_fkey"}.Sanitize()
+		_, err = pool.Exec(ctx, fmt.Sprintf(`
+			ALTER TABLE %s
+			ADD CONSTRAINT %s
+				FOREIGN KEY (_sync_scope_id, %s) REFERENCES %s(_sync_scope_id, id)
+				DEFERRABLE INITIALLY IMMEDIATE
+		`, tableIdent, constraintIdent, nextColumnIdent, nextTableIdent))
+		require.NoError(t, err)
+	}
 }
 
-func TestPushSessions_WrongOwnerUpdateDeleteDoNotAffectAnotherUsersRow(t *testing.T) {
-	ctx := context.Background()
+func pushCycleInsertRow(t *testing.T, schemaName, table string, id uuid.UUID, nextColumn string, nextID uuid.UUID) PushRequestRow {
+	t.Helper()
+
+	payload, err := json.Marshal(map[string]string{
+		"id":       id.String(),
+		nextColumn: nextID.String(),
+	})
+	require.NoError(t, err)
+
+	return PushRequestRow{
+		Schema:         schemaName,
+		Table:          table,
+		Key:            SyncKey{"id": id.String()},
+		Op:             OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(payload),
+	}
+}
+
+func requirePushCycleLink(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	schemaName string,
+	table string,
+	id uuid.UUID,
+	nextColumn string,
+	expectedNextID uuid.UUID,
+) {
+	t.Helper()
+
+	var persistedNextID uuid.UUID
+	tableIdent := pgx.Identifier{schemaName, table}.Sanitize()
+	nextColumnIdent := pgx.Identifier{nextColumn}.Sanitize()
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT %s FROM %s WHERE id = $1`, nextColumnIdent, tableIdent), id).Scan(&persistedNextID))
+	require.Equal(t, expectedNextID, persistedNextID)
+}
+
+type pushUsersFixture struct {
+	ctx        context.Context
+	pool       *pgxpool.Pool
+	svc        *SyncService
+	schemaName string
+	suffix     string
+	actor      Actor
+}
+
+func newPushUsersFixture(t *testing.T, ctx context.Context, schemaPrefix, appName, userPrefix string) *pushUsersFixture {
+	t.Helper()
+
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
 
 	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "push_wrong_owner_conflict_" + suffix
+	schemaName := schemaPrefix + suffix
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
 	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-wrong-scope-conflict-test",
+		AppName:                   appName,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
-	rowID := uuid.New()
-	actorA := Actor{UserID: "push-owner-a-" + suffix, SourceID: "device-a"}
-	actorB := Actor{UserID: "push-owner-b-" + suffix, SourceID: "device-b"}
+	return &pushUsersFixture{
+		ctx:        ctx,
+		pool:       pool,
+		svc:        svc,
+		schemaName: schemaName,
+		suffix:     suffix,
+		actor:      Actor{UserID: userPrefix + suffix, SourceID: "device-a"},
+	}
+}
 
-	_, err := pushRowsViaSession(t, ctx, svc, actorA, 1, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpInsert,
-		BaseRowVersion: 0,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Owner A","email":"owner-a@example.com"}`, rowID)),
-	}})
-	require.NoError(t, err)
+func (f *pushUsersFixture) actorWith(userPrefix, sourceID string) Actor {
+	return Actor{UserID: userPrefix + f.suffix, SourceID: sourceID}
+}
 
-	_, err = pushRowsViaSession(t, ctx, svc, actorB, 1, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpUpdate,
-		BaseRowVersion: 1,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Intruder","email":"intruder@example.com"}`, rowID)),
-	}})
-	var updateConflict *PushConflictError
-	require.ErrorAs(t, err, &updateConflict)
-	require.Equal(t, SyncKey{"id": rowID.String()}, updateConflict.Conflict.Key)
+func (f *pushUsersFixture) push(t *testing.T, actor Actor, sourceBundleID int64, rows ...PushRequestRow) (*Bundle, error) {
+	t.Helper()
+	return pushRowsViaSession(t, f.ctx, f.svc, actor, sourceBundleID, rows)
+}
 
-	_, err = pushRowsViaSession(t, ctx, svc, actorB, 1, []PushRequestRow{{
-		Schema:         schemaName,
+func (f *pushUsersFixture) userInsert(rowID uuid.UUID, name, email string) PushRequestRow {
+	return f.userWrite(rowID, OpInsert, 0, name, email)
+}
+
+func (f *pushUsersFixture) userUpdate(rowID uuid.UUID, baseRowVersion int64, name, email string) PushRequestRow {
+	return f.userWrite(rowID, OpUpdate, baseRowVersion, name, email)
+}
+
+func (f *pushUsersFixture) userDelete(rowID uuid.UUID, baseRowVersion int64) PushRequestRow {
+	return PushRequestRow{
+		Schema:         f.schemaName,
 		Table:          "users",
 		Key:            SyncKey{"id": rowID.String()},
 		Op:             OpDelete,
-		BaseRowVersion: 1,
-	}})
-	var deleteConflict *PushConflictError
-	require.ErrorAs(t, err, &deleteConflict)
-	require.Equal(t, SyncKey{"id": rowID.String()}, deleteConflict.Conflict.Key)
+		BaseRowVersion: baseRowVersion,
+	}
+}
 
-	var name string
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
+func (f *pushUsersFixture) userWrite(rowID uuid.UUID, op string, baseRowVersion int64, name, email string) PushRequestRow {
+	return PushRequestRow{
+		Schema:         f.schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": rowID.String()},
+		Op:             op,
+		BaseRowVersion: baseRowVersion,
+		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"%s","email":"%s"}`, rowID, name, email)),
+	}
+}
+
+func (f *pushUsersFixture) bundleLogCount(t *testing.T, userID string) int {
+	t.Helper()
+
+	var bundleCount int
+	require.NoError(t, f.pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleCount))
+	return bundleCount
+}
+
+func (f *pushUsersFixture) userRowCount(t *testing.T, rowID uuid.UUID) int {
+	t.Helper()
+
+	var rowCount int
+	require.NoError(t, f.pool.QueryRow(f.ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s.users WHERE id = $1`, pgx.Identifier{f.schemaName}.Sanitize()), rowID).Scan(&rowCount))
+	return rowCount
+}
+
+func (f *pushUsersFixture) userName(t *testing.T, rowID uuid.UUID) string {
+	t.Helper()
+
+	return f.scanUserName(t, fmt.Sprintf(`SELECT name FROM %s.users WHERE id = $1`, pgx.Identifier{f.schemaName}.Sanitize()), rowID)
+}
+
+func (f *pushUsersFixture) scopedUserName(t *testing.T, userID string, rowID uuid.UUID) string {
+	t.Helper()
+
+	return f.scanUserName(t, fmt.Sprintf(`
 		SELECT name
 		FROM %s.users
 		WHERE _sync_scope_id = $1 AND id = $2
-	`, pgx.Identifier{schemaName}.Sanitize()), actorA.UserID, rowID).Scan(&name))
-	require.Equal(t, "Owner A", name)
-
-	var rowCount int
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
-		SELECT COUNT(*)
-		FROM %s.users
-		WHERE id = $1
-	`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&rowCount))
-	require.Equal(t, 1, rowCount)
+	`, pgx.Identifier{f.schemaName}.Sanitize()), userID, rowID)
 }
 
-func TestPushSessions_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+func (f *pushUsersFixture) scanUserName(t *testing.T, query string, args ...any) string {
+	t.Helper()
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "push_update_after_insert_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+	var name string
+	require.NoError(t, f.pool.QueryRow(f.ctx, query, args...).Scan(&name))
+	return name
+}
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-update-after-insert-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
+func (f *pushUsersFixture) rowStateBundleSeq(t *testing.T, userID string, rowID uuid.UUID) int64 {
+	t.Helper()
 
-	userID := "push-update-after-insert-user-" + suffix
-	actor := Actor{UserID: userID, SourceID: "device-a"}
-	rowID := uuid.New()
-
-	firstBundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpInsert,
-		BaseRowVersion: 0,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alice","email":"alice@example.com"}`, rowID)),
-	}})
-	require.NoError(t, err)
-	require.Equal(t, int64(1), firstBundle.BundleSeq)
-
-	secondBundle, err := pushRowsViaSession(t, ctx, svc, actor, 2, []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpUpdate,
-		BaseRowVersion: 1,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alice Updated","email":"alice-updated@example.com"}`, rowID)),
-	}})
-	require.NoError(t, err)
-	require.Equal(t, int64(2), secondBundle.BundleSeq)
-
-	userPK, tableID, keyBytes := mustCompactStorageIdentity(t, ctx, svc, userID, schemaName, "users", rowID.String())
+	userPK, tableID, keyBytes := mustCompactStorageIdentity(t, f.ctx, f.svc, userID, f.schemaName, "users", rowID.String())
 	var stateBundleSeq int64
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, f.pool.QueryRow(f.ctx, `
 		SELECT bundle_seq
 		FROM sync.row_state
 		WHERE user_pk = $1 AND table_id = $2 AND key_bytes = $3
 	`, userPK, tableID, keyBytes).Scan(&stateBundleSeq))
-	require.Equal(t, int64(2), stateBundleSeq)
+	return stateBundleSeq
+}
 
-	var name string
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id = $1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&name))
-	require.Equal(t, "Alice Updated", name)
+func TestPushSessions_ConflictRejectsWholeBundle(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushUsersFixture(t, ctx, "push_conflict_", "push-conflict-test", "push-conflict-user-")
+	rowID := uuid.New()
+
+	_, err := fixture.push(t, fixture.actor, 1, fixture.userInsert(rowID, "Alice", "alice@example.com"))
+	require.NoError(t, err)
+
+	_, err = fixture.push(t, fixture.actor, 2, fixture.userUpdate(rowID, 999, "Alice 2", "alice2@example.com"))
+	var conflictErr *PushConflictError
+	require.ErrorAs(t, err, &conflictErr)
+	require.NotNil(t, conflictErr.Conflict)
+	require.NotContains(t, string(conflictErr.Conflict.ServerRow), `"_sync_scope_id"`)
+	require.Equal(t, 1, fixture.bundleLogCount(t, fixture.actor.UserID))
+	require.Equal(t, "Alice", fixture.userName(t, rowID))
+}
+
+func TestPushSessions_AllowsSameVisibleSyncKeyForDifferentUsers(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushUsersFixture(t, ctx, "push_same_key_users_", "push-same-key-users-test", "push-same-key-user-a-")
+	rowID := uuid.New()
+	actorA := fixture.actor
+	actorB := fixture.actorWith("push-same-key-user-b-", "device-b")
+
+	_, err := fixture.push(t, actorA, 1, fixture.userInsert(rowID, "Alice", "alice@example.com"))
+	require.NoError(t, err)
+
+	_, err = fixture.push(t, actorB, 1, fixture.userInsert(rowID, "Bob", "bob@example.com"))
+	require.NoError(t, err)
+
+	require.Equal(t, 2, fixture.userRowCount(t, rowID))
+	require.Equal(t, "Alice", fixture.scopedUserName(t, actorA.UserID, rowID))
+	require.Equal(t, "Bob", fixture.scopedUserName(t, actorB.UserID, rowID))
+}
+
+func TestPushSessions_WrongOwnerUpdateDeleteDoNotAffectAnotherUsersRow(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushUsersFixture(t, ctx, "push_wrong_owner_conflict_", "push-wrong-scope-conflict-test", "push-owner-a-")
+	rowID := uuid.New()
+	actorA := fixture.actor
+	actorB := fixture.actorWith("push-owner-b-", "device-b")
+
+	_, err := fixture.push(t, actorA, 1, fixture.userInsert(rowID, "Owner A", "owner-a@example.com"))
+	require.NoError(t, err)
+
+	_, err = fixture.push(t, actorB, 1, fixture.userUpdate(rowID, 1, "Intruder", "intruder@example.com"))
+	var updateConflict *PushConflictError
+	require.ErrorAs(t, err, &updateConflict)
+	require.Equal(t, SyncKey{"id": rowID.String()}, updateConflict.Conflict.Key)
+
+	_, err = fixture.push(t, actorB, 1, fixture.userDelete(rowID, 1))
+	var deleteConflict *PushConflictError
+	require.ErrorAs(t, err, &deleteConflict)
+	require.Equal(t, SyncKey{"id": rowID.String()}, deleteConflict.Conflict.Key)
+
+	require.Equal(t, "Owner A", fixture.scopedUserName(t, actorA.UserID, rowID))
+	require.Equal(t, 1, fixture.userRowCount(t, rowID))
+}
+
+func TestPushSessions_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPushUsersFixture(t, ctx, "push_update_after_insert_", "push-update-after-insert-test", "push-update-after-insert-user-")
+	rowID := uuid.New()
+
+	firstBundle, err := fixture.push(t, fixture.actor, 1, fixture.userInsert(rowID, "Alice", "alice@example.com"))
+	require.NoError(t, err)
+	require.Equal(t, int64(1), firstBundle.BundleSeq)
+
+	secondBundle, err := fixture.push(t, fixture.actor, 2, fixture.userUpdate(rowID, 1, "Alice Updated", "alice-updated@example.com"))
+	require.NoError(t, err)
+	require.Equal(t, int64(2), secondBundle.BundleSeq)
+	require.Equal(t, int64(2), fixture.rowStateBundleSeq(t, fixture.actor.UserID, rowID))
+	require.Equal(t, "Alice Updated", fixture.userName(t, rowID))
 }
 
 func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t *testing.T) {
@@ -377,43 +459,16 @@ func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t 
 
 func TestPushSessions_AlreadyCommittedReturnsSameCommittedBundle(t *testing.T) {
 	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "push_replay_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-replay-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "push-replay-user-" + suffix
-	actor := Actor{UserID: userID, SourceID: "device-a"}
+	fixture := newPushUsersFixture(t, ctx, "push_replay_", "push-replay-test", "push-replay-user-")
 	rowID := uuid.New()
-	rows := []PushRequestRow{{
-		Schema:         schemaName,
-		Table:          "users",
-		Key:            SyncKey{"id": rowID.String()},
-		Op:             OpInsert,
-		BaseRowVersion: 0,
-		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Replay","email":"replay@example.com"}`, rowID)),
-	}}
+	rows := []PushRequestRow{fixture.userInsert(rowID, "Replay", "replay@example.com")}
 
-	firstBundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, rows)
+	firstBundle, err := fixture.push(t, fixture.actor, 1, rows...)
 	require.NoError(t, err)
-	replayBundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, rows)
+	replayBundle, err := fixture.push(t, fixture.actor, 1, rows...)
 	require.NoError(t, err)
 	requireBundlesSemanticallyEqual(t, firstBundle, replayBundle)
-
-	var bundleCount int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.bundle_log WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)`, userID).Scan(&bundleCount))
-	require.Equal(t, 1, bundleCount)
+	require.Equal(t, 1, fixture.bundleLogCount(t, fixture.actor.UserID))
 }
 
 func TestPushSessions_AllowsSelfReferentialInsert(t *testing.T) {
@@ -469,194 +524,18 @@ func TestPushSessions_AllowsSelfReferentialInsert(t *testing.T) {
 	require.Equal(t, rowID, parentID)
 }
 
-func TestPushSessions_AllowsTwoTableCycleInsert(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+func TestPushSessions_AllowsCycleInsert(t *testing.T) {
+	tests := []struct {
+		name   string
+		tables []string
+	}{
+		{name: "two_table", tables: []string{"alpha", "beta"}},
+		{name: "three_table", tables: []string{"alpha", "beta", "gamma"}},
+	}
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "push_two_cycle_" + suffix
-	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
-	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		CREATE TABLE %s.alpha (
-			_sync_scope_id TEXT NOT NULL,
-			id UUID NOT NULL,
-			beta_id UUID NOT NULL,
-			PRIMARY KEY (_sync_scope_id, id)
-		)`, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		CREATE TABLE %s.beta (
-			_sync_scope_id TEXT NOT NULL,
-			id UUID NOT NULL,
-			alpha_id UUID NOT NULL,
-			PRIMARY KEY (_sync_scope_id, id),
-			CONSTRAINT beta_alpha_id_fkey
-				FOREIGN KEY (_sync_scope_id, alpha_id) REFERENCES %s.alpha(_sync_scope_id, id)
-				DEFERRABLE INITIALLY IMMEDIATE
-		)`, schemaIdent, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		ALTER TABLE %s.alpha
-		ADD CONSTRAINT alpha_beta_id_fkey
-			FOREIGN KEY (_sync_scope_id, beta_id) REFERENCES %s.beta(_sync_scope_id, id)
-			DEFERRABLE INITIALLY IMMEDIATE
-	`, schemaIdent, schemaIdent))
-	require.NoError(t, err)
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-two-cycle-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "alpha", SyncKeyColumns: []string{"id"}},
-			{Schema: schemaName, Table: "beta", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	actor := Actor{UserID: "push-two-cycle-user-" + suffix, SourceID: "device-a"}
-	alphaID := uuid.New()
-	betaID := uuid.New()
-
-	bundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, []PushRequestRow{
-		{
-			Schema:         schemaName,
-			Table:          "alpha",
-			Key:            SyncKey{"id": alphaID.String()},
-			Op:             OpInsert,
-			BaseRowVersion: 0,
-			Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","beta_id":"%s"}`, alphaID, betaID)),
-		},
-		{
-			Schema:         schemaName,
-			Table:          "beta",
-			Key:            SyncKey{"id": betaID.String()},
-			Op:             OpInsert,
-			BaseRowVersion: 0,
-			Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","alpha_id":"%s"}`, betaID, alphaID)),
-		},
-	})
-	require.NoError(t, err)
-	require.Len(t, bundle.Rows, 2)
-
-	var persistedBetaID uuid.UUID
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT beta_id FROM %s.alpha WHERE id = $1`, schemaIdent), alphaID).Scan(&persistedBetaID))
-	require.Equal(t, betaID, persistedBetaID)
-	var persistedAlphaID uuid.UUID
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT alpha_id FROM %s.beta WHERE id = $1`, schemaIdent), betaID).Scan(&persistedAlphaID))
-	require.Equal(t, alphaID, persistedAlphaID)
-}
-
-func TestPushSessions_AllowsThreeTableCycleInsert(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "push_three_cycle_" + suffix
-	require.NoError(t, dropTestSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
-	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		CREATE TABLE %s.alpha (
-			_sync_scope_id TEXT NOT NULL,
-			id UUID NOT NULL,
-			beta_id UUID NOT NULL,
-			PRIMARY KEY (_sync_scope_id, id)
-		)`, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		CREATE TABLE %s.beta (
-			_sync_scope_id TEXT NOT NULL,
-			id UUID NOT NULL,
-			gamma_id UUID NOT NULL,
-			PRIMARY KEY (_sync_scope_id, id)
-		)`, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		CREATE TABLE %s.gamma (
-			_sync_scope_id TEXT NOT NULL,
-			id UUID NOT NULL,
-			alpha_id UUID NOT NULL,
-			PRIMARY KEY (_sync_scope_id, id),
-			CONSTRAINT gamma_alpha_id_fkey
-				FOREIGN KEY (_sync_scope_id, alpha_id) REFERENCES %s.alpha(_sync_scope_id, id)
-				DEFERRABLE INITIALLY IMMEDIATE
-		)`, schemaIdent, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		ALTER TABLE %s.alpha
-		ADD CONSTRAINT alpha_beta_id_fkey
-			FOREIGN KEY (_sync_scope_id, beta_id) REFERENCES %s.beta(_sync_scope_id, id)
-			DEFERRABLE INITIALLY IMMEDIATE
-	`, schemaIdent, schemaIdent))
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, fmt.Sprintf(`
-		ALTER TABLE %s.beta
-		ADD CONSTRAINT beta_gamma_id_fkey
-			FOREIGN KEY (_sync_scope_id, gamma_id) REFERENCES %s.gamma(_sync_scope_id, id)
-			DEFERRABLE INITIALLY IMMEDIATE
-	`, schemaIdent, schemaIdent))
-	require.NoError(t, err)
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-three-cycle-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "alpha", SyncKeyColumns: []string{"id"}},
-			{Schema: schemaName, Table: "beta", SyncKeyColumns: []string{"id"}},
-			{Schema: schemaName, Table: "gamma", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	actor := Actor{UserID: "push-three-cycle-user-" + suffix, SourceID: "device-a"}
-	alphaID := uuid.New()
-	betaID := uuid.New()
-	gammaID := uuid.New()
-
-	bundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, []PushRequestRow{
-		{
-			Schema:         schemaName,
-			Table:          "alpha",
-			Key:            SyncKey{"id": alphaID.String()},
-			Op:             OpInsert,
-			BaseRowVersion: 0,
-			Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","beta_id":"%s"}`, alphaID, betaID)),
-		},
-		{
-			Schema:         schemaName,
-			Table:          "beta",
-			Key:            SyncKey{"id": betaID.String()},
-			Op:             OpInsert,
-			BaseRowVersion: 0,
-			Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","gamma_id":"%s"}`, betaID, gammaID)),
-		},
-		{
-			Schema:         schemaName,
-			Table:          "gamma",
-			Key:            SyncKey{"id": gammaID.String()},
-			Op:             OpInsert,
-			BaseRowVersion: 0,
-			Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","alpha_id":"%s"}`, gammaID, alphaID)),
-		},
-	})
-	require.NoError(t, err)
-	require.Len(t, bundle.Rows, 3)
-
-	var persistedBetaID uuid.UUID
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT beta_id FROM %s.alpha WHERE id = $1`, schemaIdent), alphaID).Scan(&persistedBetaID))
-	require.Equal(t, betaID, persistedBetaID)
-	var persistedGammaID uuid.UUID
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT gamma_id FROM %s.beta WHERE id = $1`, schemaIdent), betaID).Scan(&persistedGammaID))
-	require.Equal(t, gammaID, persistedGammaID)
-	var persistedAlphaID uuid.UUID
-	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT alpha_id FROM %s.gamma WHERE id = $1`, schemaIdent), gammaID).Scan(&persistedAlphaID))
-	require.Equal(t, alphaID, persistedAlphaID)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runPushCycleInsertTest(t, tc.name+"_cycle", tc.tables)
+		})
+	}
 }

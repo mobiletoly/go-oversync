@@ -4,12 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path/filepath"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/mobiletoly/go-oversync/examples/mobile_flow/config"
-	"github.com/mobiletoly/go-oversync/oversqlite"
 )
 
 // MultiDeviceSyncScenario tests a complex multi-device scenario for the SAME user:
@@ -102,34 +99,11 @@ func (s *MultiDeviceSyncScenario) Setup(ctx context.Context) error {
 
 // createDeviceApp creates a mobile app for a specific device
 func (s *MultiDeviceSyncScenario) createDeviceApp(scenarioConfig *config.ScenarioConfig, deviceID, deviceName string) (*MobileApp, error) {
-	simCfg := s.simulator.GetConfig()
-
-	// Create unique database file path using device ID and timestamp to prevent collisions
-	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, scenarioConfig.UserID, time.Now().UnixNano()))
-
-	// Create oversqlite config
-	oversqliteConfig := &oversqlite.Config{
-		Schema:        "business",
-		Tables:        managedSyncTables(),
-		UploadLimit:   100, // Standard batch size
-		DownloadLimit: 100, // Standard batch size
-	}
-
-	// Create mobile app config
-	appConfig := &mobileAppConfig{
-		DatabaseFile:     dbFile,
-		ServerURL:        simCfg.ServerURL,
-		UserID:           scenarioConfig.UserID,
-		DeviceID:         deviceID,
-		DeviceName:       deviceName,
-		JWTSecret:        simCfg.JWTSecret,
-		OversqliteConfig: oversqliteConfig,
-		PreserveDB:       simCfg.PreserveDB,
-		Logger:           s.simulator.GetLogger(),
-	}
-
-	// Create mobile app
-	app, err := newMobileApp(appConfig)
+	app, err := s.simulator.newScenarioMobileApp(scenarioMobileAppOptions{
+		UserID:     scenarioConfig.UserID,
+		DeviceID:   deviceID,
+		DeviceName: deviceName,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create mobile app: %w", err)
 	}

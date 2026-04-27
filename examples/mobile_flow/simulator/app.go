@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -28,6 +29,48 @@ type mobileAppConfig struct {
 	OversqliteConfig *oversqlite.Config
 	PreserveDB       bool // Preserve database file after app shutdown
 	Logger           *slog.Logger
+}
+
+type scenarioMobileAppOptions struct {
+	UserID           string
+	DeviceID         string
+	DeviceName       string
+	DBNamePrefix     string
+	OversqliteConfig *oversqlite.Config
+}
+
+func standardScenarioOversqliteConfig() *oversqlite.Config {
+	return &oversqlite.Config{
+		Schema:        "business",
+		Tables:        managedSyncTables(),
+		UploadLimit:   100,
+		DownloadLimit: 100,
+	}
+}
+
+func (s *Simulator) newScenarioMobileApp(opts scenarioMobileAppOptions) (*MobileApp, error) {
+	dbNamePrefix := opts.DBNamePrefix
+	if dbNamePrefix == "" {
+		dbNamePrefix = opts.DeviceID
+	}
+
+	oversqliteConfig := opts.OversqliteConfig
+	if oversqliteConfig == nil {
+		oversqliteConfig = standardScenarioOversqliteConfig()
+	}
+
+	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", dbNamePrefix, opts.UserID, time.Now().UnixNano()))
+	return newMobileApp(&mobileAppConfig{
+		DatabaseFile:     dbFile,
+		ServerURL:        s.config.ServerURL,
+		UserID:           opts.UserID,
+		DeviceID:         opts.DeviceID,
+		DeviceName:       opts.DeviceName,
+		JWTSecret:        s.config.JWTSecret,
+		OversqliteConfig: oversqliteConfig,
+		PreserveDB:       s.config.PreserveDB,
+		Logger:           s.logger,
+	})
 }
 
 // MobileApp represents a simulated mobile application

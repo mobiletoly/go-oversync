@@ -581,124 +581,109 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 	require.Equal(t, "Trigger User", nickname)
 }
 
-func TestWithinSyncBundle_RejectsMismatchedOwnerOnInsert(t *testing.T) {
+type bundleOwnerGuardFixture struct {
+	ctx         context.Context
+	svc         *SyncService
+	schemaIdent string
+	rowID       uuid.UUID
+}
+
+func newBundleOwnerGuardFixture(t *testing.T, schemaPrefix, appName string) *bundleOwnerGuardFixture {
+	t.Helper()
+
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
 
 	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "bundle_owner_insert_reject_" + suffix
+	schemaName := schemaPrefix + suffix
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
 	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-owner-insert-reject-test",
+		AppName:                   appName,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
 	}, logger)
 
-	rowID := uuid.New()
-	mustInitializeEmptyScope(t, ctx, svc, "actor-a", "server-app")
-	err := svc.WithinSyncBundle(ctx, Actor{UserID: "actor-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s.users (_sync_scope_id, id, name, email)
-			VALUES ($1, $2, $3, $4)
-		`, pgx.Identifier{schemaName}.Sanitize()), "actor-b", rowID, "Mallory", "mallory@example.com")
+	return &bundleOwnerGuardFixture{
+		ctx:         ctx,
+		svc:         svc,
+		schemaIdent: pgx.Identifier{schemaName}.Sanitize(),
+		rowID:       uuid.New(),
+	}
+}
+
+func (f *bundleOwnerGuardFixture) initializeOwner(t *testing.T, ownerID string) {
+	t.Helper()
+
+	mustInitializeEmptyScope(t, f.ctx, f.svc, ownerID, "server-app")
+}
+
+func (f *bundleOwnerGuardFixture) source(bundleID int64) BundleSource {
+	return BundleSource{SourceID: "server-app", SourceBundleID: bundleID}
+}
+
+func (f *bundleOwnerGuardFixture) seedOwnerUser(t *testing.T, ownerID string, bundleID int64) {
+	t.Helper()
+
+	f.initializeOwner(t, ownerID)
+	require.NoError(t, f.svc.WithinSyncBundle(f.ctx, Actor{UserID: ownerID}, f.source(bundleID), func(tx pgx.Tx) error {
+		_, err := tx.Exec(f.ctx, fmt.Sprintf(`
+			INSERT INTO %s.users (id, name, email)
+			VALUES ($1, $2, $3)
+		`, f.schemaIdent), f.rowID, "Owner A", "owner-a@example.com")
+		return err
+	}))
+}
+
+func (f *bundleOwnerGuardFixture) requireRejectedUserWrite(t *testing.T, ownerID string, bundleID int64, expectedMessage, query string, args ...any) {
+	t.Helper()
+
+	err := f.svc.WithinSyncBundle(f.ctx, Actor{UserID: ownerID}, f.source(bundleID), func(tx pgx.Tx) error {
+		_, err := tx.Exec(f.ctx, fmt.Sprintf(query, f.schemaIdent), args...)
 		return err
 	})
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "scope mismatch")
+	require.Contains(t, err.Error(), expectedMessage)
+}
+
+func TestWithinSyncBundle_RejectsMismatchedOwnerOnInsert(t *testing.T) {
+	f := newBundleOwnerGuardFixture(t, "bundle_owner_insert_reject_", "bundle-owner-insert-reject-test")
+	f.initializeOwner(t, "actor-a")
+
+	f.requireRejectedUserWrite(t, "actor-a", 1, "scope mismatch", `
+			INSERT INTO %s.users (_sync_scope_id, id, name, email)
+			VALUES ($1, $2, $3, $4)
+		`, "actor-b", f.rowID, "Mallory", "mallory@example.com")
 }
 
 func TestWithinSyncBundle_RejectsCrossOwnerWriteByVisibleKeyAlone(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+	f := newBundleOwnerGuardFixture(t, "bundle_cross_owner_reject_", "bundle-cross-owner-reject-test")
+	f.seedOwnerUser(t, "owner-a", 1)
+	f.initializeOwner(t, "owner-b")
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "bundle_cross_owner_reject_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-cross-owner-reject-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	rowID := uuid.New()
-	mustInitializeEmptyScope(t, ctx, svc, "owner-a", "server-app")
-	mustInitializeEmptyScope(t, ctx, svc, "owner-b", "server-app")
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: "owner-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s.users (id, name, email)
-			VALUES ($1, $2, $3)
-		`, pgx.Identifier{schemaName}.Sanitize()), rowID, "Owner A", "owner-a@example.com")
-		return err
-	}))
-
-	err := svc.WithinSyncBundle(ctx, Actor{UserID: "owner-b"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
+	f.requireRejectedUserWrite(t, "owner-b", 1, "scope mismatch", `
 			UPDATE %s.users
 			SET name = $2
 			WHERE id = $1
-		`, pgx.Identifier{schemaName}.Sanitize()), rowID, "Intruder")
-		return err
-	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "scope mismatch")
+		`, f.rowID, "Intruder")
 
-	err = svc.WithinSyncBundle(ctx, Actor{UserID: "owner-b"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
+	f.requireRejectedUserWrite(t, "owner-b", 1, "scope mismatch", `
 			DELETE FROM %s.users
 			WHERE id = $1
-		`, pgx.Identifier{schemaName}.Sanitize()), rowID)
-		return err
-	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "scope mismatch")
+		`, f.rowID)
 }
 
 func TestWithinSyncBundle_RejectsOwnerMutationOnUpdate(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+	f := newBundleOwnerGuardFixture(t, "bundle_owner_update_reject_", "bundle-owner-update-reject-test")
+	f.seedOwnerUser(t, "owner-a", 1)
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "bundle_owner_update_reject_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-owner-update-reject-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	rowID := uuid.New()
-	mustInitializeEmptyScope(t, ctx, svc, "owner-a", "server-app")
-	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: "owner-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s.users (id, name, email)
-			VALUES ($1, $2, $3)
-		`, pgx.Identifier{schemaName}.Sanitize()), rowID, "Owner A", "owner-a@example.com")
-		return err
-	}))
-
-	err := svc.WithinSyncBundle(ctx, Actor{UserID: "owner-a"}, BundleSource{SourceID: "server-app", SourceBundleID: 2}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
+	f.requireRejectedUserWrite(t, "owner-a", 2, "scope mutation is not allowed", `
 			UPDATE %s.users
 			SET _sync_scope_id = $2
 			WHERE id = $1
-		`, pgx.Identifier{schemaName}.Sanitize()), rowID, "owner-b")
-		return err
-	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "scope mutation is not allowed")
+		`, f.rowID, "owner-b")
 }

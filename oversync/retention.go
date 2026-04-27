@@ -45,38 +45,37 @@ func (s retainedHistoryState) highestBundleSeq() int64 {
 	return s.NextBundleSeq - 1
 }
 
-func loadRetainedHistoryStateByUserID(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, userID string) (*retainedHistoryState, error) {
-	var state retainedHistoryState
-	err := q.QueryRow(ctx, `
+func loadRetainedHistoryStateByUserID(ctx context.Context, q userStateQuerier, userID string) (*retainedHistoryState, error) {
+	state, err := scanRetainedHistoryState(q.QueryRow(ctx, `
 		SELECT user_pk, next_bundle_seq, retained_bundle_floor
 		FROM sync.user_state
 		WHERE user_id = $1
-	`, userID).Scan(&state.UserPK, &state.NextBundleSeq, &state.RetainedFloor)
+	`, userID))
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
 		return nil, fmt.Errorf("query retained history state for %q: %w", userID, err)
 	}
-	return &state, nil
+	return state, nil
 }
 
-func loadRetainedHistoryStateByUserPK(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, userPK int64) (*retainedHistoryState, error) {
-	var state retainedHistoryState
-	err := q.QueryRow(ctx, `
+func loadRetainedHistoryStateByUserPK(ctx context.Context, q userStateQuerier, userPK int64) (*retainedHistoryState, error) {
+	state, err := scanRetainedHistoryState(q.QueryRow(ctx, `
 		SELECT user_pk, next_bundle_seq, retained_bundle_floor
 		FROM sync.user_state
 		WHERE user_pk = $1
-	`, userPK).Scan(&state.UserPK, &state.NextBundleSeq, &state.RetainedFloor)
+	`, userPK))
 	if err != nil {
+		return nil, fmt.Errorf("query retained history state for user_pk %d: %w", userPK, err)
+	}
+	return state, nil
+}
+
+func scanRetainedHistoryState(row pgx.Row) (*retainedHistoryState, error) {
+	var state retainedHistoryState
+	if err := row.Scan(&state.UserPK, &state.NextBundleSeq, &state.RetainedFloor); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("query retained history state for user_pk %d: %w", userPK, err)
+		return nil, err
 	}
 	return &state, nil
 }

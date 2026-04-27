@@ -168,36 +168,58 @@ func TestNewClient_RequiresExplicitPrimaryKeyConfig(t *testing.T) {
 	}
 }
 
-func TestNewClient_FailsWhenSyncKeyColumnDoesNotExist(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
+func TestNewClient_RejectsInvalidSyncKeyColumnDefinitions(t *testing.T) {
+	tests := []struct {
+		name               string
+		schemaName         string
+		syncKeyColumnName  string
+		ddl                string
+		expectedSubstrings []string
+	}{
+		{
+			name:              "missing column",
+			schemaName:        "test",
+			syncKeyColumnName: "missing_pk",
+			ddl: `
+				CREATE TABLE users (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL
+				)
+			`,
+			expectedSubstrings: []string{"missing_pk"},
+		},
+		{
+			name:              "integer primary key",
+			schemaName:        "main",
+			syncKeyColumnName: "id",
+			ddl: `
+				CREATE TABLE users (
+					id INTEGER PRIMARY KEY,
+					name TEXT NOT NULL
+				)
+			`,
+			expectedSubstrings: []string{"supports only TEXT keys and UUID-backed BLOB keys"},
+		},
+		{
+			name:              "bigint primary key",
+			schemaName:        "main",
+			syncKeyColumnName: "id",
+			ddl: `
+				CREATE TABLE users (
+					id BIGINT PRIMARY KEY,
+					name TEXT NOT NULL
+				)
+			`,
+			expectedSubstrings: []string{"supports only TEXT keys and UUID-backed BLOB keys"},
+		},
 	}
-	defer db.Close()
 
-	_, err = db.Exec(`
-		CREATE TABLE users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL
-		)
-	`)
-	if err != nil {
-		t.Fatalf("Failed to create users table: %v", err)
-	}
-
-	config := DefaultConfig("test", []SyncTable{
-		{TableName: "users", SyncKeyColumnName: "missing_pk"},
-	})
-	tokenFunc := func(ctx context.Context) (string, error) {
-		return "mock-token", nil
-	}
-
-	_, err = NewClient(db, "http://localhost:8080", tokenFunc, config)
-	if err == nil {
-		t.Fatal("expected client creation to fail when SyncKeyColumnName does not exist")
-	}
-	if !strings.Contains(err.Error(), "missing_pk") {
-		t.Fatalf("expected error to mention missing_pk, got: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireNewClientConfigError(t, tt.schemaName, []SyncTable{
+				{TableName: "users", SyncKeyColumnName: tt.syncKeyColumnName},
+			}, []string{tt.ddl}, tt.expectedSubstrings...)
+		})
 	}
 }
 
@@ -392,68 +414,6 @@ func TestTriggersWithCustomPKFunctionality(t *testing.T) {
 	}
 	if op != "DELETE" {
 		t.Errorf("Expected queued delete after local delete, got %s", op)
-	}
-}
-
-func TestNewClient_FailsWhenSyncKeyColumnUsesIntegerPrimaryKey(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer db.Close()
-
-	_, err = db.Exec(`
-		CREATE TABLE users (
-			id INTEGER PRIMARY KEY,
-			name TEXT NOT NULL
-		)
-	`)
-	if err != nil {
-		t.Fatalf("Failed to create users table: %v", err)
-	}
-
-	tokenFunc := func(ctx context.Context) (string, error) {
-		return "mock-token", nil
-	}
-	_, err = NewClient(db, "http://localhost:8080", tokenFunc, DefaultConfig("main", []SyncTable{
-		{TableName: "users", SyncKeyColumnName: "id"},
-	}))
-	if err == nil {
-		t.Fatal("expected integer sync key setup to fail")
-	}
-	if !strings.Contains(err.Error(), "supports only TEXT keys and UUID-backed BLOB keys") {
-		t.Fatalf("expected integer sync key error, got: %v", err)
-	}
-}
-
-func TestNewClient_FailsWhenSyncKeyColumnUsesBigIntPrimaryKey(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer db.Close()
-
-	_, err = db.Exec(`
-		CREATE TABLE users (
-			id BIGINT PRIMARY KEY,
-			name TEXT NOT NULL
-		)
-	`)
-	if err != nil {
-		t.Fatalf("Failed to create users table: %v", err)
-	}
-
-	tokenFunc := func(ctx context.Context) (string, error) {
-		return "mock-token", nil
-	}
-	_, err = NewClient(db, "http://localhost:8080", tokenFunc, DefaultConfig("main", []SyncTable{
-		{TableName: "users", SyncKeyColumnName: "id"},
-	}))
-	if err == nil {
-		t.Fatal("expected BIGINT sync key setup to fail")
-	}
-	if !strings.Contains(err.Error(), "supports only TEXT keys and UUID-backed BLOB keys") {
-		t.Fatalf("expected BIGINT sync key error, got: %v", err)
 	}
 }
 

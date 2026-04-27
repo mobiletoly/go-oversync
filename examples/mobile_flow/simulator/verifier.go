@@ -305,54 +305,48 @@ func (v *DatabaseVerifier) GetUserRetentionState(ctx context.Context, userID str
 	return state, nil
 }
 
+func (v *DatabaseVerifier) countUserRows(ctx context.Context, userID string, query string, failure string) (int, error) {
+	var count int
+	err := v.pool.QueryRow(ctx, query, userID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("%s for user %s: %w", failure, userID, err)
+	}
+	return count, nil
+}
+
 // CountCommittedBundlesAtOrBelowRetainedFloor counts committed bundle_log rows at or below the user's retained floor.
 func (v *DatabaseVerifier) CountCommittedBundlesAtOrBelowRetainedFloor(ctx context.Context, userID string) (int, error) {
-	var count int
-	err := v.pool.QueryRow(ctx, `
+	return v.countUserRows(ctx, userID, `
 		SELECT COUNT(*)
 		FROM sync.bundle_log bl
 		INNER JOIN sync.user_state us
 			ON us.user_pk = bl.user_pk
 		WHERE us.user_id = $1
 		  AND bl.bundle_seq <= us.retained_bundle_floor
-	`, userID).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count committed bundles at or below retained floor for user %s: %w", userID, err)
-	}
-	return count, nil
+	`, "failed to count committed bundles at or below retained floor")
 }
 
 // CountCommittedBundleRowsAtOrBelowRetainedFloor counts committed bundle_rows at or below the user's retained floor.
 func (v *DatabaseVerifier) CountCommittedBundleRowsAtOrBelowRetainedFloor(ctx context.Context, userID string) (int, error) {
-	var count int
-	err := v.pool.QueryRow(ctx, `
+	return v.countUserRows(ctx, userID, `
 		SELECT COUNT(*)
 		FROM sync.bundle_rows br
 		INNER JOIN sync.user_state us
 			ON us.user_pk = br.user_pk
 		WHERE us.user_id = $1
 		  AND br.bundle_seq <= us.retained_bundle_floor
-	`, userID).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count committed bundle rows at or below retained floor for user %s: %w", userID, err)
-	}
-	return count, nil
+	`, "failed to count committed bundle rows at or below retained floor")
 }
 
 // CountSourceStateRows counts retained source_state rows for one user.
 func (v *DatabaseVerifier) CountSourceStateRows(ctx context.Context, userID string) (int, error) {
-	var count int
-	err := v.pool.QueryRow(ctx, `
+	return v.countUserRows(ctx, userID, `
 		SELECT COUNT(*)
 		FROM sync.source_state ss
 		INNER JOIN sync.user_state us
 			ON us.user_pk = ss.user_pk
 		WHERE us.user_id = $1
-	`, userID).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count source_state rows for user %s: %w", userID, err)
-	}
-	return count, nil
+	`, "failed to count source_state rows")
 }
 
 // DeleteCommittedHistoryAtOrBelowRetainedFloor physically deletes committed history below the current retained floor.

@@ -123,6 +123,45 @@ func TestHTTPSyncHandlers_HandleCapabilities(t *testing.T) {
 	}
 }
 
+func TestParseChunkQueryParams(t *testing.T) {
+	t.Run("defaults when query params are absent", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/sync/chunks", nil)
+
+		params, err := parseChunkQueryParams(req, 25)
+
+		require.NoError(t, err)
+		require.Nil(t, params.afterRowOrdinal)
+		require.Equal(t, 25, params.maxRows)
+	})
+
+	t.Run("parses explicit params", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/sync/chunks?after_row_ordinal=7&max_rows=11", nil)
+
+		params, err := parseChunkQueryParams(req, 25)
+
+		require.NoError(t, err)
+		require.NotNil(t, params.afterRowOrdinal)
+		require.EqualValues(t, 7, *params.afterRowOrdinal)
+		require.Equal(t, 11, params.maxRows)
+	})
+
+	t.Run("does not trim query tokens", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/sync/chunks?after_row_ordinal=%207", nil)
+
+		_, err := parseChunkQueryParams(req, 25)
+
+		require.EqualError(t, err, "after_row_ordinal must be an integer")
+	})
+
+	t.Run("reports invalid max rows", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/sync/chunks?max_rows=many", nil)
+
+		_, err := parseChunkQueryParams(req, 25)
+
+		require.EqualError(t, err, "max_rows must be an integer")
+	})
+}
+
 func TestHTTPSyncHandlers_HandleHealthUsesStatusCodeForUnhealthyService(t *testing.T) {
 	svc := &SyncService{
 		config:    &ServiceConfig{AppName: "health-test"},

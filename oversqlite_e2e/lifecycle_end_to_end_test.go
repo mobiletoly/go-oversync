@@ -113,132 +113,140 @@ func TestEndToEnd_ConnectInitializeEmptyThenPushWorks(t *testing.T) {
 	require.Equal(t, "INITIALIZED", requireServerScopeState(t, server, userID))
 }
 
-func TestEndToEnd_ConnectRemoteAuthoritativeRebuildsExistingRemote(t *testing.T) {
-	ctx := context.Background()
-	schema := "e2e_connect_remote_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
+type lifecycleAttachFixture struct {
+	ctx     context.Context
+	server  *exampleserver.TestServer
+	userID  string
+	clientA *oversqlite.Client
+	dbA     *sql.DB
+	clientB *oversqlite.Client
+	dbB     *sql.DB
+}
 
-	userID := "e2e-connect-remote-user-" + uuid.NewString()
+func newLifecycleAttachFixture(t *testing.T, scenario string) *lifecycleAttachFixture {
+	t.Helper()
+
+	ctx := context.Background()
+	schema := "e2e_connect_" + scenario + "_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	server := newExampleServer(t, schema)
+	userID := "e2e-connect-" + scenario + "-user-" + uuid.NewString()
 	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 	clientB, dbB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
 
-	connectA, err := clientA.Attach(ctx, userID)
+	return &lifecycleAttachFixture{
+		ctx:     ctx,
+		server:  server,
+		userID:  userID,
+		clientA: clientA,
+		dbA:     dbA,
+		clientB: clientB,
+		dbB:     dbB,
+	}
+}
+
+func (f *lifecycleAttachFixture) attachA(t *testing.T) oversqlite.AttachResult {
+	t.Helper()
+
+	result, err := f.clientA.Attach(f.ctx, f.userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
+	return result
+}
+
+func (f *lifecycleAttachFixture) attachB(t *testing.T) oversqlite.AttachResult {
+	t.Helper()
+
+	result, err := f.clientB.Attach(f.ctx, f.userID)
+	require.NoError(t, err)
+	return result
+}
+
+func (f *lifecycleAttachFixture) insertUser(t *testing.T, db *sql.DB, name, email string) string {
+	t.Helper()
 
 	rowID := uuid.NewString()
-	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Remote", "remote@example.com")
+	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, name, email)
 	require.NoError(t, err)
-	mustPushPendingE2E(t, clientA, ctx)
+	return rowID
+}
 
-	connectB, err := clientB.Attach(ctx, userID)
-	require.NoError(t, err)
+func TestEndToEnd_ConnectRemoteAuthoritativeRebuildsExistingRemote(t *testing.T) {
+	f := newLifecycleAttachFixture(t, "remote")
+	connectA := f.attachA(t)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
+
+	rowID := f.insertUser(t, f.dbA, "Remote", "remote@example.com")
+	mustPushPendingE2E(t, f.clientA, f.ctx)
+
+	connectB := f.attachB(t)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
 	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, connectB.Outcome)
 
 	var name string
-	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
+	require.NoError(t, f.dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
 	require.Equal(t, "Remote", name)
 }
 
 func TestEndToEnd_ConnectRemoteAuthoritativeReplacesAnonymousLocalRows(t *testing.T) {
-	ctx := context.Background()
-	schema := "e2e_connect_replace_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
-
-	userID := "e2e-connect-replace-user-" + uuid.NewString()
-	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientB, dbB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-
-	connectA, err := clientA.Attach(ctx, userID)
-	require.NoError(t, err)
+	f := newLifecycleAttachFixture(t, "replace")
+	connectA := f.attachA(t)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
 
-	remoteRowID := uuid.NewString()
-	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, remoteRowID, "Remote", "remote@example.com")
-	require.NoError(t, err)
-	mustPushPendingE2E(t, clientA, ctx)
+	remoteRowID := f.insertUser(t, f.dbA, "Remote", "remote@example.com")
+	mustPushPendingE2E(t, f.clientA, f.ctx)
 
-	localOnlyID := uuid.NewString()
-	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, localOnlyID, "Local", "local@example.com")
-	require.NoError(t, err)
-	mustOpenE2E(t, clientB, ctx, "device-b")
+	localOnlyID := f.insertUser(t, f.dbB, "Local", "local@example.com")
+	mustOpenE2E(t, f.clientB, f.ctx, "device-b")
 
-	connectB, err := clientB.Attach(ctx, userID)
-	require.NoError(t, err)
+	connectB := f.attachB(t)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
 	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, connectB.Outcome)
 
 	var count int
-	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, localOnlyID).Scan(&count))
+	require.NoError(t, f.dbB.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, localOnlyID).Scan(&count))
 	require.Equal(t, 0, count)
-	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, remoteRowID).Scan(&count))
+	require.NoError(t, f.dbB.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, remoteRowID).Scan(&count))
 	require.Equal(t, 1, count)
 }
 
 func TestEndToEnd_ConnectInitializeLocalThenSeedRemote(t *testing.T) {
-	ctx := context.Background()
-	schema := "e2e_connect_local_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
+	f := newLifecycleAttachFixture(t, "local")
+	rowID := f.insertUser(t, f.dbA, "Seed", "seed@example.com")
 
-	userID := "e2e-connect-local-user-" + uuid.NewString()
-	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientB, dbB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-
-	rowID := uuid.NewString()
-	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Seed", "seed@example.com")
-	require.NoError(t, err)
-
-	connectA, err := clientA.Attach(ctx, userID)
-	require.NoError(t, err)
+	connectA := f.attachA(t)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
 	require.Equal(t, oversqlite.AttachOutcomeSeededLocal, connectA.Outcome)
 
-	mustPushPendingE2E(t, clientA, ctx)
+	mustPushPendingE2E(t, f.clientA, f.ctx)
 
-	connectB, err := clientB.Attach(ctx, userID)
-	require.NoError(t, err)
+	connectB := f.attachB(t)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
 	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, connectB.Outcome)
 
 	var name string
-	require.NoError(t, dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
+	require.NoError(t, f.dbB.QueryRow(`SELECT name FROM users WHERE id = ?`, rowID).Scan(&name))
 	require.Equal(t, "Seed", name)
 }
 
 func TestEndToEnd_ConnectRemoteAuthoritativeEmptyStillReplacesAnonymousLocalRows(t *testing.T) {
-	ctx := context.Background()
-	schema := "e2e_connect_empty_remote_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
-
-	userID := "e2e-connect-empty-remote-user-" + uuid.NewString()
-	clientA, dbA := newSQLiteClientWithoutConnect(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientB, dbB := newSQLiteClientWithoutConnect(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-
-	connectA, err := clientA.Attach(ctx, userID)
-	require.NoError(t, err)
+	f := newLifecycleAttachFixture(t, "empty_remote")
+	connectA := f.attachA(t)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectA.Status)
 
-	remoteRowID := uuid.NewString()
-	_, err = dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, remoteRowID, "Transient", "transient@example.com")
+	remoteRowID := f.insertUser(t, f.dbA, "Transient", "transient@example.com")
+	mustPushPendingE2E(t, f.clientA, f.ctx)
+	_, err := f.dbA.Exec(`DELETE FROM users WHERE id = ?`, remoteRowID)
 	require.NoError(t, err)
-	mustPushPendingE2E(t, clientA, ctx)
-	_, err = dbA.Exec(`DELETE FROM users WHERE id = ?`, remoteRowID)
-	require.NoError(t, err)
-	mustPushPendingE2E(t, clientA, ctx)
+	mustPushPendingE2E(t, f.clientA, f.ctx)
 
-	localOnlyID := uuid.NewString()
-	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, localOnlyID, "Local", "local@example.com")
-	require.NoError(t, err)
-	mustOpenE2E(t, clientB, ctx, "device-b")
+	f.insertUser(t, f.dbB, "Local", "local@example.com")
+	mustOpenE2E(t, f.clientB, f.ctx, "device-b")
 
-	connectB, err := clientB.Attach(ctx, userID)
-	require.NoError(t, err)
+	connectB := f.attachB(t)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectB.Status)
 	require.Equal(t, oversqlite.AttachOutcomeUsedRemote, connectB.Outcome)
 
 	var count int
-	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
+	require.NoError(t, f.dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
 	require.Equal(t, 0, count)
 }
 

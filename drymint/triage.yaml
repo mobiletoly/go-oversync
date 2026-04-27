@@ -1,0 +1,21 @@
+version: v0
+pair_dismiss:
+  - pair_id: 'pi0:bvwyopgg2ftjunvo~z4szhjuwbm7ft5qi'
+    reason: 'remaining overlap is intentional lifecycle scenario structure after shared attach fixture extraction; further helper would hide distinct remote-present versus remote-empty assertions'
+    a:
+      entity_identity_id: 'ei0:bvwyopgg2ftjunvo'
+      unit_fingerprint_id: 'uf0:deftpcs4zf33u4bt'
+      lang: 'go'
+      kind: 'function'
+      symbol: 'oversqlite_e2e.TestEndToEnd_ConnectRemoteAuthoritativeReplacesAnonymousLocalRows'
+      signature: '(*testing.T)'
+      path: 'oversqlite_e2e/lifecycle_end_to_end_test.go'
+    b:
+      entity_identity_id: 'ei0:z4szhjuwbm7ft5qi'
+      unit_fingerprint_id: 'uf0:lppnzfij7off73xa'
+      lang: 'go'
+      kind: 'function'
+      symbol: 'oversqlite_e2e.TestEndToEnd_ConnectRemoteAuthoritativeEmptyStillReplacesAnonymousLocalRows'
+      signature: '(*testing.T)'
+      path: 'oversqlite_e2e/lifecycle_end_to_end_test.go'
+group_contracts: []

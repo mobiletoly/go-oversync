@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -172,36 +171,21 @@ func (s *ComplexMultiBatchScenario) createAppWithSmallBatches(scenarioConfig *co
 
 // createMobileApp creates a mobile app with the given configuration (DRY helper)
 func (s *ComplexMultiBatchScenario) createMobileApp(config *AppConfig, devicePrefix string) (*MobileApp, error) {
-	simCfg := s.simulator.GetConfig()
-
-	// Create unique database file path using user ID and timestamp to prevent collisions in parallel execution
-	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", devicePrefix, config.UserID, time.Now().UnixNano()))
-
 	// Force both push-session chunking and incremental pull replay so the scenario exercises
 	// multi-chunk upload/download paths under a large FK-connected working set.
-	oversqliteConfig := &oversqlite.Config{
-		Schema:            "business",
-		Tables:            managedSyncTables(),
-		UploadLimit:       config.PushLimit,
-		DownloadLimit:     config.PullLimit,
-		SnapshotChunkRows: config.SnapshotChunkRows,
-	}
-
-	// Create mobile app config
-	appConfig := &mobileAppConfig{
-		DatabaseFile:     dbFile,
-		ServerURL:        simCfg.ServerURL,
-		UserID:           config.UserID,
-		DeviceID:         config.DeviceID,
-		DeviceName:       config.DeviceName,
-		JWTSecret:        simCfg.JWTSecret,
-		OversqliteConfig: oversqliteConfig,
-		PreserveDB:       simCfg.PreserveDB,
-		Logger:           s.simulator.GetLogger(),
-	}
-
-	// Create mobile app
-	app, err := newMobileApp(appConfig)
+	app, err := s.simulator.newScenarioMobileApp(scenarioMobileAppOptions{
+		UserID:       config.UserID,
+		DeviceID:     config.DeviceID,
+		DeviceName:   config.DeviceName,
+		DBNamePrefix: devicePrefix,
+		OversqliteConfig: &oversqlite.Config{
+			Schema:            "business",
+			Tables:            managedSyncTables(),
+			UploadLimit:       config.PushLimit,
+			DownloadLimit:     config.PullLimit,
+			SnapshotChunkRows: config.SnapshotChunkRows,
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create mobile app: %w", err)
 	}

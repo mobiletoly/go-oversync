@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,43 +52,151 @@ func collectSnapshotChunkRows(
 	return seen, stableSnapshotBundleSeq
 }
 
-func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
+type snapshotSessionFixture struct {
+	ctx        context.Context
+	pool       *pgxpool.Pool
+	svc        *SyncService
+	suffix     string
+	schemaName string
+	userID     string
+	writer     Actor
+	reader     Actor
+}
+
+type snapshotSessionFixtureOptions struct {
+	defaultRowsPerSnapshotChunk int
+	maxRowsPerSnapshotChunk     int
+	maxRowsPerSnapshotSession   int64
+	maxBytesPerSnapshotSession  int64
+}
+
+func newSnapshotSessionFixture(t *testing.T, scenario string, opts snapshotSessionFixtureOptions) *snapshotSessionFixture {
+	t.Helper()
+
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
 
 	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_chunks_" + suffix
+	scenarioID := "snapshot-" + strings.ReplaceAll(scenario, "_", "-")
+	schemaName := "snapshot_" + scenario + "_" + suffix
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
+	userID := scenarioID + "-user-" + suffix
 	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
 		MaxSupportedSchemaVersion:   1,
-		AppName:                     "snapshot-chunks-test",
-		DefaultRowsPerSnapshotChunk: 2,
-		MaxRowsPerSnapshotChunk:     2,
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
+		AppName:                     scenarioID + "-test",
+		DefaultRowsPerSnapshotChunk: opts.defaultRowsPerSnapshotChunk,
+		MaxRowsPerSnapshotChunk:     opts.maxRowsPerSnapshotChunk,
+		MaxRowsPerSnapshotSession:   opts.maxRowsPerSnapshotSession,
+		MaxBytesPerSnapshotSession:  opts.maxBytesPerSnapshotSession,
+		RegisteredTables:            []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
 	}, logger)
 
-	userID := "snapshot-chunks-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
+	return &snapshotSessionFixture{
+		ctx:        ctx,
+		pool:       pool,
+		svc:        svc,
+		suffix:     suffix,
+		schemaName: schemaName,
+		userID:     userID,
+		writer:     Actor{UserID: userID, SourceID: "writer"},
+		reader:     Actor{UserID: userID, SourceID: "reader"},
+	}
+}
+
+func (f *snapshotSessionFixture) actor(sourceID string) Actor {
+	return Actor{UserID: f.userID, SourceID: sourceID}
+}
+
+func (f *snapshotSessionFixture) pushUser(t *testing.T, sourceBundleID int64, rowID uuid.UUID, name string) *Bundle {
+	t.Helper()
+	return f.pushUserAs(t, f.writer, sourceBundleID, rowID, name)
+}
+
+func (f *snapshotSessionFixture) pushUserAs(t *testing.T, actor Actor, sourceBundleID int64, rowID uuid.UUID, name string) *Bundle {
+	t.Helper()
+	return mustPushUserBundle(t, f.ctx, f.svc, actor, f.schemaName, sourceBundleID, rowID, name)
+}
+
+func (f *snapshotSessionFixture) createSessionWithUser(t *testing.T, rowID uuid.UUID, name string) *SnapshotSession {
+	t.Helper()
+	f.pushUser(t, 1, rowID, name)
+
+	session, err := f.svc.CreateSnapshotSession(f.ctx, f.reader)
+	require.NoError(t, err)
+	return session
+}
+
+func (f *snapshotSessionFixture) countRows(t *testing.T, query string, args ...any) int {
+	t.Helper()
+
+	var count int
+	require.NoError(t, f.pool.QueryRow(f.ctx, query, args...).Scan(&count))
+	return count
+}
+
+func (f *snapshotSessionFixture) snapshotSessionCountForUser(t *testing.T) int {
+	t.Helper()
+
+	return f.countRows(t, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_sessions
+		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, f.userID)
+}
+
+func (f *snapshotSessionFixture) snapshotSessionRowCountForUser(t *testing.T) int {
+	t.Helper()
+
+	return f.countRows(t, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_session_rows ssr
+		JOIN sync.snapshot_sessions ss ON ss.snapshot_id = ssr.snapshot_id
+		WHERE ss.user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+	`, f.userID)
+}
+
+func (f *snapshotSessionFixture) snapshotSessionCount(t *testing.T, snapshotID string) int {
+	t.Helper()
+
+	return f.countRows(t, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_sessions
+		WHERE snapshot_id = $1::uuid
+	`, snapshotID)
+}
+
+func (f *snapshotSessionFixture) snapshotSessionRowCount(t *testing.T, snapshotID string) int {
+	t.Helper()
+
+	return f.countRows(t, `
+		SELECT COUNT(*)
+		FROM sync.snapshot_session_rows
+		WHERE snapshot_id = $1::uuid
+	`, snapshotID)
+}
+
+func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
+	fixture := newSnapshotSessionFixture(t, "chunks", snapshotSessionFixtureOptions{
+		defaultRowsPerSnapshotChunk: 2,
+		maxRowsPerSnapshotChunk:     2,
+	})
 	row1 := uuid.New()
 	row2 := uuid.New()
 	row3 := uuid.New()
 
-	resp1 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, row1, "Alpha")
-	resp2 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Bravo")
-	resp3 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 3, row3, "Charlie")
+	resp1 := fixture.pushUser(t, 1, row1, "Alpha")
+	resp2 := fixture.pushUser(t, 2, row2, "Bravo")
+	resp3 := fixture.pushUser(t, 3, row3, "Charlie")
 
-	session, err := svc.CreateSnapshotSession(ctx, reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
 	require.Equal(t, resp3.BundleSeq, session.SnapshotBundleSeq)
 	require.Equal(t, int64(3), session.RowCount)
 
-	chunk1, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 2)
+	chunk1, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 2)
 	require.NoError(t, err)
 	require.Equal(t, session.SnapshotID, chunk1.SnapshotID)
 	require.Equal(t, session.SnapshotBundleSeq, chunk1.SnapshotBundleSeq)
@@ -96,10 +205,10 @@ func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
 	require.True(t, chunk1.HasMore)
 	require.Equal(t, int64(2), chunk1.NextRowOrdinal)
 
-	resp4 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 4, uuid.New(), "Delta")
+	resp4 := fixture.pushUser(t, 4, uuid.New(), "Delta")
 	require.Equal(t, int64(4), resp4.BundleSeq)
 
-	chunk2, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, chunk1.NextRowOrdinal, 2)
+	chunk2, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, chunk1.NextRowOrdinal, 2)
 	require.NoError(t, err)
 	require.Equal(t, session.SnapshotID, chunk2.SnapshotID)
 	require.Equal(t, session.SnapshotBundleSeq, chunk2.SnapshotBundleSeq)
@@ -115,58 +224,28 @@ func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
 	require.ElementsMatch(t, []string{row1.String(), row2.String(), row3.String()}, seenIDs)
 	require.NotContains(t, seenIDs, resp4.Rows[0].Key["id"].(string))
 
-	var storedRowCount int
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.snapshot_session_rows
-		WHERE snapshot_id = $1::uuid
-	`, session.SnapshotID).Scan(&storedRowCount))
-	require.Equal(t, 3, storedRowCount)
+	require.Equal(t, 3, fixture.snapshotSessionRowCount(t, session.SnapshotID))
 
 	require.Equal(t, int64(1), resp1.BundleSeq)
 	require.Equal(t, int64(2), resp2.BundleSeq)
 }
 
 func TestSnapshotSessions_OneChunkStillUsesSessionStorage(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_one_chunk_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:   1,
-		AppName:                     "snapshot-one-chunk-test",
-		DefaultRowsPerSnapshotChunk: 1000,
-		MaxRowsPerSnapshotChunk:     5000,
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-one-chunk-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
+	fixture := newSnapshotSessionFixture(t, "one_chunk", snapshotSessionFixtureOptions{
+		defaultRowsPerSnapshotChunk: 1000,
+		maxRowsPerSnapshotChunk:     5000,
+	})
 	rowID := uuid.New()
 
-	resp := mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, rowID, "Solo")
-	session, err := svc.CreateSnapshotSession(ctx, reader)
+	resp := fixture.pushUser(t, 1, rowID, "Solo")
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
 	require.Equal(t, resp.BundleSeq, session.SnapshotBundleSeq)
 	require.Equal(t, int64(1), session.RowCount)
 
-	var storedRowCount int
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.snapshot_session_rows
-		WHERE snapshot_id = $1::uuid
-	`, session.SnapshotID).Scan(&storedRowCount))
-	require.Equal(t, 1, storedRowCount)
+	require.Equal(t, 1, fixture.snapshotSessionRowCount(t, session.SnapshotID))
 
-	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 1000)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 1000)
 	require.NoError(t, err)
 	require.Len(t, chunk.Rows, 1)
 	require.False(t, chunk.HasMore)
@@ -175,38 +254,20 @@ func TestSnapshotSessions_OneChunkStillUsesSessionStorage(t *testing.T) {
 }
 
 func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_gapless_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:   1,
-		AppName:                     "snapshot-gapless-test",
-		DefaultRowsPerSnapshotChunk: 2,
-		MaxRowsPerSnapshotChunk:     2,
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-gapless-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
+	fixture := newSnapshotSessionFixture(t, "gapless", snapshotSessionFixtureOptions{
+		defaultRowsPerSnapshotChunk: 2,
+		maxRowsPerSnapshotChunk:     2,
+	})
 	insertedIDs := make([]string, 0, 5)
 	for i := 0; i < 5; i++ {
 		rowID := uuid.New()
 		insertedIDs = append(insertedIDs, rowID.String())
-		mustPushUserBundle(t, ctx, svc, writer, schemaName, int64(i+1), rowID, fmt.Sprintf("User%d", i))
+		fixture.pushUser(t, int64(i+1), rowID, fmt.Sprintf("User%d", i))
 	}
 
-	session, err := svc.CreateSnapshotSession(ctx, reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
-	rows, stableBundleSeq := collectSnapshotChunkRows(t, ctx, svc, reader, session.SnapshotID, 2)
+	rows, stableBundleSeq := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session.SnapshotID, 2)
 	require.Equal(t, session.SnapshotBundleSeq, stableBundleSeq)
 	require.Len(t, rows, 5)
 
@@ -220,7 +281,7 @@ func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
 	require.Len(t, seenSet, 5)
 	require.ElementsMatch(t, insertedIDs, seenIDs)
 
-	deterministicChunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 2)
+	deterministicChunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 2)
 	require.NoError(t, err)
 	require.Len(t, deterministicChunk.Rows, 2)
 	require.Equal(t, snapshotRowIdentity(rows[0]), snapshotRowIdentity(deterministicChunk.Rows[0]))
@@ -228,54 +289,36 @@ func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
 }
 
 func TestSnapshotSessions_ActiveSessionRemainsReadableAfterHistoryPrune(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_prune_session_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:   1,
-		AppName:                     "snapshot-prune-session-test",
-		DefaultRowsPerSnapshotChunk: 10,
-		MaxRowsPerSnapshotChunk:     10,
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-prune-session-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
+	fixture := newSnapshotSessionFixture(t, "prune_session", snapshotSessionFixtureOptions{
+		defaultRowsPerSnapshotChunk: 10,
+		maxRowsPerSnapshotChunk:     10,
+	})
 
 	row1 := uuid.New()
 	row2 := uuid.New()
 	row3 := uuid.New()
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, row1, "One")
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Two")
-	bundle3 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 3, row3, "Three")
+	fixture.pushUser(t, 1, row1, "One")
+	fixture.pushUser(t, 2, row2, "Two")
+	bundle3 := fixture.pushUser(t, 3, row3, "Three")
 
-	session, err := svc.CreateSnapshotSession(ctx, reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
 	require.Equal(t, bundle3.BundleSeq, session.SnapshotBundleSeq)
 
-	userPK, err := lookupUserPK(ctx, pool, userID)
+	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
 	require.NoError(t, err)
 
 	var sourceStateCountBefore int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.source_state WHERE user_pk = $1`, userPK).Scan(&sourceStateCountBefore))
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `SELECT COUNT(*) FROM sync.source_state WHERE user_pk = $1`, userPK).Scan(&sourceStateCountBefore))
 	require.Greater(t, sourceStateCountBefore, 0)
 
-	_, err = pool.Exec(ctx, `
+	_, err = fixture.pool.Exec(fixture.ctx, `
 		UPDATE sync.user_state
 		SET retained_bundle_floor = $2
 		WHERE user_pk = $1
 	`, userPK, session.SnapshotBundleSeq)
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, `
+	_, err = fixture.pool.Exec(fixture.ctx, `
 		DELETE FROM sync.bundle_log
 		WHERE user_pk = $1
 		  AND bundle_seq <= $2
@@ -283,51 +326,33 @@ func TestSnapshotSessions_ActiveSessionRemainsReadableAfterHistoryPrune(t *testi
 	require.NoError(t, err)
 
 	var sourceStateCountAfter int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.source_state WHERE user_pk = $1`, userPK).Scan(&sourceStateCountAfter))
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `SELECT COUNT(*) FROM sync.source_state WHERE user_pk = $1`, userPK).Scan(&sourceStateCountAfter))
 	require.Equal(t, sourceStateCountBefore, sourceStateCountAfter)
 
-	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10)
 	require.NoError(t, err)
 	require.Equal(t, session.SnapshotBundleSeq, chunk.SnapshotBundleSeq)
 	require.Len(t, chunk.Rows, 3)
 }
 
 func TestSnapshotSessions_RepeatedSessionCreationUsesDeterministicRowOrdering(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_ordering_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:   1,
-		AppName:                     "snapshot-ordering-test",
-		DefaultRowsPerSnapshotChunk: 10,
-		MaxRowsPerSnapshotChunk:     10,
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-ordering-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
+	fixture := newSnapshotSessionFixture(t, "ordering", snapshotSessionFixtureOptions{
+		defaultRowsPerSnapshotChunk: 10,
+		maxRowsPerSnapshotChunk:     10,
+	})
 
 	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, ids[2], "Zulu")
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, ids[0], "Alpha")
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 3, ids[1], "Mike")
+	fixture.pushUser(t, 1, ids[2], "Zulu")
+	fixture.pushUser(t, 2, ids[0], "Alpha")
+	fixture.pushUser(t, 3, ids[1], "Mike")
 
-	session1, err := svc.CreateSnapshotSession(ctx, reader)
+	session1, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
-	rows1, _ := collectSnapshotChunkRows(t, ctx, svc, reader, session1.SnapshotID, 10)
+	rows1, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session1.SnapshotID, 10)
 
-	session2, err := svc.CreateSnapshotSession(ctx, reader)
+	session2, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
-	rows2, _ := collectSnapshotChunkRows(t, ctx, svc, reader, session2.SnapshotID, 10)
+	rows2, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session2.SnapshotID, 10)
 
 	require.Len(t, rows1, len(rows2))
 	for i := range rows1 {
@@ -338,189 +363,86 @@ func TestSnapshotSessions_RepeatedSessionCreationUsesDeterministicRowOrdering(t 
 }
 
 func TestSnapshotSessions_DeleteInvalidatesFurtherChunkFetches(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+	fixture := newSnapshotSessionFixture(t, "delete", snapshotSessionFixtureOptions{})
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_delete_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
+	require.NoError(t, fixture.svc.DeleteSnapshotSession(fixture.ctx, fixture.reader, session.SnapshotID))
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-delete-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
+	require.Zero(t, fixture.snapshotSessionRowCount(t, session.SnapshotID))
 
-	userID := "snapshot-delete-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
-
-	session, err := svc.CreateSnapshotSession(ctx, reader)
-	require.NoError(t, err)
-	require.NoError(t, svc.DeleteSnapshotSession(ctx, reader, session.SnapshotID))
-
-	var storedRowCount int
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.snapshot_session_rows
-		WHERE snapshot_id = $1::uuid
-	`, session.SnapshotID).Scan(&storedRowCount))
-	require.Zero(t, storedRowCount)
-
-	_, err = svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10)
 	var notFoundErr *SnapshotSessionNotFoundError
 	require.ErrorAs(t, err, &notFoundErr)
 }
 
 func TestSnapshotSessions_InvalidCursorRejected(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+	fixture := newSnapshotSessionFixture(t, "invalid_cursor", snapshotSessionFixtureOptions{})
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_invalid_cursor_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
+	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-invalid-cursor-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-invalid-cursor-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
-
-	session, err := svc.CreateSnapshotSession(ctx, reader)
-	require.NoError(t, err)
-
-	_, err = svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, -1, 10)
+	_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, -1, 10)
 	var invalidErr *SnapshotChunkInvalidError
 	require.ErrorAs(t, err, &invalidErr)
 	require.Contains(t, invalidErr.Error(), "after_row_ordinal")
 
-	_, err = svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 0)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 0)
 	require.ErrorAs(t, err, &invalidErr)
 	require.Contains(t, invalidErr.Error(), "max_rows")
 }
 
 func TestSnapshotSessions_WrongUserRejected(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_wrong_user_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-wrong-user-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	writer := Actor{UserID: "snapshot-wrong-user-a-" + suffix, SourceID: "writer"}
+	fixture := newSnapshotSessionFixture(t, "wrong_user", snapshotSessionFixtureOptions{})
+	writer := fixture.writer
 	readerA := Actor{UserID: writer.UserID, SourceID: "reader-a"}
-	readerB := Actor{UserID: "snapshot-wrong-user-b-" + suffix, SourceID: "reader-b"}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+	readerB := Actor{UserID: "snapshot-wrong-user-b-" + fixture.suffix, SourceID: "reader-b"}
+	fixture.pushUserAs(t, writer, 1, uuid.New(), "Alpha")
 
-	session, err := svc.CreateSnapshotSession(ctx, readerA)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, readerA)
 	require.NoError(t, err)
 
-	_, err = svc.GetSnapshotChunk(ctx, readerB, session.SnapshotID, 0, 10)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, readerB, session.SnapshotID, 0, 10)
 	var forbiddenErr *SnapshotSessionForbiddenError
 	require.ErrorAs(t, err, &forbiddenErr)
 
-	err = svc.DeleteSnapshotSession(ctx, readerB, session.SnapshotID)
+	err = fixture.svc.DeleteSnapshotSession(fixture.ctx, readerB, session.SnapshotID)
 	require.ErrorAs(t, err, &forbiddenErr)
 }
 
 func TestSnapshotSessions_ExpiredSessionRejected(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+	fixture := newSnapshotSessionFixture(t, "expired", snapshotSessionFixtureOptions{})
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_expired_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-expired-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-expired-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
-
-	session, err := svc.CreateSnapshotSession(ctx, reader)
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, `
+	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
+	_, err := fixture.pool.Exec(fixture.ctx, `
 		UPDATE sync.snapshot_sessions
 		SET expires_at = now() - interval '1 second'
 		WHERE snapshot_id = $1::uuid
 	`, session.SnapshotID)
 	require.NoError(t, err)
 
-	_, err = svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10)
 	var expiredErr *SnapshotSessionExpiredError
 	require.ErrorAs(t, err, &expiredErr)
 }
 
 func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_after_image_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-after-image-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-after-image-user-" + suffix
-	actor := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
+	fixture := newSnapshotSessionFixture(t, "after_image", snapshotSessionFixtureOptions{})
+	actor := fixture.writer
 	row1 := uuid.New()
 	row2 := uuid.New()
 
-	mustPushUserBundle(t, ctx, svc, actor, schemaName, 1, row1, "Alpha")
-	mustPushUserBundle(t, ctx, svc, actor, schemaName, 2, row2, "Gamma")
-	require.NoError(t, svc.WithinSyncBundle(ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 3}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.users WHERE id = $1`, schemaName), row2)
+	fixture.pushUserAs(t, actor, 1, row1, "Alpha")
+	fixture.pushUserAs(t, actor, 2, row2, "Gamma")
+	require.NoError(t, fixture.svc.WithinSyncBundle(fixture.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 3}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(fixture.ctx, fmt.Sprintf(`DELETE FROM %s.users WHERE id = $1`, fixture.schemaName), row2)
 		return err
 	}))
 
-	session, err := svc.CreateSnapshotSession(ctx, reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
-	rows, stableBundleSeq := collectSnapshotChunkRows(t, ctx, svc, reader, session.SnapshotID, 10)
+	rows, stableBundleSeq := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session.SnapshotID, 10)
 	require.Equal(t, int64(3), stableBundleSeq)
 	require.Len(t, rows, 1)
-	require.Equal(t, schemaName, rows[0].Schema)
+	require.Equal(t, fixture.schemaName, rows[0].Schema)
 	require.Equal(t, "users", rows[0].Table)
 	require.Equal(t, int64(1), rows[0].RowVersion)
 	require.Equal(t, row1.String(), rows[0].Key["id"])
@@ -531,31 +453,14 @@ func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
 }
 
 func TestSnapshotSessions_CreateEmptySnapshot(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_empty_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-empty-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	reader := Actor{UserID: "snapshot-empty-user-" + suffix, SourceID: "reader"}
-	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
-	session, err := svc.CreateSnapshotSession(ctx, reader)
+	fixture := newSnapshotSessionFixture(t, "empty", snapshotSessionFixtureOptions{})
+	mustInitializeEmptyScope(t, fixture.ctx, fixture.svc, fixture.reader.UserID, fixture.reader.SourceID)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
 	require.NoError(t, err)
 	require.Zero(t, session.RowCount)
 	require.Zero(t, session.ByteCount)
 
-	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10)
 	require.NoError(t, err)
 	require.Empty(t, chunk.Rows)
 	require.False(t, chunk.HasMore)
@@ -563,30 +468,13 @@ func TestSnapshotSessions_CreateEmptySnapshot(t *testing.T) {
 }
 
 func TestSnapshotSessions_RotatedCreateRetiresPreviousAndReservesReplacement(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_rotate_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-rotate-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-rotate-user-" + suffix
+	fixture := newSnapshotSessionFixture(t, "rotate", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-old"
 	newSourceID := "writer-new"
-	writer := Actor{UserID: userID, SourceID: oldSourceID}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+	writer := fixture.actor(oldSourceID)
+	fixture.pushUserAs(t, writer, 1, uuid.New(), "Alpha")
 
-	session, err := svc.CreateSnapshotSessionWithRequest(ctx, writer, &SnapshotSessionCreateRequest{
+	session, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      newSourceID,
@@ -596,7 +484,7 @@ func TestSnapshotSessions_RotatedCreateRetiresPreviousAndReservesReplacement(t *
 	require.NoError(t, err)
 	require.NotEmpty(t, session.SnapshotID)
 
-	userPK, err := lookupUserPK(ctx, pool, userID)
+	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
 	require.NoError(t, err)
 
 	var (
@@ -609,7 +497,7 @@ func TestSnapshotSessions_RotatedCreateRetiresPreviousAndReservesReplacement(t *
 		newReplacedBySourceID   string
 		newRetirementReason     string
 	)
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
 		SELECT state, max_committed_source_bundle_id, replaced_by_source_id, retirement_reason
 		FROM sync.source_state
 		WHERE user_pk = $1 AND source_id = $2
@@ -619,7 +507,7 @@ func TestSnapshotSessions_RotatedCreateRetiresPreviousAndReservesReplacement(t *
 	require.Equal(t, newSourceID, oldReplacedBySourceID)
 	require.Equal(t, "history_pruned", oldRetirementReason)
 
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
 		SELECT state, max_committed_source_bundle_id, replaced_by_source_id, retirement_reason
 		FROM sync.source_state
 		WHERE user_pk = $1 AND source_id = $2
@@ -631,29 +519,12 @@ func TestSnapshotSessions_RotatedCreateRetiresPreviousAndReservesReplacement(t *
 }
 
 func TestSnapshotSessions_RotatedCreateForNeverCommittedSourceCreatesRetiredZeroFloor(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_rotate_empty_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-rotate-empty-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-rotate-empty-user-" + suffix
+	fixture := newSnapshotSessionFixture(t, "rotate_empty", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-empty-old"
 	newSourceID := "writer-empty-new"
-	mustInitializeEmptyScope(t, ctx, svc, userID, oldSourceID)
+	mustInitializeEmptyScope(t, fixture.ctx, fixture.svc, fixture.userID, oldSourceID)
 
-	_, err := svc.CreateSnapshotSessionWithRequest(ctx, Actor{UserID: userID, SourceID: oldSourceID}, &SnapshotSessionCreateRequest{
+	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, fixture.actor(oldSourceID), &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      newSourceID,
@@ -662,12 +533,12 @@ func TestSnapshotSessions_RotatedCreateForNeverCommittedSourceCreatesRetiredZero
 	})
 	require.NoError(t, err)
 
-	userPK, err := lookupUserPK(ctx, pool, userID)
+	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
 	require.NoError(t, err)
 
 	var oldState string
 	var oldMaxCommittedBundleID int64
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
 		SELECT state, max_committed_source_bundle_id
 		FROM sync.source_state
 		WHERE user_pk = $1 AND source_id = $2
@@ -677,7 +548,7 @@ func TestSnapshotSessions_RotatedCreateForNeverCommittedSourceCreatesRetiredZero
 
 	var newState string
 	var newMaxCommittedBundleID int64
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
 		SELECT state, max_committed_source_bundle_id
 		FROM sync.source_state
 		WHERE user_pk = $1 AND source_id = $2
@@ -687,28 +558,11 @@ func TestSnapshotSessions_RotatedCreateForNeverCommittedSourceCreatesRetiredZero
 }
 
 func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_rotate_repeat_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-rotate-repeat-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-rotate-repeat-user-" + suffix
+	fixture := newSnapshotSessionFixture(t, "rotate_repeat", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-repeat-old"
 	newSourceID := "writer-repeat-new"
-	writer := Actor{UserID: userID, SourceID: oldSourceID}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+	writer := fixture.actor(oldSourceID)
+	fixture.pushUserAs(t, writer, 1, uuid.New(), "Alpha")
 
 	req := &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
@@ -717,17 +571,17 @@ func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t
 			Reason:           "history_pruned",
 		},
 	}
-	session1, err := svc.CreateSnapshotSessionWithRequest(ctx, writer, req)
+	session1, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, req)
 	require.NoError(t, err)
-	session2, err := svc.CreateSnapshotSessionWithRequest(ctx, writer, req)
+	session2, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, req)
 	require.NoError(t, err)
 	require.NotEqual(t, session1.SnapshotID, session2.SnapshotID)
 
-	userPK, err := lookupUserPK(ctx, pool, userID)
+	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
 	require.NoError(t, err)
 
 	var sourceStateCount int
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
 		SELECT COUNT(*)
 		FROM sync.source_state
 		WHERE user_pk = $1
@@ -735,7 +589,7 @@ func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t
 	require.Equal(t, 2, sourceStateCount)
 
 	var oldState, oldReplacedBySourceID string
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
 		SELECT state, replaced_by_source_id
 		FROM sync.source_state
 		WHERE user_pk = $1 AND source_id = $2
@@ -744,7 +598,7 @@ func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t
 	require.Equal(t, newSourceID, oldReplacedBySourceID)
 
 	var newState string
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
 		SELECT state
 		FROM sync.source_state
 		WHERE user_pk = $1 AND source_id = $2
@@ -753,34 +607,17 @@ func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t
 }
 
 func TestSnapshotSessions_RotatedCreateRejectsConflictingReplacementTargets(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_rotate_conflict_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-rotate-conflict-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-rotate-conflict-user-" + suffix
+	fixture := newSnapshotSessionFixture(t, "rotate_conflict", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-conflict-old"
 	firstNewSourceID := "writer-conflict-new-a"
 	secondNewSourceID := "writer-conflict-new-b"
 	otherOldSourceID := "writer-conflict-old-b"
-	writer := Actor{UserID: userID, SourceID: oldSourceID}
-	otherWriter := Actor{UserID: userID, SourceID: otherOldSourceID}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
-	mustPushUserBundle(t, ctx, svc, otherWriter, schemaName, 1, uuid.New(), "Bravo")
+	writer := fixture.actor(oldSourceID)
+	otherWriter := fixture.actor(otherOldSourceID)
+	fixture.pushUserAs(t, writer, 1, uuid.New(), "Alpha")
+	fixture.pushUserAs(t, otherWriter, 1, uuid.New(), "Bravo")
 
-	_, err := svc.CreateSnapshotSessionWithRequest(ctx, writer, &SnapshotSessionCreateRequest{
+	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      firstNewSourceID,
@@ -789,7 +626,7 @@ func TestSnapshotSessions_RotatedCreateRejectsConflictingReplacementTargets(t *t
 	})
 	require.NoError(t, err)
 
-	_, err = svc.CreateSnapshotSessionWithRequest(ctx, writer, &SnapshotSessionCreateRequest{
+	_, err = fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      secondNewSourceID,
@@ -801,7 +638,7 @@ func TestSnapshotSessions_RotatedCreateRejectsConflictingReplacementTargets(t *t
 	require.Equal(t, oldSourceID, retiredErr.SourceID)
 	require.Equal(t, firstNewSourceID, retiredErr.ReplacedBySourceID)
 
-	_, err = svc.CreateSnapshotSessionWithRequest(ctx, otherWriter, &SnapshotSessionCreateRequest{
+	_, err = fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, otherWriter, &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: otherOldSourceID,
 			NewSourceID:      firstNewSourceID,
@@ -814,31 +651,14 @@ func TestSnapshotSessions_RotatedCreateRejectsConflictingReplacementTargets(t *t
 }
 
 func TestSnapshotSessions_FirstCommitUnderReservedReplacementActivatesSource(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_rotate_activate_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-rotate-activate-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-rotate-activate-user-" + suffix
+	fixture := newSnapshotSessionFixture(t, "rotate_activate", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-activate-old"
 	newSourceID := "writer-activate-new"
-	oldWriter := Actor{UserID: userID, SourceID: oldSourceID}
-	newWriter := Actor{UserID: userID, SourceID: newSourceID}
-	mustPushUserBundle(t, ctx, svc, oldWriter, schemaName, 1, uuid.New(), "Alpha")
+	oldWriter := fixture.actor(oldSourceID)
+	newWriter := fixture.actor(newSourceID)
+	fixture.pushUserAs(t, oldWriter, 1, uuid.New(), "Alpha")
 
-	_, err := svc.CreateSnapshotSessionWithRequest(ctx, oldWriter, &SnapshotSessionCreateRequest{
+	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldWriter, &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      newSourceID,
@@ -847,14 +667,14 @@ func TestSnapshotSessions_FirstCommitUnderReservedReplacementActivatesSource(t *
 	})
 	require.NoError(t, err)
 
-	mustPushUserBundle(t, ctx, svc, newWriter, schemaName, 1, uuid.New(), "Bravo")
+	fixture.pushUserAs(t, newWriter, 1, uuid.New(), "Bravo")
 
-	userPK, err := lookupUserPK(ctx, pool, userID)
+	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
 	require.NoError(t, err)
 
 	var state string
 	var maxCommittedSourceBundleID int64
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
 		SELECT state, max_committed_source_bundle_id
 		FROM sync.source_state
 		WHERE user_pk = $1 AND source_id = $2
@@ -864,33 +684,12 @@ func TestSnapshotSessions_FirstCommitUnderReservedReplacementActivatesSource(t *
 }
 
 func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_no_update_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-no-update-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-no-update-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
+	fixture := newSnapshotSessionFixture(t, "no_update", snapshotSessionFixtureOptions{})
 	rowID := uuid.New()
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, rowID, "Alpha")
 
-	session, err := svc.CreateSnapshotSession(ctx, reader)
-	require.NoError(t, err)
+	session := fixture.createSessionWithUser(t, rowID, "Alpha")
 
-	_, err = pool.Exec(ctx, `
+	_, err := fixture.pool.Exec(fixture.ctx, `
 		CREATE OR REPLACE FUNCTION pg_temp.reject_snapshot_session_updates()
 		RETURNS trigger
 		LANGUAGE plpgsql
@@ -901,7 +700,7 @@ func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T
 		$$
 	`)
 	require.NoError(t, err)
-	_, err = pool.Exec(ctx, `
+	_, err = fixture.pool.Exec(fixture.ctx, `
 		CREATE TRIGGER reject_snapshot_session_updates
 		BEFORE UPDATE ON sync.snapshot_sessions
 		FOR EACH ROW
@@ -909,233 +708,129 @@ func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T
 	`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS reject_snapshot_session_updates ON sync.snapshot_sessions`)
+		_, _ = fixture.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS reject_snapshot_session_updates ON sync.snapshot_sessions`)
 	})
 
-	chunk, err := svc.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, chunk.Rows, 1)
 	require.Equal(t, rowID.String(), chunk.Rows[0].Key["id"])
 }
 
-func TestSnapshotSessions_CreateRejectsRowLimitAndRollsBack(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_row_cap_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:  1,
-		AppName:                    "snapshot-row-cap-test",
-		MaxRowsPerSnapshotSession:  1,
-		MaxBytesPerSnapshotSession: 0,
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+func TestSnapshotSessions_CreateRejectsConfiguredLimitsAndRollsBack(t *testing.T) {
+	tests := []struct {
+		name                 string
+		scenario             string
+		maxRows              int64
+		maxBytes             int64
+		rowNames             []string
+		dimension            string
+		expectedActual       int64
+		actualGreaterThan    int64
+		expectRowRollbackGap bool
+	}{
+		{
+			name:                 "row limit",
+			scenario:             "row_cap",
+			maxRows:              1,
+			rowNames:             []string{"Alpha", "Bravo"},
+			dimension:            "row_count",
+			expectedActual:       2,
+			expectRowRollbackGap: true,
 		},
-	}, logger)
-
-	userID := "snapshot-row-cap-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, uuid.New(), "Bravo")
-
-	_, err := svc.CreateSnapshotSession(ctx, reader)
-	var limitErr *SnapshotSessionLimitExceededError
-	require.ErrorAs(t, err, &limitErr)
-	require.Equal(t, "row_count", limitErr.Dimension)
-	require.Equal(t, int64(2), limitErr.Actual)
-	require.Equal(t, int64(1), limitErr.Limit)
-
-	var sessionCount int
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.snapshot_sessions
-		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
-	`, userID).Scan(&sessionCount))
-	require.Zero(t, sessionCount)
-
-	var rowCount int
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.snapshot_session_rows ssr
-		JOIN sync.snapshot_sessions ss ON ss.snapshot_id = ssr.snapshot_id
-		WHERE ss.user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
-	`, userID).Scan(&rowCount))
-	require.Zero(t, rowCount)
-}
-
-func TestSnapshotSessions_CreateRejectsByteLimitAndRollsBack(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_byte_cap_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:  1,
-		AppName:                    "snapshot-byte-cap-test",
-		MaxRowsPerSnapshotSession:  0,
-		MaxBytesPerSnapshotSession: 1,
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{
+			name:              "byte limit",
+			scenario:          "byte_cap",
+			maxBytes:          1,
+			rowNames:          []string{"Alpha"},
+			dimension:         "byte_count",
+			actualGreaterThan: 1,
 		},
-	}, logger)
+	}
 
-	userID := "snapshot-byte-cap-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newSnapshotSessionFixture(t, tc.scenario, snapshotSessionFixtureOptions{
+				maxRowsPerSnapshotSession:  tc.maxRows,
+				maxBytesPerSnapshotSession: tc.maxBytes,
+			})
+			for i, name := range tc.rowNames {
+				fixture.pushUser(t, int64(i+1), uuid.New(), name)
+			}
 
-	_, err := svc.CreateSnapshotSession(ctx, reader)
-	var limitErr *SnapshotSessionLimitExceededError
-	require.ErrorAs(t, err, &limitErr)
-	require.Equal(t, "byte_count", limitErr.Dimension)
-	require.Greater(t, limitErr.Actual, int64(1))
-	require.Equal(t, int64(1), limitErr.Limit)
+			_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+			var limitErr *SnapshotSessionLimitExceededError
+			require.ErrorAs(t, err, &limitErr)
+			require.Equal(t, tc.dimension, limitErr.Dimension)
+			if tc.expectedActual > 0 {
+				require.Equal(t, tc.expectedActual, limitErr.Actual)
+			} else {
+				require.Greater(t, limitErr.Actual, tc.actualGreaterThan)
+			}
+			require.Equal(t, int64(1), limitErr.Limit)
 
-	var sessionCount int
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.snapshot_sessions
-		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
-	`, userID).Scan(&sessionCount))
-	require.Zero(t, sessionCount)
+			require.Zero(t, fixture.snapshotSessionCountForUser(t))
+			if tc.expectRowRollbackGap {
+				require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
+			}
+		})
+	}
 }
 
 func TestSnapshotSessions_CreateSucceedsUnderConfiguredLimits(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_under_cap_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:  1,
-		AppName:                    "snapshot-under-cap-test",
-		MaxRowsPerSnapshotSession:  10,
-		MaxBytesPerSnapshotSession: 1 << 20,
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-under-cap-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
+	fixture := newSnapshotSessionFixture(t, "under_cap", snapshotSessionFixtureOptions{
+		maxRowsPerSnapshotSession:  10,
+		maxBytesPerSnapshotSession: 1 << 20,
+	})
 	rowID := uuid.New()
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, rowID, "Alpha")
 
-	session, err := svc.CreateSnapshotSession(ctx, reader)
-	require.NoError(t, err)
+	session := fixture.createSessionWithUser(t, rowID, "Alpha")
 	require.Equal(t, int64(1), session.RowCount)
 	require.Greater(t, session.ByteCount, int64(0))
 }
 
 func TestSnapshotSessions_CleanupExpiredSessionsRemovesRows(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
+	fixture := newSnapshotSessionFixture(t, "cleanup", snapshotSessionFixtureOptions{})
 
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_cleanup_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-cleanup-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-cleanup-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
-	reader := Actor{UserID: userID, SourceID: "reader"}
-	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, uuid.New(), "Alpha")
-
-	session, err := svc.CreateSnapshotSession(ctx, reader)
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, `
+	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
+	_, err := fixture.pool.Exec(fixture.ctx, `
 		UPDATE sync.snapshot_sessions
 		SET expires_at = now() - interval '1 second'
 		WHERE snapshot_id = $1::uuid
 	`, session.SnapshotID)
 	require.NoError(t, err)
-	require.NoError(t, cleanupExpiredSnapshotSessionsQuerier(ctx, pool))
+	require.NoError(t, cleanupExpiredSnapshotSessionsQuerier(fixture.ctx, fixture.pool))
 
-	var sessionCount int
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.snapshot_sessions
-		WHERE snapshot_id = $1::uuid
-	`, session.SnapshotID).Scan(&sessionCount))
-	require.Zero(t, sessionCount)
-
-	var rowCount int
-	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM sync.snapshot_session_rows
-		WHERE snapshot_id = $1::uuid
-	`, session.SnapshotID).Scan(&rowCount))
-	require.Zero(t, rowCount)
+	require.Zero(t, fixture.snapshotSessionCount(t, session.SnapshotID))
+	require.Zero(t, fixture.snapshotSessionRowCount(t, session.SnapshotID))
 }
 
 func TestSnapshotSessions_CreateQueryPlanUsesRowStateSnapshotIndex(t *testing.T) {
-	ctx := context.Background()
-	logger := integrationTestLogger(slog.LevelWarn)
-	pool := newIntegrationTestPool(t, ctx)
-
-	suffix := strings.ReplaceAll(uuid.New().String(), "-", "")
-	schemaName := "snapshot_plan_" + suffix
-	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-plan-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
-	}, logger)
-
-	userID := "snapshot-plan-user-" + suffix
-	writer := Actor{UserID: userID, SourceID: "writer"}
+	fixture := newSnapshotSessionFixture(t, "plan", snapshotSessionFixtureOptions{})
 	for i := 0; i < 8; i++ {
-		mustPushUserBundle(t, ctx, svc, writer, schemaName, int64(i+1), uuid.New(), fmt.Sprintf("User%d", i))
+		fixture.pushUser(t, int64(i+1), uuid.New(), fmt.Sprintf("User%d", i))
 	}
 
 	var planLines []string
-	err := pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+	err := pgx.BeginTxFunc(fixture.ctx, fixture.pool, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(fixture.ctx, `SET LOCAL enable_seqscan = off`); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `SET LOCAL enable_hashjoin = off`); err != nil {
+		if _, err := tx.Exec(fixture.ctx, `SET LOCAL enable_hashjoin = off`); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `SET LOCAL enable_mergejoin = off`); err != nil {
+		if _, err := tx.Exec(fixture.ctx, `SET LOCAL enable_mergejoin = off`); err != nil {
 			return err
 		}
 
-		rows, err := tx.Query(ctx, `
+		rows, err := tx.Query(fixture.ctx, `
 			EXPLAIN (COSTS OFF)
 			SELECT table_id, key_bytes, bundle_seq
 			FROM sync.row_state
 			WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
 			  AND deleted = FALSE
 			ORDER BY table_id, key_bytes
-		`, userID)
+		`, fixture.userID)
 		if err != nil {
 			return err
 		}

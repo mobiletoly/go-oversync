@@ -788,27 +788,17 @@ func loadCommittedPushMetadataBySourceTuple(ctx context.Context, tx pgx.Tx, user
 }
 
 func loadNextExpectedSourceBundleID(ctx context.Context, tx pgx.Tx, userPK int64, userID, sourceID string) (int64, int64, error) {
-	state, err := loadSourceStateRow(ctx, tx, userPK, sourceID, false)
-	if err != nil {
-		return 0, 0, fmt.Errorf("query source_state next expected bundle for %s: %w", sourceID, err)
-	}
-	if state == nil {
-		return 1, 0, nil
-	}
-	if state.State == sourceStateRetired {
-		return 0, 0, &SourceRetiredError{
-			UserID:             userID,
-			SourceID:           sourceID,
-			ReplacedBySourceID: state.ReplacedBySourceID,
-		}
-	}
-	return state.MaxCommittedSourceBundleID + 1, state.MaxCommittedSourceBundleID, nil
+	return loadNextExpectedSourceBundleIDWithLock(ctx, tx, userPK, userID, sourceID, false, "query source_state next expected bundle")
 }
 
 func loadNextExpectedSourceBundleIDForUpdate(ctx context.Context, tx pgx.Tx, userPK int64, userID, sourceID string) (int64, int64, error) {
-	state, err := loadSourceStateRow(ctx, tx, userPK, sourceID, true)
+	return loadNextExpectedSourceBundleIDWithLock(ctx, tx, userPK, userID, sourceID, true, "query source_state next expected bundle for update")
+}
+
+func loadNextExpectedSourceBundleIDWithLock(ctx context.Context, tx pgx.Tx, userPK int64, userID, sourceID string, forUpdate bool, failure string) (int64, int64, error) {
+	state, err := loadSourceStateRow(ctx, tx, userPK, sourceID, forUpdate)
 	if err != nil {
-		return 0, 0, fmt.Errorf("query source_state next expected bundle for update %s: %w", sourceID, err)
+		return 0, 0, fmt.Errorf("%s %s: %w", failure, sourceID, err)
 	}
 	if state == nil {
 		return 1, 0, nil

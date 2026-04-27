@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/mobiletoly/go-oversync/oversqlite"
@@ -96,26 +94,10 @@ func (s *BundleFKAtomicityScenario) Setup(ctx context.Context) error {
 }
 
 func (s *BundleFKAtomicityScenario) createDeviceApp(deviceID, deviceName string) (*MobileApp, error) {
-	simCfg := s.simulator.GetConfig()
-	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, s.userID, time.Now().UnixNano()))
-
-	oversqliteConfig := &oversqlite.Config{
-		Schema:        "business",
-		Tables:        managedSyncTables(),
-		UploadLimit:   100,
-		DownloadLimit: 100,
-	}
-
-	app, err := newMobileApp(&mobileAppConfig{
-		DatabaseFile:     dbFile,
-		ServerURL:        simCfg.ServerURL,
-		UserID:           s.userID,
-		DeviceID:         deviceID,
-		DeviceName:       deviceName,
-		JWTSecret:        simCfg.JWTSecret,
-		OversqliteConfig: oversqliteConfig,
-		PreserveDB:       simCfg.PreserveDB,
-		Logger:           s.simulator.GetLogger(),
+	app, err := s.simulator.newScenarioMobileApp(scenarioMobileAppOptions{
+		UserID:     s.userID,
+		DeviceID:   deviceID,
+		DeviceName: deviceName,
 	})
 	if err != nil {
 		return nil, err

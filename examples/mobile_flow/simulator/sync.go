@@ -166,31 +166,14 @@ func (u *Uploader) Run(ctx context.Context) {
 
 // runOnce performs one upload cycle
 func (u *Uploader) runOnce(ctx context.Context) {
-	if !u.app.currentUI().IsOnline() {
-		return
-	}
-
-	if !u.app.currentSession().IsActive() {
-		return
-	}
-	client := u.app.currentClient()
-	if client == nil {
-		u.logger.Error("No oversqlite client available")
+	client, ok := backgroundSyncClient(u.app, u.logger)
+	if !ok {
 		return
 	}
 
 	report, err := client.PushPending(ctx)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return
-		}
-		if isIgnorableBackgroundSyncError(err) {
-			return
-		}
-		u.logger.Error("Upload failed", "error", err)
-		if isAuthError(err) {
-			u.app.currentUI().SetBanner("Session expired. Sign in.")
-		}
+		handleBackgroundSyncError(u.app, u.logger, "Upload failed", err)
 		return
 	}
 	if report.Outcome == oversqlite.PushOutcomeSkippedPaused {
@@ -246,31 +229,14 @@ func (d *Downloader) Run(ctx context.Context) {
 
 // runOnce performs one download cycle
 func (d *Downloader) runOnce(ctx context.Context) {
-	if !d.app.currentUI().IsOnline() {
-		return
-	}
-
-	if !d.app.currentSession().IsActive() {
-		return
-	}
-	client := d.app.currentClient()
-	if client == nil {
-		d.logger.Error("No oversqlite client available")
+	client, ok := backgroundSyncClient(d.app, d.logger)
+	if !ok {
 		return
 	}
 
 	report, err := client.PullToStable(ctx)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return
-		}
-		if isIgnorableBackgroundSyncError(err) {
-			return
-		}
-		d.logger.Error("Download failed", "error", err)
-		if isAuthError(err) {
-			d.app.currentUI().SetBanner("Session expired. Sign in.")
-		}
+		handleBackgroundSyncError(d.app, d.logger, "Download failed", err)
 		return
 	}
 	if report.Outcome == oversqlite.RemoteSyncOutcomeSkippedPaused {
@@ -285,6 +251,36 @@ func (d *Downloader) TriggerWake() {
 	select {
 	case d.wake <- struct{}{}:
 	default:
+	}
+}
+
+func backgroundSyncClient(app *MobileApp, logger *slog.Logger) (*oversqlite.Client, bool) {
+	if !app.currentUI().IsOnline() {
+		return nil, false
+	}
+
+	if !app.currentSession().IsActive() {
+		return nil, false
+	}
+
+	client := app.currentClient()
+	if client == nil {
+		logger.Error("No oversqlite client available")
+		return nil, false
+	}
+	return client, true
+}
+
+func handleBackgroundSyncError(app *MobileApp, logger *slog.Logger, message string, err error) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	if isIgnorableBackgroundSyncError(err) {
+		return
+	}
+	logger.Error(message, "error", err)
+	if isAuthError(err) {
+		app.currentUI().SetBanner("Session expired. Sign in.")
 	}
 }
 

@@ -11,13 +11,17 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 )
 
 // HTTPSyncHandlers provides HTTP handlers for the two-way sync API
 type HTTPSyncHandlers struct {
 	service *SyncService
 	logger  *slog.Logger
+}
+
+type chunkQueryParams struct {
+	afterRowOrdinal *int64
+	maxRows         int
 }
 
 // NewHTTPSyncHandlers creates a new instance of sync handlers
@@ -39,15 +43,54 @@ func actorFromRequest(r *http.Request) (Actor, error) {
 	return actor, nil
 }
 
-func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
-		return
+func (h *HTTPSyncHandlers) requireActorForMethod(w http.ResponseWriter, r *http.Request, method string) (Actor, bool) {
+	if r.Method != method {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only "+method+" method is allowed")
+		return Actor{}, false
 	}
 
 	actor, err := actorFromRequest(r)
 	if err != nil {
 		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+		return Actor{}, false
+	}
+
+	return actor, true
+}
+
+func parseChunkQueryParams(r *http.Request, defaultMaxRows int) (chunkQueryParams, error) {
+	params := chunkQueryParams{maxRows: defaultMaxRows}
+
+	if afterStr := r.URL.Query().Get("after_row_ordinal"); afterStr != "" {
+		parsed, err := strconv.ParseInt(afterStr, 10, 64)
+		if err != nil {
+			return chunkQueryParams{}, errors.New("after_row_ordinal must be an integer")
+		}
+		params.afterRowOrdinal = &parsed
+	}
+
+	if limitStr := r.URL.Query().Get("max_rows"); limitStr != "" {
+		parsed, err := strconv.Atoi(limitStr)
+		if err != nil {
+			return chunkQueryParams{}, errors.New("max_rows must be an integer")
+		}
+		params.maxRows = parsed
+	}
+
+	return params, nil
+}
+
+func (h *HTTPSyncHandlers) writeJSON(w http.ResponseWriter, response any, encodeErrorMessage string, logAttrs ...any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		attrs := append([]any{"error", err}, logAttrs...)
+		h.logger.Error(encodeErrorMessage, attrs...)
+	}
+}
+
+func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *http.Request) {
+	actor, ok := h.requireActorForMethod(w, r, http.MethodPost)
+	if !ok {
 		return
 	}
 
@@ -108,24 +151,15 @@ func (h *HTTPSyncHandlers) HandleCreatePushSession(w http.ResponseWriter, r *htt
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode push session response", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
-	}
+	h.writeJSON(w, response, "Failed to encode push session response", "user_id", actor.UserID, "source_id", actor.SourceID)
 }
 
 func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
+	actor, ok := h.requireActorForMethod(w, r, http.MethodPost)
+	if !ok {
 		return
 	}
-
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
-		return
-	}
-	pushID := strings.TrimSpace(r.PathValue("push_id"))
+	pushID := r.PathValue("push_id")
 
 	var req PushSessionChunkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -179,24 +213,15 @@ func (h *HTTPSyncHandlers) HandlePushSessionChunk(w http.ResponseWriter, r *http
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode push chunk response", "error", err, "user_id", actor.UserID, "push_id", pushID)
-	}
+	h.writeJSON(w, response, "Failed to encode push chunk response", "user_id", actor.UserID, "push_id", pushID)
 }
 
 func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
+	actor, ok := h.requireActorForMethod(w, r, http.MethodPost)
+	if !ok {
 		return
 	}
-
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
-		return
-	}
-	pushID := strings.TrimSpace(r.PathValue("push_id"))
+	pushID := r.PathValue("push_id")
 
 	response, err := h.service.CommitPushSession(r.Context(), actor, pushID)
 	if err != nil {
@@ -254,21 +279,12 @@ func (h *HTTPSyncHandlers) HandleCommitPushSession(w http.ResponseWriter, r *htt
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode push session commit response", "error", err, "user_id", actor.UserID, "push_id", pushID)
-	}
+	h.writeJSON(w, response, "Failed to encode push session commit response", "user_id", actor.UserID, "push_id", pushID)
 }
 
 func (h *HTTPSyncHandlers) HandleConnect(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
-		return
-	}
-
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+	actor, ok := h.requireActorForMethod(w, r, http.MethodPost)
+	if !ok {
 		return
 	}
 
@@ -294,51 +310,28 @@ func (h *HTTPSyncHandlers) HandleConnect(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode connect response", "error", err, "user_id", actor.UserID)
-	}
+	h.writeJSON(w, response, "Failed to encode connect response", "user_id", actor.UserID)
 }
 
 func (h *HTTPSyncHandlers) HandleGetCommittedBundleRows(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
+	actor, ok := h.requireActorForMethod(w, r, http.MethodGet)
+	if !ok {
 		return
 	}
 
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
-		return
-	}
-
-	bundleSeq, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("bundle_seq")), 10, 64)
+	bundleSeq, err := strconv.ParseInt(r.PathValue("bundle_seq"), 10, 64)
 	if err != nil {
 		h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", "bundle_seq must be an integer")
 		return
 	}
 
-	var afterRowOrdinal *int64
-	if afterStr := r.URL.Query().Get("after_row_ordinal"); afterStr != "" {
-		parsed, err := strconv.ParseInt(afterStr, 10, 64)
-		if err != nil {
-			h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", "after_row_ordinal must be an integer")
-			return
-		}
-		afterRowOrdinal = &parsed
+	queryParams, err := parseChunkQueryParams(r, h.service.defaultRowsPerCommittedBundleChunk())
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", err.Error())
+		return
 	}
 
-	maxRows := h.service.defaultRowsPerCommittedBundleChunk()
-	if limitStr := r.URL.Query().Get("max_rows"); limitStr != "" {
-		parsed, err := strconv.Atoi(limitStr)
-		if err != nil {
-			h.writeError(w, http.StatusBadRequest, "committed_bundle_chunk_invalid", "max_rows must be an integer")
-			return
-		}
-		maxRows = parsed
-	}
-
-	response, err := h.service.GetCommittedBundleRows(r.Context(), actor, bundleSeq, afterRowOrdinal, maxRows)
+	response, err := h.service.GetCommittedBundleRows(r.Context(), actor, bundleSeq, queryParams.afterRowOrdinal, queryParams.maxRows)
 	if err != nil {
 		if errors.Is(err, errServiceShuttingDown) {
 			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
@@ -364,24 +357,15 @@ func (h *HTTPSyncHandlers) HandleGetCommittedBundleRows(w http.ResponseWriter, r
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode committed bundle rows response", "error", err, "user_id", actor.UserID, "bundle_seq", bundleSeq)
-	}
+	h.writeJSON(w, response, "Failed to encode committed bundle rows response", "user_id", actor.UserID, "bundle_seq", bundleSeq)
 }
 
 func (h *HTTPSyncHandlers) HandleDeletePushSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only DELETE method is allowed")
+	actor, ok := h.requireActorForMethod(w, r, http.MethodDelete)
+	if !ok {
 		return
 	}
-
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
-		return
-	}
-	pushID := strings.TrimSpace(r.PathValue("push_id"))
+	pushID := r.PathValue("push_id")
 
 	if err := h.service.DeletePushSession(r.Context(), actor, pushID); err != nil {
 		if errors.Is(err, errServiceShuttingDown) {
@@ -418,14 +402,8 @@ func (h *HTTPSyncHandlers) HandleDeletePushSession(w http.ResponseWriter, r *htt
 
 // HandlePull processes bundle pull requests.
 func (h *HTTPSyncHandlers) HandlePull(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
-		return
-	}
-
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+	actor, ok := h.requireActorForMethod(w, r, http.MethodGet)
+	if !ok {
 		return
 	}
 
@@ -497,22 +475,13 @@ func (h *HTTPSyncHandlers) HandlePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err = json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode pull response", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
-	}
+	h.writeJSON(w, response, "Failed to encode pull response", "user_id", actor.UserID, "source_id", actor.SourceID)
 }
 
 // HandleCreateSnapshotSession creates one frozen snapshot session for chunked hydrate/recover.
 func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST method is allowed")
-		return
-	}
-
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
+	actor, ok := h.requireActorForMethod(w, r, http.MethodPost)
+	if !ok {
 		return
 	}
 
@@ -573,10 +542,7 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err = json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode snapshot session response", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
-	}
+	h.writeJSON(w, response, "Failed to encode snapshot session response", "user_id", actor.UserID, "source_id", actor.SourceID)
 }
 
 func (h *HTTPSyncHandlers) writeSourceRetired(w http.ResponseWriter, retiredErr *SourceRetiredError) {
@@ -606,39 +572,23 @@ func (h *HTTPSyncHandlers) writeSourceRetired(w http.ResponseWriter, retiredErr 
 
 // HandleGetSnapshotChunk returns one chunk of rows from a frozen snapshot session.
 func (h *HTTPSyncHandlers) HandleGetSnapshotChunk(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET method is allowed")
+	actor, ok := h.requireActorForMethod(w, r, http.MethodGet)
+	if !ok {
 		return
 	}
 
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
-		return
-	}
-
-	snapshotID := strings.TrimSpace(r.PathValue("snapshot_id"))
+	snapshotID := r.PathValue("snapshot_id")
 	afterRowOrdinal := int64(0)
-	if afterStr := r.URL.Query().Get("after_row_ordinal"); afterStr != "" {
-		parsed, err := strconv.ParseInt(afterStr, 10, 64)
-		if err != nil {
-			h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", "after_row_ordinal must be an integer")
-			return
-		}
-		afterRowOrdinal = parsed
+	queryParams, err := parseChunkQueryParams(r, h.service.defaultRowsPerSnapshotChunk())
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", err.Error())
+		return
+	}
+	if queryParams.afterRowOrdinal != nil {
+		afterRowOrdinal = *queryParams.afterRowOrdinal
 	}
 
-	maxRows := h.service.defaultRowsPerSnapshotChunk()
-	if limitStr := r.URL.Query().Get("max_rows"); limitStr != "" {
-		parsed, err := strconv.Atoi(limitStr)
-		if err != nil {
-			h.writeError(w, http.StatusBadRequest, "snapshot_chunk_invalid", "max_rows must be an integer")
-			return
-		}
-		maxRows = parsed
-	}
-
-	response, err := h.service.GetSnapshotChunk(r.Context(), actor, snapshotID, afterRowOrdinal, maxRows)
+	response, err := h.service.GetSnapshotChunk(r.Context(), actor, snapshotID, afterRowOrdinal, queryParams.maxRows)
 	if err != nil {
 		if errors.Is(err, errServiceShuttingDown) {
 			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
@@ -669,26 +619,17 @@ func (h *HTTPSyncHandlers) HandleGetSnapshotChunk(w http.ResponseWriter, r *http
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err = json.NewEncoder(w).Encode(response); err != nil {
-		h.logger.Error("Failed to encode snapshot chunk response", "error", err, "user_id", actor.UserID, "snapshot_id", snapshotID)
-	}
+	h.writeJSON(w, response, "Failed to encode snapshot chunk response", "user_id", actor.UserID, "snapshot_id", snapshotID)
 }
 
 // HandleDeleteSnapshotSession deletes an existing frozen snapshot session.
 func (h *HTTPSyncHandlers) HandleDeleteSnapshotSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only DELETE method is allowed")
+	actor, ok := h.requireActorForMethod(w, r, http.MethodDelete)
+	if !ok {
 		return
 	}
 
-	actor, err := actorFromRequest(r)
-	if err != nil {
-		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error())
-		return
-	}
-
-	snapshotID := strings.TrimSpace(r.PathValue("snapshot_id"))
+	snapshotID := r.PathValue("snapshot_id")
 	if err := h.service.DeleteSnapshotSession(r.Context(), actor, snapshotID); err != nil {
 		if errors.Is(err, errServiceShuttingDown) {
 			h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")

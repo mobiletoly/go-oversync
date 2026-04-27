@@ -1488,55 +1488,46 @@ func committedPushBundleFromCreateResponse(resp *oversync.PushSessionCreateRespo
 	if resp == nil {
 		return nil, fmt.Errorf("push session response missing body")
 	}
-	if resp.BundleSeq <= 0 {
-		return nil, fmt.Errorf("push session already_committed response missing bundle_seq")
+	committed, err := committedPushBundleFromFields(resp.BundleSeq, resp.SourceID, resp.SourceBundleID, resp.RowCount, resp.BundleHash)
+	if err != nil {
+		return nil, fmt.Errorf("push session already_committed response: %w", err)
 	}
-	if strings.TrimSpace(resp.SourceID) == "" {
-		return nil, fmt.Errorf("push session already_committed response missing source_id")
-	}
-	if resp.SourceBundleID <= 0 {
-		return nil, fmt.Errorf("push session already_committed response missing source_bundle_id")
-	}
-	if resp.RowCount <= 0 {
-		return nil, fmt.Errorf("push session already_committed response missing row_count")
-	}
-	if strings.TrimSpace(resp.BundleHash) == "" {
-		return nil, fmt.Errorf("push session already_committed response missing bundle_hash")
-	}
-	return &committedPushBundle{
-		BundleSeq:      resp.BundleSeq,
-		SourceID:       resp.SourceID,
-		SourceBundleID: resp.SourceBundleID,
-		RowCount:       resp.RowCount,
-		BundleHash:     resp.BundleHash,
-	}, nil
+	return committed, nil
 }
 
 func committedPushBundleFromCommitResponse(resp *oversync.PushSessionCommitResponse) (*committedPushBundle, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("push commit response missing body")
 	}
-	if resp.BundleSeq <= 0 {
-		return nil, fmt.Errorf("push commit response bundle_seq %d must be positive", resp.BundleSeq)
+	committed, err := committedPushBundleFromFields(resp.BundleSeq, resp.SourceID, resp.SourceBundleID, resp.RowCount, resp.BundleHash)
+	if err != nil {
+		return nil, fmt.Errorf("push commit response: %w", err)
 	}
-	if strings.TrimSpace(resp.SourceID) == "" {
-		return nil, fmt.Errorf("push commit response source_id must be non-empty")
+	return committed, nil
+}
+
+func committedPushBundleFromFields(bundleSeq int64, sourceID string, sourceBundleID int64, rowCount int64, bundleHash string) (*committedPushBundle, error) {
+	if bundleSeq <= 0 {
+		return nil, fmt.Errorf("bundle_seq must be positive")
 	}
-	if resp.SourceBundleID <= 0 {
-		return nil, fmt.Errorf("push commit response source_bundle_id %d must be positive", resp.SourceBundleID)
+	if sourceID == "" {
+		return nil, fmt.Errorf("source_id must be non-empty")
 	}
-	if resp.RowCount <= 0 {
-		return nil, fmt.Errorf("push commit response row_count %d must be positive", resp.RowCount)
+	if sourceBundleID <= 0 {
+		return nil, fmt.Errorf("source_bundle_id must be positive")
 	}
-	if strings.TrimSpace(resp.BundleHash) == "" {
-		return nil, fmt.Errorf("push commit response bundle_hash must be non-empty")
+	if rowCount <= 0 {
+		return nil, fmt.Errorf("row_count must be positive")
+	}
+	if bundleHash == "" {
+		return nil, fmt.Errorf("bundle_hash must be non-empty")
 	}
 	return &committedPushBundle{
-		BundleSeq:      resp.BundleSeq,
-		SourceID:       resp.SourceID,
-		SourceBundleID: resp.SourceBundleID,
-		RowCount:       resp.RowCount,
-		BundleHash:     resp.BundleHash,
+		BundleSeq:      bundleSeq,
+		SourceID:       sourceID,
+		SourceBundleID: sourceBundleID,
+		RowCount:       rowCount,
+		BundleHash:     bundleHash,
 	}, nil
 }
 

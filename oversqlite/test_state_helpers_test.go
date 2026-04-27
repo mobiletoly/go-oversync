@@ -3,10 +3,24 @@ package oversqlite
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+const usersTestDDL = `
+	CREATE TABLE users (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT NOT NULL
+	)
+`
+
+func newUsersBundleClient(t *testing.T) (*Client, *sql.DB) {
+	t.Helper()
+	return newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
+}
 
 func requireBundleState(t *testing.T, db *sql.DB) (string, int64, int64) {
 	t.Helper()
@@ -100,6 +114,23 @@ func requireOutboxBundle(t *testing.T, db *sql.DB) outboxBundleRecord {
 		&rec.RemoteBundleSeq,
 	))
 	return rec
+}
+
+func seedOutboxBundleForTest(t *testing.T, db *sql.DB, rec outboxBundleRecord) {
+	t.Helper()
+	require.NoError(t, persistOutboxBundle(context.Background(), db, &rec))
+}
+
+func seedOutboxUserInsertForTest(t *testing.T, db *sql.DB, sourceBundleID int64, rowID, name, email string) {
+	t.Helper()
+
+	payload := fmt.Sprintf(`{"id":"%s","name":"%s","email":"%s"}`, rowID, name, email)
+	_, err := db.Exec(`
+		INSERT INTO _sync_outbox_rows (
+			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
+		) VALUES (?, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?)
+	`, sourceBundleID, rowKeyJSON(rowID), rowKeyJSON(rowID), payload, payload)
+	require.NoError(t, err)
 }
 
 func setCurrentSourceBundleState(t *testing.T, db *sql.DB, nextSourceBundleID, lastBundleSeqSeen int64) {

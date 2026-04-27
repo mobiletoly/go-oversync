@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -105,30 +104,19 @@ func (s *ConflictsScenario) Setup(ctx context.Context) error {
 }
 
 func (s *ConflictsScenario) createDeviceApp(scenarioConfig *config.ScenarioConfig, deviceID, deviceName string) (*MobileApp, error) {
-	simCfg := s.simulator.GetConfig()
-	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, scenarioConfig.UserID, time.Now().UnixNano()))
-
-	oversqliteConfig := &oversqlite.Config{
-		Schema:        "business",
-		Tables:        managedSyncTables(),
-		UploadLimit:   3,
-		DownloadLimit: 100,
-		BackoffMin:    100 * time.Millisecond,
-		BackoffMax:    2 * time.Second,
-	}
-
-	appConfig := &mobileAppConfig{
-		DatabaseFile:     dbFile,
-		ServerURL:        simCfg.ServerURL,
-		UserID:           scenarioConfig.UserID,
-		DeviceID:         deviceID,
-		DeviceName:       deviceName,
-		JWTSecret:        simCfg.JWTSecret,
-		OversqliteConfig: oversqliteConfig,
-		PreserveDB:       simCfg.PreserveDB,
-		Logger:           s.simulator.GetLogger(),
-	}
-	return newMobileApp(appConfig)
+	return s.simulator.newScenarioMobileApp(scenarioMobileAppOptions{
+		UserID:     scenarioConfig.UserID,
+		DeviceID:   deviceID,
+		DeviceName: deviceName,
+		OversqliteConfig: &oversqlite.Config{
+			Schema:        "business",
+			Tables:        managedSyncTables(),
+			UploadLimit:   3,
+			DownloadLimit: 100,
+			BackoffMin:    100 * time.Millisecond,
+			BackoffMax:    2 * time.Second,
+		},
+	})
 }
 
 func (s *ConflictsScenario) seedConflictCaseIDs() {

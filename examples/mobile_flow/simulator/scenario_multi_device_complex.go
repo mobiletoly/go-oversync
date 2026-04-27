@@ -4,12 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path/filepath"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/mobiletoly/go-oversync/examples/mobile_flow/config"
-	"github.com/mobiletoly/go-oversync/oversqlite"
 )
 
 // MultiDeviceComplexScenario performs a long, mixed sequence of ops across two devices for the SAME user
@@ -100,27 +97,11 @@ func (s *MultiDeviceComplexScenario) Setup(ctx context.Context) error {
 }
 
 func (s *MultiDeviceComplexScenario) createDeviceApp(scenarioConfig *config.ScenarioConfig, deviceID, deviceName string) (*MobileApp, error) {
-	simCfg := s.simulator.GetConfig()
-
-	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", deviceID, scenarioConfig.UserID, time.Now().UnixNano()))
-	overs := &oversqlite.Config{
-		Schema:        "business",
-		Tables:        managedSyncTables(),
-		UploadLimit:   100,
-		DownloadLimit: 100,
-	}
-	appCfg := &mobileAppConfig{
-		DatabaseFile:     dbFile,
-		ServerURL:        simCfg.ServerURL,
-		UserID:           scenarioConfig.UserID,
-		DeviceID:         deviceID,
-		DeviceName:       deviceName,
-		JWTSecret:        simCfg.JWTSecret,
-		OversqliteConfig: overs,
-		PreserveDB:       simCfg.PreserveDB,
-		Logger:           s.simulator.GetLogger(),
-	}
-	return newMobileApp(appCfg)
+	return s.simulator.newScenarioMobileApp(scenarioMobileAppOptions{
+		UserID:     scenarioConfig.UserID,
+		DeviceID:   deviceID,
+		DeviceName: deviceName,
+	})
 }
 
 func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
