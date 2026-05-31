@@ -104,12 +104,21 @@ func (s *SyncService) acquireUserUploadConn(ctx context.Context, userID string) 
 	}
 
 	release := func() {
+		defer conn.Release()
+		if conn.Conn().IsClosed() {
+			s.logger.Debug("Skipped releasing user advisory lock because connection is already closed", "user_id", userID)
+			return
+		}
+
 		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if _, err := conn.Exec(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, userID); err != nil {
+			if conn.Conn().IsClosed() {
+				s.logger.Debug("Skipped releasing user advisory lock because connection closed before unlock completed", "user_id", userID, "error", err)
+				return
+			}
 			s.logger.Error("Failed to release user advisory lock", "user_id", userID, "error", err)
 		}
-		conn.Release()
 	}
 	return conn, release, nil
 }
