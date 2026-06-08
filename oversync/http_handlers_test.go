@@ -123,6 +123,50 @@ func TestHTTPSyncHandlers_HandleCapabilities(t *testing.T) {
 	}
 }
 
+func TestHTTPSyncHandlers_HandleCapabilitiesAppliesActorWatchPolicy(t *testing.T) {
+	svc := &SyncService{
+		config: &ServiceConfig{
+			MaxSupportedSchemaVersion: 2,
+			AppName:                   "handler-watch-policy-test",
+			BundleChangeWatch: BundleChangeWatchConfig{
+				Enabled: true,
+			},
+		},
+		logger: slog.Default(),
+	}
+	h := NewHTTPSyncHandlersWithConfig(svc, slog.Default(), HTTPSyncHandlersConfig{
+		BundleChangeWatchAllowed: func(_ context.Context, actor Actor) bool {
+			return actor.SourceID != "blocked-device"
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/sync/capabilities", nil)
+	rec := httptest.NewRecorder()
+	h.HandleCapabilities(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var globalResp CapabilitiesResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &globalResp))
+	require.True(t, globalResp.Features["bundle_change_watch"])
+
+	req = httptest.NewRequest(http.MethodGet, "/sync/capabilities", nil)
+	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "allowed-device"}))
+	rec = httptest.NewRecorder()
+	h.HandleCapabilities(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var allowedResp CapabilitiesResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &allowedResp))
+	require.True(t, allowedResp.Features["bundle_change_watch"])
+
+	req = httptest.NewRequest(http.MethodGet, "/sync/capabilities", nil)
+	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "blocked-device"}))
+	rec = httptest.NewRecorder()
+	h.HandleCapabilities(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var blockedResp CapabilitiesResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &blockedResp))
+	require.False(t, blockedResp.Features["bundle_change_watch"])
+}
+
 func TestParseChunkQueryParams(t *testing.T) {
 	t.Run("defaults when query params are absent", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/sync/chunks", nil)

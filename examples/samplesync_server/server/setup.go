@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -89,6 +90,9 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	svcCfg := &oversync.ServiceConfig{
 		MaxSupportedSchemaVersion: 1,
 		AppName:                   appName,
+		BundleChangeWatch: oversync.BundleChangeWatchConfig{
+			Enabled: true,
+		},
 		RegisteredTables: []oversync.RegisteredTable{
 			{Schema: "business", Table: "person", SyncKeyColumns: []string{"id"}},
 			{Schema: "business", Table: "person_address", SyncKeyColumns: []string{"id"}},
@@ -110,6 +114,11 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		cancel()
 		return nil, err
 	}
+	go func() {
+		if err := syncService.RunBundleChangeListener(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("sync bundle change listener stopped", "error", err)
+		}
+	}()
 
 	jwtSecret := config.JWTSecret
 	if jwtSecret == "" {
@@ -151,8 +160,9 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "user_required"})
 			return
 		}
+		const tokenExpiresInSeconds int64 = 180
 		// TODO (any username/password accepted for now)
-		tok, err := auth.GenerateToken(rr.User, 10*time.Minute)
+		tok, err := auth.GenerateToken(rr.User, time.Duration(tokenExpiresInSeconds)*time.Second)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(500)
@@ -160,7 +170,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp{Token: tok, ExpiresIn: 600, User: rr.User})
+		_ = json.NewEncoder(w).Encode(resp{Token: tok, ExpiresIn: tokenExpiresInSeconds, User: rr.User})
 	})
 	withSyncActor := func(next http.Handler) http.Handler {
 		return auth.Middleware(actorMiddleware(next))
@@ -172,6 +182,8 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))
 	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows)), logger))
 	mux.Handle("GET /sync/pull", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePull)), logger))
+	// Keep SSE responses off the body-capturing logger so http.Flusher remains available.
+	mux.Handle("GET /sync/watch", withSyncActor(http.HandlerFunc(syncHandlers.HandleWatch)))
 	mux.Handle("POST /sync/snapshot-sessions", withSyncActor(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession)))
 	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk)))
 	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)))

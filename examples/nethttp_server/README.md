@@ -14,6 +14,7 @@ This example shows a bundle-based go-oversync server built with the standard Go 
 - `DELETE /sync/push-sessions/{push_id}`
 - `GET /sync/committed-bundles/{bundle_seq}/rows`
 - `GET /sync/pull`
+- `GET /sync/watch`
 - `POST /sync/snapshot-sessions`
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
@@ -25,6 +26,7 @@ This example shows a bundle-based go-oversync server built with the standard Go 
 
 - Business tables are authoritative.
 - Sync history is captured from committed business-table effects.
+- `/sync/watch` is enabled as an optional wake-up hint; `/sync/pull` remains authoritative.
 - For server-originated writes, prefer `oversync.ScopeManager.ExecWrite(...)` as the convenience
   API; `WithinSyncBundle(...)` remains available for lower-level callers.
 - The supported push transport is staged push sessions plus authoritative committed-bundle fetch.

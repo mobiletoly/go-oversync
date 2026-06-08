@@ -52,6 +52,15 @@ Diagnostics:
 `SourceInfo` is debug-only. `CurrentSourceID` is opaque and must not be treated as a host-managed
 lifecycle surface.
 
+## Optional Watch Wakeups
+
+`Config.BundleChangeWatchMode` defaults to `BundleChangeWatchOff`. Set
+`BundleChangeWatchAuto` to let `Start(ctx)` use `/sync/watch` only when the server advertises
+`bundle_change_watch=true`.
+
+Watch events are wake-up hints only. `oversqlite` still applies data through `Sync(ctx)`,
+`PullToStable(ctx)`, and snapshot recovery; the watch stream never mutates SQLite directly.
+
 ## Preconditions
 
 Require no prior lifecycle step:

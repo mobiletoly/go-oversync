@@ -315,8 +315,19 @@ func (c *Client) applyAuthenticatedSyncHeaders(httpReq *http.Request, token stri
 	if httpReq == nil {
 		return
 	}
+	sourceID := ""
+	if c != nil {
+		sourceID = c.sourceID
+	}
+	applyAuthenticatedSyncHeadersWithSourceID(httpReq, token, sourceID)
+}
+
+func applyAuthenticatedSyncHeadersWithSourceID(httpReq *http.Request, token string, sourceID string) {
+	if httpReq == nil {
+		return
+	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
-	sourceID := strings.TrimSpace(c.sourceID)
+	sourceID = strings.TrimSpace(sourceID)
 	if sourceID != "" {
 		httpReq.Header.Set(oversync.SourceIDHeader, sourceID)
 	}

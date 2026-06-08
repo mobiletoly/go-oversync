@@ -15,6 +15,7 @@ Endpoints
 - `DELETE /sync/push-sessions/{push_id}`
 - `GET /sync/committed-bundles/{bundle_seq}/rows`
 - `GET /sync/pull`
+- `GET /sync/watch`
 - `POST /sync/snapshot-sessions`
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
@@ -46,6 +47,8 @@ Client settings
 - Base URL: `http://localhost:8080` (desktop/iOS) or `http://10.0.2.2:8080` (Android emulator)
 - Schema: `business`
 - Send `Oversync-Source-ID: <current-source-id>` on authenticated `/sync/*` requests
+- `/sync/watch` is available as an optional wake-up stream; clients still pull data through
+  `/sync/pull`
 - Call `POST /sync/connect` after local `Open()` to resolve
   `remote_authoritative`, `initialize_local`, `initialize_empty`, or `retry_later`
 - Expect lifecycle-related sync failures:

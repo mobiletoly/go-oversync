@@ -17,6 +17,9 @@ the CLI as partial scaffolds. This README distinguishes the two.
 - supported FK graphs in the example schema converge across devices
 - canonical binary wire payloads survive end-to-end sync for `files` and `file_reviews`
 - server-originated writes and cascades are visible as committed bundle outcomes
+- watch-mode regression tests prove default clients do not open `/sync/watch`, opt-in clients can
+  use it as a wake-up stream, and a nethttp-backed peer push wakes a watching client through normal
+  pull
 - after `Detach()`, offline local writes are still captured immediately and show up in the pending
   badge before the next sign-in
 
@@ -53,6 +56,15 @@ cd examples/mobile_flow
 go run . --scenario=fresh-install
 go run . --scenario=multi-device-sync
 go run . --scenario=files-sync
+go run . --scenario=typed-rows
+go run . --scenario=watch-all
+go run . --scenario=watch-peer-push
+go run . --scenario=watch-server-originated
+go run . --scenario=watch-reconnect-catch-up
+go run . --scenario=watch-default-off
+go run . --scenario=watch-server-unsupported-fallback
+go run . --scenario=watch-idle-cleanup
+go run . --scenario=watch-many-clients-converge
 go run . --scenario=bundle-fk-atomicity
 go run . --scenario=complex-multi-batch --cleanup=true --verbose
 go run . --scenario=all
@@ -91,6 +103,31 @@ Useful flags:
     timestamp strings in SQLite `TEXT` columns
 - `files-sync`
   - narrow BLOB-focused scenario for quick debugging of `files` / `file_reviews`
+- `typed-rows`
+  - narrow scalar/nullability scenario for quick debugging of `typed_rows`
+- `watch-peer-push`
+  - starts a watch-enabled client, pushes from a peer client, and asserts the watcher converges
+    through normal pull before the low-frequency fallback poll interval
+- `watch-server-originated`
+  - commits a `ScopeManager.ExecWrite(...)` bundle from the simulator process and asserts the
+    launched `nethttp_server` watch endpoint wakes the client through PostgreSQL `NOTIFY`
+- `watch-reconnect-catch-up`
+  - disconnects a watcher, pushes from a peer, reconnects with `after_bundle_seq`, and asserts
+    immediate durable catch-up through normal pull
+- `watch-default-off`
+  - runs through a counting proxy to prove default clients never open `/sync/watch` while still
+    converging through polling
+- `watch-server-unsupported-fallback`
+  - rewrites `/sync/capabilities` through a local proxy to advertise watch as unsupported and
+    proves watch-auto clients keep syncing through polling without opening `/sync/watch`
+- `watch-idle-cleanup`
+  - opens an idle watch stream, cancels it without a data event, and verifies the server-side
+    process-local subscriber count returns to zero
+- `watch-many-clients-converge`
+  - starts many watch-enabled clients for one scope, commits a peer push, and verifies every
+    watcher reaches the expected row state and `last_bundle_seq_seen`
+- `watch-all`
+  - runs all implemented real watch scenarios against the configured server
 
 ## Partially Scaffolded Scenario Names
 

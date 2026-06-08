@@ -30,6 +30,22 @@ func GetScenario(simulator *Simulator, scenarioName string) Scenario {
 		return NewMultiDeviceComplexScenario(simulator)
 	case "files-sync":
 		return NewFilesSyncScenario(simulator)
+	case "typed-rows":
+		return NewTypedRowsScenario(simulator)
+	case "watch-peer-push":
+		return NewWatchPeerPushScenario(simulator)
+	case "watch-server-originated":
+		return NewWatchServerOriginatedScenario(simulator)
+	case "watch-reconnect-catch-up":
+		return NewWatchReconnectCatchUpScenario(simulator)
+	case "watch-default-off":
+		return NewWatchDefaultOffScenario(simulator)
+	case "watch-server-unsupported-fallback":
+		return NewWatchServerUnsupportedFallbackScenario(simulator)
+	case "watch-idle-cleanup":
+		return NewWatchIdleCleanupScenario(simulator)
+	case "watch-many-clients-converge":
+		return NewWatchManyClientsConvergeScenario(simulator)
 	default:
 		return nil
 	}
@@ -50,5 +66,13 @@ func GetAvailableScenarios() []string {
 		"multi-device-sync",
 		"multi-device-complex",
 		"files-sync",
+		"typed-rows",
+		"watch-peer-push",
+		"watch-server-originated",
+		"watch-reconnect-catch-up",
+		"watch-default-off",
+		"watch-server-unsupported-fallback",
+		"watch-idle-cleanup",
+		"watch-many-clients-converge",
 	}
 }

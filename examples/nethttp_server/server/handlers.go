@@ -149,11 +149,11 @@ CREATE TABLE IF NOT EXISTS %s (
 	id UUID NOT NULL,
 	review TEXT NOT NULL,
 	file_id UUID NOT NULL,
-	PRIMARY KEY (_sync_scope_id, id),
-	CONSTRAINT file_reviews_file_id_fkey
-		FOREIGN KEY (_sync_scope_id, file_id) REFERENCES %s(_sync_scope_id, id) DEFERRABLE INITIALLY DEFERRED
-)
-`, fileReviewsTable, filesTable)); err != nil {
+		PRIMARY KEY (_sync_scope_id, id),
+		CONSTRAINT file_reviews_file_id_fkey
+			FOREIGN KEY (_sync_scope_id, file_id) REFERENCES %s(_sync_scope_id, id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+	)
+	`, fileReviewsTable, filesTable)); err != nil {
 			return fmt.Errorf("failed to create file_reviews table: %w", err)
 		}
 

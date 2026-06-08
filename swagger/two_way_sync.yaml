@@ -480,6 +480,76 @@ paths:
         '500':
           description: Server error
 
+  /sync/watch:
+    get:
+      summary: Watch for committed bundle wakeups
+      description: |
+        Opens a Server-Sent Events stream that emits metadata-only wake-up hints when the
+        authenticated scope has newer committed bundles. The stream is not a data delivery path:
+        clients must call `/sync/pull` or existing sync operations to fetch authoritative data.
+        Heartbeat comments keep idle connections observable and allow stale subscribers to be
+        cleaned up.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceIDHeader'
+        - name: after_bundle_seq
+          in: query
+          required: false
+          description: Last durable bundle checkpoint known by the client. Missing means 0.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: SSE stream of `bundle` events and heartbeat comments.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                bundle:
+                  value: |
+                    event: bundle
+                    data: {"bundle_seq":124,"source_id":"device-a","source_bundle_id":7}
+
+                    : heartbeat
+
+        '400':
+          description: Invalid `after_bundle_seq` (`invalid_request`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Watch is disabled for this authenticated actor/source (`bundle_change_watch_forbidden`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Scope is uninitialized or initializing (`scope_uninitialized` or `scope_initializing`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Bundle change watch is disabled (`bundle_change_watch_disabled`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Unexpected watch setup failure (`bundle_change_watch_failed`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /sync/snapshot-sessions:
     post:
       summary: Create frozen snapshot session
@@ -1060,6 +1130,21 @@ components:
           items:
             type: string
 
+    BundleChangeEvent:
+      type: object
+      required: [bundle_seq]
+      description: Metadata-only SSE bundle wake-up event. Clients must use normal pull/sync operations for data.
+      properties:
+        bundle_seq:
+          type: integer
+          format: int64
+          minimum: 1
+        source_id:
+          type: string
+        source_bundle_id:
+          type: integer
+          format: int64
+
     CapabilitiesResponse:
       type: object
       required: [protocol_version, schema_version, features]
@@ -1081,6 +1166,7 @@ components:
             $ref: '#/components/schemas/RegisteredTableSpec'
         features:
           type: object
+          description: Feature flags for the sync protocol. When capabilities are requested with authenticated sync actor context, `bundle_change_watch` may reflect actor/source-specific watch policy.
           additionalProperties:
             type: boolean
           example:
@@ -1090,6 +1176,7 @@ components:
             snapshot_chunking: true
             connect_lifecycle: true
             history_pruned_errors: true
+            bundle_change_watch: false
             registered_write_rejection_enforced: true
             accepted_push_replay_visibility: true
             committed_bundle_visibility: true

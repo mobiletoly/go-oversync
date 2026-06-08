@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +34,21 @@ type pushSessionFixtureOptions struct {
 	pushSessionTTL                     time.Duration
 	defaultRowsPerCommittedBundleChunk int
 	maxRowsPerCommittedBundleChunk     int
+}
+
+type pushSessionStressUser struct {
+	id      uuid.UUID
+	name    string
+	email   string
+	version int64
+	live    bool
+}
+
+type pushSessionStressExpectedRow struct {
+	id    uuid.UUID
+	op    string
+	name  string
+	email string
 }
 
 func newPushSessionFixture(t *testing.T, ctx context.Context, opts pushSessionFixtureOptions) *pushSessionFixture {
@@ -78,6 +95,32 @@ func (f *pushSessionFixture) userRow(id uuid.UUID, name string) PushRequestRow {
 			name,
 			strings.ToLower(name),
 		)),
+	}
+}
+
+func (f *pushSessionFixture) updateUserRow(id uuid.UUID, name string, baseRowVersion int64) PushRequestRow {
+	return PushRequestRow{
+		Schema:         f.schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": id.String()},
+		Op:             OpUpdate,
+		BaseRowVersion: baseRowVersion,
+		Payload: json.RawMessage(fmt.Sprintf(
+			`{"id":"%s","name":"%s","email":"%s@example.com"}`,
+			id,
+			name,
+			strings.ToLower(name),
+		)),
+	}
+}
+
+func (f *pushSessionFixture) deleteUserRow(id uuid.UUID, baseRowVersion int64) PushRequestRow {
+	return PushRequestRow{
+		Schema:         f.schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": id.String()},
+		Op:             OpDelete,
+		BaseRowVersion: baseRowVersion,
 	}
 }
 
@@ -186,6 +229,310 @@ func (f *pushSessionFixture) committedBundleStoredKeys(t *testing.T, ctx context
 	}
 	require.NoError(t, rows.Err())
 	return keys
+}
+
+func TestPushSessions_BatchedInsertsPreserveUploadedRowOrder(t *testing.T) {
+	ctx := context.Background()
+	f := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	lowID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	highID := uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+	createResp := f.createSession(t, ctx, 1, 2)
+	f.uploadChunk(
+		t,
+		ctx,
+		createResp.PushID,
+		0,
+		f.userRow(highID, "Grace"),
+		f.userRow(lowID, "Ada"),
+	)
+	commitResp := f.commitSession(t, ctx, createResp.PushID)
+	chunk, err := f.svc.GetCommittedBundleRows(ctx, f.reader, commitResp.BundleSeq, nil, 10)
+
+	require.NoError(t, err)
+	require.Len(t, chunk.Rows, 2)
+	require.Equal(t, highID.String(), chunk.Rows[0].Key["id"])
+	require.Equal(t, lowID.String(), chunk.Rows[1].Key["id"])
+	require.Equal(t, OpInsert, chunk.Rows[0].Op)
+	require.Equal(t, OpInsert, chunk.Rows[1].Op)
+	require.Equal(t, int64(1), chunk.NextRowOrdinal)
+	require.False(t, chunk.HasMore)
+}
+
+func TestPushSessions_BatchedUpdatesPreserveUploadedRowOrder(t *testing.T) {
+	ctx := context.Background()
+	f := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	lowID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	highID := uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+	createResp := f.createSession(t, ctx, 1, 2)
+	f.uploadChunk(
+		t,
+		ctx,
+		createResp.PushID,
+		0,
+		f.userRow(lowID, "Ada"),
+		f.userRow(highID, "Grace"),
+	)
+	f.commitSession(t, ctx, createResp.PushID)
+
+	updateResp := f.createSession(t, ctx, 2, 2)
+	f.uploadChunk(
+		t,
+		ctx,
+		updateResp.PushID,
+		0,
+		f.updateUserRow(highID, "Grace Updated", 1),
+		f.updateUserRow(lowID, "Ada Updated", 1),
+	)
+	commitResp := f.commitSession(t, ctx, updateResp.PushID)
+	chunk, err := f.svc.GetCommittedBundleRows(ctx, f.reader, commitResp.BundleSeq, nil, 10)
+
+	require.NoError(t, err)
+	require.Len(t, chunk.Rows, 2)
+	require.Equal(t, highID.String(), chunk.Rows[0].Key["id"])
+	require.Equal(t, lowID.String(), chunk.Rows[1].Key["id"])
+	require.Equal(t, OpUpdate, chunk.Rows[0].Op)
+	require.Equal(t, OpUpdate, chunk.Rows[1].Op)
+	require.Equal(t, int64(1), chunk.NextRowOrdinal)
+	require.False(t, chunk.HasMore)
+}
+
+func TestPushSessions_BatchedDeletesPreserveUploadedRowOrder(t *testing.T) {
+	ctx := context.Background()
+	f := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	lowID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	highID := uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+	createResp := f.createSession(t, ctx, 1, 2)
+	f.uploadChunk(
+		t,
+		ctx,
+		createResp.PushID,
+		0,
+		f.userRow(lowID, "Ada"),
+		f.userRow(highID, "Grace"),
+	)
+	f.commitSession(t, ctx, createResp.PushID)
+
+	deleteResp := f.createSession(t, ctx, 2, 2)
+	f.uploadChunk(
+		t,
+		ctx,
+		deleteResp.PushID,
+		0,
+		f.deleteUserRow(highID, 1),
+		f.deleteUserRow(lowID, 1),
+	)
+	commitResp := f.commitSession(t, ctx, deleteResp.PushID)
+	chunk, err := f.svc.GetCommittedBundleRows(ctx, f.reader, commitResp.BundleSeq, nil, 10)
+
+	require.NoError(t, err)
+	require.Len(t, chunk.Rows, 2)
+	require.Equal(t, highID.String(), chunk.Rows[0].Key["id"])
+	require.Equal(t, lowID.String(), chunk.Rows[1].Key["id"])
+	require.Equal(t, int64(1), chunk.NextRowOrdinal)
+	require.False(t, chunk.HasMore)
+}
+
+func TestPushSessions_MixedOperationStressPreservesCommittedOrderAndState(t *testing.T) {
+	ctx := context.Background()
+
+	for seed := int64(1); seed <= 5; seed++ {
+		t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
+			f := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+			rng := rand.New(rand.NewSource(seed))
+			model := make(map[uuid.UUID]*pushSessionStressUser)
+			nextID := int(seed * 100_000)
+			nextBundleID := int64(1)
+
+			for bundleIndex := 0; bundleIndex < 30; bundleIndex++ {
+				rows, expectedRows := buildMixedOperationStressBundle(t, f, rng, model, seed, bundleIndex, &nextID)
+				session := f.createSession(t, ctx, nextBundleID, int64(len(rows)))
+				f.uploadChunk(t, ctx, session.PushID, 0, rows...)
+				commitResp := f.commitSession(t, ctx, session.PushID)
+				chunk, err := f.svc.GetCommittedBundleRows(ctx, f.reader, commitResp.BundleSeq, nil, len(rows)+5)
+				require.NoError(t, err, "seed=%d bundle=%d", seed, bundleIndex)
+				require.Len(t, chunk.Rows, len(expectedRows), "seed=%d bundle=%d", seed, bundleIndex)
+				require.Equal(t, int64(len(expectedRows)-1), chunk.NextRowOrdinal, "seed=%d bundle=%d", seed, bundleIndex)
+				require.False(t, chunk.HasMore, "seed=%d bundle=%d", seed, bundleIndex)
+
+				for rowIndex, expected := range expectedRows {
+					actual := chunk.Rows[rowIndex]
+					require.Equal(t, expected.id.String(), actual.Key["id"], "seed=%d bundle=%d row=%d", seed, bundleIndex, rowIndex)
+					require.Equal(t, expected.op, actual.Op, "seed=%d bundle=%d row=%d", seed, bundleIndex, rowIndex)
+					if expected.op == OpDelete {
+						require.Empty(t, actual.Payload, "seed=%d bundle=%d row=%d", seed, bundleIndex, rowIndex)
+					} else {
+						var payload map[string]any
+						require.NoError(t, json.Unmarshal(actual.Payload, &payload), "seed=%d bundle=%d row=%d", seed, bundleIndex, rowIndex)
+						require.Equal(t, expected.id.String(), payload["id"], "seed=%d bundle=%d row=%d", seed, bundleIndex, rowIndex)
+						require.Equal(t, expected.name, payload["name"], "seed=%d bundle=%d row=%d", seed, bundleIndex, rowIndex)
+						require.Equal(t, expected.email, payload["email"], "seed=%d bundle=%d row=%d", seed, bundleIndex, rowIndex)
+					}
+				}
+
+				applyMixedOperationStressBundle(model, expectedRows, commitResp.BundleSeq)
+				nextBundleID++
+			}
+
+			assertMixedOperationStressBusinessState(t, ctx, f, model)
+		})
+	}
+}
+
+func buildMixedOperationStressBundle(
+	t *testing.T,
+	f *pushSessionFixture,
+	rng *rand.Rand,
+	model map[uuid.UUID]*pushSessionStressUser,
+	seed int64,
+	bundleIndex int,
+	nextID *int,
+) ([]PushRequestRow, []pushSessionStressExpectedRow) {
+	t.Helper()
+
+	targetRowCount := 1 + rng.Intn(8)
+	used := make(map[uuid.UUID]struct{}, targetRowCount)
+	rows := make([]PushRequestRow, 0, targetRowCount)
+	expectedRows := make([]pushSessionStressExpectedRow, 0, targetRowCount)
+
+	for len(rows) < targetRowCount {
+		liveIDs := pushSessionStressCandidateIDs(model, used, true)
+		deletedIDs := pushSessionStressCandidateIDs(model, used, false)
+		op := OpInsert
+		switch roll := rng.Intn(100); {
+		case len(liveIDs) == 0:
+			op = OpInsert
+		case roll < 35:
+			op = OpUpdate
+		case roll < 65:
+			op = OpDelete
+		default:
+			op = OpInsert
+		}
+
+		rowIndex := len(rows)
+		name := fmt.Sprintf("Seed%dBundle%dRow%d", seed, bundleIndex, rowIndex)
+		email := strings.ToLower(name) + "@example.com"
+		switch op {
+		case OpInsert:
+			var id uuid.UUID
+			baseRowVersion := int64(0)
+			if len(deletedIDs) > 0 && rng.Intn(4) == 0 {
+				id = deletedIDs[rng.Intn(len(deletedIDs))]
+				baseRowVersion = model[id].version
+			} else {
+				(*nextID)++
+				id = pushSessionStressUUID(*nextID)
+			}
+			row := f.userRow(id, name)
+			row.BaseRowVersion = baseRowVersion
+			rows = append(rows, row)
+			expectedRows = append(expectedRows, pushSessionStressExpectedRow{id: id, op: OpInsert, name: name, email: email})
+			used[id] = struct{}{}
+		case OpUpdate:
+			id := liveIDs[rng.Intn(len(liveIDs))]
+			rows = append(rows, f.updateUserRow(id, name, model[id].version))
+			expectedRows = append(expectedRows, pushSessionStressExpectedRow{id: id, op: OpUpdate, name: name, email: email})
+			used[id] = struct{}{}
+		case OpDelete:
+			id := liveIDs[rng.Intn(len(liveIDs))]
+			rows = append(rows, f.deleteUserRow(id, model[id].version))
+			expectedRows = append(expectedRows, pushSessionStressExpectedRow{id: id, op: OpDelete})
+			used[id] = struct{}{}
+		default:
+			t.Fatalf("unexpected stress op %q", op)
+		}
+	}
+
+	return rows, expectedRows
+}
+
+func pushSessionStressCandidateIDs(
+	model map[uuid.UUID]*pushSessionStressUser,
+	used map[uuid.UUID]struct{},
+	live bool,
+) []uuid.UUID {
+	ids := make([]uuid.UUID, 0)
+	for id, row := range model {
+		if row.live != live {
+			continue
+		}
+		if _, ok := used[id]; ok {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return ids[i].String() < ids[j].String()
+	})
+	return ids
+}
+
+func pushSessionStressUUID(n int) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("00000000-0000-0000-0000-%012x", n))
+}
+
+func applyMixedOperationStressBundle(
+	model map[uuid.UUID]*pushSessionStressUser,
+	rows []pushSessionStressExpectedRow,
+	bundleSeq int64,
+) {
+	for _, row := range rows {
+		state := model[row.id]
+		if state == nil {
+			state = &pushSessionStressUser{id: row.id}
+			model[row.id] = state
+		}
+		state.version = bundleSeq
+		if row.op == OpDelete {
+			state.live = false
+			continue
+		}
+		state.live = true
+		state.name = row.name
+		state.email = row.email
+	}
+}
+
+func assertMixedOperationStressBusinessState(
+	t *testing.T,
+	ctx context.Context,
+	f *pushSessionFixture,
+	model map[uuid.UUID]*pushSessionStressUser,
+) {
+	t.Helper()
+
+	expected := make(map[string]pushSessionStressUser)
+	for _, row := range model {
+		if row.live {
+			expected[row.id.String()] = *row
+		}
+	}
+
+	rows, err := f.pool.Query(ctx, fmt.Sprintf(`
+		SELECT id::text, name, email
+		FROM %s.users
+		WHERE _sync_scope_id = $1
+		ORDER BY id
+	`, pgx.Identifier{f.schemaName}.Sanitize()), f.writer.UserID)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	actual := make(map[string]pushSessionStressUser)
+	for rows.Next() {
+		var id string
+		var row pushSessionStressUser
+		require.NoError(t, rows.Scan(&id, &row.name, &row.email))
+		actual[id] = row
+	}
+	require.NoError(t, rows.Err())
+
+	require.Len(t, actual, len(expected))
+	for id, expectedRow := range expected {
+		actualRow, ok := actual[id]
+		require.True(t, ok, "missing live row %s", id)
+		require.Equal(t, expectedRow.name, actualRow.name, "name for %s", id)
+		require.Equal(t, expectedRow.email, actualRow.email, "email for %s", id)
+	}
 }
 
 func insertPreparedPushSessionRow(

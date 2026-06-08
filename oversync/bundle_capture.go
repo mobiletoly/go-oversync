@@ -324,6 +324,13 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 	`, userPK, bundleSeq, source.SourceID, source.SourceBundleID, len(bundleRows), byteCount, bundleHash); err != nil {
 		return nil, fmt.Errorf("insert bundle_log row: %w", err)
 	}
+	if err := s.emitBundleChangeNotify(ctx, tx, userPK, BundleChangeEvent{
+		BundleSeq:      bundleSeq,
+		SourceID:       source.SourceID,
+		SourceBundleID: source.SourceBundleID,
+	}); err != nil {
+		return nil, err
+	}
 
 	if err := persistCommittedBundleRows(ctx, tx, userPK, bundleSeq, storageRows); err != nil {
 		return nil, err

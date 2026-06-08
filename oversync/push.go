@@ -478,13 +478,10 @@ func applyPreparedPushRowBatch(ctx context.Context, tx pgx.Tx, ownerUserID strin
 }
 
 func applyPreparedDeleteBatch(ctx context.Context, tx pgx.Tx, ownerUserID string, rows []pushPreparedRow) error {
-	tableIdent := pgx.Identifier{rows[0].schema, rows[0].table}.Sanitize()
-	keyColumnIdent := pgx.Identifier{rows[0].keyColumn}.Sanitize()
-	ownerColumnIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
-
-	stmt := fmt.Sprintf(`DELETE FROM %s WHERE %s = $1 AND %s = ANY($2)`, tableIdent, ownerColumnIdent, keyColumnIdent)
-	if _, err := tx.Exec(ctx, stmt, ownerUserID, syncKeyArray(rows)); err != nil {
-		return fmt.Errorf("delete batch %s.%s (%d rows): %w", rows[0].schema, rows[0].table, len(rows), err)
+	for _, row := range rows {
+		if err := applyPreparedPushRow(ctx, tx, ownerUserID, row); err != nil {
+			return fmt.Errorf("delete batch %s.%s (%d rows): %w", rows[0].schema, rows[0].table, len(rows), err)
+		}
 	}
 	return nil
 }

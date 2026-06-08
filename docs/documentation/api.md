@@ -309,6 +309,37 @@ Failure contract:
 - `409 scope_uninitialized`
 - `409 scope_initializing`
 
+## GET `/sync/watch`
+
+Open an optional Server-Sent Events stream for metadata-only bundle wakeups.
+
+Query:
+
+- `after_bundle_seq` (optional, defaults to `0`)
+
+Event:
+
+```text
+event: bundle
+data: {"bundle_seq":157,"source_id":"device-a","source_bundle_id":9}
+```
+
+Notes:
+
+- `/sync/watch` is only a wake-up hint; clients must still call `/sync/pull` or existing sync
+  operations to receive authoritative data
+- heartbeat comments such as `: heartbeat` keep idle connections observable and clean up stale
+  subscribers
+- events can coalesce; clients must not expect one event per committed bundle
+
+Failure contract:
+
+- `400 invalid_request`
+- `401 authentication_failed`
+- `409 scope_uninitialized`
+- `409 scope_initializing`
+- `503 bundle_change_watch_disabled`
+
 ## POST `/sync/snapshot-sessions`
 
 Create one frozen snapshot session for hydration or destructive recovery.
@@ -431,6 +462,7 @@ Important feature flags:
 - `committed_bundle_row_fetch`
 - `snapshot_chunking`
 - `history_pruned_errors`
+- `bundle_change_watch`
 
 Important bundle limit fields:
 

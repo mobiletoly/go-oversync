@@ -253,16 +253,25 @@ type SyncTable struct {
 	SyncKeyColumns    []string // Ordered sync key columns for the bundle-based runtime
 }
 
+type BundleChangeWatchMode string
+
+const (
+	BundleChangeWatchOff  BundleChangeWatchMode = "off"
+	BundleChangeWatchAuto BundleChangeWatchMode = "auto"
+)
+
 // Config holds configuration for the SQLite sync client
 type Config struct {
-	Schema            string        // e.g., "app"
-	Tables            []SyncTable   // Table configurations with explicit primary key columns
-	UploadLimit       int           // e.g., 200 rows per push chunk
-	DownloadLimit     int           // e.g., 1000
-	SnapshotChunkRows int           // e.g., 1000
-	BackoffMin        time.Duration // 1s
-	BackoffMax        time.Duration // 60s
-	RetryPolicy       *RetryPolicy  // nil => conservative built-in retry policy; explicit disabled policy turns retries off
+	Schema                string                // e.g., "app"
+	Tables                []SyncTable           // Table configurations with explicit primary key columns
+	UploadLimit           int                   // e.g., 200 rows per push chunk
+	DownloadLimit         int                   // e.g., 1000
+	SnapshotChunkRows     int                   // e.g., 1000
+	BackoffMin            time.Duration         // 1s
+	BackoffMax            time.Duration         // 60s
+	RetryPolicy           *RetryPolicy          // nil => conservative built-in retry policy; explicit disabled policy turns retries off
+	BundleChangeWatchMode BundleChangeWatchMode // off by default; auto uses /sync/watch only when advertised by server
+	WatchFallbackInterval time.Duration         // 0 => BackoffMax, or 60s when BackoffMax is unset
 }
 
 // DefaultConfig returns a default configuration for the specified tables.
@@ -270,13 +279,14 @@ type Config struct {
 // Each table must also declare SyncKeyColumnName explicitly.
 func DefaultConfig(schema string, tables []SyncTable) *Config {
 	return &Config{
-		Schema:            schema,
-		Tables:            tables,
-		UploadLimit:       1000,
-		DownloadLimit:     1000,
-		SnapshotChunkRows: 1000,
-		BackoffMin:        1 * time.Second,
-		BackoffMax:        60 * time.Second,
+		Schema:                schema,
+		Tables:                tables,
+		UploadLimit:           1000,
+		DownloadLimit:         1000,
+		SnapshotChunkRows:     1000,
+		BackoffMin:            1 * time.Second,
+		BackoffMax:            60 * time.Second,
+		BundleChangeWatchMode: BundleChangeWatchOff,
 	}
 }
 
@@ -958,7 +968,7 @@ func (c *Client) Start(ctx context.Context) error {
 	go c.uploaderLoop(ctx)
 
 	// Start downloader goroutine
-	go c.downloaderLoop(ctx)
+	go c.startDownloaderLoop(ctx)
 
 	return nil
 }

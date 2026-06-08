@@ -16,6 +16,8 @@ bundle replay, and snapshot rebuilds.
 - trigger capture into `sync.bundle_capture_stage`
 - bundle finalization into `sync.bundle_log` and `sync.bundle_rows`
 - `GET /sync/pull` pagination by bundle count
+- optional `GET /sync/watch` heartbeat interval and subscriber count when bundle-change watch is
+  enabled
 - chunked snapshot-session rebuild size and retained-floor policy
 
 The server storage layout keeps hot row-bearing tables compact: registered tables are represented
@@ -28,6 +30,8 @@ runtime around those access paths rather than repeated wire-facing schema/table/
 - durable replay of accepted push bundles
 - durable replay of pulled bundles
 - snapshot rebuild time for hydrate/recover
+- optional bundle-change watch streams as wake-up hints; authoritative download cost still belongs
+  to `PullToStable()` / `Sync()`
 
 ## Guardrails
 

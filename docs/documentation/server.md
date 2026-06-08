@@ -21,6 +21,7 @@ The server treats registered PostgreSQL business tables as authoritative state.
 - staged push-session creation, chunk upload, and commit
 - committed bundle capture from business-table transactions
 - pull and snapshot serving
+- optional process-local bundle change watch fanout backed by PostgreSQL `LISTEN`/`NOTIFY`
 - source sequencing, retirement, and retained-history enforcement
 
 ## Runtime Tables
@@ -106,6 +107,16 @@ Pull and committed-bundle replay are only guaranteed above `retained_bundle_floo
 below that floor are outside the retained-history contract even if physical pruning has not deleted
 them yet. Snapshot creation reads live business tables plus `sync.row_state` from one PostgreSQL
 transaction snapshot and fails closed if they disagree.
+
+### Bundle Change Watch
+
+Servers can opt in to `BundleChangeWatch` to expose `GET /sync/watch`. Each process owns one
+PostgreSQL listener connection plus a process-local subscriber hub. Bundle commits emit a small
+`NOTIFY` payload inside the same transaction as `sync.bundle_log`; PostgreSQL delivers it only on
+commit.
+
+Watch events are not data delivery. They wake clients so they can run normal pull/sync paths.
+`GET /sync/pull`, `sync.bundle_log`, and client checkpoints remain authoritative.
 
 ## Server-Originated Writes
 

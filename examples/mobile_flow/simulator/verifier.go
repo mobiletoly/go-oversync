@@ -89,6 +89,51 @@ func (v *DatabaseVerifier) CountOrphanedReviews() (int, error) {
 	return count, nil
 }
 
+// VerifyTypedRowsForUser checks the typed_rows values used by the typed-rows scenario.
+func (v *DatabaseVerifier) VerifyTypedRowsForUser(ctx context.Context, userID string) error {
+	var nullMatches int
+	nullQuery := `
+		SELECT COUNT(*)
+		FROM business.typed_rows
+		WHERE _sync_scope_id = $1
+		  AND id = 'typed-null'
+		  AND name = 'Typed Null'
+		  AND note IS NULL
+		  AND count_value IS NULL
+		  AND enabled_flag = 0
+		  AND rating IS NULL
+		  AND data IS NULL
+		  AND created_at IS NULL`
+	if err := v.pool.QueryRow(ctx, nullQuery, userID).Scan(&nullMatches); err != nil {
+		return fmt.Errorf("failed to verify null typed row: %w", err)
+	}
+	if nullMatches != 1 {
+		return fmt.Errorf("expected null typed row to match exactly, got %d matches", nullMatches)
+	}
+
+	var richMatches int
+	richQuery := `
+		SELECT COUNT(*)
+		FROM business.typed_rows
+		WHERE _sync_scope_id = $1
+		  AND id = 'typed-rich'
+		  AND name = 'Typed Rich'
+		  AND note = 'second-device'
+		  AND count_value = 42
+		  AND enabled_flag = 1
+		  AND abs(rating - 1.25) < 0.000001
+		  AND encode(data, 'hex') = 'cafebabe'
+		  AND created_at = '2026-03-24T18:42:11Z'::timestamptz`
+	if err := v.pool.QueryRow(ctx, richQuery, userID).Scan(&richMatches); err != nil {
+		return fmt.Errorf("failed to verify rich typed row: %w", err)
+	}
+	if richMatches != 1 {
+		return fmt.Errorf("expected rich typed row to match exactly, got %d matches", richMatches)
+	}
+
+	return nil
+}
+
 // CountUserRecords counts records in a specific table for a specific user
 func (v *DatabaseVerifier) CountUserRecords(ctx context.Context, tableName string, userID string) (int, error) {
 	var count int

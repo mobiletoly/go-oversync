@@ -148,6 +148,7 @@ package main
 
 import (
     "context"
+    "errors"
     "log"
     "log/slog"
     "net/http"
@@ -174,6 +175,7 @@ func main() {
             {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
             {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
         },
+        BundleChangeWatch: oversync.BundleChangeWatchConfig{Enabled: true},
     }
 
     svc, err := oversync.NewRuntimeService(pool, cfg, logger)
@@ -183,6 +185,13 @@ func main() {
     if err := svc.Bootstrap(ctx); err != nil {
         log.Fatal(err)
     }
+    listenerCtx, stopListener := context.WithCancel(ctx)
+    defer stopListener()
+    go func() {
+        if err := svc.RunBundleChangeListener(listenerCtx); err != nil && !errors.Is(err, context.Canceled) {
+            logger.Error("bundle change listener stopped", "error", err)
+        }
+    }()
 
     handlers := oversync.NewHTTPSyncHandlers(svc, logger)
 
@@ -204,6 +213,7 @@ func main() {
     mux.Handle("DELETE /sync/push-sessions/{push_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeletePushSession)))
     mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", withSyncActor(http.HandlerFunc(handlers.HandleGetCommittedBundleRows)))
     mux.Handle("GET /sync/pull", withSyncActor(http.HandlerFunc(handlers.HandlePull)))
+    mux.Handle("GET /sync/watch", withSyncActor(http.HandlerFunc(handlers.HandleWatch)))
     mux.Handle("POST /sync/snapshot-sessions", withSyncActor(http.HandlerFunc(handlers.HandleCreateSnapshotSession)))
     mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleGetSnapshotChunk)))
     mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeleteSnapshotSession)))
@@ -270,6 +280,7 @@ func main() {
         {TableName: "users", SyncKeyColumnName: "id"},
         {TableName: "posts", SyncKeyColumnName: "id"},
     })
+    cfg.BundleChangeWatchMode = oversqlite.BundleChangeWatchAuto
 
     tokenProvider := func(ctx context.Context) (string, error) {
         return "<jwt>", nil

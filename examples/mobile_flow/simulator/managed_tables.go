@@ -11,5 +11,6 @@ func managedSyncTables() []oversqlite.SyncTable {
 		{TableName: "team_members", SyncKeyColumnName: "id"},
 		{TableName: "files", SyncKeyColumnName: "id"},
 		{TableName: "file_reviews", SyncKeyColumnName: "id"},
+		{TableName: "typed_rows", SyncKeyColumnName: "id"},
 	}
 }

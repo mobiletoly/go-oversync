@@ -36,6 +36,8 @@ const (
 	defaultSnapshotSessionTTL             time.Duration         = 15 * time.Minute
 	defaultRetainedBundlesPerUser         int64                 = 10000
 	defaultRetentionPruneBatchSize        int64                 = 1000
+	defaultBundleChangeNotifyChannel      string                = "oversync_bundle_change_v1"
+	defaultBundleChangeHeartbeatInterval  time.Duration         = 25 * time.Second
 )
 
 var errServiceShuttingDown = errors.New("sync service is shutting down")
@@ -53,6 +55,13 @@ type registeredTableRuntimeInfo struct {
 	syncKeyColumn string
 	syncKeyType   string
 	syncKeyKind   int16
+}
+
+// BundleChangeWatchConfig controls optional process-local bundle change watches.
+type BundleChangeWatchConfig struct {
+	Enabled           bool
+	NotifyChannel     string
+	HeartbeatInterval time.Duration
 }
 
 // RegisteredTable represents a table that is registered for sync operations
@@ -116,6 +125,7 @@ type SyncService struct {
 	pool                *pgxpool.Pool
 	logger              *slog.Logger
 	config              *ServiceConfig
+	bundleChangeHub     *bundleChangeHub
 	registeredTables    map[string]bool // Set of "schema.table" combinations allowed in sync operations
 	registeredTableInfo map[string]registeredTableRuntimeInfo
 	registeredTableByID map[int32]registeredTableRuntimeInfo
@@ -129,6 +139,8 @@ type SyncService struct {
 	lifecycle   serviceLifecycleState
 	inFlightOps int
 	drainedCh   chan struct{}
+	closedCh    chan struct{}
+	closeOnce   sync.Once
 }
 
 // ServiceConfig holds configuration for the sync service
@@ -171,6 +183,41 @@ type ServiceConfig struct {
 	// LogStageTimings logs per-stage timings via the service logger at DEBUG.
 	// Useful for profiling; keep disabled in production.
 	LogStageTimings bool
+
+	// BundleChangeWatch optionally enables metadata-only bundle change wakeups.
+	BundleChangeWatch BundleChangeWatchConfig
+}
+
+func normalizeBundleChangeWatchConfig(cfg BundleChangeWatchConfig) (BundleChangeWatchConfig, error) {
+	if cfg.NotifyChannel == "" {
+		cfg.NotifyChannel = defaultBundleChangeNotifyChannel
+	}
+	if _, err := quotePostgresNotificationChannel(cfg.NotifyChannel); err != nil {
+		return BundleChangeWatchConfig{}, err
+	}
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = defaultBundleChangeHeartbeatInterval
+	}
+	if cfg.Enabled && cfg.HeartbeatInterval <= 0 {
+		return BundleChangeWatchConfig{}, fmt.Errorf("bundle change watch heartbeat interval must be positive when enabled")
+	}
+	return cfg, nil
+}
+
+func (s *SyncService) effectiveBundleChangeWatchConfig() BundleChangeWatchConfig {
+	if s == nil || s.config == nil {
+		cfg, _ := normalizeBundleChangeWatchConfig(BundleChangeWatchConfig{})
+		return cfg
+	}
+	cfg, err := normalizeBundleChangeWatchConfig(s.config.BundleChangeWatch)
+	if err != nil {
+		return s.config.BundleChangeWatch
+	}
+	return cfg
+}
+
+func (s *SyncService) bundleChangeWatchEnabled() bool {
+	return s != nil && s.config != nil && s.config.BundleChangeWatch.Enabled
 }
 
 func (s *SyncService) defaultRowsPerSnapshotChunk() int {
@@ -269,16 +316,23 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 	if logger == nil {
 		logger = slog.Default()
 	}
+	normalizedWatchConfig, err := normalizeBundleChangeWatchConfig(config.BundleChangeWatch)
+	if err != nil {
+		return nil, err
+	}
+	config.BundleChangeWatch = normalizedWatchConfig
 
 	service := &SyncService{
 		pool:                pool,
 		logger:              logger,
 		config:              config,
+		bundleChangeHub:     newBundleChangeHub(),
 		registeredTables:    make(map[string]bool),
 		registeredTableInfo: make(map[string]registeredTableRuntimeInfo),
 		registeredTableByID: make(map[int32]registeredTableRuntimeInfo),
 		columnTypesByTable:  make(map[string]map[string]string),
 		lifecycle:           serviceLifecycleRunning,
+		closedCh:            make(chan struct{}),
 	}
 
 	// Initialize registered tables set and handlers
@@ -556,6 +610,7 @@ func (s *SyncService) Close(ctx context.Context) error {
 	s.mu.Lock()
 	switch s.lifecycle {
 	case serviceLifecycleClosed:
+		s.closeServiceSignalLocked()
 		s.mu.Unlock()
 		return nil
 	case serviceLifecycleRunning:
@@ -563,6 +618,7 @@ func (s *SyncService) Close(ctx context.Context) error {
 		s.lifecycle = serviceLifecycleShuttingDown
 		if s.inFlightOps == 0 {
 			s.lifecycle = serviceLifecycleClosed
+			s.closeServiceSignalLocked()
 			s.mu.Unlock()
 			s.logger.Debug("Sync service shutdown complete")
 			return nil
@@ -573,6 +629,7 @@ func (s *SyncService) Close(ctx context.Context) error {
 	case serviceLifecycleShuttingDown:
 		if s.inFlightOps == 0 {
 			s.lifecycle = serviceLifecycleClosed
+			s.closeServiceSignalLocked()
 			s.mu.Unlock()
 			return nil
 		}
@@ -636,11 +693,39 @@ func (s *SyncService) finishOperation() {
 	}
 	if s.inFlightOps == 0 && s.lifecycle == serviceLifecycleShuttingDown {
 		s.lifecycle = serviceLifecycleClosed
+		s.closeServiceSignalLocked()
 		if s.drainedCh != nil {
 			close(s.drainedCh)
 			s.drainedCh = nil
 		}
 	}
+}
+
+func (s *SyncService) closeServiceSignalLocked() {
+	if s.closedCh == nil {
+		s.closedCh = make(chan struct{})
+	}
+	ch := s.closedCh
+	s.closeOnce.Do(func() {
+		close(ch)
+	})
+}
+
+func (s *SyncService) serviceClosedChannel() <-chan struct{} {
+	if s == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closedCh == nil {
+		s.closedCh = make(chan struct{})
+		if s.lifecycle == serviceLifecycleClosed {
+			s.closeServiceSignalLocked()
+		}
+	}
+	return s.closedCh
 }
 
 func (s *SyncService) lifecycleSnapshot() (serviceLifecycleState, int, bool) {
@@ -816,6 +901,7 @@ func (s *SyncService) GetCapabilities() CapabilitiesResponse {
 		"history_pruned_visibility":           true,
 		"connect_lifecycle":                   true,
 		"scope_initialization_leases":         true,
+		"bundle_change_watch":                 s.bundleChangeWatchEnabled(),
 	}
 
 	tables := make([]string, 0, len(s.config.RegisteredTables))

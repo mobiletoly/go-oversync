@@ -22,7 +22,7 @@ import (
 func main() {
 	// Parse command line flags
 	var (
-		scenarioFlag   = flag.String("scenario", "", "Scenario to run (fresh-install, normal-usage, reinstall, device-replacement, offline-online, conflicts, user-switch, bundle-fk-atomicity, complex-multi-batch, multi-device-sync, multi-device-complex, all)")
+		scenarioFlag   = flag.String("scenario", "", "Scenario to run (fresh-install, normal-usage, reinstall, device-replacement, offline-online, conflicts, user-switch, bundle-fk-atomicity, complex-multi-batch, multi-device-sync, multi-device-complex, files-sync, typed-rows, watch-peer-push, watch-server-originated, watch-reconnect-catch-up, watch-default-off, watch-server-unsupported-fallback, watch-idle-cleanup, watch-many-clients-converge, watch-all, all)")
 		verifyFlag     = flag.Bool("verify", true, "Enable database verification")
 		outputFlag     = flag.String("output", "", "Output report file (JSON)")
 		verboseFlag    = flag.Bool("verbose", false, "Enable verbose logging")
@@ -123,12 +123,22 @@ func runInteractiveMode(ctx context.Context, sim *simulator.Simulator) {
 	fmt.Println("8. Multi-Device Sync    - Two devices sync scenario with ordering fix")
 	fmt.Println("9. Bundle FK Atomicity  - Bundle checkpoints plus self-ref/cycle/cascade FK graphs")
 	fmt.Println("10. Multi-Device Complex - Long mixed ops across two devices, converge")
-	fmt.Println("11. Run All Scenarios   - Complete test suite")
-	fmt.Println("12. Exit")
+	fmt.Println("11. Files Sync          - BLOB primary key sync")
+	fmt.Println("12. Typed Rows          - Nullable, numeric, timestamp, and BLOB typed row sync")
+	fmt.Println("13. Watch Peer Push     - Watch wake-up after peer push")
+	fmt.Println("14. Watch Server Write  - Watch wake-up after ScopeManager write")
+	fmt.Println("15. Watch Reconnect     - Watch reconnect catches up after missed push")
+	fmt.Println("16. Watch Default Off   - Default clients avoid /sync/watch")
+	fmt.Println("17. Watch Unsupported   - Watch-auto falls back to polling")
+	fmt.Println("18. Watch Idle Cleanup  - Idle watcher unregisters on cancel")
+	fmt.Println("19. Watch Many Clients  - Many watchers converge")
+	fmt.Println("20. Run Watch Scenarios - Real watch scenarios over the configured server")
+	fmt.Println("21. Run All Scenarios   - Complete test suite")
+	fmt.Println("22. Exit")
 	fmt.Println()
 
 	for {
-		fmt.Print("Select scenario (1-12): ")
+		fmt.Print("Select scenario (1-22): ")
 		var choice string
 		fmt.Scanln(&choice)
 
@@ -154,23 +164,66 @@ func runInteractiveMode(ctx context.Context, sim *simulator.Simulator) {
 		case "10":
 			runScenario(ctx, sim, "multi-device-complex")
 		case "11":
-			runScenario(ctx, sim, "all")
+			runScenario(ctx, sim, "files-sync")
 		case "12":
+			runScenario(ctx, sim, "typed-rows")
+		case "13":
+			runScenario(ctx, sim, "watch-peer-push")
+		case "14":
+			runScenario(ctx, sim, "watch-server-originated")
+		case "15":
+			runScenario(ctx, sim, "watch-reconnect-catch-up")
+		case "16":
+			runScenario(ctx, sim, "watch-default-off")
+		case "17":
+			runScenario(ctx, sim, "watch-server-unsupported-fallback")
+		case "18":
+			runScenario(ctx, sim, "watch-idle-cleanup")
+		case "19":
+			runScenario(ctx, sim, "watch-many-clients-converge")
+		case "20":
+			runScenario(ctx, sim, "watch-all")
+		case "21":
+			runScenario(ctx, sim, "all")
+		case "22":
 			fmt.Println("👋 Goodbye!")
 			return
 		default:
-			fmt.Println("❌ Invalid choice. Please select 1-12.")
+			fmt.Println("❌ Invalid choice. Please select 1-22.")
 		}
 		fmt.Println()
 	}
 }
 
 func runScenario(ctx context.Context, sim *simulator.Simulator, scenarioName string) error {
+	if scenarioName == "watch-all" {
+		scenarios := []string{
+			"watch-peer-push",
+			"watch-server-originated",
+			"watch-reconnect-catch-up",
+			"watch-default-off",
+			"watch-server-unsupported-fallback",
+			"watch-idle-cleanup",
+			"watch-many-clients-converge",
+		}
+
+		fmt.Printf("🎯 Running all %d watch scenarios...\n\n", len(scenarios))
+		for i, scenario := range scenarios {
+			fmt.Printf("📋 [%d/%d] Running watch scenario: %s\n", i+1, len(scenarios), scenario)
+			if err := sim.RunScenario(ctx, scenario); err != nil {
+				return fmt.Errorf("watch scenario %s failed: %w", scenario, err)
+			}
+			fmt.Printf("✅ [%d/%d] Watch scenario %s completed successfully\n\n", i+1, len(scenarios), scenario)
+		}
+		return nil
+	}
+
 	if scenarioName == "all" {
 		scenarios := []string{
 			"fresh-install", "normal-usage", "reinstall",
 			"device-replacement", "offline-online", "conflicts", "user-switch",
 			"bundle-fk-atomicity", "complex-multi-batch", "multi-device-sync", "multi-device-complex",
+			"files-sync", "typed-rows",
 		}
 
 		fmt.Printf("🎯 Running all %d scenarios...\n\n", len(scenarios))

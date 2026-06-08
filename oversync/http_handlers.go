@@ -4,6 +4,7 @@
 package oversync
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,12 +12,21 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // HTTPSyncHandlers provides HTTP handlers for the two-way sync API
 type HTTPSyncHandlers struct {
-	service *SyncService
-	logger  *slog.Logger
+	service                  *SyncService
+	logger                   *slog.Logger
+	bundleChangeWatchAllowed func(context.Context, Actor) bool
+}
+
+// HTTPSyncHandlersConfig configures HTTP-level sync handler policy.
+type HTTPSyncHandlersConfig struct {
+	// BundleChangeWatchAllowed optionally gates the SSE watch endpoint per actor/source.
+	// Nil allows watch for every actor when the service-level watch feature is enabled.
+	BundleChangeWatchAllowed func(context.Context, Actor) bool
 }
 
 type chunkQueryParams struct {
@@ -26,9 +36,15 @@ type chunkQueryParams struct {
 
 // NewHTTPSyncHandlers creates a new instance of sync handlers
 func NewHTTPSyncHandlers(service *SyncService, logger *slog.Logger) *HTTPSyncHandlers {
+	return NewHTTPSyncHandlersWithConfig(service, logger, HTTPSyncHandlersConfig{})
+}
+
+// NewHTTPSyncHandlersWithConfig creates a new instance of sync handlers with HTTP policy hooks.
+func NewHTTPSyncHandlersWithConfig(service *SyncService, logger *slog.Logger, config HTTPSyncHandlersConfig) *HTTPSyncHandlers {
 	return &HTTPSyncHandlers{
-		service: service,
-		logger:  logger,
+		service:                  service,
+		logger:                   logger,
+		bundleChangeWatchAllowed: config.BundleChangeWatchAllowed,
 	}
 }
 
@@ -56,6 +72,13 @@ func (h *HTTPSyncHandlers) requireActorForMethod(w http.ResponseWriter, r *http.
 	}
 
 	return actor, true
+}
+
+func (h *HTTPSyncHandlers) isBundleChangeWatchAllowed(ctx context.Context, actor Actor) bool {
+	if h == nil || h.bundleChangeWatchAllowed == nil {
+		return true
+	}
+	return h.bundleChangeWatchAllowed(ctx, actor)
 }
 
 func parseChunkQueryParams(r *http.Request, defaultMaxRows int) (chunkQueryParams, error) {
@@ -478,6 +501,134 @@ func (h *HTTPSyncHandlers) HandlePull(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, response, "Failed to encode pull response", "user_id", actor.UserID, "source_id", actor.SourceID)
 }
 
+// HandleWatch streams metadata-only bundle change wakeups as Server-Sent Events.
+func (h *HTTPSyncHandlers) HandleWatch(w http.ResponseWriter, r *http.Request) {
+	actor, ok := h.requireActorForMethod(w, r, http.MethodGet)
+	if !ok {
+		return
+	}
+	if h.service != nil && h.service.bundleChangeWatchEnabled() && !h.isBundleChangeWatchAllowed(r.Context(), actor) {
+		h.writeError(w, http.StatusForbidden, "bundle_change_watch_forbidden", "Bundle change watch is not enabled for this client")
+		return
+	}
+
+	afterBundleSeq := int64(0)
+	if afterStr := r.URL.Query().Get("after_bundle_seq"); afterStr != "" {
+		parsedAfter, err := strconv.ParseInt(afterStr, 10, 64)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, "invalid_request", "after_bundle_seq must be an integer")
+			return
+		}
+		if parsedAfter < 0 {
+			h.writeError(w, http.StatusBadRequest, "invalid_request", "after_bundle_seq must be >= 0")
+			return
+		}
+		afterBundleSeq = parsedAfter
+	}
+
+	subCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	events, err := h.service.SubscribeBundleChanges(subCtx, actor, afterBundleSeq)
+	if err != nil {
+		h.writeWatchSetupError(w, err, actor)
+		return
+	}
+
+	cfg := h.service.effectiveBundleChangeWatchConfig()
+	heartbeatInterval := cfg.HeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = defaultBundleChangeHeartbeatInterval
+	}
+
+	header := w.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if err := flushSSE(w); err != nil {
+		return
+	}
+
+	heartbeat := time.NewTicker(heartbeatInterval)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, open := <-events:
+			if !open {
+				return
+			}
+			if r.Context().Err() != nil {
+				return
+			}
+			if err := writeSSEBundleEvent(w, event); err != nil {
+				return
+			}
+			if err := flushSSE(w); err != nil {
+				return
+			}
+		case <-heartbeat.C:
+			if r.Context().Err() != nil {
+				return
+			}
+			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			if err := flushSSE(w); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (h *HTTPSyncHandlers) writeWatchSetupError(w http.ResponseWriter, err error, actor Actor) {
+	if errors.Is(err, errBundleChangeWatchDisabled) {
+		h.writeError(w, http.StatusServiceUnavailable, "bundle_change_watch_disabled", "Bundle change watch is disabled")
+		return
+	}
+	if errors.Is(err, errServiceShuttingDown) {
+		h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Sync service is shutting down")
+		return
+	}
+	var uninitializedErr *ScopeUninitializedError
+	if errors.As(err, &uninitializedErr) {
+		h.writeError(w, http.StatusConflict, "scope_uninitialized", uninitializedErr.Error())
+		return
+	}
+	var initializingErr *ScopeInitializingError
+	if errors.As(err, &initializingErr) {
+		h.writeError(w, http.StatusConflict, "scope_initializing", initializingErr.Error())
+		return
+	}
+	h.logger.Error("Failed to subscribe bundle change watch", "error", err, "user_id", actor.UserID, "source_id", actor.SourceID)
+	h.writeError(w, http.StatusInternalServerError, "bundle_change_watch_failed", "Failed to subscribe bundle change watch")
+}
+
+func writeSSEBundleEvent(w io.Writer, event BundleChangeEvent) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: bundle\ndata: %s\n\n", payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+func flushSSE(w http.ResponseWriter) error {
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+	return nil
+}
+
 // HandleCreateSnapshotSession creates one frozen snapshot session for chunked hydrate/recover.
 func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.requireActorForMethod(w, r, http.MethodPost)
@@ -701,6 +852,11 @@ func (h *HTTPSyncHandlers) HandleCapabilities(w http.ResponseWriter, r *http.Req
 		return
 	}
 	response := h.service.GetCapabilities()
+	if actor, ok := ActorFromContext(r.Context()); ok && actor.validate(true) == nil &&
+		response.Features != nil && response.Features["bundle_change_watch"] &&
+		!h.isBundleChangeWatchAllowed(r.Context(), actor) {
+		response.Features["bundle_change_watch"] = false
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }

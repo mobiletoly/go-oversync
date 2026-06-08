@@ -32,6 +32,85 @@ func TestNewRuntimeService_ConstructsWithoutBootstrapping(t *testing.T) {
 	}
 }
 
+func TestBundleChangeWatchConfig_DefaultsDisabled(t *testing.T) {
+	svc, err := NewRuntimeService(nil, &ServiceConfig{AppName: "watch-defaults-test"}, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected constructor error: %v", err)
+	}
+
+	cfg := svc.effectiveBundleChangeWatchConfig()
+	if cfg.Enabled {
+		t.Fatal("expected bundle change watch to default disabled")
+	}
+	if cfg.NotifyChannel != defaultBundleChangeNotifyChannel {
+		t.Fatalf("expected default notify channel %q, got %q", defaultBundleChangeNotifyChannel, cfg.NotifyChannel)
+	}
+	if cfg.HeartbeatInterval != defaultBundleChangeHeartbeatInterval {
+		t.Fatalf("expected default heartbeat %s, got %s", defaultBundleChangeHeartbeatInterval, cfg.HeartbeatInterval)
+	}
+	if svc.GetCapabilities().Features["bundle_change_watch"] {
+		t.Fatalf("expected disabled watch capability, got %#v", svc.GetCapabilities().Features)
+	}
+}
+
+func TestBundleChangeWatchConfig_DefaultHeartbeatWhenEnabled(t *testing.T) {
+	svc, err := NewRuntimeService(nil, &ServiceConfig{
+		AppName: "watch-enabled-defaults-test",
+		BundleChangeWatch: BundleChangeWatchConfig{
+			Enabled: true,
+		},
+	}, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected constructor error: %v", err)
+	}
+
+	cfg := svc.effectiveBundleChangeWatchConfig()
+	if !cfg.Enabled {
+		t.Fatal("expected bundle change watch to be enabled")
+	}
+	if cfg.NotifyChannel != defaultBundleChangeNotifyChannel {
+		t.Fatalf("expected default notify channel %q, got %q", defaultBundleChangeNotifyChannel, cfg.NotifyChannel)
+	}
+	if cfg.HeartbeatInterval != defaultBundleChangeHeartbeatInterval {
+		t.Fatalf("expected default heartbeat %s, got %s", defaultBundleChangeHeartbeatInterval, cfg.HeartbeatInterval)
+	}
+	if !svc.GetCapabilities().Features["bundle_change_watch"] {
+		t.Fatalf("expected enabled watch capability, got %#v", svc.GetCapabilities().Features)
+	}
+}
+
+func TestBundleChangeWatchConfig_RejectsEnabledNonPositiveHeartbeat(t *testing.T) {
+	_, err := NewRuntimeService(nil, &ServiceConfig{
+		AppName: "watch-invalid-heartbeat-test",
+		BundleChangeWatch: BundleChangeWatchConfig{
+			Enabled:           true,
+			HeartbeatInterval: -time.Second,
+		},
+	}, slog.Default())
+	if err == nil {
+		t.Fatal("expected constructor error")
+	}
+	if !strings.Contains(err.Error(), "heartbeat interval must be positive") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBundleChangeWatchConfig_RejectsInvalidNotifyChannel(t *testing.T) {
+	_, err := NewRuntimeService(nil, &ServiceConfig{
+		AppName: "watch-invalid-channel-test",
+		BundleChangeWatch: BundleChangeWatchConfig{
+			Enabled:       true,
+			NotifyChannel: strings.Repeat("x", 64),
+		},
+	}, slog.Default())
+	if err == nil {
+		t.Fatal("expected constructor error")
+	}
+	if !strings.Contains(err.Error(), "notify channel") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestSyncService_BootstrapRequiresPool(t *testing.T) {
 	svc, err := NewRuntimeService(nil, &ServiceConfig{
 		MaxSupportedSchemaVersion: 1,

@@ -68,6 +68,7 @@ func main() {
 		components.Logger.Info("  POST /sync/push-sessions/{push_id}/commit - Commit staged push")
 		components.Logger.Info("  GET  /sync/committed-bundles/{bundle_seq}/rows - Fetch committed bundle rows")
 		components.Logger.Info("  GET  /sync/pull          - Pull committed bundles from server")
+		components.Logger.Info("  GET  /sync/watch         - Watch metadata-only bundle change wake-ups")
 		components.Logger.Info("  POST /sync/snapshot-sessions               - Create frozen chunked snapshot session")
 		components.Logger.Info("  GET  /sync/snapshot-sessions/{snapshot_id} - Fetch one snapshot chunk")
 		components.Logger.Info("  DEL  /sync/snapshot-sessions/{snapshot_id} - Delete snapshot session")

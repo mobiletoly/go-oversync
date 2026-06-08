@@ -78,6 +78,23 @@ const (
 	FailureEndpointCommittedBundleRows = "committed_bundle_rows"
 )
 
+// RegisteredTablesForBusinessSchema returns the reference example server's sync table set.
+func RegisteredTablesForBusinessSchema(businessSchema string) []oversync.RegisteredTable {
+	if strings.TrimSpace(businessSchema) == "" {
+		businessSchema = "business"
+	}
+	return []oversync.RegisteredTable{
+		{Schema: businessSchema, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: businessSchema, Table: "posts", SyncKeyColumns: []string{"id"}},
+		{Schema: businessSchema, Table: "categories", SyncKeyColumns: []string{"id"}},
+		{Schema: businessSchema, Table: "teams", SyncKeyColumns: []string{"id"}},
+		{Schema: businessSchema, Table: "team_members", SyncKeyColumns: []string{"id"}},
+		{Schema: businessSchema, Table: "files", SyncKeyColumns: []string{"id"}},
+		{Schema: businessSchema, Table: "file_reviews", SyncKeyColumns: []string{"id"}},
+		{Schema: businessSchema, Table: "typed_rows", SyncKeyColumns: []string{"id"}},
+	}
+}
+
 type failureInjector struct {
 	mu    sync.Mutex
 	rules map[string]*failureRule
@@ -167,16 +184,10 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		AppName:                   appName,
 		StageMetrics:              config.StageMetrics,
 		InitializationLeaseTTL:    config.InitializationLeaseTTL,
-		RegisteredTables: []oversync.RegisteredTable{
-			{Schema: businessSchema, Table: "users", SyncKeyColumns: []string{"id"}},
-			{Schema: businessSchema, Table: "posts", SyncKeyColumns: []string{"id"}},
-			{Schema: businessSchema, Table: "categories", SyncKeyColumns: []string{"id"}},
-			{Schema: businessSchema, Table: "teams", SyncKeyColumns: []string{"id"}},
-			{Schema: businessSchema, Table: "team_members", SyncKeyColumns: []string{"id"}},
-			{Schema: businessSchema, Table: "files", SyncKeyColumns: []string{"id"}},
-			{Schema: businessSchema, Table: "file_reviews", SyncKeyColumns: []string{"id"}},
-			{Schema: businessSchema, Table: "typed_rows", SyncKeyColumns: []string{"id"}},
+		BundleChangeWatch: oversync.BundleChangeWatchConfig{
+			Enabled: true,
 		},
+		RegisteredTables: RegisteredTablesForBusinessSchema(businessSchema),
 	}
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
 		serviceConfig.LogStageTimings = true
@@ -201,6 +212,11 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		cancel()
 		return nil, err
 	}
+	go func() {
+		if err := syncService.RunBundleChangeListener(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("sync bundle change listener stopped", "error", err)
+		}
+	}()
 	// Setup example auth
 	jwtSecret := config.JWTSecret
 	if jwtSecret == "" {
@@ -292,6 +308,27 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			"retained_bundle_floor": req.RetainedBundleFloor,
 		})
 	})
+	mux.HandleFunc("GET /test/watch-subscribers", func(w http.ResponseWriter, r *http.Request) {
+		userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+		if userID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_request", "message": "user_id required"})
+			return
+		}
+		count, err := syncService.BundleChangeSubscriberCountForTest(r.Context(), userID)
+		if err != nil {
+			logger.Error("failed to inspect watch subscribers", "error", err, "user_id", userID)
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "watch_subscribers_failed", "message": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"user_id":            userID,
+			"subscriber_count":   count,
+			"process_local_only": true,
+		})
+	})
 
 	// Dummy signin endpoint returns a JWT for the provided user; any password accepted.
 	mux.HandleFunc("POST /dummy-signin", func(w http.ResponseWriter, r *http.Request) {
@@ -341,6 +378,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		syncHandlers.HandlePull(w, r)
 		logger.Info("🔥 PULL: Pull handler completed")
 	}))), logger))
+	mux.Handle("GET /sync/watch", LoggingMiddleware(false, withSyncActor(http.HandlerFunc(syncHandlers.HandleWatch)), logger))
 	mux.Handle("POST /sync/snapshot-sessions", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointSnapshotCreate, withSyncActor(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession))), logger))
 	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointSnapshotChunk, withSyncActor(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk))), logger))
 	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", LoggingMiddleware(false, withSyncActor(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)), logger))

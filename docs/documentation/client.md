@@ -52,6 +52,17 @@ Authenticated sync requests still carry the runtime's current source through
 - `LastBundleSeqSeen(ctx) (int64, error)`
 - `SourceInfo(ctx) (SourceInfo, error)`
 
+## Optional Watch Wakeups
+
+`Config.BundleChangeWatchMode` defaults to `BundleChangeWatchOff`. Set it to
+`BundleChangeWatchAuto` to let `Start(ctx)` use `GET /sync/watch` only when the server advertises
+`bundle_change_watch=true`.
+
+Watch mode is a latency optimization. Events never mutate SQLite directly; the client wakes its
+existing pull/sync behavior, so dirty-row checks, outbox replay, source recovery, snapshot recovery,
+and download pause rules still apply. `WatchFallbackInterval` controls low-frequency fallback
+polling while a watch stream is active; `0` means `BackoffMax`, or `60s` when `BackoffMax` is unset.
+
 ## Preconditions
 
 Require no prior lifecycle step:

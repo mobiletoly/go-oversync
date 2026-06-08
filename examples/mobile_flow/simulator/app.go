@@ -36,6 +36,7 @@ type scenarioMobileAppOptions struct {
 	DeviceID         string
 	DeviceName       string
 	DBNamePrefix     string
+	ServerURL        string
 	OversqliteConfig *oversqlite.Config
 }
 
@@ -58,11 +59,15 @@ func (s *Simulator) newScenarioMobileApp(opts scenarioMobileAppOptions) (*Mobile
 	if oversqliteConfig == nil {
 		oversqliteConfig = standardScenarioOversqliteConfig()
 	}
+	serverURL := opts.ServerURL
+	if serverURL == "" {
+		serverURL = s.config.ServerURL
+	}
 
 	dbFile := filepath.Join("/tmp", fmt.Sprintf("mobile_flow_%s_%s_%d.db", dbNamePrefix, opts.UserID, time.Now().UnixNano()))
 	return newMobileApp(&mobileAppConfig{
 		DatabaseFile:     dbFile,
-		ServerURL:        s.config.ServerURL,
+		ServerURL:        serverURL,
 		UserID:           opts.UserID,
 		DeviceID:         opts.DeviceID,
 		DeviceName:       opts.DeviceName,
@@ -230,11 +235,11 @@ func (app *MobileApp) closeStatements() error {
 func (app *MobileApp) createBusinessTables() error {
 	// Create local users table (SQLite)
 	createUsersSQL := `
-		CREATE TABLE IF NOT EXISTS users (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL,
-			created_at TEXT NOT NULL,
+			CREATE TABLE IF NOT EXISTS users (
+				id TEXT PRIMARY KEY NOT NULL,
+				name TEXT NOT NULL,
+				email TEXT NOT NULL,
+				created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`
 	if _, err := app.db.Exec(createUsersSQL); err != nil {
@@ -243,48 +248,48 @@ func (app *MobileApp) createBusinessTables() error {
 
 	// Create local posts table (SQLite)
 	createPostsSQL := `
-		CREATE TABLE IF NOT EXISTS posts (
-			id TEXT PRIMARY KEY,
-			title TEXT NOT NULL,
-			content TEXT NOT NULL,
-			author_id TEXT,
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			FOREIGN KEY (author_id) REFERENCES users(id)
-		)`
+			CREATE TABLE IF NOT EXISTS posts (
+				id TEXT PRIMARY KEY NOT NULL,
+				title TEXT NOT NULL,
+				content TEXT NOT NULL,
+				author_id TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				FOREIGN KEY (author_id) REFERENCES users(id) DEFERRABLE INITIALLY DEFERRED
+			)`
 
 	if _, err := app.db.Exec(createPostsSQL); err != nil {
 		return fmt.Errorf("failed to create posts table: %w", err)
 	}
 
 	createCategoriesSQL := `
-		CREATE TABLE IF NOT EXISTS categories (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			parent_id TEXT,
-			FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+			CREATE TABLE IF NOT EXISTS categories (
+				id TEXT PRIMARY KEY NOT NULL,
+				name TEXT NOT NULL,
+				parent_id TEXT,
+				FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 		)`
 	if _, err := app.db.Exec(createCategoriesSQL); err != nil {
 		return fmt.Errorf("failed to create categories table: %w", err)
 	}
 
 	createTeamsSQL := `
-		CREATE TABLE IF NOT EXISTS teams (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			captain_member_id TEXT,
-			FOREIGN KEY (captain_member_id) REFERENCES team_members(id) DEFERRABLE INITIALLY DEFERRED
+			CREATE TABLE IF NOT EXISTS teams (
+				id TEXT PRIMARY KEY NOT NULL,
+				name TEXT NOT NULL,
+				captain_member_id TEXT,
+				FOREIGN KEY (captain_member_id) REFERENCES team_members(id) DEFERRABLE INITIALLY DEFERRED
 		)`
 	if _, err := app.db.Exec(createTeamsSQL); err != nil {
 		return fmt.Errorf("failed to create teams table: %w", err)
 	}
 
 	createTeamMembersSQL := `
-		CREATE TABLE IF NOT EXISTS team_members (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			team_id TEXT NOT NULL,
-			FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+			CREATE TABLE IF NOT EXISTS team_members (
+				id TEXT PRIMARY KEY NOT NULL,
+				name TEXT NOT NULL,
+				team_id TEXT NOT NULL,
+				FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 		)`
 	if _, err := app.db.Exec(createTeamMembersSQL); err != nil {
 		return fmt.Errorf("failed to create team_members table: %w", err)
@@ -292,25 +297,40 @@ func (app *MobileApp) createBusinessTables() error {
 
 	// Create local files table (SQLite) with BLOB primary key
 	createFilesSQL := `
-		CREATE TABLE IF NOT EXISTS files (
-			id BLOB PRIMARY KEY NOT NULL DEFAULT (randomblob(16)),
-			name TEXT NOT NULL,
-			data BLOB
-		)`
+			CREATE TABLE IF NOT EXISTS files (
+				id BLOB PRIMARY KEY NOT NULL,
+				name TEXT NOT NULL,
+				data BLOB NOT NULL
+			)`
 	if _, err := app.db.Exec(createFilesSQL); err != nil {
 		return fmt.Errorf("failed to create files table: %w", err)
 	}
 
 	// Create local file_reviews table (SQLite) with BLOB primary key and foreign key
 	createFileReviewsSQL := `
-		CREATE TABLE IF NOT EXISTS file_reviews (
-			id BLOB PRIMARY KEY NOT NULL DEFAULT (randomblob(16)),
-			file_id BLOB NOT NULL,
-			review TEXT NOT NULL,
-			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
-		)`
+			CREATE TABLE IF NOT EXISTS file_reviews (
+				id BLOB PRIMARY KEY NOT NULL,
+				review TEXT NOT NULL,
+				file_id BLOB NOT NULL,
+				FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+			)`
 	if _, err := app.db.Exec(createFileReviewsSQL); err != nil {
 		return fmt.Errorf("failed to create file_reviews table: %w", err)
+	}
+
+	createTypedRowsSQL := `
+			CREATE TABLE IF NOT EXISTS typed_rows (
+				id TEXT PRIMARY KEY NOT NULL,
+				name TEXT NOT NULL,
+				note TEXT NULL,
+				count_value INTEGER NULL,
+				enabled_flag INTEGER NOT NULL,
+				rating REAL NULL,
+				data BLOB NULL,
+				created_at TEXT NULL
+			)`
+	if _, err := app.db.Exec(createTypedRowsSQL); err != nil {
+		return fmt.Errorf("failed to create typed_rows table: %w", err)
 	}
 
 	app.logger.Debug("Business tables created successfully")
