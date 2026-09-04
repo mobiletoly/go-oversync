@@ -3,7 +3,6 @@ package oversqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -165,11 +164,11 @@ func toLifecycleState(attachment *attachmentStateRecord, operation *operationSta
 }
 
 func (c *Client) loadLifecycleState(ctx context.Context) (*lifecycleState, error) {
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return nil, err
 	}
-	operation, err := loadOperationState(ctx, c.DB)
+	operation, err := loadOperationState(ctx, c.db)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +188,7 @@ func (c *Client) persistLifecycleStateInTx(ctx context.Context, tx sqliteTransac
 	attachment.AttachedUserID = state.BindingScope
 	attachment.PendingInitializationID = state.PendingInitializationID
 	if strings.TrimSpace(attachment.SchemaName) == "" {
-		attachment.SchemaName = c.config.Schema
+		attachment.SchemaName = c.config.schema
 	}
 	if err := ensureSourceState(ctx, tx, state.SourceID); err != nil {
 		return err
@@ -210,7 +209,7 @@ func (c *Client) persistLifecycleStateInTxless(ctx context.Context, state *lifec
 	if state == nil {
 		return fmt.Errorf("lifecycle state is required")
 	}
-	tx, err := c.DB.BeginTx(ctx, nil)
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin lifecycle persistence transaction: %w", err)
 	}
@@ -225,12 +224,12 @@ func (c *Client) persistLifecycleStateInTxless(ctx context.Context, state *lifec
 }
 
 func (c *Client) clearPersistedPendingInitializationID(ctx context.Context) error {
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return err
 	}
 	attachment.PendingInitializationID = ""
-	return persistAttachmentState(ctx, c.DB, attachment)
+	return persistAttachmentState(ctx, c.db, attachment)
 }
 
 func (c *Client) generateFreshSourceID(ctx context.Context, q queryRower, currentSourceID string) (string, error) {
@@ -260,12 +259,23 @@ func (c *Client) generateFreshSourceID(ctx context.Context, q queryRower, curren
 }
 
 func (c *Client) openLocked(ctx context.Context) (*lifecycleState, error) {
-	tx, err := c.DB.BeginTx(ctx, nil)
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin lifecycle open transaction: %w", err)
 	}
 	defer tx.Rollback()
 
+	state, err := c.restoreLifecycleStateInTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit lifecycle open transaction: %w", err)
+	}
+	return lifecycleStateResult(state)
+}
+
+func (c *Client) restoreLifecycleStateInTx(ctx context.Context, tx sqliteTransaction) (*lifecycleState, error) {
 	attachment, err := loadAttachmentState(ctx, tx)
 	if err != nil {
 		return nil, err
@@ -288,7 +298,7 @@ func (c *Client) openLocked(ctx context.Context) (*lifecycleState, error) {
 		attachment.CurrentSourceID = generatedSourceID
 	}
 	if strings.TrimSpace(attachment.SchemaName) == "" {
-		attachment.SchemaName = c.config.Schema
+		attachment.SchemaName = c.config.schema
 	}
 	if needsBootstrapAnonymousCapture {
 		if err := c.capturePreexistingAnonymousRowsInTx(ctx, tx); err != nil {
@@ -304,99 +314,63 @@ func (c *Client) openLocked(ctx context.Context) (*lifecycleState, error) {
 	if err := setApplyMode(ctx, tx, false); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit lifecycle open transaction: %w", err)
-	}
-	state := toLifecycleState(attachment, operation)
+	return toLifecycleState(attachment, operation), nil
+}
+
+func lifecycleStateResult(state *lifecycleState) (*lifecycleState, error) {
 	if state.PendingTransitionKind == lifecycleTransitionRemote {
 		return state, &RemoteReplacePendingError{TargetUserID: state.PendingTargetScope}
 	}
 	return state, nil
 }
 
-func (c *Client) capturePreexistingAnonymousRowsInTx(ctx context.Context, tx *sql.Tx) error {
-	for _, syncTable := range c.config.Tables {
-		tableName := strings.ToLower(strings.TrimSpace(syncTable.TableName))
-		if tableName == "" {
-			continue
-		}
-
-		pkColumn, err := c.primaryKeyColumnForTable(tableName)
-		if err != nil {
+func (c *Client) capturePreexistingAnonymousRowsInTx(ctx context.Context, tx sqliteTransaction) error {
+	for _, table := range c.config.Tables {
+		if err := c.captureAnonymousTableInTx(ctx, tx, table.TableName); err != nil {
 			return err
-		}
-		isBlobPK, err := c.isPrimaryKeyBlobInTx(tx, tableName)
-		if err != nil {
-			return err
-		}
-
-		var pkExpr string
-		if isBlobPK {
-			pkExpr = fmt.Sprintf("lower(hex(%s))", quoteIdent(pkColumn))
-		} else {
-			pkExpr = fmt.Sprintf("CAST(%s AS TEXT)", quoteIdent(pkColumn))
-		}
-		query := fmt.Sprintf("SELECT %s FROM %s ORDER BY %s", pkExpr, quoteIdent(tableName), quoteIdent(pkColumn))
-		rows, err := tx.QueryContext(ctx, query)
-		if err != nil {
-			return fmt.Errorf("failed to query preexisting keys for %s: %w", tableName, err)
-		}
-
-		var localPKs []string
-		for rows.Next() {
-			var localPK string
-			if err := rows.Scan(&localPK); err != nil {
-				rows.Close()
-				return fmt.Errorf("failed to scan preexisting key for %s: %w", tableName, err)
-			}
-			localPKs = append(localPKs, localPK)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return fmt.Errorf("failed to iterate preexisting keys for %s: %w", tableName, err)
-		}
-		rows.Close()
-
-		keyColumns, err := c.syncKeyColumnsForTable(tableName)
-		if err != nil {
-			return err
-		}
-		if len(keyColumns) != 1 {
-			return fmt.Errorf("table %s must declare exactly one sync key column in the current client runtime", tableName)
-		}
-		keyName := strings.ToLower(strings.TrimSpace(keyColumns[0]))
-
-		for _, localPK := range localPKs {
-			keyJSONBytes, err := json.Marshal(map[string]any{keyName: localPK})
-			if err != nil {
-				return fmt.Errorf("failed to encode preexisting key for %s.%s: %w", tableName, localPK, err)
-			}
-			payload, err := c.serializeRowInTx(ctx, tx, tableName, localPK)
-			if err != nil {
-				return fmt.Errorf("failed to serialize preexisting row for %s.%s: %w", tableName, localPK, err)
-			}
-			if err := c.requeueDirtyIntentInTx(
-				ctx,
-				tx,
-				c.config.Schema,
-				tableName,
-				string(keyJSONBytes),
-				oversync.OpInsert,
-				0,
-				sql.NullString{String: string(payload), Valid: true},
-			); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
 }
 
-func (c *Client) ensureAttachedClientStateLocked(ctx context.Context, userID, sourceID string) error {
-	if err := ensureSourceState(ctx, c.DB, sourceID); err != nil {
+// Stream existing rows through the same capture expressions used by triggers.
+// Keep only one local row in Go memory, even when opening a large offline database.
+func (c *Client) captureAnonymousTableInTx(ctx context.Context, tx sqliteTransaction, table string) error {
+	info, err := c.getTableInfoTx(tx, table)
+	if err != nil {
 		return err
 	}
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	pk, err := c.primaryKeyColumnForTable(table)
+	if err != nil {
+		return err
+	}
+	query := fmt.Sprintf("SELECT %s,%s FROM %s AS captured ORDER BY %s",
+		buildKeyJSONObjectExprHexAware(info, pk, "captured"), buildJsonObjectExprHexAware(info, "captured"), quoteIdent(table), quoteIdent(pk))
+	rows, err := tx.QueryContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, payload string
+		if err := rows.Scan(&key, &payload); err != nil {
+			return err
+		}
+		if err := c.installAuthoritativeBaseline(ctx, tx, c.schemaForTable(table), table, key, "unpublished", 0, nil, baselineObservation{Origin: "never_published"}); err != nil {
+			return err
+		}
+		if err := c.rebaseDirtyIntentInTx(ctx, tx, c.schemaForTable(table), table, key, oversync.OpInsert, 0, sql.NullString{String: payload, Valid: true}); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func (c *Client) ensureAttachedClientStateLocked(ctx context.Context, userID, sourceID string) error {
+	if err := ensureSourceState(ctx, c.db, sourceID); err != nil {
+		return err
+	}
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return err
 	}
@@ -410,7 +384,7 @@ func (c *Client) ensureAttachedClientStateLocked(ctx context.Context, userID, so
 }
 
 func (c *Client) hasAttachedClientStateLocked(ctx context.Context, userID, sourceID string) (bool, error) {
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return false, err
 	}
@@ -420,14 +394,10 @@ func (c *Client) hasAttachedClientStateLocked(ctx context.Context, userID, sourc
 }
 
 func (c *Client) verifyConnectLifecycleSupported(ctx context.Context) error {
-	caps, err := c.fetchValidatedCapabilities(ctx, "connect_capabilities")
-	if err != nil {
-		return err
+	if c == nil || c.discovery == nil {
+		return &AttachLifecycleUnsupportedError{Reason: "admitted discovery contract is unavailable"}
 	}
-	if caps.Features == nil || !caps.Features["connect_lifecycle"] {
-		return &AttachLifecycleUnsupportedError{Reason: "connect_lifecycle capability is absent"}
-	}
-	return nil
+	return requireSupportedProtocolVersion(c.discovery.ProtocolVersion)
 }
 
 const requiredProtocolVersion = "v1"
@@ -455,41 +425,37 @@ func isProtocolVersionMismatch(err error) bool {
 }
 
 func (c *Client) validateProtocolGateLocked(ctx context.Context, operation string) error {
-	_, err := c.fetchValidatedCapabilities(ctx, operation)
-	return err
+	if c == nil || c.discovery == nil {
+		return fmt.Errorf("%s requires an admitted discovery contract", operation)
+	}
+	return requireSupportedProtocolVersion(c.discovery.ProtocolVersion)
 }
 
-func (c *Client) fetchValidatedCapabilities(ctx context.Context, operation string) (*oversync.CapabilitiesResponse, error) {
-	result, err := c.doAuthenticatedBoundedRequestWithRetry(
-		ctx,
-		operation,
-		http.MethodGet,
-		strings.TrimRight(c.BaseURL, "/")+"/sync/capabilities",
-		nil,
-		"",
-		snapshotCapabilitiesBodyLimit,
-		snapshotControlBodyLimit,
-		nil,
-		nil,
-	)
-	if err != nil {
-		return nil, err
+func decodeSchemaGenerationRequestError(statusCode int, body []byte, proof oversync.SchemaGenerationProof) error {
+	response, ok := decodeServerErrorResponse(body)
+	if !ok {
+		return nil
 	}
-	if result.statusCode == http.StatusNotFound || result.statusCode == http.StatusMethodNotAllowed || result.statusCode == http.StatusNotImplemented {
-		return nil, &AttachLifecycleUnsupportedError{Reason: "missing /sync/capabilities endpoint"}
+	code := oversync.SchemaGenerationRequestErrorCode(response.Error)
+	switch code {
+	case oversync.SchemaGenerationUnknown, oversync.SchemaGenerationFingerprintMismatch:
+		if statusCode != http.StatusConflict {
+			return nil
+		}
+	case oversync.SchemaGenerationUnsupported:
+		if statusCode != http.StatusGone {
+			return nil
+		}
+	case oversync.SchemaGenerationRetired:
+		if statusCode != http.StatusUpgradeRequired {
+			return nil
+		}
+	default:
+		return nil
 	}
-	if result.statusCode != http.StatusOK {
-		return nil, fmt.Errorf("server returned status %d while fetching capabilities", result.statusCode)
+	return &oversync.SchemaGenerationRequestError{
+		Code: code, GenerationID: proof.ID, Message: string(code),
 	}
-
-	var caps oversync.CapabilitiesResponse
-	if err := json.Unmarshal(result.body, &caps); err != nil {
-		return nil, fmt.Errorf("invalid capabilities response: %w", err)
-	}
-	if err := requireSupportedProtocolVersion(caps.ProtocolVersion); err != nil {
-		return nil, err
-	}
-	return &caps, nil
 }
 
 type snapshotNegotiation struct {
@@ -498,46 +464,27 @@ type snapshotNegotiation struct {
 }
 
 func (c *Client) negotiateSnapshotLimits(ctx context.Context) (snapshotNegotiation, error) {
-	caps, err := c.fetchValidatedCapabilities(ctx, "snapshot_capabilities")
-	if err != nil {
-		return snapshotNegotiation{}, err
+	if c == nil || c.discovery == nil {
+		return snapshotNegotiation{}, fmt.Errorf("snapshot requires an admitted discovery contract")
 	}
-	limits := caps.BundleLimits
-	if limits.DefaultRowsPerSnapshotChunk <= 0 || limits.MaxRowsPerSnapshotChunk <= 0 {
-		return snapshotNegotiation{}, fmt.Errorf("snapshot capabilities require positive default_rows_per_snapshot_chunk and max_rows_per_snapshot_chunk")
-	}
-	if limits.DefaultRowsPerSnapshotChunk > limits.MaxRowsPerSnapshotChunk {
-		return snapshotNegotiation{}, fmt.Errorf("snapshot capability default_rows_per_snapshot_chunk exceeds max_rows_per_snapshot_chunk")
-	}
-	if limits.DefaultBytesPerSnapshotChunk <= 0 || limits.MaxBytesPerSnapshotChunk <= 0 || limits.MaxBytesPerSnapshotRow <= 0 {
-		return snapshotNegotiation{}, fmt.Errorf("snapshot capabilities require positive default/max chunk byte and max row byte limits")
-	}
-	if limits.DefaultBytesPerSnapshotChunk > limits.MaxBytesPerSnapshotChunk {
-		return snapshotNegotiation{}, fmt.Errorf("snapshot capability default_bytes_per_snapshot_chunk exceeds max_bytes_per_snapshot_chunk")
-	}
-	if limits.MaxBytesPerSnapshotRow > limits.MaxBytesPerSnapshotChunk {
-		return snapshotNegotiation{}, fmt.Errorf("snapshot capability max_bytes_per_snapshot_row exceeds max_bytes_per_snapshot_chunk")
-	}
-	if limits.MaxConcurrentSnapshotBuilds <= 0 || limits.MaxConcurrentSnapshotChunkRequests <= 0 {
-		return snapshotNegotiation{}, fmt.Errorf("snapshot capabilities require positive max_concurrent_snapshot_builds and max_concurrent_snapshot_chunk_requests")
-	}
+	limits := c.discovery.Limits
 	if c == nil || c.config == nil || c.config.SnapshotChunkRows <= 0 || c.config.SnapshotChunkBytes <= 0 {
 		return snapshotNegotiation{}, fmt.Errorf("snapshot client row and byte budgets must be positive")
 	}
-	effectiveRows := min(c.config.SnapshotChunkRows, limits.MaxRowsPerSnapshotChunk)
-	effectiveBytes := min(c.config.SnapshotChunkBytes, limits.MaxBytesPerSnapshotChunk)
-	if effectiveBytes < limits.MaxBytesPerSnapshotRow {
+	effectiveRows := min(c.config.SnapshotChunkRows, limits.MaxSnapshotRowsPerChunk)
+	effectiveBytes := min(c.config.SnapshotChunkBytes, limits.MaxSnapshotDecodedBytesPerChunk)
+	if effectiveBytes < limits.MaxRowDecodedBytes {
 		return snapshotNegotiation{}, fmt.Errorf(
-			"effective snapshot chunk byte budget %d is below server max_bytes_per_snapshot_row %d; increase Config.SnapshotChunkBytes",
+			"effective snapshot chunk byte budget %d is below server max_row_decoded_bytes %d; increase Config.SnapshotChunkBytes",
 			effectiveBytes,
-			limits.MaxBytesPerSnapshotRow,
+			limits.MaxRowDecodedBytes,
 		)
 	}
 	return snapshotNegotiation{maxRows: effectiveRows, maxBytes: effectiveBytes}, nil
 }
 
 func (c *Client) ensureNoDestructiveTransitionLocked(ctx context.Context) error {
-	operation, err := loadOperationState(ctx, c.DB)
+	operation, err := loadOperationState(ctx, c.db)
 	if err != nil {
 		return err
 	}
@@ -560,7 +507,7 @@ func (c *Client) ensureConnectedSessionLocked(ctx context.Context, operation str
 	if userID == "" {
 		return &AttachRequiredError{Operation: operation}
 	}
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return err
 	}

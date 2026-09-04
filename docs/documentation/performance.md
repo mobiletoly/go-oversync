@@ -15,7 +15,8 @@ bundle replay, and snapshot rebuilds.
   `WithinSyncBundle(...)`
 - trigger capture into `sync.bundle_capture_stage`
 - bundle finalization into `sync.bundle_log` and `sync.bundle_rows`
-- `GET /sync/pull` pagination by bundle count
+- bounded on-demand generation projection for push replay, committed pages, conflicts, and pull
+- `GET /sync/pull` pagination by bundle count and projected-byte budget
 - optional `GET /sync/watch` heartbeat interval and subscriber count when bundle-change watch is
   enabled
 - chunked snapshot-session rebuild size and retained-floor policy
@@ -40,8 +41,8 @@ On the server, `ServiceConfig` exposes session, row, chunk, materialization,
 concurrency, and cleanup bounds including `MaxRowsPerSnapshotSession`,
 `MaxBytesPerSnapshotSession`, `MaxBytesPerSnapshotRow`, the default/maximum
 row and byte limits per chunk, and the materialization and cleanup batch
-limits. The server publishes the effective transfer limits through
-capabilities.
+limits. The server publishes the effective transfer limits through generation
+discovery.
 
 Clients request both a row limit and a byte limit for every chunk and then
 clamp those requests to the advertised server limits. Go applications tune
@@ -71,7 +72,13 @@ boundedness tests without enabling these workloads.
 
 ## Guardrails
 
+- configure finite `MaxRowsPerBundle`, `MaxBytesPerBundle`, `MaxBytesPerPullResponse`, and
+  `MaxConcurrentHistoryProjections`; zero selects bounded defaults and hard maxima fail startup
 - keep bundles reasonably bounded; avoid very large dirty sets in one push
+- monitor fixed-cardinality projection row/byte, failure-code, active-permit, and high-water metrics;
+  never label them with users, sources, keys, or bundle sequences
+- projection retains one bounded canonical bundle plus admitted visible output and is recomputed on
+  demand; there is no projection cache or memory growth with retained-history length
 - keep managed table sets FK-closed
 - monitor prune fallback frequency, accepted-push replay hits, and rejected out-of-bundle writes
 - treat malformed server responses as fail-closed conditions, not retry-forever conditions

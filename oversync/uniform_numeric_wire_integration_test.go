@@ -23,12 +23,10 @@ func TestUniformNumericWire_PostgresRoundTripAcrossServerSurfaces(t *testing.T) 
 	tableIdent := createUniformNumericTestTable(t, ctx, pool, schemaName)
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "uniform-numeric-wire-round-trip",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}},
-		},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}}
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "uniform-numeric-wire-round-trip",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	userID := "uniform-numeric-user-" + suffix
@@ -45,13 +43,13 @@ func TestUniformNumericWire_PostgresRoundTripAcrossServerSurfaces(t *testing.T) 
 			"small_count":"-32768",
 			"count":"2147483647",
 			"large_count":"9007199254740993",
-			"amount":"1234567890.123456789",
-			"ratio":"1.2345678901234567",
+			"amount":"1234567890.1234567890",
+			"ratio":"1.2345678806304932",
 			"score":"5e-324",
-			"enabled":"1"
+			"enabled":true
 		}`, rowID)),
 	}}
-	bundle, err := pushRowsViaSession(t, ctx, service, writer, 1, requestRows)
+	bundle, err := pushRowsOneShot(t, ctx, service, writer, 1, requestRows)
 	require.NoError(t, err)
 	require.NotNil(t, bundle)
 	require.Len(t, bundle.Rows, 1)
@@ -93,24 +91,26 @@ func TestUniformNumericWire_PostgresRoundTripAcrossServerSurfaces(t *testing.T) 
 	})
 
 	reader := Actor{UserID: userID, SourceID: "reader"}
+	_, err = service.Connect(ctx, reader, testSchemaGenerationProofForService(service), &ConnectRequest{})
+	require.NoError(t, err)
 	t.Run("pull", func(t *testing.T) {
-		page, err := service.ProcessPull(ctx, reader, 0, 10, 0)
+		page, err := service.ProcessPull(ctx, reader, testSchemaGenerationProofForService(service), 0, 10, 0)
 		require.NoError(t, err)
 		require.Len(t, page.Bundles, 1)
 		requireUniformNumericPayload(t, page.Bundles[0].Rows[0].Payload, rowID, true)
 	})
 
 	t.Run("snapshot", func(t *testing.T) {
-		session, err := service.CreateSnapshotSession(ctx, reader)
+		session, err := service.CreateSnapshotSession(ctx, reader, testSchemaGenerationProofForService(service))
 		require.NoError(t, err)
-		chunk, err := service.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+		chunk, err := service.GetSnapshotChunk(ctx, reader, testSchemaGenerationProofForService(service), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 		require.NoError(t, err)
 		require.Len(t, chunk.Rows, 1)
 		requireUniformNumericPayload(t, chunk.Rows[0].Payload, rowID, true)
 	})
 
 	t.Run("conflict server row", func(t *testing.T) {
-		_, err := pushRowsViaSession(t, ctx, service, Actor{UserID: userID, SourceID: "conflicting-client"}, 1, []PushRequestRow{{
+		_, err := pushRowsOneShot(t, ctx, service, Actor{UserID: userID, SourceID: "conflicting-client"}, 1, []PushRequestRow{{
 			Schema:         schemaName,
 			Table:          "numeric_values",
 			Key:            SyncKey{"id": rowID.String()},
@@ -129,7 +129,7 @@ func TestUniformNumericWire_PostgresRoundTripAcrossServerSurfaces(t *testing.T) 
 		require.NoError(t, service.WithinSyncBundle(ctx, directActor, BundleSource{SourceID: directActor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 			_, err := tx.Exec(ctx, fmt.Sprintf(`
 				INSERT INTO %s (id, small_count, count, large_count, amount, ratio, score, enabled)
-				VALUES ($1, -32768, 2147483647, 9007199254740993, 1234567890.123456789, 1.2345678901234567, 5e-324, FALSE)
+				VALUES ($1, -32768, 2147483647, 9007199254740993, 1234567890.1234567890, 1.2345678901234567, 5e-324, FALSE)
 			`, tableIdent), directID)
 			return err
 		}))
@@ -152,10 +152,10 @@ func TestUniformNumericWire_NonFiniteManagedWriteRollsBack(t *testing.T) {
 	schemaName := "uniform_nonfinite_" + suffix
 	tableIdent := createUniformNumericTestTable(t, ctx, pool, schemaName)
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "uniform-numeric-nonfinite",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}}
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "uniform-numeric-nonfinite",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	userID := "uniform-nonfinite-user-" + suffix
@@ -195,21 +195,21 @@ func TestUniformNumericWire_NonFiniteManagedWriteRollsBack(t *testing.T) {
 	require.Zero(t, bundleRows)
 }
 
-func TestUniformNumericWire_InvalidPushRejectsBeforeDurableChunkStaging(t *testing.T) {
+func TestUniformNumericWire_InvalidPushRejectsWithoutPersistence(t *testing.T) {
 	ctx := context.Background()
 	pool := newIntegrationTestPool(t, ctx)
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
 	schemaName := "uniform_invalid_push_" + suffix
 	tableIdent := createUniformNumericTestTable(t, ctx, pool, schemaName)
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "uniform-numeric-invalid-push",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}}
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "uniform-numeric-invalid-push",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	actor := Actor{UserID: "uniform-invalid-push-user-" + suffix, SourceID: "sqlite-client"}
-	initializationID := resolveConnectForPushSession(t, ctx, service, actor, true)
+	initializationID := resolveConnectForPush(t, ctx, service, actor, true)
 	scenarios := []struct {
 		name          string
 		payloadFields string
@@ -217,22 +217,12 @@ func TestUniformNumericWire_InvalidPushRejectsBeforeDurableChunkStaging(t *testi
 	}{
 		{
 			name:          "legacy JSON number",
-			payloadFields: `"small_count":"1","count":"1","large_count":1,"amount":"1","ratio":"1","score":"1","enabled":"1"`,
+			payloadFields: `"small_count":"1","count":"1","large_count":1,"amount":"1","ratio":"1","score":"1","enabled":true`,
 			errorCategory: "legacy_json_number",
 		},
 		{
-			name:          "numeric precision overflow",
-			payloadFields: `"small_count":"1","count":"1","large_count":"1","amount":"100000000000000000000.0000000000","ratio":"1","score":"1","enabled":"1"`,
-			errorCategory: "destination_type_invalid",
-		},
-		{
-			name:          "numeric rounding overflow",
-			payloadFields: `"small_count":"1","count":"1","large_count":"1","amount":"99999999999999999999.99999999999","ratio":"1","score":"1","enabled":"1"`,
-			errorCategory: "destination_type_invalid",
-		},
-		{
 			name:          "float4 overflow",
-			payloadFields: `"small_count":"1","count":"1","large_count":"1","amount":"1","ratio":"3.5e+38","score":"1","enabled":"1"`,
+			payloadFields: `"small_count":"1","count":"1","large_count":"1","amount":"1","ratio":"3.5e+38","score":"1","enabled":true`,
 			errorCategory: "destination_type_invalid",
 		},
 	}
@@ -244,29 +234,40 @@ func TestUniformNumericWire_InvalidPushRejectsBeforeDurableChunkStaging(t *testi
 				Schema: schemaName, Table: "numeric_values", Key: SyncKey{"id": rowID.String()}, Op: OpInsert,
 				Payload: json.RawMessage(fmt.Sprintf(`{"id":"%s",%s}`, rowID, scenario.payloadFields)),
 			}}
-			created, err := service.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
-				SourceBundleID:       1,
-				PlannedRowCount:      1,
-				CanonicalRequestHash: mustCanonicalPushRequestHash(t, rows),
-				InitializationID:     initializationID,
+			_, err := service.PushOneShot(ctx, actor, testSchemaGenerationProofForService(service), &OneShotPushRequest{
+				SourceBundleID: 1, CanonicalRequestHash: mustCanonicalPushRequestHash(t, service, rows), InitializationID: initializationID, Rows: rows,
 			})
-			require.NoError(t, err)
 
-			_, err = service.UploadPushChunk(ctx, actor, created.PushID, &PushSessionChunkRequest{StartRowOrdinal: 0, Rows: rows})
-
-			var invalid *PushChunkInvalidError
+			var invalid *PushValidationError
 			require.ErrorAs(t, err, &invalid)
 			require.ErrorContains(t, err, scenario.errorCategory)
 
-			var stagedRows, nextExpectedRowOrdinal, businessRows int64
-			require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM sync.push_session_rows WHERE push_id = $1::uuid`, created.PushID).Scan(&stagedRows))
-			require.NoError(t, pool.QueryRow(ctx, `SELECT next_expected_row_ordinal FROM sync.push_sessions WHERE push_id = $1::uuid`, created.PushID).Scan(&nextExpectedRowOrdinal))
+			var businessRows int64
 			require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, tableIdent)).Scan(&businessRows))
-			require.Zero(t, stagedRows)
-			require.Zero(t, nextExpectedRowOrdinal)
 			require.Zero(t, businessRows)
 		})
 	}
+}
+
+func TestUniformNumericWire_ParameterizedNumericGenerationIsRejected(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	schemaName := "numeric_typmod_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	schemaIdent := pgx.Identifier{schemaName}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s; CREATE TABLE %s.values (_sync_scope_id TEXT NOT NULL,id UUID NOT NULL,amount NUMERIC(30,10) NOT NULL,PRIMARY KEY (_sync_scope_id,id))`, schemaIdent, schemaIdent))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
+	registered := []RegisteredTable{{Schema: schemaName, Table: "values", SyncKeyColumns: []string{"id"}}}
+	service, err := newTestRuntimeService(pool, &ServiceConfig{
+		RegisteredTables: registered, RegisteredTableCatalogRevision: 1,
+		SchemaGenerations: []SchemaGeneration{{ID: 1, Tables: []GenerationTable{{Schema: schemaName, Table: "values", Columns: []GenerationColumn{{Name: "amount", WireType: GenerationWireTypeDecimal}, {Name: "id", WireType: GenerationWireTypeUUID}}}}}},
+	}, integrationTestLogger(slog.LevelWarn))
+	require.NoError(t, err)
+	err = service.Bootstrap(ctx)
+	var unsupported *UnsupportedSchemaError
+	require.ErrorAs(t, err, &unsupported)
+	require.Equal(t, UnsupportedSchemaGenerationColumnTypeMismatch, unsupported.Code)
+	require.Equal(t, "amount", unsupported.Column)
 }
 
 func TestUniformNumericWire_SnapshotRejectsNonFiniteRowsAtomically(t *testing.T) {
@@ -276,18 +277,18 @@ func TestUniformNumericWire_SnapshotRejectsNonFiniteRowsAtomically(t *testing.T)
 	schemaName := "uniform_snapshot_nonfinite_" + suffix
 	tableIdent := createUniformNumericTestTable(t, ctx, pool, schemaName)
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "uniform-numeric-snapshot-nonfinite",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}}
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "uniform-numeric-snapshot-nonfinite",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	userID := "uniform-snapshot-user-" + suffix
 	actor := Actor{UserID: userID, SourceID: "writer"}
 	rowID := uuid.New()
-	_, err := pushRowsViaSession(t, ctx, service, actor, 1, []PushRequestRow{{
+	_, err := pushRowsOneShot(t, ctx, service, actor, 1, []PushRequestRow{{
 		Schema: schemaName, Table: "numeric_values", Key: SyncKey{"id": rowID.String()}, Op: OpInsert,
-		Payload: json.RawMessage(fmt.Sprintf(`{"id":"%s","small_count":"1","count":"1","large_count":"1","amount":"1","ratio":"1","score":"1","enabled":"1"}`, rowID)),
+		Payload: json.RawMessage(fmt.Sprintf(`{"id":"%s","small_count":"1","count":"1","large_count":"1","amount":"1","ratio":"1","score":"1","enabled":true}`, rowID)),
 	}})
 	require.NoError(t, err)
 
@@ -298,7 +299,10 @@ func TestUniformNumericWire_SnapshotRejectsNonFiniteRowsAtomically(t *testing.T)
 	require.NoError(t, updateErr)
 	require.NoError(t, enableErr)
 
-	_, err = service.CreateSnapshotSession(ctx, Actor{UserID: userID, SourceID: "reader"})
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	_, err = service.Connect(ctx, reader, testSchemaGenerationProofForService(service), &ConnectRequest{})
+	require.NoError(t, err)
+	_, err = service.CreateSnapshotSession(ctx, reader, testSchemaGenerationProofForService(service))
 	require.ErrorContains(t, err, "database value must be finite")
 	var sessionCount int64
 	require.NoError(t, pool.QueryRow(ctx, `
@@ -331,10 +335,10 @@ func TestUniformNumericWire_BootstrapRejectsNumericDomainAtomically(t *testing.T
 	}())
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 
-	service, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "uniform-numeric-domain-rejection",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}}
+	service, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(registered), AppName: "uniform-numeric-domain-rejection",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	err = service.Bootstrap(ctx)
@@ -360,10 +364,10 @@ func TestUniformNumericWire_BootstrapRejectsNonFiniteAdoptionAtomically(t *testi
 	`, tableIdent), "adoption-user", uuid.New())
 	require.NoError(t, err)
 
-	service, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "uniform-numeric-adoption-nonfinite",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "numeric_values", SyncKeyColumns: []string{"id"}}}
+	service, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "uniform-numeric-adoption-nonfinite",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	err = service.Bootstrap(ctx)
@@ -389,11 +393,15 @@ func createUniformNumericTestTable(t *testing.T, ctx context.Context, pool inter
 			small_count SMALLINT NOT NULL,
 			count INTEGER NOT NULL,
 			large_count BIGINT NOT NULL,
-			amount NUMERIC(30, 10) NOT NULL,
+			amount NUMERIC NOT NULL,
 			ratio REAL NOT NULL,
 			score DOUBLE PRECISION NOT NULL,
 			enabled BOOLEAN NOT NULL,
-			PRIMARY KEY (_sync_scope_id, id)
+			PRIMARY KEY (_sync_scope_id, id),
+			CONSTRAINT numeric_values_amount_bounds_chk CHECK (
+				amount = 'NaN'::numeric
+				OR (abs(amount) < 100000000000000000000::numeric AND scale(amount) <= 10)
+			)
 		)
 	`, schemaIdent, tableIdent))
 	require.NoError(t, err)

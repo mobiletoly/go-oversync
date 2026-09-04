@@ -17,12 +17,12 @@ const (
 	operationKindRemoteReplace  = "remote_replace"
 	operationKindSourceRecovery = "source_recovery"
 
-	outboxStateNone            = "none"
-	outboxStatePrepared        = "prepared"
-	outboxStateCommittedRemote = "committed_remote"
+	outboxStateNone     = "none"
+	outboxStatePrepared = "prepared"
 )
 
 type attachmentStateRecord struct {
+	AttachmentEpoch         int64
 	CurrentSourceID         string
 	BindingState            string
 	AttachedUserID          string
@@ -55,8 +55,6 @@ type outboxBundleRecord struct {
 	CanonicalRequestHash string
 	RowCount             int64
 	InitializationID     string
-	RemoteBundleHash     string
-	RemoteBundleSeq      int64
 }
 
 type queryRower interface {
@@ -73,10 +71,11 @@ func loadAttachmentState(ctx context.Context, q queryRower) (*attachmentStateRec
 		rebuildRequired int
 	)
 	if err := q.QueryRowContext(ctx, `
-		SELECT current_source_id, binding_state, attached_user_id, schema_name, last_bundle_seq_seen, rebuild_required, pending_initialization_id
+		SELECT attachment_epoch, current_source_id, binding_state, attached_user_id, schema_name, last_bundle_seq_seen, rebuild_required, pending_initialization_id
 		FROM _sync_attachment_state
 		WHERE singleton_key = 1
 	`).Scan(
+		&rec.AttachmentEpoch,
 		&rec.CurrentSourceID,
 		&rec.BindingState,
 		&rec.AttachedUserID,
@@ -100,7 +99,7 @@ func loadAttachmentState(ctx context.Context, q queryRower) (*attachmentStateRec
 	return &rec, nil
 }
 
-func persistAttachmentState(ctx context.Context, e execer, rec *attachmentStateRecord) error {
+func persistAttachmentState(ctx context.Context, e execer, rec *attachmentStateRecord, epochAlreadyAdvanced ...bool) error {
 	if rec == nil {
 		return fmt.Errorf("attachment state is required")
 	}
@@ -114,9 +113,11 @@ func persistAttachmentState(ctx context.Context, e execer, rec *attachmentStateR
 	if rec.RebuildRequired {
 		rebuildRequired = 1
 	}
+	alreadyAdvanced := len(epochAlreadyAdvanced) > 0 && epochAlreadyAdvanced[0]
 	if _, err := e.ExecContext(ctx, `
 		UPDATE _sync_attachment_state
-		SET current_source_id = ?,
+		SET attachment_epoch = attachment_epoch + CASE WHEN NOT ? AND (current_source_id <> ? OR binding_state <> ? OR attached_user_id <> ?) THEN 1 ELSE 0 END,
+			current_source_id = ?,
 			binding_state = ?,
 			attached_user_id = ?,
 			schema_name = ?,
@@ -124,8 +125,18 @@ func persistAttachmentState(ctx context.Context, e execer, rec *attachmentStateR
 			rebuild_required = ?,
 			pending_initialization_id = ?
 		WHERE singleton_key = 1
-	`, rec.CurrentSourceID, rec.BindingState, rec.AttachedUserID, rec.SchemaName, rec.LastBundleSeqSeen, rebuildRequired, rec.PendingInitializationID); err != nil {
+	`, alreadyAdvanced, rec.CurrentSourceID, rec.BindingState, rec.AttachedUserID, rec.CurrentSourceID, rec.BindingState, rec.AttachedUserID, rec.SchemaName, rec.LastBundleSeqSeen, rebuildRequired, rec.PendingInitializationID); err != nil {
 		return fmt.Errorf("failed to persist attachment state: %w", err)
+	}
+	return bindLocalBaselineContext(ctx, e)
+}
+
+// Explicit replacement advances the incarnation even if the binding repeats.
+// SQLite's checked integer column rejects overflow in the same transaction.
+func advanceAttachmentEpoch(ctx context.Context, e execer) error {
+	_, err := e.ExecContext(ctx, `UPDATE _sync_attachment_state SET attachment_epoch=attachment_epoch+1 WHERE singleton_key=1`)
+	if err != nil {
+		return fmt.Errorf("attachment incarnation cannot advance: %w", err)
 	}
 	return nil
 }
@@ -252,7 +263,7 @@ func markSourceReplaced(ctx context.Context, e execer, sourceID, replacedBySourc
 func loadOutboxBundle(ctx context.Context, q queryRower) (*outboxBundleRecord, error) {
 	var rec outboxBundleRecord
 	if err := q.QueryRowContext(ctx, `
-		SELECT state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id, remote_bundle_hash, remote_bundle_seq
+		SELECT state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id
 		FROM _sync_outbox_bundle
 		WHERE singleton_key = 1
 	`).Scan(
@@ -262,8 +273,6 @@ func loadOutboxBundle(ctx context.Context, q queryRower) (*outboxBundleRecord, e
 		&rec.CanonicalRequestHash,
 		&rec.RowCount,
 		&rec.InitializationID,
-		&rec.RemoteBundleHash,
-		&rec.RemoteBundleSeq,
 	); err != nil {
 		return nil, fmt.Errorf("failed to load outbox bundle: %w", err)
 	}
@@ -299,11 +308,9 @@ func persistOutboxBundle(ctx context.Context, e execer, rec *outboxBundleRecord)
 			source_bundle_id = ?,
 			canonical_request_hash = ?,
 			row_count = ?,
-			initialization_id = ?,
-			remote_bundle_hash = ?,
-			remote_bundle_seq = ?
+			initialization_id = ?
 		WHERE singleton_key = 1
-	`, rec.State, rec.SourceID, rec.SourceBundleID, rec.CanonicalRequestHash, rec.RowCount, rec.InitializationID, rec.RemoteBundleHash, rec.RemoteBundleSeq); err != nil {
+	`, rec.State, rec.SourceID, rec.SourceBundleID, rec.CanonicalRequestHash, rec.RowCount, rec.InitializationID); err != nil {
 		return fmt.Errorf("failed to persist outbox bundle: %w", err)
 	}
 	return nil

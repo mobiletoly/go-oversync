@@ -4,73 +4,88 @@ package oversync
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
-func newAuditCreatePushSessionHTTPFixture(t *testing.T) (*pushSessionFixture, string) {
+func newAuditPushHTTPFixture(t *testing.T) (*directPushFixture, string) {
 	t.Helper()
 	ctx := context.Background()
-	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
-	initializationID := resolveConnectForPushSession(t, ctx, fixture.svc, fixture.writer, true)
-	require.NotEmpty(t, initializationID)
+	fixture := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
+	initializationID := resolveConnectForPush(t, ctx, fixture.svc, fixture.writer, true)
 	return fixture, initializationID
 }
 
-func runAuditCreatePushSessionRequest(
+func auditCompactPushBody(t *testing.T, fixture *directPushFixture, initializationID string) string {
+	t.Helper()
+	row := fixture.userRow(uuid.New(), "Audit")
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	contract, ok := fixture.svc.schemaGenerationRegistry.Generation(proof.ID)
+	require.True(t, ok)
+	groups, err := CompactGroupsForRows(generationDescriptor(contract), []PushRequestRow{row})
+	require.NoError(t, err)
+	hash, err := computeGenerationPinnedPushRequestHash(proof, []PushRequestRow{row})
+	require.NoError(t, err)
+	body, err := json.Marshal(CompactPushRequest{
+		SourceBundleID:       1,
+		CanonicalRequestHash: hash,
+		InitializationID:     initializationID,
+		Rows:                 groups,
+	})
+	require.NoError(t, err)
+	return string(body)
+}
+
+func runAuditPushRequest(
 	t *testing.T,
-	fixture *pushSessionFixture,
+	fixture *directPushFixture,
 	body string,
 	contentType string,
 ) *httptest.ResponseRecorder {
 	t.Helper()
 
-	request := httptest.NewRequest(http.MethodPost, "/sync/push-sessions", strings.NewReader(body))
+	request := httptest.NewRequest(http.MethodPost, "/sync/push", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
 	request = request.WithContext(ContextWithActor(request.Context(), fixture.writer))
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	request.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(proof.ID))
+	request.Header.Set(SchemaGenerationFingerprintHeader, proof.Fingerprint)
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
 	recorder := httptest.NewRecorder()
 	handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
-	handlers.HandleCreatePushSession(recorder, request)
+	handlers.HandlePush(recorder, request)
 	return recorder
 }
 
-func TestAuditHTTPCreatePushSession_RejectsUnknownFields(t *testing.T) {
-	fixture, initializationID := newAuditCreatePushSessionHTTPFixture(t)
-	body := fmt.Sprintf(
-		`{"source_bundle_id":1,"planned_row_count":1,"initialization_id":%q,"unknown":true}`,
-		initializationID,
-	)
+func TestAuditHTTPPush_RejectsUnknownFields(t *testing.T) {
+	fixture, initializationID := newAuditPushHTTPFixture(t)
+	body := strings.TrimSuffix(auditCompactPushBody(t, fixture, initializationID), "}") + `,"unknown":true}`
 
-	recorder := runAuditCreatePushSessionRequest(t, fixture, body, "application/json")
+	recorder := runAuditPushRequest(t, fixture, body, "application/json")
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 }
 
-func TestAuditHTTPCreatePushSession_RejectsTrailingJSONDocument(t *testing.T) {
-	fixture, initializationID := newAuditCreatePushSessionHTTPFixture(t)
-	body := fmt.Sprintf(
-		`{"source_bundle_id":1,"planned_row_count":1,"initialization_id":%q} {"extra":true}`,
-		initializationID,
-	)
+func TestAuditHTTPPush_RejectsTrailingJSONDocument(t *testing.T) {
+	fixture, initializationID := newAuditPushHTTPFixture(t)
+	body := auditCompactPushBody(t, fixture, initializationID) + ` {"extra":true}`
 
-	recorder := runAuditCreatePushSessionRequest(t, fixture, body, "application/json")
+	recorder := runAuditPushRequest(t, fixture, body, "application/json")
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 }
 
-func TestAuditHTTPCreatePushSession_RejectsUnsupportedContentType(t *testing.T) {
-	fixture, initializationID := newAuditCreatePushSessionHTTPFixture(t)
-	body := fmt.Sprintf(
-		`{"source_bundle_id":1,"planned_row_count":1,"initialization_id":%q}`,
-		initializationID,
-	)
+func TestAuditHTTPPush_RejectsUnsupportedContentType(t *testing.T) {
+	fixture, initializationID := newAuditPushHTTPFixture(t)
+	body := auditCompactPushBody(t, fixture, initializationID)
 
-	recorder := runAuditCreatePushSessionRequest(t, fixture, body, "text/plain")
+	recorder := runAuditPushRequest(t, fixture, body, "text/plain")
 	require.Equal(t, http.StatusUnsupportedMediaType, recorder.Code)
 }

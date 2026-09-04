@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/mobiletoly/go-oversync/internal/jcs"
@@ -24,6 +25,64 @@ type userStateExecer interface {
 
 type userStateQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+type userUploadConnTestHooks struct {
+	beforeAcquire        func(context.Context) error
+	beforeAdvisoryLock   func(context.Context, *pgxpool.Conn) error
+	afterConflictRowScan func(conflictRowScanObservation)
+}
+
+type conflictRowScanObservation struct {
+	ReportedPayloadByteCount int64
+	PayloadMaterialized      bool
+	MaterializedPayloadBytes int
+}
+
+// userUploadGate keeps same-service operations for one user from consuming
+// multiple pool connections while PostgreSQL's cross-process advisory lock is
+// held elsewhere.
+type userUploadGate struct {
+	token chan struct{}
+	refs  int
+}
+
+func (s *SyncService) acquireLocalUserUploadGate(ctx context.Context, userID string) (func(), error) {
+	s.userUploadGatesMu.Lock()
+	if s.userUploadGates == nil {
+		s.userUploadGates = make(map[string]*userUploadGate)
+	}
+	gate := s.userUploadGates[userID]
+	if gate == nil {
+		gate = &userUploadGate{token: make(chan struct{}, 1)}
+		gate.token <- struct{}{}
+		s.userUploadGates[userID] = gate
+	}
+	gate.refs++
+	s.userUploadGatesMu.Unlock()
+
+	select {
+	case <-gate.token:
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				gate.token <- struct{}{}
+				s.releaseLocalUserUploadGateRef(userID, gate)
+			})
+		}, nil
+	case <-ctx.Done():
+		s.releaseLocalUserUploadGateRef(userID, gate)
+		return nil, ctx.Err()
+	}
+}
+
+func (s *SyncService) releaseLocalUserUploadGateRef(userID string, gate *userUploadGate) {
+	s.userUploadGatesMu.Lock()
+	defer s.userUploadGatesMu.Unlock()
+	gate.refs--
+	if gate.refs == 0 && s.userUploadGates[userID] == gate {
+		delete(s.userUploadGates, userID)
+	}
 }
 
 func ensureUserStateExistsWithExec(ctx context.Context, exec userStateExecer, userID string) error {
@@ -89,17 +148,42 @@ func setBundleTxContext(ctx context.Context, tx pgx.Tx, bundle bundleTxContext) 
 // acquireUserUploadConn pins push processing for one user to one connection and acquires
 // a session-level advisory lock before the bundle transaction begins.
 func (s *SyncService) acquireUserUploadConn(ctx context.Context, userID string) (*pgxpool.Conn, func(), error) {
-	conn, err := s.pool.Acquire(ctx)
+	releaseLocalGate, err := s.acquireLocalUserUploadGate(ctx, userID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("acquire push connection: %w", err)
+	}
+	if s.uploadConnHooks != nil && s.uploadConnHooks.beforeAcquire != nil {
+		if err := s.uploadConnHooks.beforeAcquire(ctx); err != nil {
+			releaseLocalGate()
+			return nil, nil, fmt.Errorf("acquire push connection: %w", err)
+		}
+	}
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		releaseLocalGate()
+		return nil, nil, fmt.Errorf("acquire push connection: %w", err)
+	}
+	if err := attestOriginSession(ctx, conn); err != nil {
+		conn.Release()
+		releaseLocalGate()
+		return nil, nil, err
+	}
+	if s.uploadConnHooks != nil && s.uploadConnHooks.beforeAdvisoryLock != nil {
+		if err := s.uploadConnHooks.beforeAdvisoryLock(ctx, conn); err != nil {
+			conn.Release()
+			releaseLocalGate()
+			return nil, nil, fmt.Errorf("acquire user advisory lock: %w", err)
+		}
 	}
 
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, userID); err != nil {
 		conn.Release()
+		releaseLocalGate()
 		return nil, nil, fmt.Errorf("acquire user advisory lock: %w", err)
 	}
 
 	release := func() {
+		defer releaseLocalGate()
 		defer conn.Release()
 		if conn.Conn().IsClosed() {
 			s.logger.Debug("Skipped releasing user advisory lock because connection is already closed", "user_id", userID)

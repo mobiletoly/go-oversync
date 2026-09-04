@@ -1,0 +1,15 @@
+{
+  "format": "go-oversync.static-baseline.v1",
+  "authority_id": "go-oversync.integration.nethttp-server",
+  "deployment_revision": 1,
+  "transition_revision": "static-schema-v1",
+  "transition_phase": "baseline",
+  "application": {
+    "id": "nethttp-server",
+    "revision": 1
+  },
+  "qualification": {
+    "id": "nethttp-server-integration-suite",
+    "revision": 1
+  }
+}

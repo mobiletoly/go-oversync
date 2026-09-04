@@ -1,0 +1,306 @@
+{
+  "format": "maintenance-conflicts-v1",
+  "scenarios": [
+    {
+      "id": "M6-C01",
+      "name": "ordinary conflicts",
+      "requirements": [
+        "C1"
+      ],
+      "initial": {
+        "generations": [
+          1,
+          3
+        ],
+        "operations": [
+          "INSERT",
+          "UPDATE",
+          "DELETE"
+        ],
+        "request": "frozen",
+        "newer_local_edit": "preserve if present"
+      },
+      "actions": [
+        "freeze upload",
+        "receive definitive push_conflict",
+        "restart runtime",
+        "inspect pending resolution"
+      ],
+      "exchanges": [
+        {
+          "status": 409,
+          "body": {
+            "error": "push_conflict"
+          },
+          "detail": "generation-filtered existing protocol conflict response; see client-upgrade/v1/wire/push-conflict.response.json"
+        }
+      ],
+      "expected": {
+        "needs_resolution": true,
+        "request_identity": "unchanged",
+        "business_intent": "preserved",
+        "default_discard": false
+      },
+      "go": [
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_OrdinaryConflicts"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_RuntimeReopenAndDestructiveGuards"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C02",
+      "name": "explicit decisions",
+      "requirements": [
+        "C2"
+      ],
+      "initial": {
+        "pending_request": "P",
+        "local_revision": "R",
+        "server_version": 2
+      },
+      "actions": [
+        "select P/R",
+        "edit locally to R+1",
+        "reject stale decision",
+        "inspect P/R+1",
+        "resolve older frozen request explicitly",
+        "retain newer edit",
+        "re-conflict if server changes again"
+      ],
+      "exchanges": [
+        {
+          "status": 409,
+          "body": {
+            "error": "push_conflict"
+          }
+        }
+      ],
+      "expected": {
+        "stale_decision": "rejected",
+        "atomic_failure": "original state preserved",
+        "newer_intent": "preserved",
+        "key_change": "rejected"
+      },
+      "go": [
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_StaleDecisionAndNewerEditSurvive"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_DecisionRollbackAndRetry"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_MergeCannotMoveKey"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_ProcessDeathKeepsAtomicDecision"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C03",
+      "name": "maintenance boundaries",
+      "requirements": [
+        "R5",
+        "E2"
+      ],
+      "initial": {
+        "pending_request": "frozen or committed with result not yet applied",
+        "retry_budget": "finite"
+      },
+      "actions": [
+        "reject create/chunk/commit/replay/pull/snapshot/watch",
+        "exhaust finite retries",
+        "preserve local file",
+        "restart or reschedule later",
+        "resume supported session"
+      ],
+      "exchanges": [
+        {
+          "status": 503,
+          "body": {
+            "error": "service_not_ready",
+            "message": "Sync service is unavailable; retry later"
+          }
+        }
+      ],
+      "expected": {
+        "acknowledged": false,
+        "outbox": "preserved",
+        "new_source": "not allocated by maintenance rejection"
+      },
+      "go": [
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_TemporaryRejection"
+        ],
+        [
+          ".",
+          "./integration/schema_evolution",
+          "TestEvolution_MaintenanceRejectsEveryOrdinaryEntry"
+        ],
+        [
+          "integration/mobile_flow",
+          "./simulator",
+          "TestMobileFlow_TransitionPostgreSQLTransitionAndUpgrade"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C04",
+      "name": "uncertain commit and session recovery",
+      "requirements": [
+        "C3",
+        "E2"
+      ],
+      "initial": {
+        "request": "immutable source/request tuple",
+        "commit_reply": "lost"
+      },
+      "actions": [
+        "server commits",
+        "response lost",
+        "maintenance",
+        "retry exact identity",
+        "apply retained committed result once",
+        "use existing guarded snapshot recovery if result pruned"
+      ],
+      "exchanges": [
+        {
+          "status": 200,
+          "body": {
+            "status": "already_committed"
+          },
+          "detail": "existing generation-pinned committed-bundle replay protocol"
+        },
+        {
+          "status": 409,
+          "body": {
+            "error": "history_pruned"
+          }
+        }
+      ],
+      "expected": {
+        "duplicate_server_commit": false,
+        "uncertain_outcome_discarded": false,
+        "unsettled_intent": "preserved until exact settlement"
+      },
+      "go": [
+        [
+          "integration/mobile_flow",
+          "./simulator",
+          "TestMobileFlow_TransitionPostgreSQLTransitionAndUpgrade"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPushPending_CommittedRemoteReplayPrunedFallsBackToKeepSourceRebuild"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPushPending_PrunedRecoveryRejectsSnapshotCorruptedByCrossRowTrigger"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C05",
+      "name": "destructive-operation guards",
+      "requirements": [
+        "C3"
+      ],
+      "initial": {
+        "generation": "old",
+        "outbox": "unresolved frozen request",
+        "newer_local_edit": "retained"
+      },
+      "actions": [
+        "attempt snapshot rebuild, detach and uninstall",
+        "reopen same file after runtime update",
+        "resolve ordinary or upgrade bound pending intent before generation migration"
+      ],
+      "exchanges": [],
+      "expected": {
+        "unresolved_work_erased": false,
+        "old_generation_request_identity": "unchanged by runtime update"
+      },
+      "go": [
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_RuntimeReopenAndDestructiveGuards"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestOpening_I03PermanentRejectionRequiresBoundResolution"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestOpening_I03ResolutionDecisionSurvivesProcessDeath"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C06",
+      "name": "deployment compatibility",
+      "requirements": [
+        "C4",
+        "E2"
+      ],
+      "initial": {
+        "generation_proof": "valid old generation",
+        "runtime_support": "not qualified"
+      },
+      "actions": [
+        "reject unsupported runtime before sync mutation",
+        "retain local file and frozen request",
+        "qualify runtime in place",
+        "allow same generation to resume"
+      ],
+      "exchanges": [
+        {
+          "status": 426,
+          "body": {
+            "error": "client_runtime_upgrade_required",
+            "message": "Update the application; keep local data and pending sync work"
+          },
+          "ownership": "example application allowlist; no new core wire generation field"
+        }
+      ],
+      "expected": {
+        "schema_proof_proves_runtime_support": false,
+        "pending_intent": "preserved",
+        "supported_runtime_resume": true
+      },
+      "go": [
+        [
+          "integration/mobile_flow",
+          "./simulator",
+          "TestMobileFlow_TransitionPostgreSQLTransitionAndUpgrade"
+        ]
+      ]
+    }
+  ]
+}

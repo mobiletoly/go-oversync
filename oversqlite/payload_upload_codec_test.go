@@ -27,9 +27,10 @@ func TestProcessPayloadForUpload_BlobUUIDPK_UsesUUIDStringForPK(t *testing.T) {
 	`)
 	require.NoError(t, err)
 
-	cfg := DefaultConfig("business", []SyncTable{{TableName: "files", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("business", []SyncTable{{TableName: "files", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
+	cfg = testConfigWithLocalContract(t, db, cfg)
 	tokenFunc := func(ctx context.Context) (string, error) { return "mock-token", nil }
-	client, err := NewClient(db, "http://localhost:8080", tokenFunc, cfg)
+	client, err := newAdmittedFixtureClient(db, "http://localhost:8080", tokenFunc, cfg)
 	require.NoError(t, err)
 
 	id := uuid.New()
@@ -38,9 +39,9 @@ func TestProcessPayloadForUpload_BlobUUIDPK_UsesUUIDStringForPK(t *testing.T) {
 	dataHex := hex.EncodeToString(data)
 
 	rawPayload := map[string]any{
-		"id":   idHex,
-		"name": "a.txt",
-		"data": dataHex,
+		"id":   map[string]any{"storage": "blob", "value": idHex},
+		"name": map[string]any{"storage": "text", "value": "a.txt"},
+		"data": map[string]any{"storage": "blob", "value": dataHex},
 	}
 	rawBytes, err := json.Marshal(rawPayload)
 	require.NoError(t, err)
@@ -76,26 +77,28 @@ func TestProcessPayloadForUpload_BlobUUIDReferenceColumns_UseUUIDStrings(t *test
 	_, err = db.Exec(`
 		CREATE TABLE file_reviews (
 			id BLOB PRIMARY KEY NOT NULL,
-			file_id BLOB NOT NULL REFERENCES files(id),
+			file_id BLOB NOT NULL REFERENCES files(id) DEFERRABLE INITIALLY DEFERRED,
 			review TEXT NOT NULL
 		)
 	`)
 	require.NoError(t, err)
 
-	cfg := DefaultConfig("business", []SyncTable{
+	cfg := admittedFixtureConfig("business", []SyncTable{
 		{TableName: "files", SyncKeyColumnName: "id"},
 		{TableName: "file_reviews", SyncKeyColumnName: "id"},
-	})
+	}, testSchemaGenerationProof())
+	cfg = testConfigWithLocalContract(t, db, cfg)
+
 	tokenFunc := func(ctx context.Context) (string, error) { return "mock-token", nil }
-	client, err := NewClient(db, "http://localhost:8080", tokenFunc, cfg)
+	client, err := newAdmittedFixtureClient(db, "http://localhost:8080", tokenFunc, cfg)
 	require.NoError(t, err)
 
 	reviewID := uuid.New()
 	fileID := uuid.New()
 	rawPayload := map[string]any{
-		"id":      hex.EncodeToString(reviewID[:]),
-		"file_id": hex.EncodeToString(fileID[:]),
-		"review":  "looks good",
+		"id":      map[string]any{"storage": "blob", "value": hex.EncodeToString(reviewID[:])},
+		"file_id": map[string]any{"storage": "blob", "value": hex.EncodeToString(fileID[:])},
+		"review":  map[string]any{"storage": "text", "value": "looks good"},
 	}
 	rawBytes, err := json.Marshal(rawPayload)
 	require.NoError(t, err)

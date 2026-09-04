@@ -233,10 +233,9 @@ func BenchmarkAuditScalabilityBootstrapRegisteredTables(b *testing.B) {
 				b.Fatalf("reset sync schema before bootstrap profile: %v", err)
 			}
 			registeredTables := auditCreateBootstrapProfileTables(b, fixture, tableCount)
-			config := &ServiceConfig{
-				MaxSupportedSchemaVersion: 1,
-				AppName:                   fmt.Sprintf("audit-scalability-bootstrap-%d", tableCount),
-				RegisteredTables:          registeredTables,
+			config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(registeredTables), AppName: fmt.Sprintf("audit-scalability-bootstrap-%d", tableCount),
+				RegisteredTables:               registeredTables,
+				RegisteredTableCatalogRevision: 1,
 			}
 
 			latencies, allocatedBytes, mallocs := auditRunFixedScalabilitySamples(b, func(measured bool) auditScalabilityOperationSample {
@@ -475,13 +474,12 @@ func newAuditPopulatedBootstrapFixture(
 		}
 	}
 
-	config := &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "oversync-audit-populated-" + scenario.name,
-		RegisteredTables:          registeredTables,
+	config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(registeredTables), AppName: "oversync-audit-populated-" + scenario.name,
+		RegisteredTables:               registeredTables,
+		RegisteredTableCatalogRevision: 1,
 	}
 	if !scenario.pristine {
-		setupService, err := NewRuntimeService(base.pool, config, integrationTestLogger(slog.LevelWarn))
+		setupService, err := newTestRuntimeService(base.pool, config, integrationTestLogger(slog.LevelWarn))
 		if err != nil {
 			b.Fatalf("create populated benchmark setup service: %v", err)
 		}
@@ -565,26 +563,21 @@ func auditSeedPopulatedBenchmarkTombstones(
 			Op:             OpDelete,
 			BaseRowVersion: 1,
 		}
-		requestHash, err := computeCanonicalPushRequestHash([]PushRequestRow{row})
+		requestHash, err := computeGenerationPinnedPushRequestHash(testSchemaGenerationProofForService(service), []PushRequestRow{row})
 		if err != nil {
 			b.Fatalf("hash populated benchmark tombstone %d: %v", scopeIndex, err)
 		}
-		response, err := service.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
+		response, err := service.PushOneShot(ctx, actor, testSchemaGenerationProofForService(service), &OneShotPushRequest{
 			SourceBundleID:       1,
-			PlannedRowCount:      1,
 			CanonicalRequestHash: requestHash,
+			Rows:                 []PushRequestRow{row},
 		})
+
 		if err != nil {
-			b.Fatalf("create populated benchmark tombstone session %d: %v", scopeIndex, err)
+			b.Fatalf("direct populated benchmark tombstone %d: %v", scopeIndex, err)
 		}
-		if _, err := service.UploadPushChunk(ctx, actor, response.PushID, &PushSessionChunkRequest{
-			StartRowOrdinal: 0,
-			Rows:            []PushRequestRow{row},
-		}); err != nil {
-			b.Fatalf("upload populated benchmark tombstone %d: %v", scopeIndex, err)
-		}
-		if _, err := service.CommitPushSession(ctx, actor, response.PushID); err != nil {
-			b.Fatalf("commit populated benchmark tombstone %d: %v", scopeIndex, err)
+		if response.Bundle == nil {
+			b.Fatalf("direct populated benchmark tombstone %d returned no bundle", scopeIndex)
 		}
 	}
 }
@@ -629,7 +622,7 @@ func (f *auditPopulatedBootstrapFixture) runBootstrapSample(
 		}
 	}
 	config := *f.config
-	service, err := NewRuntimeService(f.pool, &config, integrationTestLogger(slog.LevelWarn))
+	service, err := newTestRuntimeService(f.pool, &config, integrationTestLogger(slog.LevelWarn))
 	if err != nil {
 		b.Fatalf("create populated benchmark service: %v", err)
 	}
@@ -751,7 +744,7 @@ func auditOwnedDirectoryUsage(b *testing.B, dir string) auditTemporaryUsage {
 }
 
 func BenchmarkAuditScalabilityExpiredSessionCleanup(b *testing.B) {
-	cleanupKinds := []string{"push", "snapshot"}
+	cleanupKinds := []string{"snapshot"}
 	for _, sessionCount := range []int{100, 10_000} {
 		for _, cleanupKind := range cleanupKinds {
 			b.Run(fmt.Sprintf("%s/sessions_%d", cleanupKind, sessionCount), func(b *testing.B) {
@@ -868,7 +861,7 @@ func auditScalabilityActors(
 			userID = fmt.Sprintf("%s-scope-%04d", fixture.writer.UserID, worker)
 		}
 		actor := Actor{UserID: userID, SourceID: fmt.Sprintf("worker-%04d", worker)}
-		response, err := fixture.svc.Connect(fixture.ctx, actor, &ConnectRequest{HasLocalPendingRows: false})
+		response, err := fixture.svc.Connect(fixture.ctx, actor, testSchemaGenerationProofForService(fixture.svc), &ConnectRequest{HasLocalPendingRows: false})
 		if err != nil {
 			b.Fatalf("initialize concurrency actor %d: %v", worker, err)
 		}
@@ -1078,7 +1071,7 @@ func auditRunBootstrapProfileSample(
 	if err := resetTestSyncSchema(fixture.ctx, fixture.pool); err != nil {
 		b.Fatalf("reset sync schema for bootstrap sample: %v", err)
 	}
-	service, err := NewRuntimeService(fixture.pool, config, integrationTestLogger(slog.LevelWarn))
+	service, err := newTestRuntimeService(fixture.pool, config, integrationTestLogger(slog.LevelWarn))
 	if err != nil {
 		b.Fatalf("create bootstrap sample service: %v", err)
 	}
@@ -1114,7 +1107,7 @@ func auditRunExpiredCleanupProfileSample(
 	measured bool,
 ) auditScalabilityOperationSample {
 	b.Helper()
-	if err := auditSeedExpiredSessions(fixture.ctx, fixture.pool, cleanupKind, sessionCount, userPK, tableID); err != nil {
+	if err := auditSeedExpiredSessions(fixture.ctx, fixture.pool, cleanupKind, sessionCount, userPK, tableID, testSchemaGenerationProofForService(fixture.svc)); err != nil {
 		b.Fatalf("seed %s cleanup sample: %v", cleanupKind, err)
 	}
 	var beforeMemory runtime.MemStats
@@ -1126,7 +1119,7 @@ func auditRunExpiredCleanupProfileSample(
 	var err error
 	switch cleanupKind {
 	case "push":
-		err = cleanupExpiredPushSessionsQuerier(fixture.ctx, fixture.pool)
+		b.Fatalf("direct pushes do not create expiring server sessions")
 	case "snapshot":
 		for {
 			var result snapshotCleanupBatchResult
@@ -1151,16 +1144,9 @@ func auditRunExpiredCleanupProfileSample(
 	var remaining int64
 	query := `
 		SELECT
-			(SELECT COUNT(*) FROM sync.push_sessions) +
-			(SELECT COUNT(*) FROM sync.push_session_rows)
+			(SELECT COUNT(*) FROM sync.snapshot_sessions) +
+			(SELECT COUNT(*) FROM sync.snapshot_session_rows)
 	`
-	if cleanupKind == "snapshot" {
-		query = `
-			SELECT
-				(SELECT COUNT(*) FROM sync.snapshot_sessions) +
-				(SELECT COUNT(*) FROM sync.snapshot_session_rows)
-		`
-	}
 	if err := fixture.pool.QueryRow(fixture.ctx, query).Scan(&remaining); err != nil {
 		b.Fatalf("count remaining %s sessions: %v", cleanupKind, err)
 	}
@@ -1177,58 +1163,50 @@ func auditSeedExpiredSessions(
 	sessionCount int,
 	userPK int64,
 	tableID int32,
+	proof SchemaGenerationProof,
 ) error {
 	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO sync.source_state (
+				user_pk, source_id, state, max_committed_source_bundle_id,
+				replaced_by_source_id, retirement_reason
+			)
+			SELECT $1, 'audit-expired-' || item::text, 'active', 0, '', ''
+			FROM generate_series(1, $2) AS item
+			ON CONFLICT (user_pk, source_id) DO NOTHING
+		`, userPK, sessionCount); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO sync.source_generation_bindings (
+				user_pk, source_id, schema_generation_id, schema_generation_fingerprint
+			)
+			SELECT $1, 'audit-expired-' || item::text, $3, $4
+			FROM generate_series(1, $2) AS item
+			ON CONFLICT (user_pk, source_id) DO NOTHING
+		`, userPK, sessionCount, proof.ID, proof.Fingerprint); err != nil {
+			return err
+		}
 		switch cleanupKind {
-		case "push":
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO sync.push_sessions (
-					push_id, user_pk, source_id, source_bundle_id,
-					planned_row_count, next_expected_row_ordinal,
-					initialization_id, expires_at
-				)
-				SELECT md5('audit-expired-push-' || item::text)::uuid,
-					$1,
-					'audit-expired-' || item::text,
-					1,
-					1,
-					1,
-					NULL,
-					now() - interval '1 second'
-				FROM generate_series(1, $2) AS item
-			`, userPK, sessionCount); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO sync.push_session_rows (
-					push_id, row_ordinal, table_id, key_bytes,
-					op_code, base_bundle_seq, payload_apply
-				)
-				SELECT md5('audit-expired-push-' || item::text)::uuid,
-					0,
-					$1,
-					decode(md5('audit-expired-push-key-' || item::text), 'hex'),
-					1,
-					0,
-					'{}'::json
-				FROM generate_series(1, $2) AS item
-			`, tableID, sessionCount); err != nil {
-				return err
-			}
 		case "snapshot":
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO sync.snapshot_sessions (
-					snapshot_id, user_pk, snapshot_bundle_seq,
+					snapshot_id, user_pk, source_id,
+					schema_generation_id, schema_generation_fingerprint,
+					snapshot_bundle_seq,
 					row_count, byte_count, expires_at
 				)
 				SELECT md5('audit-expired-snapshot-' || item::text)::uuid,
 					$1,
+					'audit-expired-' || item::text,
+					$3,
+					$4,
 					0,
 					1,
 					2,
 					now() - interval '1 second'
 				FROM generate_series(1, $2) AS item
-			`, userPK, sessionCount); err != nil {
+			`, userPK, sessionCount, proof.ID, proof.Fingerprint); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `

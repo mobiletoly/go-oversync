@@ -22,6 +22,12 @@ A bundle is the smallest durable sync unit.
 - `sync.bundle_rows` records normalized row effects for that bundle.
 - Clients apply complete bundles only.
 
+The stored bundle is canonical and generation-independent. At each request the server validates
+that canonical framing, filters it through the pinned immutable generation, preserves surviving
+order, and computes a new visible count, byte count, and hash. Hidden-only bundles remain empty
+pull envelopes. No durable projection copies, transformation callbacks, aliases, or projection
+cache participate in authority.
+
 ## Structured keys
 
 Rows are identified by structured sync keys, not by an implicit single `pk` field on the wire.
@@ -52,32 +58,39 @@ resolver code.
 
 ## Canonical JSON and numeric values
 
-Canonical protocol bytes use RFC 8785 JCS plus `jcs_uniform_numeric_strings_v1`. PostgreSQL
-`SMALLINT`, `INTEGER`, `BIGINT`, `NUMERIC`, `DECIMAL`, `REAL`, and `DOUBLE PRECISION` business
-values are JSON strings on every wire surface. Floating strings use the shortest finite RFC 8785
-binary64 spelling and normalize negative zero to `"0"`. SQLite clients upload `INTEGER` and finite
-`REAL` affinity as those canonical strings; exact decimals remain SQLite `TEXT` strings.
+Generation-bound protocol bytes use RFC 8785 JCS plus the exact declared wire token. Integers are
+range-checked canonical strings. Decimals preserve bounded non-exponent text. `float64` uses the
+shortest finite spelling for both PostgreSQL `float4` and `float8`; committed `float4` values may
+reflect storage normalization. Boolean values are
+JSON literals, never `"0"` or `"1"` strings. Bytes, UUIDs, text, and inner JSON are likewise
+validated without trimming, normalization, or repair. Text and inner-JSON strings preserve every
+Unicode scalar except PostgreSQL-infeasible U+0000. SQL NULL is outer JSON `null`; a JSON document
+whose value is null is the outer string `"null"`.
 
-SQLite Boolean affinity may upload only the strict strings `"0"` and `"1"`. PostgreSQL commits,
-conflicts, pulls, and snapshots emit JSON Booleans. Numeric behavior comes from PostgreSQL schema
-discovery and SQLite affinity; clients do not configure per-column numeric maps.
+SQLite affinity cannot select between several of those tokens. generation provisions a fixed proof but
+does not add the per-column local codec metadata owned by upgrade, so the current `oversqlite`
+affinity bridge is not a generation-token fallback.
 
-Invalid signed-64, decimal, binary64, or Boolean wire values are rejected before durable staging,
+Invalid integer, decimal, floating-point, Boolean, base64, UUID, text, or inner-JSON wire values are rejected before durable staging,
 business mutation, or SQLite mutation. Native JSON/JSONB numbers remain inside the ordinary JCS
 binary64 domain; exact nested values must be modeled as strings by the application schema.
 `bundle_hash` authenticates server-committed rows. The separately stored `canonical_request_hash`
-proves that an ambiguous `already_committed` response belongs to the client's frozen original
-request even when legitimate server mutation changed committed payloads.
+proves that an exact direct-push replay belongs to the client's frozen original request even when
+legitimate server mutation changed committed payloads.
 
 ## Push
 
 Push is all-or-nothing at bundle level.
 
-- The client sends one logical dirty set with `source_id`, `source_bundle_id`, and `base_bundle_seq`.
+- The client sends one compact logical dirty set in a bounded `POST /sync/push`; `source_id` is the
+  authenticated header identity and `source_bundle_id` is in the request envelope.
 - The server validates the whole request and either rejects it or commits one bundle.
 - Retrying the same accepted `(user_id, source_id, source_bundle_id)` returns the same committed
   bundle.
 - The server stores accepted-push replay metadata in `sync.bundle_log`.
+- Every uploaded key must have exactly one final captured effect visible to the pushing generation.
+  Trigger normalization and extra effects are valid; incomplete coverage returns HTTP 422 and
+  rolls back business, audit/cascade, bundle, and source progress together.
 - `sync.source_state` keeps a monotonic committed source-bundle watermark so stale or duplicate
   source bundle ids cannot be accepted again after older bundle history is pruned.
 - Source bundle ids must be contiguous per source; stale/pruned, out-of-order, changed, or retired
@@ -87,16 +100,23 @@ Push is all-or-nothing at bundle level.
 
 The supported client/runtime contract includes structured `push_conflict` recovery.
 
-- Only decoded machine-readable `push_conflict` payloads participate in resolver-based recovery
+- The default resolver is durable defer: `PushPending()` and `Sync()` return
+  `ConflictNeedsResolutionError` without acknowledging the request or clearing its outbox.
+- Inspect the exact retained `PendingConflict`, then call `ResolveConflict(selected, result)` or
+  `RetryConflict(selected)`. Retry clears only the observation and preserves the frozen request.
+- `ServerWinsResolver` and `ClientWinsResolver` are explicit opt-in policies; only those policies
+  perform automatic conflict decisions.
+- Only presence-aware, schema-validated machine-readable `push_conflict` payloads participate in
+  resolver-based recovery. Missing `server_row` differs from explicit JSON null.
 - Valid resolver outcomes are:
   - accept server state
   - keep local intent
   - keep merged full-row payload
-- Automatic structured recovery rewrites local row state, requeues surviving dirty intents,
-  clears `_sync_outbox_*`, and retries from a fresh outbound snapshot
-- Structured retries preserve the same logical `source_bundle_id`; `next_source_bundle_id` advances
-  only after a successful committed replay
-- The retry budget is bounded to `2` automatic retries inside one `PushPending()`
+- A selected decision validates the retained revision, rewrites local/row state, requeues surviving
+  intent, and clears the outbox and conflict observation in one transaction. Failure or cancellation
+  rolls the complete decision back.
+- Opt-in automatic decisions preserve the logical `source_bundle_id`; the bounded retry budget is
+  `2` inside one `PushPending()`.
 
 ## Administrative reset and TRUNCATE protection
 
@@ -168,11 +188,17 @@ The supported envelope is intentionally strict.
 - bootstrap fails when required FK deferrability is missing
 - pull/hydrate/recover fail while local dirty rows exist
 - malformed server responses are rejected without advancing durable checkpoints
-- invalid structured conflict resolutions clear `_sync_outbox_*` and restore replayable intents
-  to `_sync_dirty_rows`
-- structured conflict retry exhaustion also clears `_sync_outbox_*` and leaves unresolved
-  intents replayable
-- generic non-conflict commit/replay failures still use the existing fail-closed recovery path
+- invalid automatic conflict decisions atomically restore missing dirty intent, clear the invalid
+  observation, and retire the frozen `_sync_outbox_*` request without overwriting newer dirty edits;
+  an explicit invalid decision retains the pending conflict and frozen request
+- inspect `PendingConflict`, then use `ResolveConflict` with the inspected decision identity;
+  stale decisions fail without discarding intent
+- `RetryConflict` clears only the conflict observation; the next `PushPending` retries the exact
+  frozen request. It does not acknowledge, rebase, or discard local edits
+- application HTTP 422 responses create a durable `PendingPushRejection`; explicit retry preserves
+  the frozen request, while explicit discard abandons that whole request only after server staging
+  is definitively retired and preserves every newer dirty edit
+- other non-conflict commit/replay failures still use the existing fail-closed recovery path
 
 ## Supported envelope
 

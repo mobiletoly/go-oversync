@@ -19,6 +19,9 @@ import (
 func (c *Client) startDownloaderLoop(ctx context.Context) {
 	useWatch, err := c.shouldUseBundleChangeWatch(ctx)
 	if err != nil {
+		if c.stopForRetiredGeneration(err) {
+			return
+		}
 		if isProtocolVersionMismatch(err) {
 			c.logger.Error("automatic downloads stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
 			return
@@ -38,10 +41,10 @@ func (c *Client) shouldUseBundleChangeWatch(ctx context.Context) (bool, error) {
 	if err := c.beginWatchSetupSyncOperation(ctx); err != nil {
 		return false, err
 	}
-	connected := c.ensureConnectedSessionLocked(ctx, "Start() bundle change watch") == nil
+	connectErr := c.ensureConnectedSessionLocked(ctx, "Start() bundle change watch")
 	c.writeMu.Unlock()
-	if !connected {
-		return false, nil
+	if connectErr != nil {
+		return false, connectErr
 	}
 	return c.serverSupportsBundleChangeWatch(ctx)
 }
@@ -62,22 +65,10 @@ func (c *Client) beginWatchSetupSyncOperation(ctx context.Context) error {
 }
 
 func (c *Client) serverSupportsBundleChangeWatch(ctx context.Context) (bool, error) {
-	result, err := c.doAuthenticatedBoundedRequestWithRetry(
-		ctx, "watch_capabilities", http.MethodGet,
-		strings.TrimRight(c.BaseURL, "/")+"/sync/capabilities", nil, "",
-		snapshotCapabilitiesBodyLimit, snapshotControlBodyLimit, nil, nil,
-	)
-	if err != nil || result.statusCode != http.StatusOK {
-		return false, nil
+	if c == nil || c.discovery == nil {
+		return false, fmt.Errorf("ready client has no admitted discovery contract")
 	}
-	var caps oversync.CapabilitiesResponse
-	if err := json.Unmarshal(result.body, &caps); err != nil {
-		return false, nil
-	}
-	if err := requireSupportedProtocolVersion(caps.ProtocolVersion); err != nil {
-		return false, err
-	}
-	return caps.Features != nil && caps.Features["bundle_change_watch"], nil
+	return c.discovery.WatchEnabled, nil
 }
 
 func (c *Client) normalizedWatchFallbackInterval() time.Duration {
@@ -130,42 +121,11 @@ func (c *Client) watchAwareDownloaderLoop(ctx context.Context) {
 		}
 
 		if err := c.watchRemoteChanges(ctx, afterBundleSeq, fallbackInterval); err != nil {
-			if ctx.Err() != nil {
+			var retry bool
+			backoff, retry = c.recoverBundleChangeWatch(ctx, err, backoff)
+			if !retry {
 				return
 			}
-			if isProtocolVersionMismatch(err) {
-				c.logger.Error("bundle change watch loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
-				return
-			}
-			if isBundleChangeWatchForbidden(err) {
-				c.logger.Warn("bundle change watch disabled for client", "error", err)
-				c.downloaderLoop(ctx)
-				return
-			}
-			c.logger.Warn("bundle change watch stream stopped", "error_type", fmt.Sprintf("%T", err))
-			backoffErr := err
-			var streamPullErr *bundleChangeWatchPullError
-			if !errors.As(err, &streamPullErr) {
-				if _, pullErr := c.PullToStable(ctx); pullErr != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					if isProtocolVersionMismatch(pullErr) {
-						c.logger.Error("bundle change watch loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", pullErr))
-						return
-					}
-					backoffErr = pullErr
-					if IsLifecyclePreconditionError(pullErr) {
-						c.logger.Warn("download loop blocked by lifecycle state", "error", pullErr)
-					} else {
-						c.logger.Warn("bundle change watch fallback pull failed", "error", pullErr)
-					}
-				}
-			}
-			if err := sleepWatchInterval(ctx, backoff); err != nil {
-				return
-			}
-			backoff = nextSyncLoopBackoffAfterError(backoffErr, backoff, c.config.BackoffMin, c.config.BackoffMax)
 			continue
 		}
 		backoff = c.config.BackoffMin
@@ -224,17 +184,25 @@ func sleepWatchInterval(ctx context.Context, d time.Duration) error {
 }
 
 func (c *Client) watchRemoteChanges(ctx context.Context, afterBundleSeq int64, fallbackInterval time.Duration) error {
-	resp, err := c.openBundleChangeWatch(ctx, afterBundleSeq)
+	watchCtx, cancel := context.WithCancel(ctx)
+	resp, err := c.openBundleChangeWatch(watchCtx, afterBundleSeq)
 	if err != nil {
+		cancel()
 		return err
 	}
-	defer resp.Body.Close()
 
 	eventCh := make(chan oversync.BundleChangeEvent, 1)
-	errCh := make(chan error, 1)
+	parserDone := make(chan struct{})
+	var parserErr error
 	go func() {
-		errCh <- parseBundleChangeWatchStream(ctx, resp.Body, eventCh)
+		defer close(parserDone)
+		parserErr = parseBundleChangeWatchStream(watchCtx, resp.Body, eventCh)
 		close(eventCh)
+	}()
+	defer func() {
+		cancel()
+		_ = resp.Body.Close()
+		<-parserDone
 	}()
 
 	fallback := time.NewTicker(fallbackInterval)
@@ -242,23 +210,23 @@ func (c *Client) watchRemoteChanges(ctx context.Context, afterBundleSeq int64, f
 
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-watchCtx.Done():
+			return watchCtx.Err()
 		case event, ok := <-eventCh:
 			if !ok {
-				if err := <-errCh; err != nil {
-					return err
+				if parserErr != nil {
+					return parserErr
 				}
 				return io.EOF
 			}
 			if event.BundleSeq <= 0 {
 				return fmt.Errorf("bundle watch event missing bundle_seq")
 			}
-			if _, err := c.PullToStable(ctx); err != nil {
+			if _, err := c.PullToStable(watchCtx); err != nil {
 				return &bundleChangeWatchPullError{err: err}
 			}
 		case <-fallback.C:
-			if _, err := c.PullToStable(ctx); err != nil {
+			if _, err := c.PullToStable(watchCtx); err != nil {
 				return &bundleChangeWatchPullError{err: err}
 			}
 		}
@@ -282,12 +250,12 @@ func (c *Client) openBundleChangeWatch(ctx context.Context, afterBundleSeq int64
 	if err != nil {
 		return nil, err
 	}
-	if err := applyAuthenticatedSyncHeadersWithSourceID(req, token, sourceID); err != nil {
+	if err := applyAuthenticatedSyncHeadersWithSourceID(req, token, sourceID, c.schemaGenerationProof); err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept-Encoding", "identity")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.doHTTP(req)
 	if err != nil {
 		return nil, err
 	}
@@ -296,6 +264,9 @@ func (c *Client) openBundleChangeWatch(ctx context.Context, afterBundleSeq int64
 		body, readErr := readDecodedBodyBounded(ctx, "bundle_change_watch", resp, snapshotControlBodyLimit)
 		if readErr != nil {
 			return nil, readErr
+		}
+		if generationErr := decodeSchemaGenerationRequestError(resp.StatusCode, body, c.schemaGenerationProof); generationErr != nil {
+			return nil, generationErr
 		}
 		if resp.StatusCode == http.StatusForbidden {
 			if errorResp, ok := decodeServerErrorResponse(body); ok && errorResp.Error == "bundle_change_watch_forbidden" {
@@ -321,7 +292,7 @@ func (c *Client) refreshCurrentSourceIDForWatch(ctx context.Context) (string, er
 		return c.sourceID, nil
 	}
 	defer c.writeMu.Unlock()
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return "", err
 	}
@@ -334,7 +305,7 @@ func (c *Client) refreshCurrentSourceIDForWatch(ctx context.Context) (string, er
 	return c.sourceID, nil
 }
 
-func parseBundleChangeWatchStream(ctx context.Context, r io.Reader, events chan<- oversync.BundleChangeEvent) error {
+func parseBundleChangeWatchStream(ctx context.Context, r io.Reader, events chan oversync.BundleChangeEvent) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1024), bundleChangeWatchMaxLineBytes+2)
 
@@ -348,15 +319,22 @@ func parseBundleChangeWatchStream(ctx context.Context, r io.Reader, events chan<
 		}
 		if line == "" {
 			if eventName == "bundle" {
-				var event oversync.BundleChangeEvent
-				if err := json.Unmarshal([]byte(data.String()), &event); err != nil {
+				event, err := decodeBundleChangeEvent([]byte(data.String()))
+				if err != nil {
 					return fmt.Errorf("decode bundle watch event: %w", err)
-				}
-				if err := validateOptionalSourceID(event.SourceID); err != nil {
-					return fmt.Errorf("bundle watch event source_id is invalid: %w", err)
 				}
 				select {
 				case events <- event:
+				default:
+					select {
+					case <-events:
+					default:
+					}
+					select {
+					case events <- event:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
 				case <-ctx.Done():
 					return ctx.Err()
 				}
@@ -389,4 +367,77 @@ func parseBundleChangeWatchStream(ctx context.Context, r io.Reader, events chan<
 		return err
 	}
 	return io.EOF
+}
+
+func decodeBundleChangeEvent(data []byte) (oversync.BundleChangeEvent, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return oversync.BundleChangeEvent{}, err
+	}
+	value, present := fields["bundle_seq"]
+	if !present || len(fields) != 1 {
+		return oversync.BundleChangeEvent{}, fmt.Errorf("bundle event must contain exactly bundle_seq")
+	}
+	var bundleSeq int64
+	if err := json.Unmarshal(value, &bundleSeq); err != nil || bundleSeq <= 0 {
+		return oversync.BundleChangeEvent{}, fmt.Errorf("bundle_seq must be a positive integer")
+	}
+	return oversync.BundleChangeEvent{BundleSeq: bundleSeq}, nil
+}
+
+// recoverBundleChangeWatch owns reconnect/fallback policy after a stream ends.
+// A retired proof stops before fallback or backoff; ordinary transient behavior
+// retains the existing lifecycle and protocol-error precedence.
+func (c *Client) recoverBundleChangeWatch(ctx context.Context, err error, backoff time.Duration) (time.Duration, bool) {
+
+	if ctx.Err() != nil {
+		return backoff, false
+	}
+	if c.stopForRetiredGeneration(err) {
+		return backoff, false
+	}
+	if isProtocolVersionMismatch(err) {
+		c.logger.Error("bundle change watch loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
+		return backoff, false
+	}
+	if isTerminalProtocolRepresentationError(err) {
+		c.logger.Error("bundle change watch stopped by terminal protocol representation error", "error_type", fmt.Sprintf("%T", err))
+		return backoff, false
+	}
+	if isBundleChangeWatchForbidden(err) {
+		c.logger.Warn("bundle change watch disabled for client", "error", err)
+		c.downloaderLoop(ctx)
+		return backoff, false
+	}
+	c.logger.Warn("bundle change watch stream stopped", "error_type", fmt.Sprintf("%T", err))
+	backoffErr := err
+	var streamPullErr *bundleChangeWatchPullError
+	if !errors.As(err, &streamPullErr) {
+		if _, pullErr := c.PullToStable(ctx); pullErr != nil {
+			if ctx.Err() != nil {
+				return backoff, false
+			}
+			if c.stopForRetiredGeneration(pullErr) {
+				return backoff, false
+			}
+			if isProtocolVersionMismatch(pullErr) {
+				c.logger.Error("bundle change watch loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", pullErr))
+				return backoff, false
+			}
+			if isTerminalProtocolRepresentationError(pullErr) {
+				c.logger.Error("bundle change watch fallback stopped by terminal protocol representation error", "error_type", fmt.Sprintf("%T", pullErr))
+				return backoff, false
+			}
+			backoffErr = pullErr
+			if IsLifecyclePreconditionError(pullErr) {
+				c.logger.Warn("download loop blocked by lifecycle state", "error", pullErr)
+			} else {
+				c.logger.Warn("bundle change watch fallback pull failed", "error", pullErr)
+			}
+		}
+	}
+	if err := sleepWatchInterval(ctx, backoff); err != nil {
+		return backoff, false
+	}
+	return nextSyncLoopBackoffAfterError(backoffErr, backoff, c.config.BackoffMin, c.config.BackoffMax), true
 }

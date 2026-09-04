@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,13 +27,14 @@ func newConnectTestService(t *testing.T, ctx context.Context) (*SyncService, str
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "connect-lifecycle-test",
-		InitializationLeaseTTL:    10 * time.Minute,
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "connect-lifecycle-test",
+		InitializationLeaseTTL: 10 * time.Minute,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	return svc, schemaName
 }
@@ -57,14 +59,14 @@ func TestConnect_InitializeEmptyMarksScopeInitialized(t *testing.T) {
 	svc, _ := newConnectTestService(t, ctx)
 
 	userID := "connect-empty-" + uuid.NewString()
-	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: false})
+	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_empty", resp.Resolution)
 
 	state := requireScopeStateForUser(t, ctx, svc, userID)
 	require.Equal(t, scopeStateInitialized, state)
 
-	session, err := svc.CreateSnapshotSession(ctx, Actor{UserID: userID})
+	session, err := svc.CreateSnapshotSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc))
 	require.NoError(t, err)
 	require.Equal(t, int64(0), session.RowCount)
 	require.Equal(t, int64(0), session.SnapshotBundleSeq)
@@ -75,7 +77,7 @@ func TestConnect_InitializeLocalSameSourceReconnectAndCommit(t *testing.T) {
 	svc, schemaName := newConnectTestService(t, ctx)
 
 	userID := "connect-local-" + uuid.NewString()
-	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
+	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", firstResp.Resolution)
 	require.NotEmpty(t, firstResp.InitializationID)
@@ -88,7 +90,7 @@ func TestConnect_InitializeLocalSameSourceReconnectAndCommit(t *testing.T) {
 	`, userID).Scan(&nextBundleSeq))
 	require.Equal(t, int64(1), nextBundleSeq)
 
-	secondResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
+	secondResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", secondResp.Resolution)
 	require.Equal(t, firstResp.InitializationID, secondResp.InitializationID)
@@ -99,24 +101,14 @@ func TestConnect_InitializeLocalSameSourceReconnectAndCommit(t *testing.T) {
 		BaseRowVersion: 0,
 		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Alpha","email":"alpha@example.com"}`, rowID)),
 	}}
-	createResp, err := svc.CreatePushSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, &PushSessionCreateRequest{
+	commitResp, err := svc.PushOneShot(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &OneShotPushRequest{
 		SourceBundleID:       1,
-		PlannedRowCount:      1,
-		CanonicalRequestHash: mustCanonicalPushRequestHash(t, pushRows),
+		CanonicalRequestHash: mustCanonicalPushRequestHash(t, svc, pushRows),
 		InitializationID:     firstResp.InitializationID,
+		Rows:                 pushRows,
 	})
 	require.NoError(t, err)
-	require.Equal(t, "staging", createResp.Status)
-
-	_, err = svc.UploadPushChunk(ctx, Actor{UserID: userID, SourceID: "device-a"}, createResp.PushID, &PushSessionChunkRequest{
-		StartRowOrdinal: 0,
-		Rows:            pushRows,
-	})
-	require.NoError(t, err)
-
-	commitResp, err := svc.CommitPushSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, createResp.PushID)
-	require.NoError(t, err)
-	require.Equal(t, int64(1), commitResp.BundleSeq)
+	require.Equal(t, int64(1), commitResp.Bundle.BundleSeq)
 
 	state := requireScopeStateForUser(t, ctx, svc, userID)
 	require.Equal(t, scopeStateInitialized, state)
@@ -127,11 +119,11 @@ func TestConnect_InitializingSameSourceWithoutPendingRowsTransitionsToInitialize
 	svc, _ := newConnectTestService(t, ctx)
 
 	userID := "connect-abandon-" + uuid.NewString()
-	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
+	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", firstResp.Resolution)
 
-	secondResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: false})
+	secondResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_empty", secondResp.Resolution)
 	require.Empty(t, secondResp.InitializationID)
@@ -157,30 +149,31 @@ func TestConnect_RemoteAuthoritativeAfterPriorInitialization(t *testing.T) {
 	svc, _ := newConnectTestService(t, ctx)
 
 	userID := "connect-remote-" + uuid.NewString()
-	_, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: false})
+	_, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 
-	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-b"}, &ConnectRequest{HasLocalPendingRows: true})
+	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-b"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "remote_authoritative", resp.Resolution)
 }
 
-func TestConnect_ExpiredInitializerCannotUpload(t *testing.T) {
+func TestConnect_ExpiredInitializerCannotPush(t *testing.T) {
 	ctx := context.Background()
 	svc, schemaName := newConnectTestService(t, ctx)
 
 	userID := "connect-expired-" + uuid.NewString()
-	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
+	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", resp.Resolution)
 
-	createResp, err := svc.CreatePushSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, &PushSessionCreateRequest{
-		SourceBundleID:       1,
-		PlannedRowCount:      1,
-		CanonicalRequestHash: strings.Repeat("0", 64),
-		InitializationID:     resp.InitializationID,
-	})
-	require.NoError(t, err)
+	pushRows := []PushRequestRow{{
+		Schema:         schemaName,
+		Table:          "users",
+		Key:            SyncKey{"id": "1b7b0f6a-37c0-4d28-b62d-6d575fa37dd7"},
+		Op:             OpInsert,
+		BaseRowVersion: 0,
+		Payload:        json.RawMessage(`{"id":"1b7b0f6a-37c0-4d28-b62d-6d575fa37dd7","name":"Late","email":"late@example.com"}`),
+	}}
 
 	_, err = svc.pool.Exec(ctx, `
 		UPDATE sync.scope_state
@@ -189,19 +182,15 @@ func TestConnect_ExpiredInitializerCannotUpload(t *testing.T) {
 	`, userID)
 	require.NoError(t, err)
 
-	_, err = svc.UploadPushChunk(ctx, Actor{UserID: userID, SourceID: "device-a"}, createResp.PushID, &PushSessionChunkRequest{
-		StartRowOrdinal: 0,
-		Rows: []PushRequestRow{{
-			Schema:         schemaName,
-			Table:          "users",
-			Key:            SyncKey{"id": "1b7b0f6a-37c0-4d28-b62d-6d575fa37dd7"},
-			Op:             OpInsert,
-			BaseRowVersion: 0,
-			Payload:        json.RawMessage(`{"id":"1b7b0f6a-37c0-4d28-b62d-6d575fa37dd7","name":"Late","email":"late@example.com"}`),
-		}},
+	_, err = svc.PushOneShot(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &OneShotPushRequest{
+		SourceBundleID:       1,
+		CanonicalRequestHash: mustCanonicalPushRequestHash(t, svc, pushRows),
+		InitializationID:     resp.InitializationID,
+		Rows:                 pushRows,
 	})
-	var staleErr *InitializationStaleError
-	require.ErrorAs(t, err, &staleErr)
+
+	var expiredErr *InitializationExpiredError
+	require.ErrorAs(t, err, &expiredErr)
 }
 
 func TestConnect_ReadPathsRejectBeforeInitialization(t *testing.T) {
@@ -209,12 +198,14 @@ func TestConnect_ReadPathsRejectBeforeInitialization(t *testing.T) {
 	svc, _ := newConnectTestService(t, ctx)
 
 	userID := "connect-uninitialized-" + uuid.NewString()
-	_, err := svc.ProcessPull(ctx, Actor{UserID: userID}, 0, 10, 0)
-	var uninitializedErr *ScopeUninitializedError
-	require.ErrorAs(t, err, &uninitializedErr)
+	_, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
+	require.NoError(t, err)
+	_, err = svc.ProcessPull(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), 0, 10, 0)
+	var initializingErr *ScopeInitializingError
+	require.ErrorAs(t, err, &initializingErr)
 
-	_, err = svc.CreateSnapshotSession(ctx, Actor{UserID: userID})
-	require.ErrorAs(t, err, &uninitializedErr)
+	_, err = svc.CreateSnapshotSession(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc))
+	require.ErrorAs(t, err, &initializingErr)
 }
 
 func TestConnect_ConcurrentFirstInitializerRaceHasSingleWinner(t *testing.T) {
@@ -236,7 +227,7 @@ func TestConnect_ConcurrentFirstInitializerRaceHasSingleWinner(t *testing.T) {
 		go func(sourceID string) {
 			defer wg.Done()
 			<-start
-			resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: sourceID}, &ConnectRequest{HasLocalPendingRows: true})
+			resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: sourceID}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 			results <- result{sourceID: sourceID, resp: resp, err: err}
 		}(sourceID)
 	}
@@ -271,6 +262,7 @@ func TestHandleConnect_SuccessAndRetryLaterMappings(t *testing.T) {
 	userID := "connect-handler-" + uuid.NewString()
 	successRec := doJSONHandlerRequest(
 		t,
+		svc,
 		handlers.HandleConnect,
 		http.MethodPost,
 		"/sync/connect",
@@ -287,6 +279,7 @@ func TestHandleConnect_SuccessAndRetryLaterMappings(t *testing.T) {
 
 	retryRec := doJSONHandlerRequest(
 		t,
+		svc,
 		handlers.HandleConnect,
 		http.MethodPost,
 		"/sync/connect",
@@ -308,7 +301,7 @@ func TestHandleConnect_ExpiredInitializerLeaseMapsToFreshInitializeLocal(t *test
 	handlers := NewHTTPSyncHandlers(svc, integrationTestLogger(slog.LevelWarn))
 
 	userID := "connect-handler-stale-" + uuid.NewString()
-	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
+	firstResp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", firstResp.Resolution)
 
@@ -321,6 +314,7 @@ func TestHandleConnect_ExpiredInitializerLeaseMapsToFreshInitializeLocal(t *test
 
 	rec := doJSONHandlerRequest(
 		t,
+		svc,
 		handlers.HandleConnect,
 		http.MethodPost,
 		"/sync/connect",
@@ -344,6 +338,7 @@ func TestHandleConnect_InvalidRequestMappings(t *testing.T) {
 
 	connectInvalidRec := doJSONHandlerRequest(
 		t,
+		svc,
 		handlers.HandleConnect,
 		http.MethodPost,
 		"/sync/connect",
@@ -355,6 +350,8 @@ func TestHandleConnect_InvalidRequestMappings(t *testing.T) {
 	require.Equal(t, "authentication_failed", decodeErrorResponse(t, connectInvalidRec).Error)
 
 	req := httptest.NewRequest(http.MethodPost, "/sync/connect", strings.NewReader(`{"source_id":`))
+	req.Header.Set("Content-Type", "application/json")
+	setTestSchemaGenerationHeaders(req, svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "connect-handler-badjson-" + uuid.NewString(), SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
 	handlers.HandleConnect(rec, req)
@@ -362,28 +359,27 @@ func TestHandleConnect_InvalidRequestMappings(t *testing.T) {
 	require.Equal(t, "invalid_request", decodeErrorResponse(t, rec).Error)
 }
 
-func TestHandleConnect_UsesActorSourceIDAsOnlyRequestLevelSourceOfTruth(t *testing.T) {
+func TestHandleConnect_RejectsBodySourceIDInsteadOfAliasingLegacyInput(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newConnectTestService(t, ctx)
 	handlers := NewHTTPSyncHandlers(svc, integrationTestLogger(slog.LevelWarn))
 
 	userID := "connect-source-truth-" + uuid.NewString()
 	req := httptest.NewRequest(http.MethodPost, "/sync/connect", strings.NewReader(`{"source_id":"wrong-source","has_local_pending_rows":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	setTestSchemaGenerationHeaders(req, svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: userID, SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
 	handlers.HandleConnect(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	var resp ConnectResponse
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
-	require.Equal(t, "initialize_local", resp.Resolution)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "invalid_request", decodeErrorResponse(t, rec).Error)
 
 	var initializerSourceID string
-	require.NoError(t, svc.pool.QueryRow(ctx, `
+	err := svc.pool.QueryRow(ctx, `
 		SELECT ss.initializer_source_id
 		FROM sync.scope_state ss
 		JOIN sync.user_state us ON us.user_pk = ss.user_pk
 		WHERE us.user_id = $1
-	`, userID).Scan(&initializerSourceID))
-	require.Equal(t, "device-a", initializerSourceID)
+	`, userID).Scan(&initializerSourceID)
+	require.ErrorIs(t, err, pgx.ErrNoRows)
 }

@@ -60,7 +60,7 @@ func TestAuditActorMiddleware_PreservesExactVisibleASCIISourceToken(t *testing.T
 	request.Header.Set(SourceIDHeader, sourceID)
 	handler.ServeHTTP(httptest.NewRecorder(), request)
 
-	require.Equal(t, "audit-user", actor.UserID, "human-facing user id handling remains unchanged")
+	require.Equal(t, userID, actor.UserID, "middleware must preserve the validated user id exactly")
 	require.Equal(t, sourceID, actor.SourceID, "middleware must not silently normalize source_id")
 }
 

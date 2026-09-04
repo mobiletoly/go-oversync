@@ -57,9 +57,9 @@ func benchmarkAuditSnapshotBuildAdmission(b *testing.B, requestCount int) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+			session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 			if err == nil {
-				_ = fixture.svc.DeleteSnapshotSession(context.Background(), fixture.reader, session.SnapshotID)
+				_ = fixture.svc.DeleteSnapshotSession(context.Background(), fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID)
 			}
 			results <- err
 		}()
@@ -123,7 +123,7 @@ func benchmarkAuditSnapshotChunkAdmission(b *testing.B, requestCount int) {
 		wg.Add(1)
 		go func(writer *blockingSnapshotResponseWriter) {
 			defer wg.Done()
-			request := snapshotRequestWithActor(http.MethodGet, "/sync/snapshot-sessions/"+snapshotID+"?max_rows=5000&max_bytes=16777216", snapshotID, fixture.reader)
+			request := snapshotRequestWithActor(http.MethodGet, "/sync/snapshot-sessions/"+snapshotID+"?max_rows=5000&max_bytes=16777216", snapshotID, fixture.reader, fixture.svc)
 			handlers.HandleGetSnapshotChunk(writer, request)
 			results <- writer.StatusCode()
 		}(writers[i])
@@ -186,7 +186,7 @@ func benchmarkAuditSnapshotAdmissionSyncProbe(b *testing.B, fixture *auditDataba
 	}); err != nil {
 		b.Fatalf("ordinary push probe while snapshot requests are admitted: %v", err)
 	}
-	if _, err := fixture.svc.ProcessPull(ctx, fixture.reader, 0, 10, 0); err != nil {
+	if _, err := fixture.svc.ProcessPull(ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), 0, 10, 0); err != nil {
 		b.Fatalf("ordinary pull probe while snapshot requests are admitted: %v", err)
 	}
 	return time.Since(started)
@@ -207,6 +207,7 @@ func seedAuditMaximumBudgetSnapshot(fixture *auditDatabaseBenchmarkFixture) (str
 		return "", err
 	}
 	snapshotID := uuid.NewString()
+	proof := testSchemaGenerationProofForService(fixture.svc)
 	payload := json.RawMessage(`{"blob":"` + strings.Repeat("x", 3000) + `"}`)
 	const rowCount = 5001
 	wireCounts := make([]int64, rowCount)
@@ -220,7 +221,7 @@ func seedAuditMaximumBudgetSnapshot(fixture *auditDatabaseBenchmarkFixture) (str
 		wireCounts[i] = int64(len(wire))
 		byteCount += wireCounts[i]
 	}
-	if _, err = fixture.pool.Exec(ctx, `INSERT INTO sync.snapshot_sessions(snapshot_id,user_pk,snapshot_bundle_seq,row_count,byte_count,expires_at) VALUES($1::uuid,$2,1,$3,$4,now()+interval '15 minutes')`, snapshotID, userPK, rowCount, byteCount); err != nil {
+	if _, err = fixture.pool.Exec(ctx, `INSERT INTO sync.snapshot_sessions(snapshot_id,user_pk,source_id,schema_generation_id,schema_generation_fingerprint,snapshot_bundle_seq,row_count,byte_count,expires_at) VALUES($1::uuid,$2,$3,$4,$5,1,$6,$7,now()+interval '15 minutes')`, snapshotID, userPK, fixture.reader.SourceID, proof.ID, proof.Fingerprint, rowCount, byteCount); err != nil {
 		return "", err
 	}
 	written, err := fixture.pool.CopyFrom(ctx, pgx.Identifier{"sync", "snapshot_session_rows"}, []string{"snapshot_id", "row_ordinal", "table_id", "key_bytes", "bundle_seq", "payload_wire", "wire_byte_count"}, pgx.CopyFromSlice(rowCount, func(i int) ([]any, error) {

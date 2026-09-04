@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
+	exampleserver "github.com/mobiletoly/go-oversync/integration/nethttp_server/server"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/stretchr/testify/require"
 )
@@ -27,7 +27,7 @@ func TestEndToEnd_PushPending_RetriesInjectedTransientFailure(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Retry", "retry@example.com")
 	require.NoError(t, err)
 
-	server.InjectFailure(exampleserver.FailureEndpointPushSessionCreate, 503, 1)
+	server.InjectFailure(exampleserver.FailureEndpointPush, 503, 1)
 
 	mustPushPendingE2E(t, client, ctx)
 
@@ -55,7 +55,7 @@ func TestEndToEnd_PushPending_RetryExhaustionReturnsTypedError(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, uuid.NewString(), "Retry", "retry@example.com")
 	require.NoError(t, err)
 
-	server.InjectFailure(exampleserver.FailureEndpointPushSessionCreate, 503, 3)
+	server.InjectFailure(exampleserver.FailureEndpointPush, 503, 3)
 
 	_, err = client.PushPending(ctx)
 	var retryErr *oversqlite.RetryExhaustedError

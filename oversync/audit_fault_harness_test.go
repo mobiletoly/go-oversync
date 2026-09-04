@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -214,17 +215,14 @@ func newAuditFaultHTTPHandler(service *SyncService, logger *slog.Logger) http.Ha
 	}
 
 	mux.Handle("POST /sync/connect", withActor(http.HandlerFunc(handlers.HandleConnect)))
-	mux.Handle("POST /sync/push-sessions", withActor(responseGate.wrap(auditResponseGatePushCreate, http.HandlerFunc(handlers.HandleCreatePushSession))))
-	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", withActor(responseGate.wrap(auditResponseGatePushChunk, http.HandlerFunc(handlers.HandlePushSessionChunk))))
-	mux.Handle("POST /sync/push-sessions/{push_id}/commit", withActor(responseGate.wrap(auditResponseGatePushCommit, http.HandlerFunc(handlers.HandleCommitPushSession))))
-	mux.Handle("DELETE /sync/push-sessions/{push_id}", withActor(responseGate.wrap(auditResponseGatePushDelete, http.HandlerFunc(handlers.HandleDeletePushSession))))
-	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", withActor(http.HandlerFunc(handlers.HandleGetCommittedBundleRows)))
+	mux.Handle("POST /sync/push", withActor(responseGate.wrap(auditResponseGatePushCommit, http.HandlerFunc(handlers.HandlePush))))
 	mux.Handle("GET /sync/pull", withActor(responseGate.wrap(auditResponseGatePull, http.HandlerFunc(handlers.HandlePull))))
 	mux.Handle("GET /sync/watch", withActor(http.HandlerFunc(handlers.HandleWatch)))
 	mux.Handle("POST /sync/snapshot-sessions", withActor(responseGate.wrap(auditResponseGateSnapshotCreate, http.HandlerFunc(handlers.HandleCreateSnapshotSession))))
 	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withActor(responseGate.wrap(auditResponseGateSnapshotGet, http.HandlerFunc(handlers.HandleGetSnapshotChunk))))
 	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withActor(responseGate.wrap(auditResponseGateSnapshotDelete, http.HandlerFunc(handlers.HandleDeleteSnapshotSession))))
-	mux.Handle("GET /sync/capabilities", withActor(http.HandlerFunc(handlers.HandleCapabilities)))
+	mux.Handle("GET /sync/generations/{generation_id}", withActor(http.HandlerFunc(handlers.HandleGeneration)))
+	mux.Handle("GET /sync/generations/", withActor(http.HandlerFunc(handlers.HandleGeneration)))
 	return mux
 }
 
@@ -256,15 +254,22 @@ func runAuditHarnessHelperProcess() error {
 		return fmt.Errorf("ping audit helper database: %w", err)
 	}
 
-	service, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "oversync-audit-helper",
+	service, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: []SchemaGeneration{{ID: 1, Tables: []GenerationTable{{
+		Schema: schemaName,
+		Table:  "users",
+		Columns: []GenerationColumn{
+			{Name: "id", WireType: GenerationWireTypeUUID},
+			{Name: "name", WireType: GenerationWireTypeText},
+			{Name: "email", WireType: GenerationWireTypeText},
+		},
+	}}}}, AppName: "oversync-audit-helper",
 		BundleChangeWatch: BundleChangeWatchConfig{
 			Enabled: true,
 		},
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	if err != nil {
 		return fmt.Errorf("create audit helper service: %w", err)
@@ -308,7 +313,8 @@ func runAuditHarnessHelperProcess() error {
 		return fmt.Errorf("serve audit helper HTTP: %w", serveErr)
 	default:
 	}
-	fmt.Printf("%s%s\n", auditHelperReadyLinePrefix, listener.Addr().String())
+	proof := testSchemaGenerationProofForService(service)
+	fmt.Printf("%s%s|%d|%s\n", auditHelperReadyLinePrefix, listener.Addr().String(), proof.ID, proof.Fingerprint)
 
 	select {
 	case serveErr := <-serveDone:
@@ -367,12 +373,15 @@ func (o *auditHelperProcessOutput) String() string {
 type auditHTTPHelperProcess struct {
 	command  *exec.Cmd
 	address  string
+	proof    SchemaGenerationProof
 	done     chan struct{}
 	waitErr  error
 	output   *auditHelperProcessOutput
 	stopOnce sync.Once
 	stopErr  error
 }
+
+var auditSchemaGenerationProofByAddress sync.Map
 
 func startAuditHTTPHelperProcess(t *testing.T, databaseURL, schemaName string) *auditHTTPHelperProcess {
 	t.Helper()
@@ -427,11 +436,24 @@ func startAuditHTTPHelperProcess(t *testing.T, databaseURL, schemaName string) *
 	}()
 
 	select {
-	case process.address = <-ready:
+	case readyValue := <-ready:
+		parts := strings.SplitN(readyValue, "|", 3)
+		if len(parts) != 3 {
+			process.abort()
+			t.Fatalf("audit helper reported malformed readiness %q\n%s", readyValue, process.output.String())
+		}
+		process.address = parts[0]
 		if _, err := net.ResolveTCPAddr("tcp", process.address); err != nil {
 			process.abort()
 			t.Fatalf("audit helper reported invalid address %q: %v\n%s", process.address, err, process.output.String())
 		}
+		parsedGenerationID, err := strconv.ParseInt(parts[1], 10, 32)
+		if err != nil {
+			process.abort()
+			t.Fatalf("audit helper reported invalid generation id %q: %v", parts[1], err)
+		}
+		process.proof = SchemaGenerationProof{ID: SchemaGenerationID(parsedGenerationID), Fingerprint: parts[2]}
+		auditSchemaGenerationProofByAddress.Store(process.address, process.proof)
 	case <-process.done:
 		t.Fatalf("audit helper exited before readiness: %v\n%s", process.waitErr, process.output.String())
 	case <-time.After(10 * time.Second):
@@ -440,6 +462,7 @@ func startAuditHTTPHelperProcess(t *testing.T, databaseURL, schemaName string) *
 	}
 
 	t.Cleanup(func() {
+		auditSchemaGenerationProofByAddress.Delete(process.address)
 		if err := process.Stop(); err != nil {
 			t.Errorf("stop audit helper: %v\n%s", err, process.output.String())
 		}
@@ -551,7 +574,7 @@ func TestAuditHarness_HelperProcessStartsServesRealHandlersAndStops(t *testing.T
 	require.Equal(t, http.StatusOK, response.StatusCode)
 	require.NoError(t, response.Body.Close())
 
-	request, err := http.NewRequest(http.MethodGet, process.URL()+"/sync/capabilities", nil)
+	request, err := http.NewRequest(http.MethodGet, process.URL()+"/sync/generations/1", nil)
 	require.NoError(t, err)
 	request.Header.Set(auditHelperUserIDHeader, "audit-user")
 	request.Header.Set(SourceIDHeader, "audit-source")

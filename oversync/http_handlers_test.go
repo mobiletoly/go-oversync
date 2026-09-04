@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -21,130 +20,87 @@ func TestHTTPSyncHandlers_WritePushTransactionFailurePreservesCommitAmbiguity(t 
 	h := NewHTTPSyncHandlers(nil, slog.Default())
 	rec := httptest.NewRecorder()
 
-	handled := h.writePushTransactionFailure(rec, &CommitOutcomeUnknownError{Err: errors.New("lost commit response")})
+	handled := h.writePushTransactionFailure(rec, nil, &CommitOutcomeUnknownError{Err: errors.New("lost commit response")})
 
 	require.True(t, handled)
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	response := decodeErrorResponse(t, rec)
 	require.Equal(t, "commit_outcome_unknown", response.Error)
-	require.Equal(t, "Push transaction commit outcome is unknown; restart push session creation with the same source tuple", response.Message)
+	require.Equal(t, "Push transaction commit outcome is unknown; retry the same complete push with the same source tuple", response.Message)
 }
 
-func TestSyncService_GetCapabilities(t *testing.T) {
-	svc := &SyncService{
-		config: &ServiceConfig{
-			MaxSupportedSchemaVersion:          3,
-			AppName:                            "test-app",
-			MaxRowsPerBundle:                   250,
-			MaxBytesPerBundle:                  4096,
-			MaxRowsPerPushChunk:                321,
-			PushSessionTTL:                     17 * time.Second,
-			DefaultRowsPerCommittedBundleChunk: 45,
-			MaxRowsPerCommittedBundleChunk:     67,
-			MaxRowsPerSnapshotSession:          890,
-			MaxBytesPerSnapshotSession:         98765,
-			RegisteredTables: []RegisteredTable{
-				{Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
-				{Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
-			},
-		},
-		logger: slog.Default(),
-	}
+func TestNewHTTPSyncHandlersWithConfig_DefaultsNilLogger(t *testing.T) {
+	h := NewHTTPSyncHandlersWithConfig(nil, nil, HTTPSyncHandlersConfig{})
+	recorder := httptest.NewRecorder()
 
-	caps := svc.GetCapabilities()
-	if caps.ProtocolVersion != SyncProtocolVersion {
-		t.Fatalf("expected protocol version %q, got %q", SyncProtocolVersion, caps.ProtocolVersion)
-	}
-	if caps.SchemaVersion != 3 {
-		t.Fatalf("expected schema version 3, got %d", caps.SchemaVersion)
-	}
-	if caps.AppName != "test-app" {
-		t.Fatalf("expected app name test-app, got %q", caps.AppName)
-	}
-	if len(caps.RegisteredTables) != 2 || caps.RegisteredTables[0] != "business.posts" || caps.RegisteredTables[1] != "business.users" {
-		t.Fatalf("unexpected registered tables: %#v", caps.RegisteredTables)
-	}
-	if len(caps.RegisteredTableSpecs) != 2 {
-		t.Fatalf("expected registered table specs, got %#v", caps.RegisteredTableSpecs)
-	}
-	if caps.RegisteredTableSpecs[0].Schema != "business" || caps.RegisteredTableSpecs[0].Table != "posts" || len(caps.RegisteredTableSpecs[0].SyncKeyColumns) != 1 || caps.RegisteredTableSpecs[0].SyncKeyColumns[0] != "id" {
-		t.Fatalf("unexpected first registered table spec: %#v", caps.RegisteredTableSpecs[0])
-	}
-	if !caps.Features["bundle_pull"] || !caps.Features["snapshot_chunking"] || !caps.Features["capabilities_endpoint"] {
-		t.Fatalf("expected core capability flags to be enabled: %#v", caps.Features)
-	}
-	if !caps.Features["history_pruned_errors"] {
-		t.Fatalf("expected retention capability flags to be enabled: %#v", caps.Features)
-	}
-	if !caps.Features["bundle_push"] || !caps.Features["structured_sync_keys"] {
-		t.Fatalf("expected new contract preview capability flags to be enabled: %#v", caps.Features)
-	}
-	if !caps.Features["push_session_chunking"] || !caps.Features["committed_bundle_row_fetch"] {
-		t.Fatalf("expected push-session capability flags to be enabled: %#v", caps.Features)
-	}
-	if caps.Features["push_sessions"] {
-		t.Fatalf("expected legacy push_sessions capability flag to be absent: %#v", caps.Features)
-	}
-	if caps.BundleLimits.MaxRowsPerBundle != 250 ||
-		caps.BundleLimits.MaxBytesPerBundle != 4096 ||
-		caps.BundleLimits.MaxBundlesPerPull != defaultMaxBundlesPerPull ||
-		caps.BundleLimits.DefaultRowsPerPushChunk != defaultRowsPerPushChunk ||
-		caps.BundleLimits.MaxRowsPerPushChunk != 321 ||
-		caps.BundleLimits.PushSessionTTLSeconds != 17 ||
-		caps.BundleLimits.DefaultRowsPerCommittedBundleChunk != 45 ||
-		caps.BundleLimits.MaxRowsPerCommittedBundleChunk != 67 ||
-		caps.BundleLimits.DefaultRowsPerSnapshotChunk != defaultRowsPerSnapshotChunk ||
-		caps.BundleLimits.MaxRowsPerSnapshotChunk != defaultMaxRowsPerSnapshotChunk ||
-		caps.BundleLimits.SnapshotSessionTTLSeconds != int(defaultSnapshotSessionTTL.Seconds()) ||
-		caps.BundleLimits.MaxRowsPerSnapshotSession != 890 ||
-		caps.BundleLimits.MaxBytesPerSnapshotSession != 98765 {
-		t.Fatalf("unexpected bundle limits: %#v", caps.BundleLimits)
-	}
+	require.NotPanics(t, func() {
+		h.writeError(recorder, http.StatusBadRequest, "test_error", "test error")
+	})
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
 }
 
-func TestHTTPSyncHandlers_HandleCapabilities(t *testing.T) {
+func TestSyncService_GenerationDiscoveryModel(t *testing.T) {
+	tables := []RegisteredTable{
+		{Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
+		{Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
+	}
+	registry, err := CompileSchemaGenerationRegistry(tables, testSchemaGenerationsForRegisteredTables(tables))
+	require.NoError(t, err)
+	contract, _ := registry.Generation(registry.GenerationIDs()[0])
+	svc := &SyncService{config: &ServiceConfig{
+		MaxRowsPerBundle:           250,
+		MaxBytesPerBundle:          4096,
+		MaxBytesPerPullResponse:    8192,
+		MaxRowsPerSnapshotChunk:    45,
+		MaxBytesPerSnapshotChunk:   5678,
+		MaxRowsPerSnapshotSession:  890,
+		MaxBytesPerSnapshotSession: 98765,
+		MaxBytesPerSnapshotRow:     1234,
+	}, logger: slog.Default()}
+
+	response := svc.generationDiscoveryResponse(contract, true)
+	require.Equal(t, SyncProtocolVersion, response.ProtocolVersion)
+	require.Equal(t, generationDescriptor(contract), response.SchemaGeneration)
+	require.True(t, response.WatchEnabled)
+	require.Equal(t, WireLimits{
+		MaxPushRows:                     250,
+		MaxPushDecodedBytes:             4096 + historyEnvelopeAllowance,
+		MaxPullBundles:                  defaultMaxBundlesPerPull,
+		MaxPullDecodedBytes:             8192,
+		MaxSnapshotRowsPerChunk:         45,
+		MaxSnapshotDecodedBytesPerChunk: 5678,
+		MaxSnapshotRows:                 890,
+		MaxSnapshotLogicalBytes:         98765,
+		MaxRowDecodedBytes:              1234,
+	}, response.Limits)
+}
+
+func TestHTTPSyncHandlers_HandleGenerationRequiresAuthentication(t *testing.T) {
 	svc := &SyncService{
 		config: &ServiceConfig{
-			MaxSupportedSchemaVersion:          2,
 			AppName:                            "handler-test",
 			MaxConcurrentSnapshotBuilds:        defaultMaxConcurrentSnapshotBuilds,
 			MaxConcurrentSnapshotChunkRequests: defaultMaxConcurrentSnapshotChunkRequests,
 			DefaultBytesPerSnapshotChunk:       defaultBytesPerSnapshotChunk,
 			MaxBytesPerSnapshotChunk:           defaultMaxBytesPerSnapshotChunk,
 			MaxBytesPerSnapshotRow:             defaultMaxBytesPerSnapshotRow,
+			RegisteredTableCatalogRevision:     1,
 		},
 		logger: slog.Default(),
 	}
 	h := NewHTTPSyncHandlers(svc, slog.Default())
 
-	req := httptest.NewRequest(http.MethodGet, "/sync/capabilities", nil)
+	req := httptest.NewRequest(http.MethodGet, "/sync/generations/1", nil)
 	rec := httptest.NewRecorder()
 
-	h.HandleCapabilities(rec, req)
+	h.HandleGeneration(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", rec.Code)
-	}
-
-	var resp CapabilitiesResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	if resp.ProtocolVersion != SyncProtocolVersion {
-		t.Fatalf("expected protocol version %q, got %q", SyncProtocolVersion, resp.ProtocolVersion)
-	}
-	if resp.SchemaVersion != 2 {
-		t.Fatalf("expected schema version 2, got %d", resp.SchemaVersion)
-	}
-	if bytes.Contains(rec.Body.Bytes(), []byte(`"sync_key_type"`)) {
-		t.Fatalf("expected capabilities response to omit visible sync key type, got %s", rec.Body.String())
-	}
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
-func TestHTTPSyncHandlers_HandleCapabilitiesAppliesActorWatchPolicy(t *testing.T) {
+func TestHTTPSyncHandlers_GenerationDiscoveryAppliesActorWatchPolicy(t *testing.T) {
 	svc := &SyncService{
 		config: &ServiceConfig{
-			MaxSupportedSchemaVersion:          2,
 			AppName:                            "handler-watch-policy-test",
 			MaxConcurrentSnapshotBuilds:        defaultMaxConcurrentSnapshotBuilds,
 			MaxConcurrentSnapshotChunkRequests: defaultMaxConcurrentSnapshotChunkRequests,
@@ -154,6 +110,7 @@ func TestHTTPSyncHandlers_HandleCapabilitiesAppliesActorWatchPolicy(t *testing.T
 			BundleChangeWatch: BundleChangeWatchConfig{
 				Enabled: true,
 			},
+			RegisteredTableCatalogRevision: 1,
 		},
 		logger: slog.Default(),
 	}
@@ -163,31 +120,8 @@ func TestHTTPSyncHandlers_HandleCapabilitiesAppliesActorWatchPolicy(t *testing.T
 		},
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/sync/capabilities", nil)
-	rec := httptest.NewRecorder()
-	h.HandleCapabilities(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-	var globalResp CapabilitiesResponse
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &globalResp))
-	require.True(t, globalResp.Features["bundle_change_watch"])
-
-	req = httptest.NewRequest(http.MethodGet, "/sync/capabilities", nil)
-	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "allowed-device"}))
-	rec = httptest.NewRecorder()
-	h.HandleCapabilities(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-	var allowedResp CapabilitiesResponse
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &allowedResp))
-	require.True(t, allowedResp.Features["bundle_change_watch"])
-
-	req = httptest.NewRequest(http.MethodGet, "/sync/capabilities", nil)
-	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "blocked-device"}))
-	rec = httptest.NewRecorder()
-	h.HandleCapabilities(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-	var blockedResp CapabilitiesResponse
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &blockedResp))
-	require.False(t, blockedResp.Features["bundle_change_watch"])
+	require.True(t, h.isBundleChangeWatchAllowed(context.Background(), Actor{SourceID: "allowed-device"}))
+	require.False(t, h.isBundleChangeWatchAllowed(context.Background(), Actor{SourceID: "blocked-device"}))
 }
 
 func TestParseChunkQueryParams(t *testing.T) {
@@ -229,9 +163,67 @@ func TestParseChunkQueryParams(t *testing.T) {
 	})
 }
 
+func TestOptionalScalarQueryParam_RejectsEmptyAndRepeatedValuesForEveryScalar(t *testing.T) {
+	for _, name := range []string{
+		"after_bundle_seq",
+		"max_bundles",
+		"target_bundle_seq",
+		"after_row_ordinal",
+		"max_rows",
+		"max_bytes",
+	} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			tests := []struct {
+				name        string
+				rawQuery    string
+				wantValue   string
+				wantPresent bool
+				wantError   bool
+			}{
+				{name: "omitted uses default", wantPresent: false},
+				{name: "valid", rawQuery: name + "=7", wantValue: "7", wantPresent: true},
+				{name: "empty", rawQuery: name + "=", wantPresent: true, wantError: true},
+				{name: "repeated", rawQuery: name + "=7&" + name + "=8", wantPresent: true, wantError: true},
+			}
+			for _, test := range tests {
+				t.Run(test.name, func(t *testing.T) {
+					req := httptest.NewRequest(http.MethodGet, "/sync/test?"+test.rawQuery, nil)
+
+					value, present, err := optionalScalarQueryParam(req, name)
+
+					require.Equal(t, test.wantPresent, present)
+					if test.wantError {
+						require.EqualError(t, err, name+" must be provided exactly once with a non-empty value")
+						return
+					}
+					require.NoError(t, err)
+					require.Equal(t, test.wantValue, value)
+				})
+			}
+		})
+	}
+}
+
+func TestParseChunkQueryParams_DefaultsApplyOnlyWhenKeysAreAbsent(t *testing.T) {
+	for _, rawQuery := range []string{
+		"after_row_ordinal=",
+		"after_row_ordinal=1&after_row_ordinal=2",
+		"max_rows=",
+		"max_rows=1&max_rows=2",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/sync/chunks?"+rawQuery, nil)
+
+		_, err := parseChunkQueryParams(req, 25)
+
+		require.Error(t, err, rawQuery)
+	}
+}
+
 func TestHTTPSyncHandlers_HandleHealthUsesStatusCodeForUnhealthyService(t *testing.T) {
 	svc := &SyncService{
-		config:    &ServiceConfig{AppName: "health-test"},
+		config: &ServiceConfig{AppName: "health-test",
+			RegisteredTableCatalogRevision: 1},
 		logger:    slog.Default(),
 		lifecycle: serviceLifecycleClosed,
 	}
@@ -254,13 +246,36 @@ func TestHTTPSyncHandlers_HandleHealthUsesStatusCodeForUnhealthyService(t *testi
 	}
 }
 
+func TestHTTPSyncHandlers_HandleHealthReportsWithdrawnReadiness(t *testing.T) {
+	svc := &SyncService{
+		config:             &ServiceConfig{AppName: "withdrawn-health-test", RegisteredTableCatalogRevision: 1},
+		logger:             slog.Default(),
+		lifecycle:          serviceLifecycleRunning,
+		bootstrapReadiness: bootstrapReadinessReady,
+	}
+	svc.WithdrawReadiness(DeploymentContractMismatch)
+
+	status, err := svc.GetStatus(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "unhealthy", status.Status)
+	require.False(t, status.AcceptingOperations)
+
+	h := NewHTTPSyncHandlers(svc, slog.Default())
+	req := httptest.NewRequest(http.MethodGet, "/syncx/health", nil)
+	rec := httptest.NewRecorder()
+	h.HandleHealth(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
 func TestHTTPSyncHandlers_HandleStatusReturnsLifecycleSnapshot(t *testing.T) {
 	svc := &SyncService{
-		config: &ServiceConfig{
-			AppName: "status-test",
+		config: &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+			{Schema: "business", Table: "users"},
+		}), AppName: "status-test",
 			RegisteredTables: []RegisteredTable{
 				{Schema: "business", Table: "users"},
 			},
+			RegisteredTableCatalogRevision: 1,
 		},
 		logger:    slog.Default(),
 		lifecycle: serviceLifecycleRunning,
@@ -289,7 +304,8 @@ func TestHTTPSyncHandlers_HandleStatusReturnsLifecycleSnapshot(t *testing.T) {
 
 func TestHTTPSyncHandlers_HandleCreateSnapshotSessionRequiresAuthenticatedActor(t *testing.T) {
 	svc := &SyncService{
-		config: &ServiceConfig{AppName: "snapshot-auth-test"},
+		config: &ServiceConfig{AppName: "snapshot-auth-test",
+			RegisteredTableCatalogRevision: 1},
 		logger: slog.Default(),
 	}
 	h := NewHTTPSyncHandlers(svc, slog.Default())
@@ -304,20 +320,19 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionRequiresAuthenticatedActor(
 }
 
 func TestHTTPSyncHandlers_HandleCreateSnapshotSessionRejectsMalformedBody(t *testing.T) {
-	svc := &SyncService{
-		config: &ServiceConfig{AppName: "snapshot-invalid-body-test"},
-		logger: slog.Default(),
-	}
-	h := NewHTTPSyncHandlers(svc, slog.Default())
+	fixture := newSnapshotSessionFixture(t, "invalid_body", snapshotSessionFixtureOptions{})
+	h := NewHTTPSyncHandlers(fixture.svc, slog.Default())
 
 	req := httptest.NewRequest(http.MethodPost, "/sync/snapshot-sessions", bytes.NewBufferString(`{"source_replacement":`))
+	req.Header.Set("Content-Type", "application/json")
+	setTestSchemaGenerationHeaders(req, fixture.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "snapshot-invalid-body-user", SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
 	h.HandleCreateSnapshotSession(rec, req)
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	errResp := decodeErrorResponse(t, rec)
-	require.Equal(t, "snapshot_session_invalid", errResp.Error)
+	require.Equal(t, "invalid_request", errResp.Error)
 }
 
 func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T) {
@@ -330,12 +345,13 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T)
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "snapshot-handler-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "snapshot-handler-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	h := NewHTTPSyncHandlers(svc, slog.Default())
 
@@ -357,6 +373,8 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T)
 			"reason": "history_pruned"
 		}
 	}`, oldSourceID, firstNewSourceID)))
+	initialReq.Header.Set("Content-Type", "application/json")
+	setTestSchemaGenerationHeaders(initialReq, svc)
 	initialReq = initialReq.WithContext(ContextWithActor(initialReq.Context(), oldWriter))
 	initialRec := httptest.NewRecorder()
 	h.HandleCreateSnapshotSession(initialRec, initialReq)
@@ -369,6 +387,8 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T)
 			"reason": "history_pruned"
 		}
 	}`, oldSourceID, secondNewSourceID)))
+	retiredReq.Header.Set("Content-Type", "application/json")
+	setTestSchemaGenerationHeaders(retiredReq, svc)
 	retiredReq = retiredReq.WithContext(ContextWithActor(retiredReq.Context(), oldWriter))
 	retiredRec := httptest.NewRecorder()
 	h.HandleCreateSnapshotSession(retiredRec, retiredReq)
@@ -383,6 +403,8 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T)
 			"reason": "history_pruned"
 		}
 	}`, otherOldSourceID, firstNewSourceID)))
+	replacementReq.Header.Set("Content-Type", "application/json")
+	setTestSchemaGenerationHeaders(replacementReq, svc)
 	replacementReq = replacementReq.WithContext(ContextWithActor(replacementReq.Context(), otherWriter))
 	replacementRec := httptest.NewRecorder()
 	h.HandleCreateSnapshotSession(replacementRec, replacementReq)

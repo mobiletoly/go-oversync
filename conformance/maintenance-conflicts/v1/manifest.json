@@ -1,0 +1,18 @@
+{
+  "format": "maintenance-conflicts-v1",
+  "revision": 1,
+  "authority": [
+    "baseline contract sections 13.1 and 13.2",
+    "transition revision 4"
+  ],
+  "runtime_status": {
+    "Go": "reference implementation; qualification recorded in transition ledger",
+    "KMP": "pending_non_go",
+    "Dart/Flutter": "pending_non_go",
+    "Swift": "pending_non_go"
+  },
+  "artifacts": {
+    "README.md": "08d14516689b8ce51782b8bc107a411800c02c765032b1b736046123a18bd66f",
+    "scenarios.json": "bbed08bd576f45bafbac04f0969a2ea9274273fb1f55ab9fd9fbf1e1268e49bc"
+  }
+}

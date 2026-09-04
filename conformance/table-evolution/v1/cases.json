@@ -1,0 +1,269 @@
+{
+  "attachment": "22222222-2222-4222-8222-222222222222",
+  "cases": [
+    {
+      "expected_payloads": [
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "Person",
+          "project_id": "33333333-3333-4333-8333-333333333333"
+        },
+        {
+          "id": "33333333-3333-4333-8333-333333333333",
+          "title": "Shared project"
+        }
+      ],
+      "expected_tables": [
+        "people",
+        "projects"
+      ],
+      "generation": 2,
+      "id": "added-table-snapshot",
+      "method": "GET",
+      "path": "/sync/snapshot-sessions/{snapshot_id}"
+    },
+    {
+      "expected_payloads": [
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "Person"
+        }
+      ],
+      "expected_tables": [
+        "people"
+      ],
+      "generation": 1,
+      "id": "old-hidden-column",
+      "method": "GET",
+      "path": "/sync/snapshot-sessions/{snapshot_id}"
+    },
+    {
+      "push_request": {
+        "canonical_request_hash": "52830d90ed937da65d9648475787d7fa01aaca4b81b3a072aac2d205a0d047fb",
+        "source_bundle_id": 1
+      },
+      "expected_project_id": null,
+      "generation": 2,
+      "headers": {
+        "Oversync-Schema-Generation-ID": "2",
+        "Oversync-Schema-Generation-Fingerprint": "dc8c0efa7465a3f1e38424745c4051fc0bd5fba4c4695d2a0adc75fbbd526322"
+      },
+      "id": "explicit-null",
+      "method": "POST",
+      "path": "/sync/push",
+      "row": {
+        "base_row_version": 3,
+        "key": {
+          "id": "11111111-1111-4111-8111-111111111111"
+        },
+        "op": "UPDATE",
+        "payload": {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "Person",
+          "project_id": null
+        },
+        "schema": "main",
+        "table": "people"
+      }
+    },
+    {
+      "push_request": {
+        "canonical_request_hash": "500f4ce408dcd031965575e8fe254a037782d4549cdc96e77b8934cfce13e498",
+        "source_bundle_id": 1
+      },
+      "expected_project_id": "33333333-3333-4333-8333-333333333333",
+      "generation": 1,
+      "headers": {
+        "Oversync-Schema-Generation-ID": "1",
+        "Oversync-Schema-Generation-Fingerprint": "a0b1f54db1af23c6da00b147633d2c5a59e6e8053b91ee3d3907f7d87f3ad60d"
+      },
+      "id": "old-update-omission",
+      "method": "POST",
+      "path": "/sync/push",
+      "row": {
+        "base_row_version": 2,
+        "key": {
+          "id": "11111111-1111-4111-8111-111111111111"
+        },
+        "op": "UPDATE",
+        "payload": {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "Person"
+        },
+        "schema": "main",
+        "table": "people"
+      }
+    },
+    {
+      "canonical_deleted_tables": [
+        "people",
+        "attachments"
+      ],
+      "expected_tables": [
+        "people"
+      ],
+      "generation": 1,
+      "id": "hidden-cascade",
+      "method": "POST",
+      "path": "/sync/push"
+    },
+    {
+      "expected_local_version": 1,
+      "expected_outcome": "local_contract_mismatch",
+      "generation": 2,
+      "id": "fk-mismatch",
+      "local_mutation": "omit people.project_id foreign key"
+    },
+    {
+      "boundaries": [
+        "migration",
+        "snapshot"
+      ],
+      "expected_local_tables": [
+        "people",
+        "projects",
+        "attachments",
+        "table_local_notes"
+      ],
+      "gate": "old intent settled before migration",
+      "generation": 2,
+      "id": "omitted-table-upgrade",
+      "old_only_table": "legacy_notes",
+      "pending": [
+        "insert",
+        "update",
+        "delete",
+        "committed_reply_lost",
+        "newer_intent"
+      ],
+      "retained_server_table": "legacy_notes"
+    },
+    {
+      "events": [
+        "stage upload",
+        "create unfinished snapshot",
+        "close admission",
+        "expire within immutable deadline",
+        "private bounded cleanup",
+        "append without FK",
+        "install validated FK",
+        "fresh Bootstrap",
+        "captured population",
+        "reopen",
+        "replay committed result or restage exact uncommitted request"
+      ],
+      "generation": 1,
+      "id": "interrupted-append-sessions",
+      "maintenance_error": "service_not_ready",
+      "maintenance_status": 503,
+      "preserved": [
+        "source_id",
+        "source_bundle_id",
+        "canonical_request_hash",
+        "frozen_rows",
+        "newer_intent",
+        "committed_receipts"
+      ]
+    },
+    {
+      "id": "captured-set-null",
+      "generation": 2,
+      "method": "POST",
+      "path": "/sync/push",
+      "headers": {
+        "Oversync-Schema-Generation-ID": "2",
+        "Oversync-Schema-Generation-Fingerprint": "dc8c0efa7465a3f1e38424745c4051fc0bd5fba4c4695d2a0adc75fbbd526322"
+      },
+      "push_request": {
+        "source_bundle_id": 1,
+        "canonical_request_hash": "e8338b58f6ae53677405abe105ec0be9b62a55aff14f29a2e4033ed308009dbd"
+      },
+      "row": {
+        "schema": "main",
+        "table": "projects",
+        "key": {
+          "id": "33333333-3333-4333-8333-333333333333"
+        },
+        "op": "DELETE",
+        "base_row_version": 2
+      },
+      "views": [
+        {
+          "generation": 1,
+          "expected_rows": [
+            {
+              "schema": "main",
+              "table": "people",
+              "key": {
+                "id": "11111111-1111-4111-8111-111111111111"
+              },
+              "op": "UPDATE",
+              "row_version": 3,
+              "payload": {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "name": "Person"
+              }
+            }
+          ],
+          "expected_snapshot_row": {
+            "schema": "main",
+            "table": "people",
+            "key": {
+              "id": "11111111-1111-4111-8111-111111111111"
+            },
+            "row_version": 3,
+            "payload": {
+              "id": "11111111-1111-4111-8111-111111111111",
+              "name": "Person"
+            }
+          }
+        },
+        {
+          "generation": 2,
+          "expected_rows": [
+            {
+              "schema": "main",
+              "table": "projects",
+              "key": {
+                "id": "33333333-3333-4333-8333-333333333333"
+              },
+              "op": "DELETE",
+              "row_version": 3
+            },
+            {
+              "schema": "main",
+              "table": "people",
+              "key": {
+                "id": "11111111-1111-4111-8111-111111111111"
+              },
+              "op": "UPDATE",
+              "row_version": 3,
+              "payload": {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "name": "Person",
+                "project_id": null
+              }
+            }
+          ],
+          "expected_snapshot_row": {
+            "schema": "main",
+            "table": "people",
+            "key": {
+              "id": "11111111-1111-4111-8111-111111111111"
+            },
+            "row_version": 3,
+            "payload": {
+              "id": "11111111-1111-4111-8111-111111111111",
+              "name": "Person",
+              "project_id": null
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "format": "oversync.table-evolution.cases.v1",
+  "person": "11111111-1111-4111-8111-111111111111",
+  "project": "33333333-3333-4333-8333-333333333333",
+  "scope": "scope"
+}

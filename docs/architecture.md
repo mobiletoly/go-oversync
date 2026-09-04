@@ -29,10 +29,10 @@ The current architecture has four main pieces:
 4. The SQLite client tracks local writes in `_sync_dirty_rows` with triggers.
    After `Detach()`, those triggers stay active so offline anonymous writes continue to enqueue
    local dirty state immediately.
-5. `PushPending()` freezes those writes into `_sync_outbox_*`, uploads them through
-   `/sync/push-sessions`, then replays the authoritative committed bundle returned by the server.
-   Process restart keeps that singleton outbox durable and resumes from it instead of recollecting
-   a new local bundle.
+5. `PushPending()` freezes those writes into `_sync_outbox_*`, sends exactly one bounded
+   `/sync/push` request, then atomically applies the authoritative response bundle. Process restart
+   keeps that singleton outbox durable and replays the same tuple instead of recollecting a new
+   local bundle.
 6. `PullToStable()` reads complete committed bundles from `/sync/pull` and advances the local
    checkpoint only after durable local apply.
 7. `Rebuild(ctx)` rebuilds managed tables from `/sync/snapshot-sessions` when a client is new or
@@ -78,8 +78,6 @@ Important runtime tables include:
 - `sync.bundle_rows`
 - `sync.scope_write_receipts`
 - `sync.server_source_reservations`
-- `sync.push_sessions`
-- `sync.push_session_rows`
 - `sync.snapshot_sessions`
 - `sync.snapshot_session_rows`
 
@@ -119,3 +117,32 @@ and examples.
 ### [Core Concepts →]({{ site.baseurl }}/documentation/core-concepts/)
 
 Read the core concepts page for the exact vocabulary used by the current contract.
+# Schema-generation sessions
+
+The service is constructed with one or two complete `SchemaGenerations` declarations and joins
+each compiled immutable contract to the registered-table catalog and live PostgreSQL metadata at
+Bootstrap. There is no `MaxSupportedSchemaVersion` fallback. Fresh generation databases include
+`sync.source_generation_bindings`, generation-bound push and snapshot sessions, and
+`sync.bundle_log.planned_row_count`; pre-generation managed layouts fail closed instead of being
+automatically migrated.
+
+Connect permanently binds a client `(user, source)` to an exact generation ID/fingerprint pair.
+Admission uses the indexed per-user source limit; retained active, reserved, and retired bindings
+remain protocol witnesses. Push and snapshot sessions pin that pair. The Q39 client request hash
+includes the generation proof and the exact ordered physical request rows. Its durable
+`planned_row_count` is distinct from `bundle_log.row_count`, which describes canonical server
+effects after transitions and cascades. In other words, request identity covers supplied rows while
+bundle identity covers canonical server effects.
+
+All generations read the same immutable `sync.bundle_log` / `sync.bundle_rows` history. The runtime
+validates each canonical bundle and derives a deterministic generation-visible stream on demand,
+preserving canonical order while removing hidden tables and columns. Projected counts, byte counts,
+and hashes describe that visible stream. No projection metadata cache or per-generation durable
+copy exists. Empty visible streams remain pull envelopes so checkpoints can cross invisible-only
+canonical commits.
+
+Push commit validates, inside the business transaction, that every uploaded key produced a final
+captured effect visible to the pinned generation. Missing coverage rolls back business, trigger,
+cascade, audit, and source-progress changes together. Normalized and additional effects are valid;
+the client settles them without comparing effect payloads to original intent and preserves newer
+local edits.

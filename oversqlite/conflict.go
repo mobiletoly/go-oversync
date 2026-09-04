@@ -12,6 +12,25 @@ import (
 
 const maxPushConflictAutoRetries = 2
 
+// PushEffectCoverageError is a permanent server admission rejection. The
+// frozen outbox remains available for explicit application resolution/retry.
+type PushEffectCoverageError struct {
+	Operation string
+	Status    int
+	Message   string
+}
+
+func (e *PushEffectCoverageError) Error() string {
+	return "push did not produce a captured result for every uploaded key"
+}
+
+func (e *PushEffectCoverageError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return &retryHTTPError{Operation: e.Operation, StatusCode: e.Status}
+}
+
 // ConflictContext is the structured resolver input for push_conflict recovery.
 type ConflictContext struct {
 	Schema           string
@@ -68,12 +87,12 @@ func (r *ClientWinsResolver) Resolve(conflict ConflictContext) MergeResult {
 	return KeepLocal{}
 }
 
-// DefaultResolver preserves the prior exported default-resolver name with server-wins behavior.
+// DefaultResolver preserves conflicting intent until the application resolves it.
 type DefaultResolver struct{}
 
-// Resolve preserves the historical default behavior of resolving conflicts as server-wins.
+// Resolve never infers permission to discard a local edit.
 func (r *DefaultResolver) Resolve(conflict ConflictContext) MergeResult {
-	return AcceptServer{}
+	return DeferConflict{}
 }
 
 // PushConflictError is the typed transport/decode-layer representation of a structured push_conflict.
@@ -137,18 +156,15 @@ func decodePushConflictError(status int, body []byte) *PushConflictError {
 		return nil
 	}
 
-	var response oversync.PushConflictResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil
-	}
-	if response.Error != "push_conflict" || response.Conflict == nil {
+	response, err := completeConflictResponse(body)
+	if err != nil {
 		return nil
 	}
 	response.Message = ""
 	return &PushConflictError{
 		Status:   status,
 		RawBody:  "",
-		Response: response,
+		Response: *response,
 	}
 }
 

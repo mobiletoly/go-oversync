@@ -142,7 +142,7 @@ func TestAuditExpectedDriftResilience_MissingManagedConstraintRejectsBootstrap(t
 
 func newAuditDriftService(t *testing.T, fixture *auditDatabaseContractFixture, appName string) *SyncService {
 	t.Helper()
-	service, err := NewRuntimeService(
+	service, err := newTestRuntimeService(
 		fixture.pool,
 		fixture.newServiceConfig(appName),
 		integrationTestLogger(slog.LevelWarn),

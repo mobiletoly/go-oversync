@@ -7,19 +7,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"math"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/mobiletoly/go-oversync/internal/jcs"
-	"github.com/mobiletoly/go-oversync/internal/wirevalue"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -44,6 +38,17 @@ func nextSyncLoopBackoffAfterError(err error, current, min, max time.Duration) t
 	return next
 }
 
+func waitForSyncLoopDelay(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // uploaderLoop runs the push loop with backoff.
 func (c *Client) uploaderLoop(ctx context.Context) {
 	backoff := c.config.BackoffMin
@@ -55,28 +60,43 @@ func (c *Client) uploaderLoop(ctx context.Context) {
 		}
 
 		if atomic.LoadInt32(&c.uploadPaused) == 1 {
-			time.Sleep(backoff)
+			if !waitForSyncLoopDelay(ctx, backoff) {
+				return
+			}
 			continue
 		}
 
 		if _, err := c.PushPending(ctx); err != nil {
+			if c.stopForRetiredGeneration(err) {
+				return
+			}
 			if isProtocolVersionMismatch(err) {
 				c.logger.Error("upload loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
+				return
+			}
+			if isTerminalProtocolRepresentationError(err) {
+				c.logger.Error("upload loop stopped by terminal protocol representation error", "error_type", fmt.Sprintf("%T", err))
 				return
 			}
 			if IsLifecyclePreconditionError(err) {
 				c.logger.Warn("upload loop blocked by lifecycle state", "error", err)
 				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
-				time.Sleep(backoff)
+				if !waitForSyncLoopDelay(ctx, backoff) {
+					return
+				}
 				continue
 			}
-			time.Sleep(backoff)
+			if !waitForSyncLoopDelay(ctx, backoff) {
+				return
+			}
 			backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
 			continue
 		}
 
 		backoff = c.config.BackoffMin
-		time.Sleep(backoff)
+		if !waitForSyncLoopDelay(ctx, backoff) {
+			return
+		}
 	}
 }
 
@@ -91,6 +111,9 @@ func (c *Client) downloaderLoop(ctx context.Context) {
 		}
 
 		if atomic.LoadInt32(&c.downloadPaused) == 1 {
+			if !waitForSyncLoopDelay(ctx, backoff) {
+				return
+			}
 			continue
 		}
 
@@ -99,26 +122,44 @@ func (c *Client) downloaderLoop(ctx context.Context) {
 			if IsLifecyclePreconditionError(err) {
 				c.logger.Warn("download loop blocked by lifecycle state", "error", err)
 				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
-				time.Sleep(backoff)
+				if !waitForSyncLoopDelay(ctx, backoff) {
+					return
+				}
 				continue
 			}
-			time.Sleep(backoff)
+			if !waitForSyncLoopDelay(ctx, backoff) {
+				return
+			}
 			backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
 			continue
 		}
 
 		if _, err := c.PullToStable(ctx); err != nil {
+			if c.stopForRetiredGeneration(err) {
+				return
+			}
+			if c.probeRetiredGenerationWhileDownloadBlocked(ctx, before, err) {
+				return
+			}
 			if isProtocolVersionMismatch(err) {
 				c.logger.Error("download loop stopped by protocol version mismatch", "error_type", fmt.Sprintf("%T", err))
+				return
+			}
+			if isTerminalProtocolRepresentationError(err) {
+				c.logger.Error("download loop stopped by terminal protocol representation error", "error_type", fmt.Sprintf("%T", err))
 				return
 			}
 			if IsLifecyclePreconditionError(err) {
 				c.logger.Warn("download loop blocked by lifecycle state", "error", err)
 				backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
-				time.Sleep(backoff)
+				if !waitForSyncLoopDelay(ctx, backoff) {
+					return
+				}
 				continue
 			}
-			time.Sleep(backoff)
+			if !waitForSyncLoopDelay(ctx, backoff) {
+				return
+			}
 			backoff = nextSyncLoopBackoffAfterError(err, backoff, c.config.BackoffMin, c.config.BackoffMax)
 			continue
 		}
@@ -126,15 +167,35 @@ func (c *Client) downloaderLoop(ctx context.Context) {
 		backoff = c.config.BackoffMin
 		after, seqErr := c.LastBundleSeqSeen(ctx)
 		if seqErr != nil || after == before {
-			time.Sleep(backoff)
+			if !waitForSyncLoopDelay(ctx, backoff) {
+				return
+			}
 		}
 	}
 }
 
-func (c *Client) serializeExistingRowInTx(ctx context.Context, tx *sql.Tx, tableName, pk string) (json.RawMessage, bool, error) {
+// probeRetiredGenerationWhileDownloadBlocked lets an automatic downloader
+// observe the terminal generation response even when local intent correctly
+// prevents applying an incremental pull. The response is never applied here:
+// this is only the ordinary pull endpoint's retirement signal, and every
+// non-retirement result leaves the dirty-state rejection in force.
+func (c *Client) probeRetiredGenerationWhileDownloadBlocked(ctx context.Context, afterBundleSeq int64, pullErr error) bool {
+	var dirty *DirtyStateRejectedError
+	if !errors.As(pullErr, &dirty) {
+		return false
+	}
+	maxBundles := c.config.DownloadLimit
+	if maxBundles <= 0 {
+		maxBundles = 1000
+	}
+	_, err := c.sendPullRequest(ctx, afterBundleSeq, maxBundles, 0)
+	return c.stopForRetiredGeneration(err)
+}
+
+func (c *Client) serializeExistingRowInTx(ctx context.Context, tx sqliteTransaction, tableName, pk string) (json.RawMessage, bool, error) {
 	payload, err := c.serializeRowInTx(ctx, tx, tableName, pk)
 	if err != nil {
-		if strings.Contains(err.Error(), "row not found") {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("failed to serialize current row for %s.%s: %w", tableName, pk, err)
@@ -187,6 +248,9 @@ func canonicalPayloadEqual(left sql.NullString, right sql.NullString) (bool, err
 	if err != nil {
 		return false, err
 	}
+	if left.String == right.String {
+		return true, nil
+	}
 	rightNorm, err := canonicalizeJSON(right.String)
 	if err != nil {
 		return false, err
@@ -217,105 +281,11 @@ func (c *Client) processPayloadForUpload(tableName, payloadStr string) (json.Raw
 		return nil, fmt.Errorf("failed to parse payload JSON: %w", err)
 	}
 
-	tableInfo, err := c.getTableInfo(strings.ToLower(tableName))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get table info: %w", err)
-	}
-
-	pkColLower := ""
-	if tableInfo.PrimaryKey != nil {
-		pkColLower = strings.ToLower(tableInfo.PrimaryKey.Name)
-	}
-	if err := normalizeNumericPayloadForWire(payloadData, tableInfo); err != nil {
+	if err := c.validateAndUnwrapCapturedPayload(tableName, payloadData); err != nil {
 		return nil, err
 	}
-	for _, col := range tableInfo.Columns {
-		colNameLower := strings.ToLower(col.Name)
-		if payloadData[colNameLower] == nil {
-			continue
-		}
-		if !col.IsBlob() {
-			continue
-		}
-		hexValue, ok := payloadData[colNameLower].(string)
-		if !ok || hexValue == "" {
-			continue
-		}
-
-		if tableInfo.PrimaryKeyIsBlob && pkColLower != "" && colNameLower == pkColLower {
-			uuidBytes, err := decodeUUIDBytesFromString(hexValue)
-			if err != nil {
-				return nil, fmt.Errorf("failed to decode blob UUID pk for column %s: %w", col.Name, err)
-			}
-			id, err := uuid.FromBytes(uuidBytes)
-			if err != nil {
-				return nil, fmt.Errorf("invalid UUID bytes for column %s: %w", col.Name, err)
-			}
-			payloadData[colNameLower] = id.String()
-			continue
-		}
-		if tableInfo.IsBlobReferenceColumn(col.Name) {
-			uuidBytes, err := decodeUUIDBytesFromString(hexValue)
-			if err != nil {
-				return nil, fmt.Errorf("failed to decode blob UUID reference for column %s: %w", col.Name, err)
-			}
-			id, err := uuid.FromBytes(uuidBytes)
-			if err != nil {
-				return nil, fmt.Errorf("invalid UUID bytes for reference column %s: %w", col.Name, err)
-			}
-			payloadData[colNameLower] = id.String()
-			continue
-		}
-
-		hexBytes, err := hex.DecodeString(hexValue)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode hex for column %s: %w", col.Name, err)
-		}
-		payloadData[colNameLower] = base64.StdEncoding.EncodeToString(hexBytes)
+	if err := c.processPayloadWithDeclaredCodecs(tableName, payloadData); err != nil {
+		return nil, err
 	}
-
-	processedBytes, err := jcs.Marshal(payloadData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal processed payload: %w", err)
-	}
-	return processedBytes, nil
-}
-
-func normalizeNumericPayloadForWire(payloadData map[string]any, tableInfo *TableInfo) error {
-	for _, col := range tableInfo.Columns {
-		colNameLower := strings.ToLower(col.Name)
-		if payloadData[colNameLower] == nil {
-			continue
-		}
-		if col.IsInteger() {
-			raw, ok := payloadData[colNameLower].(string)
-			if !ok {
-				return fmt.Errorf("INTEGER column %s must be captured as canonical signed-64 text", col.Name)
-			}
-			if _, err := wirevalue.ParseInt64(raw); err != nil {
-				return fmt.Errorf("invalid INTEGER in column %s: %w", col.Name, err)
-			}
-			payloadData[colNameLower] = raw
-		} else if col.IsReal() {
-			var raw string
-			switch value := payloadData[colNameLower].(type) {
-			case json.Number:
-				raw = value.String()
-			case string:
-				raw = value
-			default:
-				return fmt.Errorf("REAL column %s must be captured as finite text", col.Name)
-			}
-			parsed, err := strconv.ParseFloat(raw, 64)
-			if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
-				return fmt.Errorf("REAL column %s must be finite", col.Name)
-			}
-			canonical, err := wirevalue.RenderFloat64(parsed)
-			if err != nil {
-				return fmt.Errorf("render REAL column %s: %w", col.Name, err)
-			}
-			payloadData[colNameLower] = canonical
-		}
-	}
-	return nil
+	return jcs.Marshal(payloadData)
 }

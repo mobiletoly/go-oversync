@@ -11,16 +11,22 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func (s *SyncService) Connect(ctx context.Context, actor Actor, req *ConnectRequest) (_ *ConnectResponse, err error) {
+func (s *SyncService) Connect(ctx context.Context, actor Actor, proof SchemaGenerationProof, req *ConnectRequest) (_ *ConnectResponse, err error) {
 	if err := rejectRetryableCallbackContext(ctx, "Connect"); err != nil {
 		return nil, err
 	}
-	done, err := s.beginOperation()
+	if err := s.validateClientActor(actor, true); err != nil {
+		return nil, err
+	}
+	if err := validateSchemaGenerationProof(proof); err != nil {
+		return nil, err
+	}
+	done, err := s.beginOperation(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	if err := s.validateClientActor(actor, true); err != nil {
+	if _, err := s.resolveRequestGeneration(ctx, actor, proof); err != nil {
 		return nil, err
 	}
 	if req == nil {
@@ -40,6 +46,9 @@ func (s *SyncService) Connect(ctx context.Context, actor Actor, req *ConnectRequ
 		}
 		state, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
 		if err != nil {
+			return err
+		}
+		if err := s.createOrConfirmSourceGenerationBinding(ctx, tx, actor, state.UserPK, proof); err != nil {
 			return err
 		}
 		state, err = expireInitializationLeaseIfNeeded(ctx, tx, state)

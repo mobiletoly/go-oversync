@@ -11,8 +11,8 @@ import (
 func mustOpenE2E(t *testing.T, client *oversqlite.Client, ctx context.Context, sourceID string) {
 	t.Helper()
 	_ = sourceID
-	err := client.Open(ctx)
-	require.NoError(t, err)
+	require.NotNil(t, client.Database())
+	require.NoError(t, ctx.Err())
 }
 
 func mustPushPendingE2E(t *testing.T, client *oversqlite.Client, ctx context.Context) oversqlite.PushReport {

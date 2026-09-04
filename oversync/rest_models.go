@@ -4,6 +4,7 @@
 package oversync
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -32,7 +33,8 @@ type Bundle struct {
 	BundleSeq            int64       `json:"bundle_seq"`
 	SourceID             string      `json:"source_id"`
 	SourceBundleID       int64       `json:"source_bundle_id"`
-	RowCount             int64       `json:"row_count,omitempty"`
+	RowCount             int64       `json:"row_count"`
+	ByteCount            int64       `json:"byte_count"`
 	BundleHash           string      `json:"bundle_hash,omitempty"`
 	CanonicalRequestHash string      `json:"canonical_request_hash,omitempty"`
 	Rows                 []BundleRow `json:"rows"`
@@ -48,28 +50,105 @@ type PushRequestRow struct {
 	Payload        json.RawMessage `json:"payload,omitempty"`
 }
 
-type PushSessionCreateRequest struct {
-	SourceBundleID       int64  `json:"source_bundle_id"`
-	PlannedRowCount      int64  `json:"planned_row_count"`
-	CanonicalRequestHash string `json:"canonical_request_hash"`
-	InitializationID     string `json:"initialization_id,omitempty"`
+// CompactPushRequest carries exactly one complete v1 source bundle. The rows
+// are compact transport groups; their retained logical form is reconstructed
+// before canonical-hash validation and any service call.
+type CompactPushRequest struct {
+	SourceBundleID       int64             `json:"source_bundle_id"`
+	CanonicalRequestHash string            `json:"canonical_request_hash"`
+	InitializationID     string            `json:"initialization_id,omitempty"`
+	Rows                 []CompactRowGroup `json:"rows"`
 }
 
-type PushSessionCreateResponse struct {
-	PushID                 string `json:"push_id,omitempty"`
-	Status                 string `json:"status"`
-	PlannedRowCount        int64  `json:"planned_row_count,omitempty"`
-	NextExpectedRowOrdinal int64  `json:"next_expected_row_ordinal,omitempty"`
-	BundleSeq              int64  `json:"bundle_seq,omitempty"`
-	SourceID               string `json:"source_id,omitempty"`
-	SourceBundleID         int64  `json:"source_bundle_id,omitempty"`
-	RowCount               int64  `json:"row_count,omitempty"`
-	BundleHash             string `json:"bundle_hash,omitempty"`
-	CanonicalRequestHash   string `json:"canonical_request_hash,omitempty"`
+func validateJSONObjectFields(data []byte, objectName string, required, optional []string) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return fmt.Errorf("%s must be an object", objectName)
+	}
+	allowed := make(map[string]struct{}, len(required)+len(optional))
+	for _, name := range required {
+		allowed[name] = struct{}{}
+	}
+	for _, name := range optional {
+		allowed[name] = struct{}{}
+	}
+	for name := range fields {
+		if _, ok := allowed[name]; !ok {
+			return fmt.Errorf("%s contains unknown member %q", objectName, name)
+		}
+	}
+	for _, name := range required {
+		value, ok := fields[name]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%s missing required %s", objectName, name)
+		}
+	}
+	for _, name := range optional {
+		if value, ok := fields[name]; ok && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%s %s must be omitted or non-null", objectName, name)
+		}
+	}
+	return nil
+}
+
+func (request *CompactPushRequest) UnmarshalJSON(data []byte) error {
+	type plain CompactPushRequest
+	if err := validateJSONObjectFields(data, "compact push request",
+		[]string{"source_bundle_id", "canonical_request_hash", "rows"},
+		[]string{"initialization_id"}); err != nil {
+		return err
+	}
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*request = CompactPushRequest(decoded)
+	return nil
+}
+
+// CompactPushResponse is the complete committed/replayed authoritative
+// effect. It intentionally omits request/session bookkeeping the client
+// already owns.
+type CompactPushResponse struct {
+	BundleSeq  int64             `json:"bundle_seq"`
+	BundleHash string            `json:"bundle_hash"`
+	Rows       []CompactRowGroup `json:"rows"`
+}
+
+// CompactBundle and CompactPullResponse remove redundant row-count, byte-count
+// and push-only request-hash fields from the retained incremental read path.
+type CompactBundle struct {
+	BundleSeq      int64             `json:"bundle_seq"`
+	SourceID       string            `json:"source_id"`
+	SourceBundleID int64             `json:"source_bundle_id"`
+	BundleHash     string            `json:"bundle_hash"`
+	Rows           []CompactRowGroup `json:"rows"`
+}
+
+type CompactPullResponse struct {
+	StableBundleSeq int64           `json:"stable_bundle_seq"`
+	Bundles         []CompactBundle `json:"bundles"`
+	HasMore         bool            `json:"has_more"`
 }
 
 type ConnectRequest struct {
 	HasLocalPendingRows bool `json:"has_local_pending_rows"`
+}
+
+func (request *ConnectRequest) UnmarshalJSON(data []byte) error {
+	type plain ConnectRequest
+	if err := validateJSONObjectFields(data, "connect request", []string{"has_local_pending_rows"}, nil); err != nil {
+		return err
+	}
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*request = ConnectRequest(decoded)
+	return nil
 }
 
 type ConnectResponse struct {
@@ -79,42 +158,12 @@ type ConnectResponse struct {
 	RetryAfterSec    int    `json:"retry_after_seconds,omitempty"`
 }
 
-type PushSessionChunkRequest struct {
-	StartRowOrdinal int64            `json:"start_row_ordinal"`
-	Rows            []PushRequestRow `json:"rows"`
-}
-
-type PushSessionChunkResponse struct {
-	PushID                 string `json:"push_id"`
-	NextExpectedRowOrdinal int64  `json:"next_expected_row_ordinal"`
-}
-
-type PushSessionCommitResponse struct {
-	BundleSeq            int64  `json:"bundle_seq"`
-	SourceID             string `json:"source_id"`
-	SourceBundleID       int64  `json:"source_bundle_id"`
-	RowCount             int64  `json:"row_count"`
-	BundleHash           string `json:"bundle_hash"`
-	CanonicalRequestHash string `json:"canonical_request_hash"`
-}
-
-type CommittedBundleRowsResponse struct {
-	BundleSeq            int64       `json:"bundle_seq"`
-	SourceID             string      `json:"source_id"`
-	SourceBundleID       int64       `json:"source_bundle_id"`
-	RowCount             int64       `json:"row_count"`
-	BundleHash           string      `json:"bundle_hash"`
-	CanonicalRequestHash string      `json:"canonical_request_hash"`
-	Rows                 []BundleRow `json:"rows"`
-	NextRowOrdinal       int64       `json:"next_row_ordinal"`
-	HasMore              bool        `json:"has_more"`
-}
-
 // PullResponse returns one or more complete committed bundles.
 type PullResponse struct {
-	StableBundleSeq int64    `json:"stable_bundle_seq"`
-	Bundles         []Bundle `json:"bundles"`
-	HasMore         bool     `json:"has_more"`
+	StableBundleSeq          int64    `json:"stable_bundle_seq"`
+	Bundles                  []Bundle `json:"bundles"`
+	HasMore                  bool     `json:"has_more"`
+	historyProjectionRelease func()   `json:"-"`
 }
 
 // SnapshotRow is the current after-image for one non-deleted row in the bundle-based contract.
@@ -130,10 +179,37 @@ type SnapshotSessionCreateRequest struct {
 	SourceReplacement *SnapshotSourceReplacement `json:"source_replacement,omitempty"`
 }
 
+func (request *SnapshotSessionCreateRequest) UnmarshalJSON(data []byte) error {
+	type plain SnapshotSessionCreateRequest
+	if err := validateJSONObjectFields(data, "snapshot session create request", nil, []string{"source_replacement"}); err != nil {
+		return err
+	}
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*request = SnapshotSessionCreateRequest(decoded)
+	return nil
+}
+
 type SnapshotSourceReplacement struct {
 	PreviousSourceID string `json:"previous_source_id"`
 	NewSourceID      string `json:"new_source_id"`
 	Reason           string `json:"reason"`
+}
+
+func (replacement *SnapshotSourceReplacement) UnmarshalJSON(data []byte) error {
+	type plain SnapshotSourceReplacement
+	if err := validateJSONObjectFields(data, "snapshot source replacement",
+		[]string{"previous_source_id", "new_source_id", "reason"}, nil); err != nil {
+		return err
+	}
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*replacement = SnapshotSourceReplacement(decoded)
+	return nil
 }
 
 // SnapshotSession describes one frozen server-side snapshot session.
@@ -155,130 +231,74 @@ type SnapshotChunkResponse struct {
 	ByteCount         int64         `json:"byte_count"`
 }
 
+type CompactSnapshotSessionResponse struct {
+	SnapshotID        string `json:"snapshot_id"`
+	SnapshotBundleSeq int64  `json:"snapshot_bundle_seq"`
+	RowCount          int64  `json:"row_count"`
+	LogicalByteCount  int64  `json:"logical_byte_count"`
+	ExpiresAt         string `json:"expires_at"`
+}
+
+type CompactSnapshotChunkResponse struct {
+	Rows             []CompactRowGroup `json:"rows"`
+	NextRowOrdinal   int64             `json:"next_row_ordinal"`
+	LogicalByteCount int64             `json:"logical_byte_count"`
+	HasMore          bool              `json:"has_more"`
+}
+
 // Common response models
 
 const SyncProtocolVersion = "v1"
 
-// CapabilitiesResponse describes the currently supported sync protocol surface.
-type CapabilitiesResponse struct {
-	ProtocolVersion      string                   `json:"protocol_version"`
-	SchemaVersion        int                      `json:"schema_version"`
-	AppName              string                   `json:"app_name,omitempty"`
-	RegisteredTables     []string                 `json:"registered_tables,omitempty"`
-	RegisteredTableSpecs []RegisteredTableSpec    `json:"registered_table_specs"`
-	Features             map[string]bool          `json:"features"`
-	BundleLimits         BundleCapabilitiesLimits `json:"bundle_limits"`
+// GenerationDiscoveryResponse is the sole admitted wire-contract response.
+type GenerationDiscoveryResponse struct {
+	ProtocolVersion  string                       `json:"protocol_version"`
+	SchemaGeneration SchemaGenerationCapabilities `json:"schema_generation"`
+	Limits           WireLimits                   `json:"limits"`
+	WatchEnabled     bool                         `json:"watch_enabled"`
 }
 
-// BundleCapabilitiesLimits reports bundle-oriented guardrails in the target contract.
-type BundleCapabilitiesLimits struct {
-	MaxRowsPerBundle                   int   `json:"max_rows_per_bundle,omitempty"`
-	MaxBytesPerBundle                  int   `json:"max_bytes_per_bundle,omitempty"`
-	MaxBundlesPerPull                  int   `json:"max_bundles_per_pull,omitempty"`
-	DefaultRowsPerPushChunk            int   `json:"default_rows_per_push_chunk,omitempty"`
-	MaxRowsPerPushChunk                int   `json:"max_rows_per_push_chunk,omitempty"`
-	PushSessionTTLSeconds              int   `json:"push_session_ttl_seconds,omitempty"`
-	DefaultRowsPerCommittedBundleChunk int   `json:"default_rows_per_committed_bundle_chunk,omitempty"`
-	MaxRowsPerCommittedBundleChunk     int   `json:"max_rows_per_committed_bundle_chunk,omitempty"`
-	DefaultRowsPerSnapshotChunk        int   `json:"default_rows_per_snapshot_chunk,omitempty"`
-	MaxRowsPerSnapshotChunk            int   `json:"max_rows_per_snapshot_chunk,omitempty"`
-	SnapshotSessionTTLSeconds          int   `json:"snapshot_session_ttl_seconds,omitempty"`
-	MaxRowsPerSnapshotSession          int64 `json:"max_rows_per_snapshot_session,omitempty"`
-	MaxBytesPerSnapshotSession         int64 `json:"max_bytes_per_snapshot_session,omitempty"`
-	DefaultBytesPerSnapshotChunk       int64 `json:"default_bytes_per_snapshot_chunk"`
-	MaxBytesPerSnapshotChunk           int64 `json:"max_bytes_per_snapshot_chunk"`
-	MaxBytesPerSnapshotRow             int64 `json:"max_bytes_per_snapshot_row"`
-	SnapshotMaterializationBatchRows   int   `json:"snapshot_materialization_batch_rows"`
-	SnapshotMaterializationBatchBytes  int64 `json:"snapshot_materialization_batch_bytes"`
-	MaxConcurrentSnapshotBuilds        int   `json:"max_concurrent_snapshot_builds"`
-	MaxConcurrentSnapshotChunkRequests int   `json:"max_concurrent_snapshot_chunk_requests"`
-	InitializationLeaseTTLSeconds      int   `json:"initialization_lease_ttl_seconds,omitempty"`
+// WireLimits contains only client-enforced protocol bounds, never server
+// scheduling or materialization tuning.
+type WireLimits struct {
+	MaxPushRows                     int   `json:"max_push_rows"`
+	MaxPushDecodedBytes             int64 `json:"max_push_decoded_bytes"`
+	MaxPullBundles                  int   `json:"max_pull_bundles"`
+	MaxPullDecodedBytes             int64 `json:"max_pull_decoded_bytes"`
+	MaxSnapshotRowsPerChunk         int   `json:"max_snapshot_rows_per_chunk"`
+	MaxSnapshotDecodedBytesPerChunk int64 `json:"max_snapshot_decoded_bytes_per_chunk"`
+	MaxSnapshotRows                 int64 `json:"max_snapshot_rows"`
+	MaxSnapshotLogicalBytes         int64 `json:"max_snapshot_logical_bytes"`
+	MaxRowDecodedBytes              int64 `json:"max_row_decoded_bytes"`
 }
 
-func (limits *BundleCapabilitiesLimits) UnmarshalJSON(data []byte) error {
-	type plainLimits BundleCapabilitiesLimits
-	var decoded plainLimits
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
-	}
-	required := []string{
-		"default_rows_per_snapshot_chunk",
-		"max_rows_per_snapshot_chunk",
-		"default_bytes_per_snapshot_chunk",
-		"max_bytes_per_snapshot_chunk",
-		"max_bytes_per_snapshot_row",
-		"max_concurrent_snapshot_builds",
-		"max_concurrent_snapshot_chunk_requests",
-	}
-	for _, name := range required {
-		value, ok := fields[name]
-		if !ok || string(value) == "null" {
-			return fmt.Errorf("capabilities bundle_limits missing required %s", name)
-		}
-	}
-	for _, name := range []string{
-		"snapshot_materialization_batch_rows",
-		"snapshot_materialization_batch_bytes",
-	} {
-		if value, ok := fields[name]; ok && string(value) == "null" {
-			return fmt.Errorf("capabilities bundle_limits %s must be an integer when present", name)
-		}
-	}
-	*limits = BundleCapabilitiesLimits(decoded)
-	if limits.DefaultRowsPerSnapshotChunk <= 0 || limits.MaxRowsPerSnapshotChunk <= 0 ||
-		limits.DefaultBytesPerSnapshotChunk <= 0 || limits.MaxBytesPerSnapshotChunk <= 0 ||
-		limits.MaxBytesPerSnapshotRow <= 0 || limits.MaxConcurrentSnapshotBuilds <= 0 ||
-		limits.MaxConcurrentSnapshotChunkRequests <= 0 {
-		return fmt.Errorf("capabilities bundle_limits required snapshot limits must be positive")
-	}
-	if limits.DefaultRowsPerSnapshotChunk > limits.MaxRowsPerSnapshotChunk {
-		return fmt.Errorf("capabilities default_rows_per_snapshot_chunk exceeds maximum")
-	}
-	if limits.DefaultBytesPerSnapshotChunk > limits.MaxBytesPerSnapshotChunk {
-		return fmt.Errorf("capabilities default_bytes_per_snapshot_chunk exceeds maximum")
-	}
-	if limits.MaxBytesPerSnapshotRow > limits.MaxBytesPerSnapshotChunk {
-		return fmt.Errorf("capabilities max_bytes_per_snapshot_row exceeds chunk maximum")
-	}
-	return nil
+type SchemaGenerationCapabilities struct {
+	ID          string                              `json:"id"`
+	Fingerprint string                              `json:"fingerprint"`
+	Tables      []SchemaGenerationTableCapabilities `json:"tables"`
 }
 
-func (response *CapabilitiesResponse) UnmarshalJSON(data []byte) error {
-	type plainResponse CapabilitiesResponse
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
-	}
-	for _, name := range []string{"protocol_version", "schema_version", "registered_table_specs", "features", "bundle_limits"} {
-		value, ok := fields[name]
-		if !ok || string(value) == "null" {
-			return fmt.Errorf("capabilities response missing required %s", name)
-		}
-	}
-	var decoded plainResponse
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	if decoded.Features == nil {
-		return fmt.Errorf("capabilities response features must be an object")
-	}
-	if decoded.RegisteredTableSpecs == nil {
-		return fmt.Errorf("capabilities response registered_table_specs must be an array")
-	}
-	seenTables := make(map[[2]string]struct{}, len(decoded.RegisteredTableSpecs))
-	for _, spec := range decoded.RegisteredTableSpecs {
-		key := [2]string{spec.Schema, spec.Table}
-		if _, exists := seenTables[key]; exists {
-			return fmt.Errorf("capabilities response registered_table_specs contains a duplicate table")
-		}
-		seenTables[key] = struct{}{}
-	}
-	*response = CapabilitiesResponse(decoded)
-	return nil
+type SchemaGenerationTableCapabilities struct {
+	Schema         string                                   `json:"schema"`
+	Table          string                                   `json:"table"`
+	SyncKeyColumns []string                                 `json:"sync_key_columns"`
+	Columns        []SchemaGenerationColumnCapabilities     `json:"columns"`
+	ForeignKeys    []SchemaGenerationForeignKeyCapabilities `json:"foreign_keys"`
+}
+
+type SchemaGenerationColumnCapabilities struct {
+	Name     string             `json:"name"`
+	WireType GenerationWireType `json:"wire_type"`
+	Nullable bool               `json:"nullable"`
+}
+
+type SchemaGenerationForeignKeyCapabilities struct {
+	Columns           []string                   `json:"columns"`
+	ReferencedSchema  string                     `json:"referenced_schema"`
+	ReferencedTable   string                     `json:"referenced_table"`
+	ReferencedColumns []string                   `json:"referenced_columns"`
+	OnDelete          GenerationForeignKeyAction `json:"on_delete"`
+	OnUpdate          GenerationForeignKeyAction `json:"on_update"`
 }
 
 // RegisteredTableSpec describes one registered sync table in the newer contract surface.
@@ -322,9 +342,9 @@ func (spec *RegisteredTableSpec) UnmarshalJSON(data []byte) error {
 
 // ErrorResponse represents an error response
 type ErrorResponse struct {
-	Error             string `json:"error"`
-	Message           string `json:"message"`
-	RequiredByteCount int64  `json:"required_byte_count,omitempty"`
+	Error                    string `json:"error"`
+	Message                  string `json:"message"`
+	RequiredDecodedBodyBytes int64  `json:"required_decoded_body_bytes,omitempty"`
 }
 
 // SnapshotSessionLimitResponse reports a stable snapshot materialization limit failure.

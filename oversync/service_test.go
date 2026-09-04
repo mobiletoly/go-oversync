@@ -10,13 +10,14 @@ import (
 	"time"
 )
 
+func runtimeServiceTestRegisteredTables() []RegisteredTable {
+	return []RegisteredTable{{Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}}}
+}
+
 func TestNewRuntimeService_ConstructsWithoutBootstrapping(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		MaxSupportedSchemaVersion: 2,
-		AppName:                   "runtime-only-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: "business", Table: "users"},
-		},
+	svc, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "runtime-only-test",
+		RegisteredTables:               runtimeServiceTestRegisteredTables(),
+		RegisteredTableCatalogRevision: 1,
 	}, slog.Default())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -27,13 +28,14 @@ func TestNewRuntimeService_ConstructsWithoutBootstrapping(t *testing.T) {
 	if svc.discoveredSchema != nil {
 		t.Fatalf("expected runtime constructor to avoid topology discovery")
 	}
-	if got := svc.GetSchemaVersion(); got != 2 {
-		t.Fatalf("expected schema version 2, got %d", got)
+	if svc.schemaGenerationRegistry == nil {
+		t.Fatal("expected compiled generation registry")
 	}
 }
 
 func TestBundleChangeWatchConfig_DefaultsDisabled(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{AppName: "watch-defaults-test"}, slog.Default())
+	svc, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "watch-defaults-test", RegisteredTables: runtimeServiceTestRegisteredTables(),
+		RegisteredTableCatalogRevision: 1}, slog.Default())
 	if err != nil {
 		t.Fatalf("unexpected constructor error: %v", err)
 	}
@@ -48,17 +50,17 @@ func TestBundleChangeWatchConfig_DefaultsDisabled(t *testing.T) {
 	if cfg.HeartbeatInterval != defaultBundleChangeHeartbeatInterval {
 		t.Fatalf("expected default heartbeat %s, got %s", defaultBundleChangeHeartbeatInterval, cfg.HeartbeatInterval)
 	}
-	if svc.GetCapabilities().Features["bundle_change_watch"] {
-		t.Fatalf("expected disabled watch capability, got %#v", svc.GetCapabilities().Features)
+	if svc.serviceFeatures()["bundle_change_watch"] {
+		t.Fatalf("expected disabled watch capability, got %#v", svc.serviceFeatures())
 	}
 }
 
 func TestBundleChangeWatchConfig_DefaultHeartbeatWhenEnabled(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "watch-enabled-defaults-test",
+	svc, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "watch-enabled-defaults-test", RegisteredTables: runtimeServiceTestRegisteredTables(),
 		BundleChangeWatch: BundleChangeWatchConfig{
 			Enabled: true,
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, slog.Default())
 	if err != nil {
 		t.Fatalf("unexpected constructor error: %v", err)
@@ -74,18 +76,18 @@ func TestBundleChangeWatchConfig_DefaultHeartbeatWhenEnabled(t *testing.T) {
 	if cfg.HeartbeatInterval != defaultBundleChangeHeartbeatInterval {
 		t.Fatalf("expected default heartbeat %s, got %s", defaultBundleChangeHeartbeatInterval, cfg.HeartbeatInterval)
 	}
-	if !svc.GetCapabilities().Features["bundle_change_watch"] {
-		t.Fatalf("expected enabled watch capability, got %#v", svc.GetCapabilities().Features)
+	if !svc.serviceFeatures()["bundle_change_watch"] {
+		t.Fatalf("expected enabled watch capability, got %#v", svc.serviceFeatures())
 	}
 }
 
 func TestBundleChangeWatchConfig_RejectsEnabledNonPositiveHeartbeat(t *testing.T) {
-	_, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "watch-invalid-heartbeat-test",
+	_, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "watch-invalid-heartbeat-test", RegisteredTables: runtimeServiceTestRegisteredTables(),
 		BundleChangeWatch: BundleChangeWatchConfig{
 			Enabled:           true,
 			HeartbeatInterval: -time.Second,
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, slog.Default())
 	if err == nil {
 		t.Fatal("expected constructor error")
@@ -96,12 +98,12 @@ func TestBundleChangeWatchConfig_RejectsEnabledNonPositiveHeartbeat(t *testing.T
 }
 
 func TestBundleChangeWatchConfig_RejectsInvalidNotifyChannel(t *testing.T) {
-	_, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "watch-invalid-channel-test",
+	_, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "watch-invalid-channel-test", RegisteredTables: runtimeServiceTestRegisteredTables(),
 		BundleChangeWatch: BundleChangeWatchConfig{
 			Enabled:       true,
 			NotifyChannel: strings.Repeat("x", 64),
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, slog.Default())
 	if err == nil {
 		t.Fatal("expected constructor error")
@@ -112,9 +114,9 @@ func TestBundleChangeWatchConfig_RejectsInvalidNotifyChannel(t *testing.T) {
 }
 
 func TestSyncService_BootstrapRequiresPool(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bootstrap-no-pool-test",
+	svc, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "bootstrap-no-pool-test",
+		RegisteredTables:               runtimeServiceTestRegisteredTables(),
+		RegisteredTableCatalogRevision: 1,
 	}, slog.Default())
 	if err != nil {
 		t.Fatalf("unexpected constructor error: %v", err)
@@ -127,7 +129,8 @@ func TestSyncService_BootstrapRequiresPool(t *testing.T) {
 }
 
 func TestSyncService_CloseWaitsForInflightOperations(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{AppName: "close-test"}, slog.Default())
+	svc, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "close-test", RegisteredTables: runtimeServiceTestRegisteredTables(),
+		RegisteredTableCatalogRevision: 1}, slog.Default())
 	if err != nil {
 		t.Fatalf("unexpected constructor error: %v", err)
 	}
@@ -162,7 +165,7 @@ func TestSyncService_CloseWaitsForInflightOperations(t *testing.T) {
 		}
 	}
 
-	if _, err := svc.CreatePushSession(context.Background(), Actor{UserID: "user", SourceID: "device"}, nil); err != errServiceShuttingDown {
+	if _, err := svc.Connect(context.Background(), Actor{UserID: "user", SourceID: "device"}, testSchemaGenerationProofForService(svc), &ConnectRequest{}); err != errServiceShuttingDown {
 		t.Fatalf("expected errServiceShuttingDown, got %v", err)
 	}
 
@@ -185,11 +188,9 @@ func TestSyncService_CloseWaitsForInflightOperations(t *testing.T) {
 }
 
 func TestSyncService_GetStatusHealthyByDefault(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "status-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: "business", Table: "users"},
-		},
+	svc, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "status-test",
+		RegisteredTables:               runtimeServiceTestRegisteredTables(),
+		RegisteredTableCatalogRevision: 1,
 	}, slog.Default())
 	if err != nil {
 		t.Fatalf("unexpected constructor error: %v", err)
@@ -213,26 +214,29 @@ func TestSyncService_GetStatusHealthyByDefault(t *testing.T) {
 	}
 }
 
-func TestSyncService_GetCapabilities_DoesNotAdvertiseVisibleSyncKeyType(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "capabilities-test",
+func TestSyncService_GenerationDiscovery_DoesNotAdvertiseHiddenSyncFields(t *testing.T) {
+	svc, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: "business", Table: "docs", SyncKeyColumns: []string{"doc_id"}},
+	}), AppName: "capabilities-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: "business", Table: "docs", SyncKeyColumns: []string{"doc_id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, slog.Default())
 	if err != nil {
 		t.Fatalf("unexpected constructor error: %v", err)
 	}
 
-	payload, err := json.Marshal(svc.GetCapabilities())
+	contract, _ := svc.schemaGenerationRegistry.Generation(1)
+	payload, err := json.Marshal(svc.generationDiscoveryResponse(contract, false))
 	if err != nil {
-		t.Fatalf("marshal capabilities: %v", err)
+		t.Fatalf("marshal generation discovery response: %v", err)
 	}
 	if string(payload) == "" {
 		t.Fatal("expected non-empty capabilities payload")
 	}
 	if strings.Contains(string(payload), `"sync_key_type"`) || strings.Contains(string(payload), `"_sync_scope_id"`) {
-		t.Fatalf("expected hidden-owner design to stay out of capabilities payload, got %s", payload)
+		t.Fatalf("expected hidden-owner design to stay out of generation discovery payload, got %s", payload)
 	}
 }
 
@@ -243,14 +247,15 @@ func TestSyncService_DoesNotExposeRuntimeTopologyRefreshAPI(t *testing.T) {
 }
 
 func TestSyncService_UploadLockTimeoutMillis_DefaultDisabled(t *testing.T) {
-	svc := &SyncService{config: &ServiceConfig{}}
+	svc := &SyncService{config: &ServiceConfig{RegisteredTableCatalogRevision: 1}}
 	if ms, ok := svc.uploadLockTimeoutMillis(); ok || ms != 0 {
 		t.Fatalf("expected upload lock timeout to be disabled by default, got ms=%d ok=%t", ms, ok)
 	}
 }
 
 func TestSyncService_UploadLockTimeoutMillis_Configured(t *testing.T) {
-	svc := &SyncService{config: &ServiceConfig{UploadLockTimeout: 2500 * time.Millisecond}}
+	svc := &SyncService{config: &ServiceConfig{UploadLockTimeout: 2500 * time.Millisecond,
+		RegisteredTableCatalogRevision: 1}}
 	ms, ok := svc.uploadLockTimeoutMillis()
 	if !ok {
 		t.Fatal("expected upload lock timeout to be enabled")
@@ -261,7 +266,8 @@ func TestSyncService_UploadLockTimeoutMillis_Configured(t *testing.T) {
 }
 
 func TestSyncService_UploadLockTimeoutMillis_RoundsSubMillisecondUp(t *testing.T) {
-	svc := &SyncService{config: &ServiceConfig{UploadLockTimeout: 500 * time.Microsecond}}
+	svc := &SyncService{config: &ServiceConfig{UploadLockTimeout: 500 * time.Microsecond,
+		RegisteredTableCatalogRevision: 1}}
 	ms, ok := svc.uploadLockTimeoutMillis()
 	if !ok {
 		t.Fatal("expected upload lock timeout to be enabled")

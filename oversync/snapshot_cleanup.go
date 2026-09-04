@@ -29,7 +29,7 @@ func (s *SyncService) startSnapshotCleanupWorker() {
 	if s.snapshotHooks != nil && s.snapshotHooks.beforeSnapshotCleanupWorkerPublish != nil {
 		s.snapshotHooks.beforeSnapshotCleanupWorkerPublish()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(withSyncMaintenanceContext(context.Background()))
 	done := make(chan struct{})
 	s.snapshotCleanupCancel = cancel
 	s.snapshotCleanupDone = done
@@ -134,7 +134,15 @@ func (s *SyncService) runSnapshotCleanup(ctx context.Context, reason string) {
 }
 
 func (s *SyncService) cleanupSnapshotBatch(ctx context.Context) (result snapshotCleanupBatchResult, err error) {
-	err = pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+	err = withOriginTransaction(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		if s.config.Readiness != nil {
+			if adapter, ok := s.config.Readiness.Adapter.(OperationAdmissionAdapter); ok {
+				if err := adapter.Admit(ctx, tx); err != nil {
+					return err
+				}
+			}
+		}
+
 		rows, err := tx.Query(ctx, `
 			SELECT snapshot_id::text, expires_at, transaction_timestamp()
 			FROM sync.snapshot_sessions

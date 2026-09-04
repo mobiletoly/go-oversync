@@ -165,7 +165,11 @@ sequenceDiagram
 - Sync metadata is derived from committed business-table effects
 - Server-side cascades and trigger-driven writes are captured into bundles naturally because they are
   part of the committed database transaction
-- There is no projection backlog in the core sync path
+- There is no projection backlog in the core sync path: generation-visible history is derived on
+  demand from one canonical stream under finite row, byte, response, and concurrency bounds
+- Invisible-only canonical bundles remain empty pull envelopes so durable checkpoints never stall
+- A push is atomic only if every uploaded key has a final captured effect visible to its fixed
+  generation; uncovered trigger-suppressed work rolls back completely
 
 ## Summary
 

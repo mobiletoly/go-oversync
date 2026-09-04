@@ -9,7 +9,7 @@ import (
 
 func TestSessionTokenState_CorruptedInitializationIDsFailClosedOnLoad(t *testing.T) {
 	ctx := context.Background()
-	_, db := newBundleClient(t, "main", nil)
+	_, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL)`)
 
 	_, err := db.Exec(`UPDATE _sync_attachment_state SET pending_initialization_id = ' init-corrupt ' WHERE singleton_key = 1`)
 	require.NoError(t, err)
@@ -28,7 +28,7 @@ func TestSessionTokenState_CorruptedInitializationIDsFailClosedOnLoad(t *testing
 
 func TestSessionTokenState_RejectsInvalidInitializationIDsBeforePersist(t *testing.T) {
 	ctx := context.Background()
-	_, db := newBundleClient(t, "main", nil)
+	_, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL)`)
 
 	attachment, err := loadAttachmentState(ctx, db)
 	require.NoError(t, err)

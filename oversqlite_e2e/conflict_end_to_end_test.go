@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
+	exampleserver "github.com/mobiletoly/go-oversync/integration/nethttp_server/server"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
@@ -35,8 +35,8 @@ func newUserConflictFixture(t *testing.T, scenario string, initialName string) *
 	schema := "e2e_conflict_" + scenario + "_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 	userID := "e2e-user-" + scenario + "-" + uuid.NewString()
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
+	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
 
 	f := &userConflictFixture{
 		ctx:            ctx,
@@ -93,6 +93,7 @@ func (f *userConflictFixture) updateClientBName(t *testing.T, name string) {
 
 func TestEndToEnd_ConflictServerWinsResolverRecoversAutomatically(t *testing.T) {
 	f := newUserConflictFixture(t, "serverwins", "Ada")
+	f.clientB.Resolver = &oversqlite.ServerWinsResolver{}
 	f.serverUpdateName(t, "Ada Server")
 	f.updateClientBName(t, "Ada Local")
 
@@ -182,7 +183,7 @@ func TestEndToEnd_ConflictRetryExhaustionLeavesReplayableDirtyState(t *testing.T
 	commitAttempts := 0
 	baseTransport := http.DefaultTransport
 	f.clientB.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/sync/push-sessions/") && strings.HasSuffix(r.URL.Path, "/commit") {
+		if r.Method == http.MethodPost && r.URL.Path == "/sync/push" {
 			commitAttempts++
 			f.serverUpdateNameInBundle(t, int64(commitAttempts), fmt.Sprintf("Ada Server %d", commitAttempts))
 		}

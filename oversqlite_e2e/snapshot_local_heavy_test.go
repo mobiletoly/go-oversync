@@ -11,7 +11,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
@@ -41,7 +40,7 @@ func TestLocalHeavy_EndToEndLargeMultiChunkRowByteSnapshotRestore(t *testing.T) 
 	schema := "e2e_phase2_large_restore_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 	userID := "e2e-phase2-large-" + uuid.NewString()
-	config := oversqlite.DefaultConfig(schema, syncTables("users"))
+	config := defaultOversqliteConfig(schema, syncTables("users"))
 	config.SnapshotChunkRows = 250
 	config.SnapshotChunkBytes = 4 << 20
 	follower, followerDB := newSQLiteClient(t, server, userID, "phase2-follower", config, usersDDL)

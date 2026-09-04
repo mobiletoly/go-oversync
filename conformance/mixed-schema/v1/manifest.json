@@ -1,0 +1,655 @@
+{
+  "version": 1,
+  "expected_pass_count": 34,
+  "cases": [
+    {
+      "id": "C01/main",
+      "scenario": "C01",
+      "test": "TestMixedSchema_C01_BidirectionalCRUD",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C02/main",
+      "scenario": "C02",
+      "test": "TestMixedSchema_C02_HiddenFieldPreservation",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C03/main",
+      "scenario": "C03",
+      "test": "TestMixedSchema_C03_DefaultsAndNull",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C04/main",
+      "scenario": "C04",
+      "test": "TestMixedSchema_C04_NullableRelationships",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C05/main",
+      "scenario": "C05",
+      "test": "TestMixedSchema_C05_HiddenCheckpoint",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C06/A_first_accept",
+      "scenario": "C06",
+      "test": "TestMixedSchema_C06_OfflineConflicts/A_first_accept",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C06/A_first_local",
+      "scenario": "C06",
+      "test": "TestMixedSchema_C06_OfflineConflicts/A_first_local",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C06/A_first_merged",
+      "scenario": "C06",
+      "test": "TestMixedSchema_C06_OfflineConflicts/A_first_merged",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C06/B_first_accept",
+      "scenario": "C06",
+      "test": "TestMixedSchema_C06_OfflineConflicts/B_first_accept",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C06/B_first_local",
+      "scenario": "C06",
+      "test": "TestMixedSchema_C06_OfflineConflicts/B_first_local",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C06/B_first_merged",
+      "scenario": "C06",
+      "test": "TestMixedSchema_C06_OfflineConflicts/B_first_merged",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C07/A_first",
+      "scenario": "C07",
+      "test": "TestMixedSchema_C07_DisjointConflicts/A_first",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C07/B_first",
+      "scenario": "C07",
+      "test": "TestMixedSchema_C07_DisjointConflicts/B_first",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C08/main",
+      "scenario": "C08",
+      "test": "TestMixedSchema_C08_LostReplyNewerIntent",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P",
+        "R"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/A_updates_delete_first_accept",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/A_updates_delete_first_accept",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/A_updates_delete_first_local",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/A_updates_delete_first_local",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/A_updates_delete_first_merged",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/A_updates_delete_first_merged",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/A_updates_update_first_accept",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/A_updates_update_first_accept",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/A_updates_update_first_local",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/A_updates_update_first_local",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/A_updates_update_first_merged",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/A_updates_update_first_merged",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/B_updates_delete_first_accept",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/B_updates_delete_first_accept",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/B_updates_delete_first_local",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/B_updates_delete_first_local",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/B_updates_delete_first_merged",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/B_updates_delete_first_merged",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/B_updates_update_first_accept",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/B_updates_update_first_accept",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/B_updates_update_first_local",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/B_updates_update_first_local",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C09/B_updates_update_first_merged",
+      "scenario": "C09",
+      "test": "TestMixedSchema_C09_DeleteConflicts/B_updates_update_first_merged",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C10/staged",
+      "scenario": "C10",
+      "test": "TestMixedSchema_C10_ProcessRecovery/staged",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P",
+        "R"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C10/committed",
+      "scenario": "C10",
+      "test": "TestMixedSchema_C10_ProcessRecovery/committed",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P",
+        "R"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C11/G1_nonfinal",
+      "scenario": "C11",
+      "test": "TestMixedSchema_C11_InterruptedRebuild/G1_nonfinal",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C11/G1_final",
+      "scenario": "C11",
+      "test": "TestMixedSchema_C11_InterruptedRebuild/G1_final",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C11/G2_nonfinal",
+      "scenario": "C11",
+      "test": "TestMixedSchema_C11_InterruptedRebuild/G2_nonfinal",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C11/G2_final",
+      "scenario": "C11",
+      "test": "TestMixedSchema_C11_InterruptedRebuild/G2_final",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C12/pull",
+      "scenario": "C12",
+      "test": "TestMixedSchema_C12_RetryRecovery/pull",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    },
+    {
+      "id": "C12/upload",
+      "scenario": "C12",
+      "test": "TestMixedSchema_C12_RetryRecovery/upload",
+      "package": "github.com/mobiletoly/go-oversync/oversqlite_e2e",
+      "owner": "oversqlite_e2e/mixed_schema_process_test.go",
+      "profiles": [
+        "S",
+        "V",
+        "P"
+      ],
+      "runtime_roles": [
+        "Go G1",
+        "Go G2"
+      ],
+      "required": true,
+      "status": "implemented",
+      "expected_pass_count": 1
+    }
+  ],
+  "supporting_tests": [
+    {
+      "test": "TestGenerationVisibleDataPlane_OmittedVisibleFieldsPreserveValuesAndUseDefaults",
+      "package": "github.com/mobiletoly/go-oversync/oversync",
+      "owner": "oversync/generation_data_plane_integration_test.go",
+      "lane": "package",
+      "expected_pass_count": 1
+    }
+  ]
+}

@@ -85,7 +85,6 @@ type adoptionScopeState struct {
 	maxBundleSeq         sql.NullInt64
 	sourceCount          int64
 	sourceMismatchCount  int64
-	pushSessionCount     int64
 	snapshotSessionCount int64
 	captureStageCount    int64
 }
@@ -115,11 +114,15 @@ type adoptionCurrentRowState struct {
 }
 
 func (s *SyncService) lockRegisteredTablesForAdoption(ctx context.Context, tx pgx.Tx) error {
-	if s == nil || s.config == nil {
+	if s == nil {
 		return nil
 	}
+	return lockRegisteredTables(ctx, tx, s.activeRegisteredTableDeclarations())
+}
+
+func lockRegisteredTables(ctx context.Context, tx pgx.Tx, tables []RegisteredTable) error {
 	targetsByKey := make(map[string]registeredTableTriggerTarget)
-	for _, table := range s.config.RegisteredTables {
+	for _, table := range tables {
 		targets, err := loadRegisteredTableTriggerTargets(ctx, tx, table)
 		if err != nil {
 			return err
@@ -210,7 +213,7 @@ func (s *SyncService) adoptFreshPopulatedRegisteredTables(ctx context.Context, t
 		if timingEnabled {
 			batchStartedAt = time.Now()
 		}
-		reader, readerErr := newAdoptionBusinessScopeReader(ctx, tx, infos, batchUserIDs, func(schemaName, tableName string, payload []byte) ([]byte, error) {
+		reader, readerErr := newAdoptionBusinessScopeReader(ctx, tx, infos, s.columnTypesByTable, batchUserIDs, func(schemaName, tableName string, payload []byte) ([]byte, error) {
 			canonical, canonicalErr := s.canonicalizeWirePayload(schemaName, tableName, payload)
 			if canonicalErr != nil {
 				return nil, canonicalErr
@@ -226,7 +229,7 @@ func (s *SyncService) adoptFreshPopulatedRegisteredTables(ctx context.Context, t
 				}
 			}
 			return canonical, nil
-		})
+		}, s.config.MaxBytesPerBundle)
 		if readerErr != nil {
 			businessScanHadError = true
 			if timingEnabled {
@@ -235,6 +238,7 @@ func (s *SyncService) adoptFreshPopulatedRegisteredTables(ctx context.Context, t
 			return readerErr
 		}
 		reader.spoolOwner = newAdoptionSpoolOwner(s.adoptionSpoolDir)
+		reader.maxRowsPerBundle = s.config.MaxRowsPerBundle
 		reader.onProgress = func(scannedRows int64) {
 			businessRowCount += scannedRows
 			progress.maybeLog("business_row_scan_canonicalization", processedScopeCount, businessRowCount, len(adoptedScopes))
@@ -396,31 +400,54 @@ func newAdoptionSpoolOwner(dir string) adoptionSpoolOwner {
 }
 
 type adoptionBusinessScopeReader struct {
-	ctx                   context.Context
-	rows                  pgx.Rows
-	infosByID             map[int32]registeredTableRuntimeInfo
-	userIDs               []string
-	canonicalize          adoptionPayloadCanonicalizer
-	spoolOwner            adoptionSpoolOwner
-	afterBusinessRowsRead func() error
-	onProgress            func(scannedRows int64)
-	onSpoolCreated        func(path string)
-	onSpoolRemoved        func(path string, bytes int64, cleanupErr error)
+	ctx                     context.Context
+	rows                    pgx.Rows
+	infosByID               map[int32]registeredTableRuntimeInfo
+	userIDs                 []string
+	canonicalize            adoptionPayloadCanonicalizer
+	spoolOwner              adoptionSpoolOwner
+	afterBusinessRowsRead   func() error
+	afterBoundedRowScan     func(keyTextValid bool, keyByteCount int64, payloadPresent bool, payloadByteCount int64)
+	onProgress              func(scannedRows int64)
+	onSpoolCreated          func(path string)
+	onSpoolRemoved          func(path string, bytes int64, cleanupErr error)
+	maxRowsPerBundle        int
+	maxBytesPerBundle       int
+	maxPhysicalPayloadBytes int64
 }
 
 func newAdoptionBusinessScopeReader(
 	ctx context.Context,
 	tx pgx.Tx,
 	infos []registeredTableRuntimeInfo,
+	columnTypesByTable map[string]map[string]string,
 	userIDs []string,
 	canonicalize adoptionPayloadCanonicalizer,
+	maxBytesPerBundle int,
 ) (*adoptionBusinessScopeReader, error) {
+	maxPhysicalPayloadBytes := int64(0)
+	for _, info := range infos {
+		tableLimit, err := physicalDatabasePayloadByteLimitForColumnTypes(int64(maxBytesPerBundle), columnTypesByTable[Key(info.schemaName, info.tableName)])
+		if err != nil {
+			return nil, err
+		}
+		maxPhysicalPayloadBytes = max(maxPhysicalPayloadBytes, tableLimit)
+	}
+	if maxPhysicalPayloadBytes == 0 {
+		var err error
+		maxPhysicalPayloadBytes, err = physicalStoredPushPayloadByteLimit(int64(maxBytesPerBundle))
+		if err != nil {
+			return nil, err
+		}
+	}
 	reader := &adoptionBusinessScopeReader{
-		ctx:          ctx,
-		infosByID:    make(map[int32]registeredTableRuntimeInfo, len(infos)),
-		userIDs:      userIDs,
-		canonicalize: canonicalize,
-		spoolOwner:   newAdoptionSpoolOwner(""),
+		ctx:                     ctx,
+		infosByID:               make(map[int32]registeredTableRuntimeInfo, len(infos)),
+		userIDs:                 userIDs,
+		canonicalize:            canonicalize,
+		spoolOwner:              newAdoptionSpoolOwner(""),
+		maxBytesPerBundle:       maxBytesPerBundle,
+		maxPhysicalPayloadBytes: maxPhysicalPayloadBytes,
 	}
 	for _, info := range infos {
 		reader.infosByID[info.tableID] = info
@@ -432,7 +459,11 @@ func newAdoptionBusinessScopeReader(
 	var query strings.Builder
 	query.WriteString(`
 		/* oversync:adoption-business-scan */
-		SELECT requested.scope_ordinal, business.table_id, business.key_text, business.payload_db
+		SELECT requested.scope_ordinal, business.table_id,
+			CASE WHEN business.key_byte_count <= $2 THEN business.key_text END,
+			business.key_byte_count,
+			CASE WHEN business.payload_byte_count <= business.physical_payload_limit THEN business.payload_db END,
+			business.payload_byte_count
 		FROM (
 			SELECT scope_id, scope_ordinal
 			FROM unnest($1::text[]) WITH ORDINALITY AS input(scope_id, scope_ordinal)
@@ -447,6 +478,11 @@ func newAdoptionBusinessScopeReader(
 		tableIdent := pgx.Identifier{info.schemaName, info.tableName}.Sanitize()
 		keyIdent := pgx.Identifier{info.syncKeyColumn}.Sanitize()
 		ownerIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
+		payloadExpression := databaseWirePayloadExpression("src", columnTypesByTable[Key(info.schemaName, info.tableName)])
+		tablePhysicalLimit, err := physicalDatabasePayloadByteLimitForColumnTypes(int64(maxBytesPerBundle), columnTypesByTable[Key(info.schemaName, info.tableName)])
+		if err != nil {
+			return nil, err
+		}
 		keyOrder := fmt.Sprintf("convert_to(CAST(src.%s AS text), 'UTF8')", keyIdent)
 		if info.syncKeyType == syncKeyTypeUUID {
 			keyOrder = fmt.Sprintf("uuid_send(src.%s)", keyIdent)
@@ -454,19 +490,22 @@ func newAdoptionBusinessScopeReader(
 		fmt.Fprintf(&query, `(
 			SELECT %d::integer AS table_id,
 				CAST(src.%s AS text) AS key_text,
+				octet_length(CAST(src.%s AS text)) AS key_byte_count,
 				%s AS key_order,
-				to_jsonb(src) - '_sync_scope_id' AS payload_db
+				%s AS payload_db,
+				octet_length((%s)::text) AS payload_byte_count,
+				%d::bigint AS physical_payload_limit
 			FROM %s AS src
 			WHERE src.%s = requested.scope_id
 			ORDER BY key_order
-		)`, info.tableID, keyIdent, keyOrder, tableIdent, ownerIdent)
+		)`, info.tableID, keyIdent, keyIdent, keyOrder, payloadExpression, payloadExpression, tablePhysicalLimit, tableIdent, ownerIdent)
 	}
 	query.WriteString(`
 		) AS business
 		ORDER BY requested.scope_ordinal, business.table_id, business.key_order
 	`)
 
-	rows, err := tx.Query(ctx, query.String(), userIDs)
+	rows, err := tx.Query(ctx, query.String(), userIDs, maxBytesPerBundle)
 	if err != nil {
 		return nil, fmt.Errorf("query bounded populated-table adoption batch: %w", err)
 	}
@@ -527,6 +566,7 @@ func (r *adoptionBusinessScopeReader) forEach(consume func(userID string, rows [
 	}()
 	writer := bufio.NewWriterSize(spool, adoptionSpoolBufferSize)
 	rowCounts := make([]int, len(r.userIDs))
+	bundleHashers := make([]*protocolhash.CommittedBundleHasher, len(r.userIDs))
 	currentOrdinal := int64(0)
 
 	for r.rows.Next() {
@@ -534,10 +574,19 @@ func (r *adoptionBusinessScopeReader) forEach(consume func(userID string, rows [
 			scopeOrdinal int64
 			tableID      int32
 			keyText      sql.NullString
+			keyByteCount sql.NullInt64
 			payloadDB    []byte
+			payloadBytes int64
 		)
-		if err := r.rows.Scan(&scopeOrdinal, &tableID, &keyText, &payloadDB); err != nil {
+		if err := r.rows.Scan(&scopeOrdinal, &tableID, &keyText, &keyByteCount, &payloadDB, &payloadBytes); err != nil {
 			return fmt.Errorf("scan bounded populated-table adoption batch: %w", err)
+		}
+		if r.afterBoundedRowScan != nil {
+			reportedKeyBytes := int64(-1)
+			if keyByteCount.Valid {
+				reportedKeyBytes = keyByteCount.Int64
+			}
+			r.afterBoundedRowScan(keyText.Valid, reportedKeyBytes, payloadDB != nil, payloadBytes)
 		}
 		if scopeOrdinal < currentOrdinal || scopeOrdinal < 1 || scopeOrdinal > int64(len(r.userIDs)) {
 			return fmt.Errorf("bounded populated-table adoption batch returned invalid scope ordinal %d", scopeOrdinal)
@@ -553,13 +602,23 @@ func (r *adoptionBusinessScopeReader) forEach(consume func(userID string, rows [
 				Detail: fmt.Sprintf("registered row has unknown table identity %d", tableID),
 			}
 		}
-		if !keyText.Valid {
+		if keyByteCount.Valid && (keyByteCount.Int64 < 0 || r.maxBytesPerBundle <= 0 || keyByteCount.Int64 > int64(r.maxBytesPerBundle)) {
+			return projectionError(BundleLimitExceeded, "adoption", "adoption baseline exceeds configured bundle limits")
+		}
+		if !keyText.Valid || !keyByteCount.Valid {
 			return &PopulatedTableAdoptionError{
 				Reason: "identity_unrepresentable",
 				UserID: r.userIDs[currentOrdinal-1],
 				Table:  Key(info.schemaName, info.tableName),
 				Detail: "registered row has a NULL sync key",
 			}
+		}
+		scopeIndex := int(scopeOrdinal - 1)
+		if r.maxRowsPerBundle > 0 && rowCounts[scopeIndex] >= r.maxRowsPerBundle {
+			return projectionError(BundleLimitExceeded, "adoption", "adoption baseline exceeds configured bundle limits")
+		}
+		if payloadBytes < 0 || r.maxPhysicalPayloadBytes <= 0 || payloadBytes > r.maxPhysicalPayloadBytes || payloadDB == nil {
+			return projectionError(BundleLimitExceeded, "adoption", "adoption baseline exceeds configured bundle limits")
 		}
 		keyBytes, _, err := encodeKeyBytes(info.syncKeyType, keyText.String)
 		if err != nil {
@@ -585,10 +644,23 @@ func (r *adoptionBusinessScopeReader) forEach(consume func(userID string, rows [
 			keyBytes:    keyBytes,
 			payloadWire: payloadWire,
 		}
+		if bundleHashers[scopeIndex] == nil {
+			bundleHashers[scopeIndex] = protocolhash.NewCommittedBundleHasher()
+		}
+		if err := bundleHashers[scopeIndex].Add(protocolhash.BundleRow{
+			Schema: info.schemaName, Table: info.tableName,
+			Key: SyncKey{info.syncKeyColumn: keyText.String}, Op: OpInsert,
+			RowVersion: 1, Payload: payloadWire,
+		}); err != nil {
+			return &PopulatedTableAdoptionError{Reason: "baseline_unrepresentable", UserID: r.userIDs[scopeIndex], Table: Key(info.schemaName, info.tableName), Detail: err.Error()}
+		}
+		if r.maxBytesPerBundle > 0 && bundleHashers[scopeIndex].CurrentByteCount() > int64(r.maxBytesPerBundle) {
+			return projectionError(BundleLimitExceeded, "adoption", "adoption baseline exceeds configured bundle limits")
+		}
 		if err := writeAdoptionSpoolRow(writer, row); err != nil {
 			return err
 		}
-		rowCounts[scopeOrdinal-1]++
+		rowCounts[scopeIndex]++
 		if r.onProgress != nil {
 			r.onProgress(1)
 		}
@@ -864,11 +936,6 @@ func loadAdoptionScopeStates(ctx context.Context, tx pgx.Tx, userIDs []string) (
 			FROM sync.source_state AS sources
 			JOIN requested USING (user_pk)
 			GROUP BY sources.user_pk
-		), push_counts AS (
-			SELECT sessions.user_pk, COUNT(*) AS push_session_count
-			FROM sync.push_sessions AS sessions
-			JOIN requested USING (user_pk)
-			GROUP BY sessions.user_pk
 		), snapshot_counts AS (
 			SELECT sessions.user_pk, COUNT(*) AS snapshot_session_count
 			FROM sync.snapshot_sessions AS sessions
@@ -887,14 +954,12 @@ func loadAdoptionScopeStates(ctx context.Context, tx pgx.Tx, userIDs []string) (
 			bundle_counts.max_bundle_seq,
 			COALESCE(source_counts.source_count, 0),
 			COALESCE(bundle_counts.source_mismatch_count, 0),
-			COALESCE(push_counts.push_session_count, 0),
 			COALESCE(snapshot_counts.snapshot_session_count, 0),
 			COALESCE(capture_counts.capture_stage_count, 0)
 		FROM requested
 		LEFT JOIN row_counts USING (user_pk)
 		LEFT JOIN bundle_counts USING (user_pk)
 		LEFT JOIN source_counts USING (user_pk)
-		LEFT JOIN push_counts USING (user_pk)
 		LEFT JOIN snapshot_counts USING (user_pk)
 		LEFT JOIN capture_counts USING (user_pk)
 		ORDER BY requested.user_pk
@@ -913,7 +978,6 @@ func loadAdoptionScopeStates(ctx context.Context, tx pgx.Tx, userIDs []string) (
 			&state.maxBundleSeq,
 			&state.sourceCount,
 			&state.sourceMismatchCount,
-			&state.pushSessionCount,
 			&state.snapshotSessionCount,
 			&state.captureStageCount,
 		); err != nil {
@@ -1071,7 +1135,7 @@ func validatePersistedAdoptionState(adopted adoptedScopeSummary, state adoptionS
 		state.nextBundleSeq == 2 && state.retainedBundleFloor == 0 &&
 		state.rowStateCount == adopted.rowCount && state.liveRowStateCount == adopted.rowCount &&
 		state.bundleCount == 1 && state.maxBundleSeq.Valid && state.maxBundleSeq.Int64 == 1 &&
-		state.sourceCount == 1 && state.sourceMismatchCount == 0 && state.pushSessionCount == 0 &&
+		state.sourceCount == 1 && state.sourceMismatchCount == 0 &&
 		state.snapshotSessionCount == 0 && state.captureStageCount == 0
 	if valid {
 		return nil
@@ -1433,7 +1497,8 @@ func (s *SyncService) persistAdoptionBaseline(
 			return adoptionScopeState{}, err
 		}
 	}
-	if err := s.emitBundleChangeNotify(ctx, tx, scope.UserPK, BundleChangeEvent{
+	if err := s.emitBundleChangeNotify(ctx, tx, bundleChangeNotification{
+		UserPK:         scope.UserPK,
 		BundleSeq:      bundleSeq,
 		SourceID:       sourceID,
 		SourceBundleID: 1,

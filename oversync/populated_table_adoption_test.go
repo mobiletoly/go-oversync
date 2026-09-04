@@ -25,17 +25,19 @@ func TestBootstrap_PopulatedAdoptionReadiness(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 
-	svc, err := NewRuntimeService(pool, &ServiceConfig{
-		AppName: "populated-adoption-readiness",
+	svc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "populated-adoption-readiness",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
 	actor := Actor{UserID: "readiness-user", SourceID: "reader"}
 
-	_, err = svc.Connect(ctx, actor, &ConnectRequest{})
+	_, err = svc.Connect(ctx, actor, testSchemaGenerationProofForService(svc), &ConnectRequest{})
 	require.ErrorIs(t, err, errServiceNotReady)
 	status, err := svc.GetStatus(ctx)
 	require.NoError(t, err)
@@ -44,17 +46,19 @@ func TestBootstrap_PopulatedAdoptionReadiness(t *testing.T) {
 
 	handlers := NewHTTPSyncHandlers(svc, integrationTestLogger(slog.LevelWarn))
 	req := httptest.NewRequest(http.MethodPost, "/sync/connect", bytes.NewBufferString(`{"has_local_pending_rows":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	setTestSchemaGenerationHeaders(req, svc)
 	req = req.WithContext(ContextWithActor(req.Context(), actor))
 	rec := httptest.NewRecorder()
 	handlers.HandleConnect(rec, req)
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
-	require.Contains(t, rec.Body.String(), `"service_unavailable"`)
+	require.Contains(t, rec.Body.String(), `"service_not_ready"`)
 
 	require.NoError(t, svc.Bootstrap(ctx))
 	status, err = svc.GetStatus(ctx)
 	require.NoError(t, err)
 	require.True(t, status.AcceptingOperations)
-	connect, err := svc.Connect(ctx, actor, &ConnectRequest{})
+	connect, err := svc.Connect(ctx, actor, testSchemaGenerationProofForService(svc), &ConnectRequest{})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_empty", connect.Resolution)
 }
@@ -88,12 +92,10 @@ func TestBootstrap_FreshPopulatedAdoptionPreservesExactDurableState(t *testing.T
 	`, tableIdent), userID, rowID, "Existing")
 	require.NoError(t, err)
 
-	svc, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "populated-table-adoption",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}
+	svc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "populated-table-adoption",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
@@ -104,23 +106,21 @@ func TestBootstrap_FreshPopulatedAdoptionPreservesExactDurableState(t *testing.T
 	require.Equal(t, userID, businessScope)
 	require.Equal(t, rowID, businessID)
 	require.Equal(t, "Existing", businessName)
-	var pushSessions, snapshotSessions, captureRows int64
+	var snapshotSessions, captureRows int64
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT
-			(SELECT count(*) FROM sync.push_sessions),
 			(SELECT count(*) FROM sync.snapshot_sessions),
 			(SELECT count(*) FROM sync.bundle_capture_stage)
-	`).Scan(&pushSessions, &snapshotSessions, &captureRows))
-	require.Zero(t, pushSessions)
+	`).Scan(&snapshotSessions, &captureRows))
 	require.Zero(t, snapshotSessions)
 	require.Zero(t, captureRows)
 
 	actor := Actor{UserID: userID, SourceID: "reader"}
-	connect, err := svc.Connect(ctx, actor, &ConnectRequest{})
+	connect, err := svc.Connect(ctx, actor, testSchemaGenerationProofForService(svc), &ConnectRequest{})
 	require.NoError(t, err)
 	require.Equal(t, "remote_authoritative", connect.Resolution)
 
-	pull, err := svc.ProcessPull(ctx, actor, 0, 10, 0)
+	pull, err := svc.ProcessPull(ctx, actor, testSchemaGenerationProofForService(svc), 0, 10, 0)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), pull.StableBundleSeq)
 	require.Len(t, pull.Bundles, 1)
@@ -139,7 +139,7 @@ func TestBootstrap_FreshPopulatedAdoptionPreservesExactDurableState(t *testing.T
 		Payload:        pull.Bundles[0].Rows[0].Payload,
 	}})
 	require.NoError(t, err)
-	require.Equal(t, expectedRequestHash, pull.Bundles[0].CanonicalRequestHash)
+	require.Empty(t, pull.Bundles[0].CanonicalRequestHash)
 	expectedBundleHash, expectedByteCount, err := computeCommittedBundleHash(pull.Bundles[0].Rows)
 	require.NoError(t, err)
 	require.Equal(t, renderBundleHash(expectedBundleHash), pull.Bundles[0].BundleHash)
@@ -160,12 +160,12 @@ func TestBootstrap_FreshPopulatedAdoptionPreservesExactDurableState(t *testing.T
 	require.Equal(t, int64(1), storedSourceBundleID)
 	require.Equal(t, expectedRequestHash, storedRequestHash)
 
-	session, err := svc.CreateSnapshotSession(ctx, actor)
+	session, err := svc.CreateSnapshotSession(ctx, actor, testSchemaGenerationProofForService(svc))
 	require.NoError(t, err)
 	require.Equal(t, int64(1), session.SnapshotBundleSeq)
 	require.Equal(t, int64(1), session.RowCount)
 
-	chunk, err := svc.GetSnapshotChunk(ctx, actor, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	chunk, err := svc.GetSnapshotChunk(ctx, actor, testSchemaGenerationProofForService(svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Len(t, chunk.Rows, 1)
 	require.Equal(t, int64(1), chunk.Rows[0].RowVersion)
@@ -243,11 +243,13 @@ func TestBootstrap_CloseWaitsForActiveBootstrap(t *testing.T) {
 		}
 	}()
 
-	svc, err := NewRuntimeService(pool, &ServiceConfig{
-		AppName: "bootstrap-close-drain",
+	svc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bootstrap-close-drain",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
@@ -298,12 +300,15 @@ func TestBootstrap_PopulatedAdoptionConcurrentInstances(t *testing.T) {
 		VALUES ($1, $2, 'Existing', 'existing@example.com')
 	`, pgx.Identifier{schemaName}.Sanitize()), userID, uuid.New())
 	require.NoError(t, err)
-	config := &ServiceConfig{AppName: "parallel-adoption", RegisteredTables: []RegisteredTable{
+	config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
 		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-	}}
+	}), AppName: "parallel-adoption", RegisteredTables: []RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	},
+		RegisteredTableCatalogRevision: 1}
 	services := make([]*SyncService, 2)
 	for i := range services {
-		services[i], err = NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+		services[i], err = newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = services[i].Close(context.Background()) })
 	}
@@ -356,9 +361,12 @@ func TestBootstrap_PopulatedAdoptionConcurrency(t *testing.T) {
 	`, tableIdent), userID, uuid.New())
 	require.NoError(t, err)
 
-	svc, err := NewRuntimeService(pool, &ServiceConfig{AppName: "locking-adoption", RegisteredTables: []RegisteredTable{
+	svc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
 		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-	}}, integrationTestLogger(slog.LevelWarn))
+	}), AppName: "locking-adoption", RegisteredTables: []RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	},
+		RegisteredTableCatalogRevision: 1}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
 	bootstrapResult := make(chan error, 1)
@@ -369,13 +377,13 @@ func TestBootstrap_PopulatedAdoptionConcurrency(t *testing.T) {
 		defer svc.mu.RUnlock()
 		return svc.bootstrapReadiness == bootstrapReadinessBootstrapping
 	}, 5*time.Second, 10*time.Millisecond)
-	_, err = svc.Connect(ctx, Actor{UserID: userID, SourceID: "reader"}, &ConnectRequest{})
+	_, err = svc.Connect(ctx, Actor{UserID: userID, SourceID: "reader"}, testSchemaGenerationProofForService(svc), &ConnectRequest{})
 	require.ErrorIs(t, err, errServiceNotReady)
 
 	require.NoError(t, writerTx.Commit(ctx))
 	writerDone = true
 	require.NoError(t, <-bootstrapResult)
-	connect, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "reader"}, &ConnectRequest{})
+	connect, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: "reader"}, testSchemaGenerationProofForService(svc), &ConnectRequest{})
 	require.NoError(t, err)
 	require.Equal(t, "remote_authoritative", connect.Resolution)
 	var rowStateCount int64
@@ -389,7 +397,7 @@ func TestBootstrap_PopulatedAdoptionConcurrency(t *testing.T) {
 	require.Error(t, err, "a writer waking after adoption must encounter the owner guard")
 
 	managedID := uuid.New()
-	bundle, err := pushRowsViaSession(t, ctx, svc, Actor{UserID: userID, SourceID: "managed-writer"}, 1, []PushRequestRow{{
+	bundle, err := pushRowsOneShot(t, ctx, svc, Actor{UserID: userID, SourceID: "managed-writer"}, 1, []PushRequestRow{{
 		Schema:         schemaName,
 		Table:          "users",
 		Key:            SyncKey{"id": managedID.String()},
@@ -431,9 +439,12 @@ func TestBootstrap_PopulatedAdoptionRollbackAndRetry(t *testing.T) {
 		_, _ = pool.Exec(context.Background(), "DROP FUNCTION IF EXISTS public."+pgx.Identifier{functionName}.Sanitize()+"()")
 	})
 
-	svc, err := NewRuntimeService(pool, &ServiceConfig{AppName: "retry-adoption", RegisteredTables: []RegisteredTable{
+	svc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
 		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-	}}, integrationTestLogger(slog.LevelWarn))
+	}), AppName: "retry-adoption", RegisteredTables: []RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	},
+		RegisteredTableCatalogRevision: 1}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
 	err = svc.Bootstrap(ctx)
@@ -441,7 +452,7 @@ func TestBootstrap_PopulatedAdoptionRollbackAndRetry(t *testing.T) {
 	var syncSchemaExists bool
 	require.NoError(t, pool.QueryRow(ctx, `SELECT to_regnamespace('sync') IS NOT NULL`).Scan(&syncSchemaExists))
 	require.False(t, syncSchemaExists, "failed adoption must roll back schema and state")
-	_, connectErr := svc.Connect(ctx, Actor{UserID: userID, SourceID: "reader"}, &ConnectRequest{})
+	_, connectErr := svc.Connect(ctx, Actor{UserID: userID, SourceID: "reader"}, testSchemaGenerationProofForService(svc), &ConnectRequest{})
 	require.True(t, errors.Is(connectErr, errServiceNotReady))
 
 	_, err = pool.Exec(ctx, "DROP EVENT TRIGGER "+pgx.Identifier{eventName}.Sanitize())

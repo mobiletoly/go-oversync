@@ -5,21 +5,22 @@ This example runs a minimal bundle-based go-oversync server for the `samplesync-
 The server uses business tables as authoritative state and exposes the supported lifecycle and
 bundle-based sync endpoints.
 
+It stores one immutable canonical effect history and computes bounded generation-visible push,
+pull, conflict, and snapshot results on demand. Empty visible bundles still advance checkpoints.
+Trigger-normalized and additional effects are valid, but an uploaded key without a final visible
+effect rejects and rolls back the whole commit with HTTP 422 `push_effect_coverage_incomplete`.
+
 Endpoints
 
 - `POST /dummy-signin`
 - `POST /sync/connect`
-- `POST /sync/push-sessions`
-- `POST /sync/push-sessions/{push_id}/chunks`
-- `POST /sync/push-sessions/{push_id}/commit`
-- `DELETE /sync/push-sessions/{push_id}`
-- `GET /sync/committed-bundles/{bundle_seq}/rows`
+- `POST /sync/push`
 - `GET /sync/pull`
 - `GET /sync/watch`
 - `POST /sync/snapshot-sessions`
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
-- `GET /sync/capabilities`
+- `GET /sync/generations/{generation_id}`
 - `GET /syncx/health`
 - `GET /syncx/status`
 
@@ -42,6 +43,10 @@ Run locally
 2. Set environment variables and start the server:
    `DATABASE_URL="postgres://postgres:postgres@localhost:5432/samplesync?sslmode=disable" JWT_SECRET="dev-secret" go run ./examples/samplesync_server`
 
+The tracked `server/baseline-readiness.json` is this sample's canonical static deployment identity.
+Changing one of its semantic revisions requires recreating the non-production PostgreSQL database;
+source comments, formatting, and file location do not rotate the identity.
+
 Concurrency
 
 - Snapshot admission defaults to eight active builds and four active chunk requests.
@@ -59,6 +64,10 @@ Client settings
 - Base URL: `http://localhost:8080` (desktop/iOS) or `http://10.0.2.2:8080` (Android emulator)
 - Schema: `business`
 - Send `Oversync-Source-ID: <current-source-id>` on authenticated `/sync/*` requests
+- Send the fixed `Oversync-Schema-Generation-ID` and
+  `Oversync-Schema-Generation-Fingerprint` on every authenticated `/sync/*` request
+- The server declares one complete generation at `/sync/generations/{generation_id}`. Opening clients
+  cache that immutable contract; steady-state sync does not perform a discovery preflight.
 - `/sync/watch` is available as an optional wake-up stream; clients still pull data through
   `/sync/pull`
 - Call `POST /sync/connect` after local `Open()` to resolve

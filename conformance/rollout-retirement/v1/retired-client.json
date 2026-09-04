@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "cases": [
+    {"id":"retired-upload", "operation":"upload", "status":426, "error":"retired_schema_generation", "retryable":false, "remediation":"upgrade_application", "requests":1},
+    {"id":"retired-download", "operation":"download", "status":426, "error":"retired_schema_generation", "retryable":false, "remediation":"upgrade_application", "requests":1},
+    {"id":"retired-watch", "operation":"watch", "status":426, "error":"retired_schema_generation", "retryable":false, "remediation":"upgrade_application", "requests":1},
+    {"id":"retired-watch-auto", "operation":"watch_auto", "status":426, "error":"retired_schema_generation", "retryable":false, "remediation":"upgrade_application", "requests":1}
+  ],
+  "local_intent": {"id":"00000000-0000-4000-8000-000000000008","name":"Offline work","email":"offline@example.invalid"},
+  "preservation": ["business_rows","source_identity","checkpoint","pending_intent"],
+  "qualification_scope": "Go client; KMP, Dart and Swift remain separate gates"
+}

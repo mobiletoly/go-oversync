@@ -27,78 +27,24 @@ type phase3Tx struct {
 
 func (tx *phase3Tx) QueryRow(context.Context, string, ...any) pgx.Row { return tx.row }
 
-func TestPhase3CapabilitiesRequiredPresenceAtDecodeBoundary(t *testing.T) {
-	valid := `{"protocol_version":"v1","schema_version":1,"registered_table_specs":[{"schema":"business","table":"users","sync_key_columns":["id"]}],"features":{},"bundle_limits":{"default_rows_per_snapshot_chunk":1000,"max_rows_per_snapshot_chunk":2000,"default_bytes_per_snapshot_chunk":4194304,"max_bytes_per_snapshot_chunk":8388608,"max_bytes_per_snapshot_row":1048576,"max_concurrent_snapshot_builds":2,"max_concurrent_snapshot_chunk_requests":3}}`
-	require.NoError(t, json.Unmarshal([]byte(valid), &CapabilitiesResponse{}))
+func TestPhase3GenerationDiscoveryDecodeBoundary(t *testing.T) {
+	valid := `{"protocol_version":"v1","schema_generation":{"id":"1","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tables":[]},"limits":{"max_push_rows":10000,"max_push_decoded_bytes":16777216,"max_pull_bundles":5000,"max_pull_decoded_bytes":33554432,"max_snapshot_rows_per_chunk":2000,"max_snapshot_decoded_bytes_per_chunk":8388608,"max_snapshot_rows":50000,"max_snapshot_logical_bytes":134217728,"max_row_decoded_bytes":1048576},"watch_enabled":true}`
+	var response GenerationDiscoveryResponse
+	require.NoError(t, json.Unmarshal([]byte(valid), &response))
+	require.Equal(t, SyncProtocolVersion, response.ProtocolVersion)
+	require.Equal(t, "1", response.SchemaGeneration.ID)
+	require.Equal(t, 10000, response.Limits.MaxPushRows)
+	require.EqualValues(t, 16777216, response.Limits.MaxPushDecodedBytes)
+	require.True(t, response.WatchEnabled)
 
-	for _, field := range []string{
-		"protocol_version",
-		"schema_version",
-		"registered_table_specs",
-		"features",
-		"bundle_limits",
-		"default_rows_per_snapshot_chunk",
-		"max_rows_per_snapshot_chunk",
-		"default_bytes_per_snapshot_chunk",
-		"max_bytes_per_snapshot_chunk",
-		"max_bytes_per_snapshot_row",
-		"max_concurrent_snapshot_builds",
-		"max_concurrent_snapshot_chunk_requests",
-	} {
-		t.Run(field, func(t *testing.T) {
-			var document map[string]any
-			require.NoError(t, json.Unmarshal([]byte(valid), &document))
-			if field == "protocol_version" || field == "schema_version" || field == "registered_table_specs" || field == "features" || field == "bundle_limits" {
-				delete(document, field)
-			} else {
-				delete(document["bundle_limits"].(map[string]any), field)
-			}
-			encoded, err := json.Marshal(document)
-			require.NoError(t, err)
-			require.Error(t, json.Unmarshal(encoded, &CapabilitiesResponse{}))
-		})
-	}
-
-	for _, testCase := range []struct {
-		name  string
-		value any
-	}{
-		{name: "null specs", value: nil},
-		{name: "non-array specs", value: map[string]any{}},
-		{name: "missing schema", value: []any{map[string]any{"table": "users", "sync_key_columns": []any{"id"}}}},
-		{name: "blank schema", value: []any{map[string]any{"schema": " ", "table": "users", "sync_key_columns": []any{"id"}}}},
-		{name: "missing table", value: []any{map[string]any{"schema": "business", "sync_key_columns": []any{"id"}}}},
-		{name: "blank table", value: []any{map[string]any{"schema": "business", "table": " ", "sync_key_columns": []any{"id"}}}},
-		{name: "missing keys", value: []any{map[string]any{"schema": "business", "table": "users"}}},
-		{name: "null keys", value: []any{map[string]any{"schema": "business", "table": "users", "sync_key_columns": nil}}},
-		{name: "empty keys", value: []any{map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{}}}},
-		{name: "multiple keys", value: []any{map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{"id", "tenant_id"}}}},
-		{name: "blank key", value: []any{map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{" "}}}},
-		{name: "duplicate spec", value: []any{
-			map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{"id"}},
-			map[string]any{"schema": "business", "table": "users", "sync_key_columns": []any{"id"}},
-		}},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			var document map[string]any
-			require.NoError(t, json.Unmarshal([]byte(valid), &document))
-			document["registered_table_specs"] = testCase.value
-			encoded, err := json.Marshal(document)
-			require.NoError(t, err)
-			require.Error(t, json.Unmarshal(encoded, &CapabilitiesResponse{}))
-		})
-	}
-
-	for _, field := range []string{"snapshot_materialization_batch_rows", "snapshot_materialization_batch_bytes"} {
-		t.Run(field+" null", func(t *testing.T) {
-			var document map[string]any
-			require.NoError(t, json.Unmarshal([]byte(valid), &document))
-			document["bundle_limits"].(map[string]any)[field] = nil
-			encoded, err := json.Marshal(document)
-			require.NoError(t, err)
-			require.Error(t, json.Unmarshal(encoded, &CapabilitiesResponse{}))
-		})
-	}
+	var document map[string]any
+	require.NoError(t, json.Unmarshal([]byte(valid), &document))
+	delete(document, "limits")
+	encoded, err := json.Marshal(document)
+	require.NoError(t, err)
+	response = GenerationDiscoveryResponse{}
+	require.NoError(t, json.Unmarshal(encoded, &response))
+	require.Zero(t, response.Limits)
 }
 
 func TestPhase3SourceRetiredJSONPresenceDistinctions(t *testing.T) {
@@ -130,7 +76,7 @@ func TestPhase3SourceRetiredJSONPresenceDistinctions(t *testing.T) {
 func TestPhase3SourceRetiredWireMessageIsFixedAndRedacted(t *testing.T) {
 	handler := &HTTPSyncHandlers{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	recorder := httptest.NewRecorder()
-	handler.writeSourceRetired(recorder, "request-source", &SourceRetiredError{
+	handler.writeSourceRetired(recorder, nil, "request-source", &SourceRetiredError{
 		UserID:             "private-user",
 		SourceID:           "request-source",
 		ReplacedBySourceID: "replacement-source",
@@ -146,10 +92,27 @@ func TestPhase3SourceRetiredWireMessageIsFixedAndRedacted(t *testing.T) {
 	require.False(t, strings.Contains(response.Message, "replacement-source"))
 }
 
+func TestPhase3GenerationOrSourceLifecycleWriterMapsRetiredSource(t *testing.T) {
+	handler := &HTTPSyncHandlers{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	recorder := httptest.NewRecorder()
+	require.True(t, handler.writeGenerationOrSourceLifecycleError(recorder, nil, "request-source", &SourceRetiredError{
+		UserID:             "private-user",
+		SourceID:           "request-source",
+		ReplacedBySourceID: "replacement-source",
+	}))
+
+	require.Equal(t, http.StatusConflict, recorder.Code)
+	var response SourceRetiredResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.Equal(t, "source_retired", response.Error)
+	require.Equal(t, "request-source", response.SourceID)
+	require.Equal(t, "replacement-source", response.ReplacedBySourceID)
+}
+
 func TestPhase3SourceRetiredWriterRejectsMismatchedRequestSource(t *testing.T) {
 	handler := &HTTPSyncHandlers{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	recorder := httptest.NewRecorder()
-	handler.writeSourceRetired(recorder, "request-source", &SourceRetiredError{
+	handler.writeSourceRetired(recorder, nil, "request-source", &SourceRetiredError{
 		UserID:   "private-user",
 		SourceID: "different-source",
 	})
@@ -196,33 +159,16 @@ func TestPhase3PersistedAndNotificationSourceIDsFailClosed(t *testing.T) {
 		require.NotContains(t, err.Error(), invalidSourceID)
 	})
 
-	t.Run("push_sessions", func(t *testing.T) {
-		tx := &phase3Tx{row: phase3RowFunc(func(dest ...any) error {
-			*dest[0].(*string) = "00000000-0000-0000-0000-000000000001"
-			*dest[1].(*int64) = 1
-			*dest[2].(*string) = "user"
-			*dest[3].(*string) = invalidSourceID
-			*dest[4].(*int64) = 1
-			*dest[5].(*int64) = 0
-			*dest[6].(*string) = strings.Repeat("a", 64)
-			*dest[7].(*int64) = 0
-			*dest[8].(*string) = ""
-			*dest[9].(*time.Time) = time.Now().Add(time.Minute)
-			return nil
-		})}
-		_, err := loadPushSessionForUpdate(context.Background(), tx, "00000000-0000-0000-0000-000000000001")
-		require.Error(t, err)
-		require.NotContains(t, err.Error(), invalidSourceID)
-	})
-
 	t.Run("bundle_log", func(t *testing.T) {
 		tx := &phase3Tx{row: phase3RowFunc(func(dest ...any) error {
+			planned := int64(1)
 			*dest[0].(*int64) = 1
 			*dest[1].(*string) = invalidSourceID
 			*dest[2].(*int64) = 1
 			*dest[3].(*int64) = 0
-			*dest[4].(*[]byte) = []byte{1}
-			*dest[5].(*string) = strings.Repeat("a", 64)
+			*dest[4].(**int64) = &planned
+			*dest[5].(*[]byte) = []byte{1}
+			*dest[6].(*string) = strings.Repeat("a", 64)
 			return nil
 		})}
 		_, err := loadCommittedPushMetadataBySourceTuple(context.Background(), tx, 1, "request-source", 1)

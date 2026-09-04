@@ -55,11 +55,12 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 	}
 
 	// Create configuration with custom primary key columns
-	config := DefaultConfig("test", []SyncTable{
+	config := admittedFixtureConfig("test", []SyncTable{
 		{TableName: "users", SyncKeyColumnName: "user_uuid"},
 		{TableName: "products", SyncKeyColumnName: "product_code"},
 		{TableName: "posts", SyncKeyColumnName: "id"},
-	})
+	}, testSchemaGenerationProof())
+	config = testConfigWithLocalContract(t, db, config)
 
 	// Mock token function
 	tokenFunc := func(ctx context.Context) (string, error) {
@@ -67,7 +68,7 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 	}
 
 	// Create client
-	client, err := NewClient(db, "http://localhost:8080", tokenFunc, config)
+	client, err := newAdmittedFixtureClient(db, "http://localhost:8080", tokenFunc, config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -118,8 +119,8 @@ func TestCustomPrimaryKeyColumns(t *testing.T) {
 	}
 }
 
-// TestNewClient_RequiresExplicitPrimaryKeyConfig verifies that setup fails without SyncKeyColumnName.
-func TestNewClient_RequiresExplicitPrimaryKeyConfig(t *testing.T) {
+// TestBorrowedClient_RequiresExplicitPrimaryKeyConfig verifies that setup fails without SyncKeyColumnName.
+func TestBorrowedClient_RequiresExplicitPrimaryKeyConfig(t *testing.T) {
 	// Create in-memory SQLite database
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
@@ -140,9 +141,9 @@ func TestNewClient_RequiresExplicitPrimaryKeyConfig(t *testing.T) {
 	}
 
 	// Use DefaultConfig with empty SyncKeyColumnName - this is now invalid.
-	config := DefaultConfig("test", []SyncTable{
+	config := admittedFixtureConfig("test", []SyncTable{
 		{TableName: "users"},
-	})
+	}, testSchemaGenerationProof())
 
 	// Verify the config was created correctly
 	if len(config.Tables) != 1 {
@@ -162,13 +163,13 @@ func TestNewClient_RequiresExplicitPrimaryKeyConfig(t *testing.T) {
 		return "mock-token", nil
 	}
 
-	_, err = NewClient(db, "http://localhost:8080", tokenFunc, config)
+	_, err = newAdmittedFixtureClient(db, "http://localhost:8080", tokenFunc, config)
 	if err == nil {
 		t.Fatal("expected client creation to fail when SyncKeyColumnName is omitted")
 	}
 }
 
-func TestNewClient_RejectsInvalidSyncKeyColumnDefinitions(t *testing.T) {
+func TestBorrowedClient_RejectsInvalidSyncKeyColumnDefinitions(t *testing.T) {
 	tests := []struct {
 		name               string
 		schemaName         string
@@ -216,7 +217,7 @@ func TestNewClient_RejectsInvalidSyncKeyColumnDefinitions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			requireNewClientConfigError(t, tt.schemaName, []SyncTable{
+			requireBorrowedClientConfigError(t, tt.schemaName, []SyncTable{
 				{TableName: "users", SyncKeyColumnName: tt.syncKeyColumnName},
 			}, []string{tt.ddl}, tt.expectedSubstrings...)
 		})

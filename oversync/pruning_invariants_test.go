@@ -20,14 +20,15 @@ func TestRetentionPolicy_PrunesCommittedHistoryButPreservesCurrentStateAndSource
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "retention-prune-invariants-test",
-		RetainedBundlesPerUser:    1,
-		RetentionPruneBatchSize:   100,
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "retention-prune-invariants-test",
+		RetainedBundlesPerUser:  1,
+		RetentionPruneBatchSize: 100,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "retention-prune-user-" + suffix
@@ -39,8 +40,9 @@ func TestRetentionPolicy_PrunesCommittedHistoryButPreservesCurrentStateAndSource
 	row3 := uuid.New()
 
 	bundle1 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, row1, "One")
-	bundle2 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Two")
+	_ = mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Two")
 	bundle3 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 3, row3, "Three")
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
 
 	userPK, err := lookupUserPK(ctx, pool, userID)
 	require.NoError(t, err)
@@ -132,21 +134,17 @@ func TestRetentionPolicy_PrunesCommittedHistoryButPreservesCurrentStateAndSource
 	`, userPK, writer.SourceID).Scan(&maxCommittedSourceBundleID))
 	require.Equal(t, int64(3), maxCommittedSourceBundleID)
 
-	_, err = svc.GetCommittedBundleRows(ctx, reader, bundle2.BundleSeq, nil, 10)
+	_, err = svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), 1, 10, 0)
 	var prunedErr *HistoryPrunedError
 	require.ErrorAs(t, err, &prunedErr)
 	require.Equal(t, retainedFloor, prunedErr.RetainedFloor)
 
-	_, err = svc.ProcessPull(ctx, reader, 1, 10, 0)
-	require.ErrorAs(t, err, &prunedErr)
-	require.Equal(t, retainedFloor, prunedErr.RetainedFloor)
-
-	resp, err := svc.GetCommittedBundleRows(ctx, reader, bundle3.BundleSeq, nil, 10)
+	resp, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), retainedFloor, 10, 0)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
-	require.Len(t, resp.Rows, 1)
-	require.Equal(t, bundle3.BundleSeq, resp.BundleSeq)
-	require.Equal(t, bundle3.BundleSeq, resp.Rows[0].RowVersion)
-	require.Equal(t, schemaName, resp.Rows[0].Schema)
-	require.Equal(t, "users", resp.Rows[0].Table)
+	require.Len(t, resp.Bundles, 1)
+	require.Equal(t, bundle3.BundleSeq, resp.Bundles[0].BundleSeq)
+	require.Equal(t, bundle3.BundleSeq, resp.Bundles[0].Rows[0].RowVersion)
+	require.Equal(t, schemaName, resp.Bundles[0].Rows[0].Schema)
+	require.Equal(t, "users", resp.Bundles[0].Rows[0].Table)
 }

@@ -2,20 +2,36 @@ package wirevalue
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
 func TestValidateDecimal(t *testing.T) {
 	t.Parallel()
 
-	for _, value := range []string{"0", "0.0", "1234567890.123456789", "1e700", "-1.25E-20"} {
+	for _, value := range []string{"0", "0.0", "1234567890.123456789", strings.Repeat("9", 1000)} {
 		if err := ValidateDecimal(value); err != nil {
 			t.Errorf("ValidateDecimal(%q): %v", value, err)
 		}
 	}
-	for _, value := range []string{"", "+1", "01", ".1", "1.", "1e01", "-0", "-0.0", "-0e10", "-0.000E-9"} {
+	for _, value := range []string{"", "+1", "01", ".1", "1.", "1e01", "1.25e3", "-0", "-0.0", strings.Repeat("9", 1001), "0." + strings.Repeat("1", 1000)} {
 		if err := ValidateDecimal(value); err == nil {
 			t.Errorf("ValidateDecimal(%q) succeeded, want rejection", value)
+		}
+	}
+}
+
+func TestParseFloat32(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"0", "1.2345678806304932", "1.401298464324817e-45", "3.4028234663852886e+38"} {
+		if _, err := ParseFloat32(value); err != nil {
+			t.Errorf("ParseFloat32(%q): %v", value, err)
+		}
+	}
+	for _, value := range []string{"", "-0", "1.2345678901234567", "3.4028236e+38", "NaN", "Infinity"} {
+		if _, err := ParseFloat32(value); err == nil {
+			t.Errorf("ParseFloat32(%q) succeeded, want rejection", value)
 		}
 	}
 }

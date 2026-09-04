@@ -76,21 +76,22 @@ func (h *auditSchemaEdgeHarness) newService(
 	scenario string,
 	tableName string,
 	keyColumn string,
-) *SyncService {
+) (*SyncService, error) {
 	t.Helper()
 
-	svc, err := NewRuntimeService(h.pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "audit-schema-edge-" + scenario,
-		RegisteredTables: []RegisteredTable{{
-			Schema:         h.schemaName,
-			Table:          tableName,
-			SyncKeyColumns: []string{keyColumn},
-		}},
+	registered := []RegisteredTable{{
+		Schema:         h.schemaName,
+		Table:          tableName,
+		SyncKeyColumns: []string{keyColumn},
+	}}
+	svc, err := newTestRuntimeService(h.pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, h.ctx, h.pool, registered, nil), AppName: "audit-schema-edge-" + scenario,
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, h.logger)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = svc.Close(context.Background()) })
-	return svc
+	if svc != nil {
+		t.Cleanup(func() { _ = svc.Close(context.Background()) })
+	}
+	return svc, err
 }
 
 func requireAuditSchemaEdgeRejectedAtomically(t *testing.T, h *auditSchemaEdgeHarness, bootstrapErr error) {
@@ -133,7 +134,7 @@ func auditSchemaEdgePushRow(
 	if payload != nil {
 		row.Payload = auditSchemaEdgePayload(t, payload)
 	}
-	return pushRowsViaSession(t, h.ctx, svc, actor, sourceBundleID, []PushRequestRow{row})
+	return pushRowsOneShot(t, h.ctx, svc, actor, sourceBundleID, []PushRequestRow{row})
 }
 
 func auditSchemaEdgePayloadObject(t *testing.T, payload json.RawMessage) map[string]any {
@@ -157,8 +158,9 @@ func requireAuditSchemaEdgePullAndSnapshot(
 	wantPayload map[string]any,
 ) {
 	t.Helper()
+	mustInitializeEmptyScope(t, h.ctx, svc, reader.UserID, reader.SourceID)
 
-	pull, err := svc.ProcessPull(h.ctx, reader, 0, 100, 0)
+	pull, err := svc.ProcessPull(h.ctx, reader, testSchemaGenerationProofForService(svc), 0, 100, 0)
 	require.NoError(t, err)
 	require.Equal(t, wantBundleSeq, pull.StableBundleSeq)
 	require.NotEmpty(t, pull.Bundles)
@@ -170,7 +172,7 @@ func requireAuditSchemaEdgePullAndSnapshot(
 	require.Equal(t, keyValue, lastBundle.Rows[0].Key[keyColumn])
 	require.Equal(t, wantPayload, auditSchemaEdgePayloadObject(t, lastBundle.Rows[0].Payload))
 
-	session, err := svc.CreateSnapshotSession(h.ctx, reader)
+	session, err := svc.CreateSnapshotSession(h.ctx, reader, testSchemaGenerationProofForService(svc))
 	require.NoError(t, err)
 	require.Equal(t, wantBundleSeq, session.SnapshotBundleSeq)
 	require.Equal(t, int64(1), session.RowCount)
@@ -199,7 +201,8 @@ func TestAuditSchemaEdge_GeneratedColumnRoundTripsOrBootstrapRejectsAtomically(t
 			PRIMARY KEY (_sync_scope_id, id)
 		)`, h.schemaIdent)
 
-	svc := h.newService(t, "generated", "records", "id")
+	svc, err := h.newService(t, "generated", "records", "id")
+	require.NoError(t, err)
 	if err := svc.Bootstrap(h.ctx); err != nil {
 		var schemaErr *UnsupportedSchemaError
 		require.ErrorAs(t, err, &schemaErr, "generated columns may be unsupported, but bootstrap must reject them explicitly")
@@ -280,7 +283,8 @@ func TestAuditSchemaEdge_PartitionedRegisteredTableIsCoherentOrRejectedAtomicall
 		CREATE TABLE %s.records_p1 PARTITION OF %s.records
 		FOR VALUES WITH (MODULUS 2, REMAINDER 1)`, h.schemaIdent, h.schemaIdent)
 
-	svc := h.newService(t, "partitioned", "records", "id")
+	svc, err := h.newService(t, "partitioned", "records", "id")
+	require.NoError(t, err)
 	if err := svc.Bootstrap(h.ctx); err != nil {
 		var schemaErr *UnsupportedSchemaError
 		require.ErrorAs(t, err, &schemaErr, "partitioned tables may be unsupported, but bootstrap must reject them explicitly")
@@ -338,7 +342,8 @@ func TestAuditSchemaEdge_UnloggedRegisteredTableIsRejectedBeforeBootstrapMutatio
 			PRIMARY KEY (_sync_scope_id, id)
 		)`, h.schemaIdent)
 
-	svc := h.newService(t, "unlogged", "records", "id")
+	svc, err := h.newService(t, "unlogged", "records", "id")
+	require.NoError(t, err)
 	bootstrapErr := svc.Bootstrap(h.ctx)
 	if bootstrapErr == nil {
 		var persistence string
@@ -355,7 +360,7 @@ func TestAuditSchemaEdge_UnloggedRegisteredTableIsRejectedBeforeBootstrapMutatio
 	require.Contains(t, bootstrapErr.Error(), h.schemaName+".records")
 	require.Contains(t, strings.ToLower(bootstrapErr.Error()), "unlogged")
 	require.Contains(t, bootstrapErr.Error(), `relpersistence="u"`)
-	require.Contains(t, bootstrapErr.Error(), "recreate the database with permanent tables")
+	require.Contains(t, bootstrapErr.Error(), "permanent logged PostgreSQL storage")
 	requireAuditSchemaEdgeRejectedAtomically(t, h, bootstrapErr)
 }
 
@@ -373,7 +378,8 @@ func TestAuditSchemaEdge_ReservedIdentifiersRoundTrip(t *testing.T) {
 			PRIMARY KEY (_sync_scope_id, "select")
 		)`, tableIdent)
 
-	svc := h.newService(t, "reserved-identifiers", tableName, keyColumn)
+	svc, err := h.newService(t, "reserved-identifiers", tableName, keyColumn)
+	require.NoError(t, err)
 	require.NoError(t, svc.Bootstrap(h.ctx))
 	keyValue := "Key / 01"
 	writer := Actor{UserID: "quoted identifier owner", SourceID: "writer"}
@@ -381,9 +387,7 @@ func TestAuditSchemaEdge_ReservedIdentifiersRoundTrip(t *testing.T) {
 	wantPayload := map[string]any{
 		"select": keyValue,
 		"from":   "origin",
-		"where": map[string]any{
-			"nested": "value",
-		},
+		"where":  `{"nested":"value"}`,
 	}
 	bundle, err := auditSchemaEdgePushRow(
 		t, h, svc, writer, 1, tableName, keyColumn, keyValue, OpInsert, 0, wantPayload,
@@ -411,8 +415,10 @@ func TestAuditSchemaEdge_QuotedMixedCaseIdentifiersRejectWithoutPartialBootstrap
 			PRIMARY KEY (_sync_scope_id, "Item ID")
 		)`, tableIdent)
 
-	svc := h.newService(t, "quoted-mixed-case", tableName, keyColumn)
-	bootstrapErr := svc.Bootstrap(h.ctx)
+	svc, bootstrapErr := h.newService(t, "quoted-mixed-case", tableName, keyColumn)
+	if bootstrapErr == nil {
+		bootstrapErr = svc.Bootstrap(h.ctx)
+	}
 	requireAuditSchemaEdgeRejectedAtomically(t, h, bootstrapErr)
 }
 
@@ -427,10 +433,12 @@ func TestAuditSchemaEdge_ViewRegistrationRejectsWithoutPartialBootstrap(t *testi
 		)`, h.schemaIdent)
 	h.execf(t, `CREATE VIEW %s.records AS SELECT * FROM %s.base_records`, h.schemaIdent, h.schemaIdent)
 
-	svc := h.newService(t, "view", "records", "id")
-	bootstrapErr := svc.Bootstrap(h.ctx)
-	var schemaErr *UnsupportedSchemaError
-	require.ErrorAs(t, bootstrapErr, &schemaErr)
-	require.Contains(t, strings.ToLower(bootstrapErr.Error()), "unique")
+	svc, bootstrapErr := h.newService(t, "view", "records", "id")
+	if bootstrapErr == nil {
+		bootstrapErr = svc.Bootstrap(h.ctx)
+	}
+	var configErr *SchemaGenerationConfigError
+	require.ErrorAs(t, bootstrapErr, &configErr)
+	require.Contains(t, strings.ToLower(bootstrapErr.Error()), "sync_key")
 	requireAuditSchemaEdgeRejectedAtomically(t, h, bootstrapErr)
 }

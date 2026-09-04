@@ -48,6 +48,9 @@ func newAuditTCPProxy(listenAddress, targetAddress string) (*auditTCPProxy, erro
 		dialer:   net.Dialer{Timeout: 2 * time.Second},
 		pairs:    make(map[*auditTCPProxyPair]struct{}),
 	}
+	if proof, ok := auditSchemaGenerationProofByAddress.Load(targetAddress); ok {
+		auditSchemaGenerationProofByAddress.Store(listener.Addr().String(), proof)
+	}
 	proxy.wg.Add(1)
 	go proxy.accept()
 	return proxy, nil
@@ -140,6 +143,7 @@ func (p *auditTCPProxy) Interrupt() int {
 func (p *auditTCPProxy) Close() error {
 	var closeErr error
 	p.closeOnce.Do(func() {
+		auditSchemaGenerationProofByAddress.Delete(p.listener.Addr().String())
 		p.mu.Lock()
 		p.closed = true
 		pairs := make([]*auditTCPProxyPair, 0, len(p.pairs))

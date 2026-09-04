@@ -28,6 +28,44 @@ func TestAcquireUserUploadConnReleaseSkipsErrorLogWhenConnectionClosed(t *testin
 	require.True(t, logs.hasMessage("Skipped releasing user advisory lock because connection is already closed"))
 }
 
+func TestLocalUserUploadGateCancellationDoesNotLeakOrBlockRetry(t *testing.T) {
+	svc := &SyncService{}
+	releaseFirst, err := svc.acquireLocalUserUploadGate(context.Background(), "same-user")
+	require.NoError(t, err)
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = svc.acquireLocalUserUploadGate(cancelledCtx, "same-user")
+	require.ErrorIs(t, err, context.Canceled)
+
+	svc.userUploadGatesMu.Lock()
+	require.Equal(t, 1, svc.userUploadGates["same-user"].refs)
+	svc.userUploadGatesMu.Unlock()
+
+	releaseFirst()
+	svc.userUploadGatesMu.Lock()
+	require.NotContains(t, svc.userUploadGates, "same-user")
+	svc.userUploadGatesMu.Unlock()
+
+	releaseRetry, err := svc.acquireLocalUserUploadGate(context.Background(), "same-user")
+	require.NoError(t, err)
+	releaseRetry()
+}
+
+func TestLocalUserUploadGateDoesNotSerializeDifferentUsers(t *testing.T) {
+	svc := &SyncService{}
+	releaseLeft, err := svc.acquireLocalUserUploadGate(context.Background(), "left-user")
+	require.NoError(t, err)
+	releaseRight, err := svc.acquireLocalUserUploadGate(context.Background(), "right-user")
+	require.NoError(t, err)
+
+	releaseRight()
+	releaseLeft()
+	svc.userUploadGatesMu.Lock()
+	require.Empty(t, svc.userUploadGates)
+	svc.userUploadGatesMu.Unlock()
+}
+
 type recordingSlogHandler struct {
 	mu      sync.Mutex
 	records []slog.Record

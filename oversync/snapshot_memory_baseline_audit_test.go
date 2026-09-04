@@ -243,13 +243,16 @@ func seedAuditExpiredSnapshotSession(
 		return "", 0, err
 	}
 	snapshotID := uuid.NewString()
+	proof := testSchemaGenerationProofForService(fixture.svc)
 	payload := `{"email":"snapshot@example.com","id":"00000000-0000-0000-0000-000000000000","name":"` + strings.Repeat("x", 150) + `"}`
 	byteCount := int64(len(payload) * rowCount)
 	if _, err := fixture.pool.Exec(ctx, `
 		INSERT INTO sync.snapshot_sessions (
-			snapshot_id, user_pk, snapshot_bundle_seq, row_count, byte_count, expires_at
-		) VALUES ($1::uuid, $2, 0, $3, $4, now() - interval '1 minute')
-	`, snapshotID, userPK, rowCount, byteCount); err != nil {
+			snapshot_id, user_pk, source_id,
+			schema_generation_id, schema_generation_fingerprint,
+			snapshot_bundle_seq, row_count, byte_count, expires_at
+		) VALUES ($1::uuid, $2, $3, $4, $5, 0, $6, $7, now() - interval '1 minute')
+	`, snapshotID, userPK, fixture.writer.SourceID, proof.ID, proof.Fingerprint, rowCount, byteCount); err != nil {
 		return "", 0, fmt.Errorf("insert expired snapshot session: %w", err)
 	}
 	if rowCount == 0 {
@@ -292,7 +295,7 @@ func BenchmarkAuditDatabaseSnapshotBoundedCleanup(b *testing.B) {
 	}
 
 	fixture := newAuditDatabaseBenchmarkFixture(b, fmt.Sprintf("cleanup_%d", rowCount))
-	activeSession, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	activeSession, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	if err != nil {
 		b.Fatalf("create unexpired cleanup-control snapshot: %v", err)
 	}
@@ -416,7 +419,7 @@ func BenchmarkAuditDatabaseSnapshotBoundedCleanup(b *testing.B) {
 	<-cleanupBegan
 
 	syncProbeStarted := time.Now()
-	activeChunk, syncProbeErr := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, activeSession.SnapshotID, 0, 1, defaultBytesPerSnapshotChunk)
+	activeChunk, syncProbeErr := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), activeSession.SnapshotID, 0, 1, defaultBytesPerSnapshotChunk)
 	if syncProbeErr == nil && (len(activeChunk.Rows) != 0 || activeChunk.HasMore) {
 		syncProbeErr = fmt.Errorf("unexpired frozen empty session changed during cleanup")
 	}
@@ -429,7 +432,7 @@ func BenchmarkAuditDatabaseSnapshotBoundedCleanup(b *testing.B) {
 		})
 	}
 	if syncProbeErr == nil {
-		pull, pullErr := fixture.svc.ProcessPull(fixture.ctx, fixture.reader, 0, 10, 0)
+		pull, pullErr := fixture.svc.ProcessPull(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), 0, 10, 0)
 		if pullErr != nil {
 			syncProbeErr = pullErr
 		} else if len(pull.Bundles) != 1 || len(pull.Bundles[0].Rows) != 1 {
@@ -470,7 +473,7 @@ func BenchmarkAuditDatabaseSnapshotBoundedCleanup(b *testing.B) {
 	if activeSessionCount != 1 {
 		b.Fatalf("cleanup removed unexpired cleanup-control snapshot")
 	}
-	activeChunkAfter, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, activeSession.SnapshotID, 0, 1, defaultBytesPerSnapshotChunk)
+	activeChunkAfter, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), activeSession.SnapshotID, 0, 1, defaultBytesPerSnapshotChunk)
 	if err != nil {
 		b.Fatalf("read unexpired cleanup-control snapshot after cleanup: %v", err)
 	}

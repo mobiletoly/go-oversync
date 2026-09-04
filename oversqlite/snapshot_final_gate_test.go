@@ -45,13 +45,27 @@ func ensureRollbackFailureDriver() {
 
 func stageUserSnapshotForGate(t *testing.T, client *Client, snapshotID, rowID string, bundleSeq int64, payload []byte) *oversync.SnapshotSession {
 	t.Helper()
+	rows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": rowID}, RowVersion: bundleSeq, Payload: payload}}
+	byteCount := testSnapshotRowsByteCount(rows)
 	chunk := &oversync.SnapshotChunkResponse{
 		SnapshotID: snapshotID, SnapshotBundleSeq: bundleSeq,
-		Rows:           []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": rowID}, RowVersion: bundleSeq, Payload: payload}},
-		NextRowOrdinal: 1, ByteCount: 1,
+		Rows:           rows,
+		NextRowOrdinal: 1, ByteCount: byteCount,
 	}
 	require.NoError(t, client.stageSnapshotChunk(context.Background(), chunk, 0))
-	return &oversync.SnapshotSession{SnapshotID: snapshotID, SnapshotBundleSeq: bundleSeq, RowCount: 1, ByteCount: 1, ExpiresAt: "2030-01-01T00:00:00Z"}
+	return &oversync.SnapshotSession{SnapshotID: snapshotID, SnapshotBundleSeq: bundleSeq, RowCount: 1, ByteCount: byteCount, ExpiresAt: "2030-01-01T00:00:00Z"}
+}
+
+func stageUserSnapshotRowsForGate(t *testing.T, client *Client, snapshotID string, bundleSeq int64, rows []oversync.SnapshotRow) *oversync.SnapshotSession {
+	t.Helper()
+	byteCount := testSnapshotRowsByteCount(rows)
+	chunk := &oversync.SnapshotChunkResponse{
+		SnapshotID: snapshotID, SnapshotBundleSeq: bundleSeq,
+		Rows:           rows,
+		NextRowOrdinal: int64(len(rows)), ByteCount: byteCount,
+	}
+	require.NoError(t, client.stageSnapshotChunk(context.Background(), chunk, 0))
+	return &oversync.SnapshotSession{SnapshotID: snapshotID, SnapshotBundleSeq: bundleSeq, RowCount: int64(len(rows)), ByteCount: byteCount, ExpiresAt: "2030-01-01T00:00:00Z"}
 }
 
 func TestSnapshotFinalGate_LocalWriteDuringDownloadPreservesEverything(t *testing.T) {
@@ -62,20 +76,22 @@ func TestSnapshotFinalGate_LocalWriteDuringDownloadPreservesEverything(t *testin
 	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
 	require.NoError(t, err)
 	setCurrentSourceBundleState(t, db, 1, 3)
+	remoteRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote"}, RowVersion: 7, Payload: mustJSONPayload(t, map[string]any{"id": "remote", "name": "Remote", "email": "remote@example.com"})}}
+	remoteBytes := testSnapshotRowsByteCount(remoteRows)
 
 	var retired atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch {
-		case r.URL.Path == "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+		case r.URL.Path == "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: "snapshot-race", SnapshotBundleSeq: 7, RowCount: 1, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return jsonResponse(oversync.SnapshotSession{SnapshotID: "snapshot-race", SnapshotBundleSeq: 7, RowCount: 1, ByteCount: remoteBytes, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
 		case r.Method == http.MethodGet && r.URL.Path == "/sync/snapshot-sessions/snapshot-race":
 			_, writeErr := db.Exec(`INSERT INTO users(id,name,email) VALUES('local-race','Local','local@example.com')`)
 			require.NoError(t, writeErr)
 			return jsonResponse(oversync.SnapshotChunkResponse{
 				SnapshotID: "snapshot-race", SnapshotBundleSeq: 7,
-				Rows:           []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote"}, RowVersion: 7, Payload: mustJSONPayload(t, map[string]any{"id": "remote", "name": "Remote", "email": "remote@example.com"})}},
+				Rows:           remoteRows,
 				NextRowOrdinal: 1,
 			}), nil
 		case r.Method == http.MethodDelete && r.URL.Path == "/sync/snapshot-sessions/snapshot-race":
@@ -156,6 +172,8 @@ func TestSnapshotFinalGate_PreparedSourceRecoveryReappliesAndRebindsAtomically(t
 		CanonicalRequestHash: "prepared-hash", RowCount: 1,
 	})
 	seedOutboxUserInsertForTest(t, db, 8, "intent", "Intent", "intent@example.com")
+	originalBase := baselineText(t, db, `SELECT base_provenance FROM _sync_outbox_rows`)
+	originalWire := baselineText(t, db, `SELECT wire_payload FROM _sync_outbox_rows`)
 	attachment, err := loadAttachmentState(ctx, db)
 	require.NoError(t, err)
 	attachment.RebuildRequired = true
@@ -191,6 +209,11 @@ func TestSnapshotFinalGate_PreparedSourceRecoveryReappliesAndRebindsAtomically(t
 	require.Equal(t, "replacement-source", attachment.CurrentSourceID)
 	require.Equal(t, int64(9), attachment.LastBundleSeqSeen)
 	require.False(t, attachment.RebuildRequired)
+	require.Equal(t, originalBase, baselineText(t, db, `SELECT base_provenance FROM _sync_outbox_rows`))
+	require.Equal(t, originalWire, baselineText(t, db, `SELECT wire_payload FROM _sync_outbox_rows`))
+	require.Equal(t, "absent", baselineText(t, db, `SELECT server_kind FROM _sync_row_state WHERE key_json='{"id":"intent"}'`))
+	require.Equal(t, "9", baselineText(t, db, `SELECT json_extract(server_provenance,'$.bundle_sequence') FROM _sync_row_state WHERE key_json='{"id":"intent"}'`))
+	require.Equal(t, "Remote", baselineText(t, db, `SELECT json_extract(server_payload,'$.name.value') FROM _sync_row_state WHERE key_json='{"id":"remote"}'`))
 }
 
 func TestSnapshotFinalGate_ChangedFingerprintAndCommittedMisclassificationFailClosed(t *testing.T) {
@@ -225,80 +248,7 @@ func TestSnapshotFinalGate_ChangedFingerprintAndCommittedMisclassificationFailCl
 		require.Equal(t, 1, snapshotStageCount(t, db))
 	})
 
-	t.Run("committed remote is not prepared source recovery", func(t *testing.T) {
-		ctx := context.Background()
-		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
-		seedOutboxBundleForTest(t, db, outboxBundleRecord{
-			State: outboxStateCommittedRemote, SourceID: client.sourceID, SourceBundleID: 3,
-			CanonicalRequestHash: "hash", RowCount: 1, RemoteBundleSeq: 7, RemoteBundleHash: "remote-hash",
-		})
-		seedOutboxUserInsertForTest(t, db, 3, "intent", "Intent", "intent@example.com")
-		attachment, err := loadAttachmentState(ctx, db)
-		require.NoError(t, err)
-		attachment.RebuildRequired = true
-		require.NoError(t, persistAttachmentState(ctx, db, attachment))
-		setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindSourceRecovery, ReplacementSourceID: "replacement"})
-		_, err = client.pinSnapshotApplyGuard(ctx, snapshotApplyOptions{PreserveOutbox: true, ClearSourceRecovery: true})
-		var sourceErr *SourceRecoveryRequiredError
-		require.ErrorAs(t, err, &sourceErr)
-	})
 }
-
-func TestSnapshotFinalGate_PreserveCommittedRemoteMode(t *testing.T) {
-	for _, testCase := range []struct {
-		name        string
-		snapshotSeq int64
-		wantError   bool
-	}{
-		{name: "clears exact committed outbox after sufficiently new snapshot", snapshotSeq: 8},
-		{name: "rejects snapshot older than committed remote bundle", snapshotSeq: 6, wantError: true},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			ctx := context.Background()
-			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
-			_, err := db.Exec(`INSERT INTO users VALUES('old','Old','old@example.com')`)
-			require.NoError(t, err)
-			_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
-			require.NoError(t, err)
-			seedOutboxBundleForTest(t, db, outboxBundleRecord{
-				State: outboxStateCommittedRemote, SourceID: client.sourceID, SourceBundleID: 4,
-				CanonicalRequestHash: "committed-hash", RowCount: 1,
-				RemoteBundleSeq: 7, RemoteBundleHash: "remote-hash",
-			})
-			seedOutboxUserInsertForTest(t, db, 4, "committed-intent", "Intent", "intent@example.com")
-			require.NoError(t, client.markCheckpointRecoveryRequiredLocked(ctx, "history_pruned"))
-			options := snapshotApplyOptions{AdvanceSourceBundleFloor: 5}
-			guard, err := client.pinSnapshotApplyGuard(ctx, options)
-			require.NoError(t, err)
-			options.PinnedGuard = guard
-			session := stageUserSnapshotForGate(t, client, "snapshot-committed", "remote", testCase.snapshotSeq, mustJSONPayload(t, map[string]any{"id": "remote", "name": "Remote", "email": "remote@example.com"}))
-			err = client.applyStagedSnapshotLocked(ctx, session, options)
-			if testCase.wantError {
-				var gateErr *SnapshotFinalApplyGateError
-				var pendingErr *PendingPushReplayError
-				require.ErrorAs(t, err, &gateErr)
-				require.ErrorAs(t, err, &pendingErr)
-				requireUserCount(t, db, "old", 1)
-				requireUserCount(t, db, "remote", 0)
-				require.Equal(t, outboxStateCommittedRemote, requireOutboxBundle(t, db).State)
-				require.Equal(t, 1, snapshotStageCount(t, db))
-				return
-			}
-			require.NoError(t, err)
-			requireUserCount(t, db, "old", 0)
-			requireUserCount(t, db, "remote", 1)
-			require.Equal(t, outboxStateNone, requireOutboxBundle(t, db).State)
-			var outboxRows int
-			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboxRows))
-			require.Equal(t, 0, outboxRows)
-			source, err := loadSourceState(ctx, db, client.sourceID)
-			require.NoError(t, err)
-			require.GreaterOrEqual(t, source.NextSourceBundleID, int64(5))
-			require.Equal(t, 0, snapshotStageCount(t, db))
-		})
-	}
-}
-
 func TestSnapshotApplyFailureRollsBackAuthoritativeStateAndStageDeletion(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
@@ -479,7 +429,7 @@ func TestSnapshotApplyFailureBoundariesRollBackCompleteTransition(t *testing.T) 
 		require.Equal(t, 1, snapshotStageCount(t, db))
 	})
 
-	t.Run("deferred foreign key commit failure", func(t *testing.T) {
+	t.Run("missing dependency preserves primary state", func(t *testing.T) {
 		ctx := context.Background()
 		client, db := newBundleClient(t, "main", []SyncTable{
 			{TableName: "parents", SyncKeyColumnName: "id"},
@@ -510,13 +460,19 @@ func TestSnapshotApplyFailureBoundariesRollBackCompleteTransition(t *testing.T) 
 				Schema: "main", Table: "children", Key: oversync.SyncKey{"id": "remote"}, RowVersion: 9,
 				Payload: mustJSONPayload(t, map[string]any{"id": "remote", "parent_id": "missing-parent"}),
 			}},
-			NextRowOrdinal: 1, ByteCount: 1,
+			NextRowOrdinal: 1,
 		}
+		chunk.ByteCount = testSnapshotRowsByteCount(chunk.Rows)
 		require.NoError(t, client.stageSnapshotChunk(ctx, chunk, 0))
-		session := &oversync.SnapshotSession{SnapshotID: chunk.SnapshotID, SnapshotBundleSeq: 9, RowCount: 1, ByteCount: 1, ExpiresAt: "2030-01-01T00:00:00Z"}
+		session := &oversync.SnapshotSession{SnapshotID: chunk.SnapshotID, SnapshotBundleSeq: 9, RowCount: 1, ByteCount: chunk.ByteCount, ExpiresAt: "2030-01-01T00:00:00Z"}
 
+		before := owningRemediationPrimaryState(t, db, "parents", "children")
 		err = client.applyStagedSnapshotLocked(ctx, session, options)
-		require.ErrorContains(t, err, "failed to commit staged snapshot apply")
+		var pending *FKReconciliationRequiredError
+		require.ErrorAs(t, err, &pending)
+		require.Equal(t, "dependency_unavailable", pending.Detail)
+		require.Len(t, pending.Unit, 64)
+		require.Equal(t, before, owningRemediationPrimaryState(t, db, "parents", "children"))
 		var count int
 		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM children WHERE id = 'old'`).Scan(&count))
 		require.Equal(t, 1, count)

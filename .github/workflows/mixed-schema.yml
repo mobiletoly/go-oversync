@@ -1,0 +1,86 @@
+name: Mixed schema qualification
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  coexistence:
+    name: mixed-schema-pg${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+      - run: docker pull postgres:${{ matrix.pg }}
+      - run: python3 scripts/mixed-schema-fixture.py '${{ matrix.pg }}' coexistence
+        env:
+          M0011_REPORT_DIR: ${{ runner.temp }}/mixed-schema-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mixed-schema-pg${{ matrix.pg }}
+          path: ${{ runner.temp }}/mixed-schema-results
+          if-no-files-found: error
+          retention-days: 14
+  regression:
+    name: mixed-schema-${{ matrix.lane }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [package, full, mobile, vet]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+      - run: docker pull postgres:16
+      - run: python3 scripts/mixed-schema-fixture.py 16 '${{ matrix.lane }}'
+        env:
+          M0011_REPORT_DIR: ${{ runner.temp }}/mixed-schema-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mixed-schema-${{ matrix.lane }}
+          path: ${{ runner.temp }}/mixed-schema-results
+          if-no-files-found: error
+          retention-days: 14
+  guards:
+    name: mixed-schema-guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+      - run: python3 -B -m unittest discover -s scripts -p test_mixed_schema.py
+      - run: python3 -B scripts/mixed-schema.py manifest
+      - run: test -z "$(gofmt -l oversync/integration_test_postgres_test.go oversync/generation_data_plane_integration_test.go oversqlite/conflict_pending.go oversqlite/conflict_pending_test.go oversqlite_e2e/mixed_schema_test.go oversqlite_e2e/mixed_schema_process_test.go)"
+      - run: git diff --check
+  mixed-schema-required:
+    name: mixed-schema-required
+    if: always()
+    needs: [coexistence, regression, guards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every qualification job
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          assert set(results) == {'coexistence', 'regression', 'guards'}, 'missing required job'
+          assert all(v['result'] == 'success' for v in results.values()), 'failed, cancelled, skipped or missing qualification'
+          PY

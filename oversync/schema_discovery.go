@@ -16,12 +16,13 @@ import (
 
 // SchemaDiscovery handles automatic discovery of table relationships and ordering
 type SchemaDiscovery struct {
-	pool   *pgxpool.Pool
-	logger *slog.Logger
+	querier syncCatalogQuerier
+	logger  *slog.Logger
 }
 
 // ForeignKeyConstraint represents a foreign key relationship
 type ForeignKeyConstraint struct {
+	constraintOID  int64  // PostgreSQL constraint object identity
 	ConstraintName string // Name of the FK constraint
 	TableSchema    string // Schema of the child table
 	TableName      string // Name of the child table
@@ -33,6 +34,9 @@ type ForeignKeyConstraint struct {
 	MatchOption    string // SIMPLE / FULL / PARTIAL
 	OnDeleteAction string // CASCADE / RESTRICT / SET NULL / SET DEFAULT / NO ACTION
 	OnUpdateAction string // CASCADE / RESTRICT / SET NULL / SET DEFAULT / NO ACTION
+	// deleteSetColumnsSpecified records PostgreSQL's ON DELETE SET NULL target-list form.
+	deleteSetColumnsSpecified bool
+	deleteSetsThisColumn      bool
 }
 
 // DiscoveredSchema contains the discovered table relationships
@@ -56,9 +60,13 @@ func key(schema, table string) string {
 
 // NewSchemaDiscovery creates a new schema discovery instance
 func NewSchemaDiscovery(pool *pgxpool.Pool, logger *slog.Logger) *SchemaDiscovery {
+	return newSchemaDiscoveryWithQuerier(pool, logger)
+}
+
+func newSchemaDiscoveryWithQuerier(querier syncCatalogQuerier, logger *slog.Logger) *SchemaDiscovery {
 	return &SchemaDiscovery{
-		pool:   pool,
-		logger: logger,
+		querier: querier,
+		logger:  logger,
 	}
 }
 
@@ -169,6 +177,7 @@ func validateSupportedForeignKeyConstraints(
 	type fkGroupKey struct {
 		childSchema string
 		childTable  string
+		identity    string
 		constraint  string
 	}
 
@@ -206,6 +215,7 @@ func validateSupportedForeignKeyConstraints(
 		groupKey := fkGroupKey{
 			childSchema: fk.TableSchema,
 			childTable:  fk.TableName,
+			identity:    foreignKeyGroupIdentity(fk),
 			constraint:  fk.ConstraintName,
 		}
 		groups[groupKey] = append(groups[groupKey], fk)
@@ -335,29 +345,33 @@ func (sd *SchemaDiscovery) getForeignKeyConstraints(ctx context.Context, registe
 
 	query := `
 		SELECT
-			kcu.constraint_name,
-			kcu.table_schema,
-			kcu.table_name,
-			kcu.column_name,
-			kcu.ordinal_position,
-			rc.unique_constraint_schema AS referenced_table_schema,
-			kcu2.table_name AS referenced_table_name,
-			kcu2.column_name AS referenced_column_name,
-			rc.match_option,
-			rc.delete_rule,
-			rc.update_rule
-		FROM information_schema.key_column_usage AS kcu
-		JOIN information_schema.referential_constraints AS rc
-			ON kcu.constraint_name = rc.constraint_name
-			AND kcu.constraint_schema = rc.constraint_schema
-		JOIN information_schema.key_column_usage AS kcu2
-			ON rc.unique_constraint_name = kcu2.constraint_name
-			AND rc.unique_constraint_schema = kcu2.constraint_schema
-			AND kcu.ordinal_position = kcu2.ordinal_position
-		WHERE (kcu.table_schema || '.' || kcu.table_name) = ANY(@registered_tables::text[])
-		ORDER BY kcu.table_schema, kcu.table_name, kcu.constraint_name, kcu.ordinal_position`
+			con.oid::bigint,
+			con.conname,
+			child_ns.nspname,
+			child.relname,
+			child_col.attname,
+			keys.ordinality::integer,
+			parent_ns.nspname,
+			parent.relname,
+			parent_col.attname,
+			CASE con.confmatchtype WHEN 's' THEN 'SIMPLE' WHEN 'f' THEN 'FULL' WHEN 'p' THEN 'PARTIAL' END,
+			CASE con.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END,
+			CASE con.confupdtype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END,
+			con.confdelsetcols IS NOT NULL,
+			COALESCE(child_col.attnum = ANY(con.confdelsetcols), false)
+		FROM pg_constraint AS con
+		JOIN pg_class AS child ON child.oid = con.conrelid
+		JOIN pg_namespace AS child_ns ON child_ns.oid = child.relnamespace
+		JOIN pg_class AS parent ON parent.oid = con.confrelid
+		JOIN pg_namespace AS parent_ns ON parent_ns.oid = parent.relnamespace
+		CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS keys(child_attnum, parent_attnum, ordinality)
+		JOIN pg_attribute AS child_col ON child_col.attrelid = child.oid AND child_col.attnum = keys.child_attnum
+		JOIN pg_attribute AS parent_col ON parent_col.attrelid = parent.oid AND parent_col.attnum = keys.parent_attnum
+		WHERE con.contype = 'f'
+		  AND (child_ns.nspname || '.' || child.relname) = ANY(@registered_tables::text[])
+		ORDER BY child_ns.nspname, child.relname, con.oid, keys.ordinality`
 
-	rows, err := sd.pool.Query(ctx, query, pgx.NamedArgs{
+	rows, err := sd.querier.Query(ctx, query, pgx.NamedArgs{
 		"registered_tables": registeredTablesList,
 	})
 	if err != nil {
@@ -369,6 +383,7 @@ func (sd *SchemaDiscovery) getForeignKeyConstraints(ctx context.Context, registe
 	for rows.Next() {
 		var fk ForeignKeyConstraint
 		err := rows.Scan(
+			&fk.constraintOID,
 			&fk.ConstraintName,
 			&fk.TableSchema,
 			&fk.TableName,
@@ -380,6 +395,8 @@ func (sd *SchemaDiscovery) getForeignKeyConstraints(ctx context.Context, registe
 			&fk.MatchOption,
 			&fk.OnDeleteAction,
 			&fk.OnUpdateAction,
+			&fk.deleteSetColumnsSpecified,
+			&fk.deleteSetsThisColumn,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan foreign key constraint: %w", err)
@@ -393,6 +410,13 @@ func (sd *SchemaDiscovery) getForeignKeyConstraints(ctx context.Context, registe
 	}
 
 	return constraints, nil
+}
+
+func foreignKeyGroupIdentity(fk ForeignKeyConstraint) string {
+	if fk.constraintOID != 0 {
+		return fmt.Sprintf("oid:%d", fk.constraintOID)
+	}
+	return "name:" + fk.ConstraintName
 }
 
 // buildDependencyGraph creates a dependency map from FK constraints
@@ -609,55 +633,62 @@ func (sd *SchemaDiscovery) validateDeferrableConstraints(ctx context.Context, fk
 		return nil
 	}
 
-	// Build constraint names for batch query
-	var constraintNames []string
-	constraintSet := make(map[string]bool)
+	// Batch by PostgreSQL object identity. Constraint names are not unique per
+	// schema because two child tables may deliberately reuse the same name.
+	var constraintOIDs []int64
+	constraintSet := make(map[int64]bool)
 
 	for _, fk := range fkConstraints {
 		childTableKey := key(fk.TableSchema, fk.TableName)
 		if registeredTables[childTableKey] {
-			constraintKey := fk.TableSchema + "." + fk.ConstraintName
-			if !constraintSet[constraintKey] {
-				constraintSet[constraintKey] = true
-				constraintNames = append(constraintNames, constraintKey)
+			if fk.constraintOID != 0 && !constraintSet[fk.constraintOID] {
+				constraintSet[fk.constraintOID] = true
+				constraintOIDs = append(constraintOIDs, fk.constraintOID)
 			}
 		}
 	}
-	if len(constraintNames) == 0 {
+	if len(constraintOIDs) == 0 {
 		return nil
 	}
+	sort.Slice(constraintOIDs, func(i, j int) bool { return constraintOIDs[i] < constraintOIDs[j] })
 
 	// Query for deferrable status using pg_catalog for better reliability
 	query := `
 		SELECT
+			con.oid::bigint AS constraint_oid,
 			n.nspname AS schema_name,
 			con.conname AS constraint_name,
 			con.condeferrable AS is_deferrable,
-			con.condeferred AS is_deferred
+			con.condeferred AS is_deferred,
+			con.convalidated AS is_validated
 		FROM pg_catalog.pg_constraint con
 		JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
 		WHERE con.contype = 'f'
-		  AND n.nspname || '.' || con.conname = ANY(@constraint_names)`
+		  AND con.oid::bigint = ANY(@constraint_oids::bigint[])`
 
-	rows, err := sd.pool.Query(ctx, query, pgx.NamedArgs{
-		"constraint_names": constraintNames,
+	rows, err := sd.querier.Query(ctx, query, pgx.NamedArgs{
+		"constraint_oids": constraintOIDs,
 	})
 	if err != nil {
 		return fmt.Errorf("check FK deferrable status: %w", err)
 	}
 	defer rows.Close()
 
-	var nonDeferrable []string
+	var nonDeferrable, unvalidated []string
 	for rows.Next() {
+		var constraintOID int64
 		var schemaName, constraintName string
-		var isDeferrable, isDeferred bool
+		var isDeferrable, isDeferred, isValidated bool
 
-		if err := rows.Scan(&schemaName, &constraintName, &isDeferrable, &isDeferred); err != nil {
+		if err := rows.Scan(&constraintOID, &schemaName, &constraintName, &isDeferrable, &isDeferred, &isValidated); err != nil {
 			return fmt.Errorf("scan FK deferrable status: %w", err)
 		}
 
+		if !isValidated {
+			unvalidated = append(unvalidated, fmt.Sprintf("%s.%s (oid %d)", schemaName, constraintName, constraintOID))
+		}
 		if !isDeferrable {
-			nonDeferrable = append(nonDeferrable, schemaName+"."+constraintName)
+			nonDeferrable = append(nonDeferrable, fmt.Sprintf("%s.%s (oid %d)", schemaName, constraintName, constraintOID))
 			sd.logger.Error("FK constraint is NOT DEFERRABLE and blocks bootstrap",
 				"schema", schemaName,
 				"constraint", constraintName,
@@ -679,6 +710,10 @@ func (sd *SchemaDiscovery) validateDeferrableConstraints(ctx context.Context, fk
 			"registered schema contains non-deferrable FK constraints: %s; make these constraints DEFERRABLE before bootstrap (INITIALLY DEFERRED recommended)",
 			strings.Join(nonDeferrable, ", "),
 		)
+	}
+	if len(unvalidated) > 0 {
+		sort.Strings(unvalidated)
+		return unsupportedSchemaf("registered schema contains unvalidated FK constraints: %s; validate before bootstrap", strings.Join(unvalidated, ", "))
 	}
 	return nil
 }

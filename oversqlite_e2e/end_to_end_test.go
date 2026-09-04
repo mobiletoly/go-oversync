@@ -20,11 +20,11 @@ import (
 func TestEndToEnd_RebuildKeepSourcePullAndServerCascadeOnCategories(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_server_cascade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
+	server := newExampleServer(t, schema, "categories")
 
 	userID := "e2e-user-cascade-" + uuid.NewString()
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("categories")), categoriesDDL)
-	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("categories")), categoriesDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("categories")), categoriesDDL)
+	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", defaultOversqliteConfig(schema, syncTables("categories")), categoriesDDL)
 
 	rootID := uuid.NewString()
 	childID := uuid.NewString()
@@ -58,8 +58,8 @@ func TestEndToEnd_PushThenOwnPushThenPullStillFetchesEarlierPeerBundle(t *testin
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-user-gap-" + uuid.NewString()
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
+	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
 
 	rowAID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
@@ -88,9 +88,9 @@ func TestEndToEnd_ThreeDevicesPushWithoutPullThenAllPullConverge(t *testing.T) {
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-user-three-gap-" + uuid.NewString()
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientC, dbC := newSQLiteClient(t, server, userID, "device-c", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
+	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
+	clientC, dbC := newSQLiteClient(t, server, userID, "device-c", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
 
 	rowAID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
@@ -126,7 +126,7 @@ func TestEndToEnd_ThreeDevicesPushWithoutPullThenAllPullConverge(t *testing.T) {
 	require.Equal(t, "From B", name)
 
 	for _, client := range []*oversqlite.Client{clientA, clientB, clientC} {
-		lastBundleSeq := requireLastBundleSeqSeen(t, client.DB)
+		lastBundleSeq := requireLastBundleSeqSeen(t, client.Database())
 		require.Equal(t, int64(3), lastBundleSeq)
 	}
 }
@@ -137,8 +137,8 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-user-restart-gap-" + uuid.NewString()
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
-	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
+	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
 
 	rowAID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowAID, "From A", "from-a@example.com")
@@ -149,15 +149,15 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowBID, "From B", "from-b@example.com")
 	require.NoError(t, err)
 	mustPushPendingE2E(t, clientB, ctx)
+	databasePath := sqliteDatabasePath(t, dbB)
 	require.NoError(t, clientB.Close())
 
-	restartedConfig := oversqlite.DefaultConfig(schema, syncTables("users"))
-	restarted, err := oversqlite.NewClient(dbB, server.URL(), func(context.Context) (string, error) {
+	restartedConfig := defaultOversqliteConfig(schema, syncTables("users"))
+	restarted := openReadySQLiteClient(t, databasePath, server.URL(), func(context.Context) (string, error) {
 		return server.GenerateToken(userID, time.Hour)
 	}, restartedConfig)
-	require.NoError(t, err)
 	defer func() { require.NoError(t, restarted.Close()) }()
-	mustOpenE2E(t, restarted, ctx, "")
+	dbB = restarted.Database()
 	restartedConnect, err := restarted.Attach(ctx, userID)
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.AttachStatusConnected, restartedConnect.Status)
@@ -176,28 +176,11 @@ func TestEndToEnd_RestartAfterOwnPushBeforePullStillFetchesEarlierPeerBundle(t *
 func TestEndToEnd_ExampleServerSchemaTimestampParity(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_example_schema_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
+	server := newExampleServer(t, schema, "users", "posts")
 
 	userID := "e2e-example-user-" + uuid.NewString()
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err)
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	t.Cleanup(func() { _ = db.Close() })
-
-	for _, stmt := range []string{usersDDL, postsDDL} {
-		_, err = db.Exec(stmt)
-		require.NoError(t, err)
-	}
-
-	var client *oversqlite.Client
-	tokenFn := func(ctx context.Context) (string, error) {
-		return server.GenerateToken(userID, time.Hour)
-	}
-	client, err = oversqlite.NewClient(db, server.URL(), tokenFn, oversqlite.DefaultConfig(schema, syncTables("users", "posts")))
-	require.NoError(t, err)
+	client, db := newSQLiteClientWithoutConnect(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users", "posts")), usersDDL, postsDDL)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	mustOpenE2E(t, client, ctx, "device-a")
 	connectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
@@ -222,14 +205,14 @@ func TestEndToEnd_ExampleServerSchemaTimestampParity(t *testing.T) {
 	require.Equal(t, 1, postCount)
 }
 
-func TestEndToEnd_PushSessionCreateTransportRetryLeavesClientRecoverable(t *testing.T) {
+func TestEndToEnd_DirectPushTransportRetryLeavesClientRecoverable(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_push_retry_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-user-" + uuid.NewString()
 	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", newNoRetryConfig(schema, syncTables("users")), usersDDL)
-	clientB, _ := newSQLiteClient(t, server, userID, "device-b", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientB, _ := newSQLiteClient(t, server, userID, "device-b", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
 
 	rowUserID := uuid.NewString()
 	_, err := dbA.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowUserID, "Ada", "ada@example.com")
@@ -238,7 +221,7 @@ func TestEndToEnd_PushSessionCreateTransportRetryLeavesClientRecoverable(t *test
 	baseTransport := http.DefaultTransport
 	failFirstPush := true
 	clientA.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/sync/push-sessions" && failFirstPush {
+		if r.URL.Path == "/sync/push" && failFirstPush {
 			failFirstPush = false
 			return nil, io.ErrUnexpectedEOF
 		}
@@ -257,15 +240,15 @@ func TestEndToEnd_PushSessionCreateTransportRetryLeavesClientRecoverable(t *test
 	mustRebuildE2E(t, clientB, ctx)
 }
 
-func TestEndToEnd_StaleFollowerConvergesAfterChunkedPushAndPruneFallback(t *testing.T) {
+func TestEndToEnd_StaleFollowerConvergesAfterDirectPushAndPruneFallback(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_stale_follower_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-user-" + uuid.NewString()
-	configA := oversqlite.DefaultConfig(schema, syncTables("users"))
+	configA := defaultOversqliteConfig(schema, syncTables("users"))
 	configA.UploadLimit = 2
-	configB := oversqlite.DefaultConfig(schema, syncTables("users"))
+	configB := defaultOversqliteConfig(schema, syncTables("users"))
 	configB.SnapshotChunkRows = 2
 	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", configA, usersDDL)
 	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", configB, usersDDL)
@@ -279,10 +262,9 @@ func TestEndToEnd_StaleFollowerConvergesAfterChunkedPushAndPruneFallback(t *test
 		require.NoError(t, err)
 	}
 
-	clientA.ResetPushTransferDiagnostics()
-	mustPushPendingE2E(t, clientA, ctx)
-	pushStats := clientA.PushTransferDiagnostics()
-	require.Greater(t, pushStats.ChunksUploaded, int64(1))
+	for range 3 {
+		mustPushPendingE2E(t, clientA, ctx)
+	}
 
 	stableBundleSeq, err := clientA.LastBundleSeqSeen(ctx)
 	require.NoError(t, err)
@@ -298,7 +280,7 @@ func TestEndToEnd_StaleFollowerConvergesAfterChunkedPushAndPruneFallback(t *test
 	clientB.ResetSnapshotTransferDiagnostics()
 	mustPullToStableE2E(t, clientB, ctx)
 	snapshotStats := clientB.SnapshotTransferDiagnostics()
-	require.Greater(t, snapshotStats.ChunksFetched, int64(1))
+	require.Positive(t, snapshotStats.ChunksFetched)
 
 	var localCount int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&localCount))
@@ -309,15 +291,15 @@ func TestEndToEnd_StaleFollowerConvergesAfterChunkedPushAndPruneFallback(t *test
 	require.Equal(t, stableBundleSeq, lastSeen)
 }
 
-func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T) {
+func TestEndToEnd_DirectPushConflictPreservesWholeBundleSemantics(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_chunked_conflict_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-user-" + uuid.NewString()
-	configB := oversqlite.DefaultConfig(schema, syncTables("users"))
+	configB := defaultOversqliteConfig(schema, syncTables("users"))
 	configB.UploadLimit = 2
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
 	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", configB, usersDDL)
 	clientB.Resolver = &oversqlite.ClientWinsResolver{}
 
@@ -349,12 +331,8 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	_, err = dbB.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, extraUserTwo, "Extra Two", "extra2@example.com")
 	require.NoError(t, err)
 
-	clientB.ResetPushTransferDiagnostics()
 	mustPushPendingE2E(t, clientB, ctx)
-
-	pushStats := clientB.PushTransferDiagnostics()
-	require.Equal(t, int64(2), pushStats.SessionsCreated)
-	require.Greater(t, pushStats.ChunksUploaded, int64(2))
+	mustPushPendingE2E(t, clientB, ctx)
 
 	var dirtyCount, outboundCount, stagedCount int
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
@@ -365,7 +343,7 @@ func TestEndToEnd_ChunkedPushConflictPreservesWholeBundleSemantics(t *testing.T)
 	require.Equal(t, 0, stagedCount)
 
 	nextSourceBundleID := requireNextSourceBundleID(t, dbB)
-	require.Equal(t, int64(2), nextSourceBundleID)
+	require.Equal(t, int64(3), nextSourceBundleID)
 
 	var serverName string
 	require.NoError(t, server.Pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id = $1`, pgx.Identifier{schema}.Sanitize()), conflictUserID).Scan(&serverName))
@@ -382,7 +360,7 @@ func TestEndToEnd_PullRetryPruneFallbackAndRebuild(t *testing.T) {
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-user-" + uuid.NewString()
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
 	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", newNoRetryConfig(schema, syncTables("users")), usersDDL)
 
 	insertUser := func(id, name string) {
@@ -452,12 +430,12 @@ func TestEndToEnd_PullRetryPruneFallbackAndRebuild(t *testing.T) {
 func TestEndToEnd_LargeFKConnectedHydrateUsesChunkedSnapshot(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_chunked_hydrate_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
+	server := newExampleServer(t, schema, "users", "posts")
 
 	userID := "e2e-chunked-user-" + uuid.NewString()
-	configB := oversqlite.DefaultConfig(schema, syncTables("users", "posts"))
+	configB := defaultOversqliteConfig(schema, syncTables("users", "posts"))
 	configB.SnapshotChunkRows = 10
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users", "posts")), usersDDL, postsDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users", "posts")), usersDDL, postsDDL)
 	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", configB, usersDDL, postsDDL)
 
 	for i := 0; i < 3; i++ {
@@ -495,9 +473,9 @@ func TestEndToEnd_RebuildRetryClearsStaleStageAndStartsNewSession(t *testing.T) 
 	server := newExampleServer(t, schema)
 
 	userID := "e2e-retry-user-" + uuid.NewString()
-	configB := oversqlite.DefaultConfig(schema, syncTables("users"))
+	configB := defaultOversqliteConfig(schema, syncTables("users"))
 	configB.SnapshotChunkRows = 1
-	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", oversqlite.DefaultConfig(schema, syncTables("users")), usersDDL)
+	clientA, dbA := newSQLiteClient(t, server, userID, "device-a", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
 	clientB, dbB := newSQLiteClient(t, server, userID, "device-b", configB, usersDDL)
 
 	for i := 0; i < 3; i++ {

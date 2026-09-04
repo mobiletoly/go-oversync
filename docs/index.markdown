@@ -13,7 +13,7 @@ PostgreSQL servers.
 The verified contract in this repository is:
 
 - PostgreSQL business tables are authoritative
-- clients push one logical dirty set through staged push sessions
+- clients push one logical dirty set through one bounded `POST /sync/push` request
 - clients replay the authoritative committed bundle returned by the server
 - clients pull complete committed bundles only
 - retained-history gaps, fresh installs, and source recovery rebuild through frozen snapshot
@@ -23,8 +23,8 @@ The verified contract in this repository is:
 
 - `oversync/`: PostgreSQL adapter, bundle capture, schema validation, HTTP handlers
 - `oversqlite/`: SQLite client SDK with trigger-based dirty capture
-- `examples/nethttp_server/`: reference `net/http` server
-- `examples/mobile_flow/`: simulator for the current sync contract
+- `examples/samplesync_server/`: maintained application-facing sample server
+- `integration/`: repository-owned server, simulator, schema-evolution, and qualification harnesses
 - `swagger/two_way_sync.yaml`: OpenAPI description of the HTTP surface
 
 ## Design Constraints
@@ -46,6 +46,7 @@ The runtime is intentionally fail-closed.
 
 - Read [Core Concepts](documentation/core-concepts/) for the vocabulary and end-to-end model.
 - Use [Getting Started](getting-started.html) to stand up a server and client.
+- Run the maintained server example in `examples/samplesync_server/`.
 - Use [Server Deployment and Operations](documentation/server-deployment-and-operations/) to
   configure capacity, monitoring, shutdown, upgrades, and recovery.
 - Use [HTTP API](documentation/api/) for the wire contract.

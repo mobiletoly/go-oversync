@@ -21,10 +21,10 @@ import (
 // Phase 5 evidence:
 //   - TestAuditActorMiddleware_PreservesExactVisibleASCIISourceToken covers
 //     exact valid source identities.
-//   - TestAuditHTTPCreatePushSession_RejectsUnknownFields,
-//     TestAuditHTTPCreatePushSession_RejectsTrailingJSONDocument, and
-//     TestAuditHTTPCreatePushSession_RejectsUnsupportedContentType cover the
-//     corresponding create-session decoder contracts.
+//   - TestAuditHTTPPush_RejectsUnknownFields,
+//     TestAuditHTTPPush_RejectsTrailingJSONDocument, and
+//     TestAuditHTTPPush_RejectsUnsupportedContentType cover the
+//     corresponding direct-push decoder contracts.
 
 func runAuditProtocolActorRequest(
 	t *testing.T,
@@ -122,8 +122,10 @@ func TestAuditProtocolContract_ActorMiddlewareRejectsControlAndOversizedActorIDs
 }
 
 func TestAuditProtocolGreen_HTTPRejectsMalformedAndSnapshotUnknownJSON(t *testing.T) {
-	handlers := NewHTTPSyncHandlers(nil, integrationTestLogger(slog.LevelWarn))
-	actor := Actor{UserID: "audit-protocol-user", SourceID: "audit-protocol-source"}
+	ctx := context.Background()
+	fixture := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
+	handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
+	actor := fixture.writer
 	tests := []struct {
 		name      string
 		path      string
@@ -131,16 +133,16 @@ func TestAuditProtocolGreen_HTTPRejectsMalformedAndSnapshotUnknownJSON(t *testin
 		handle    func(http.ResponseWriter, *http.Request)
 		wantError string
 	}{
-		{name: "create malformed", path: "/sync/push-sessions", body: `{`, handle: handlers.HandleCreatePushSession, wantError: "invalid_request"},
+		{name: "push malformed", path: "/sync/push", body: `{`, handle: handlers.HandlePush, wantError: "invalid_request"},
 		{name: "connect malformed", path: "/sync/connect", body: `{`, handle: handlers.HandleConnect, wantError: "invalid_request"},
-		{name: "chunk malformed", path: "/sync/push-sessions/not-used/chunks", body: `{`, handle: handlers.HandlePushSessionChunk, wantError: "invalid_request"},
-		{name: "snapshot unknown field", path: "/sync/snapshot-sessions", body: `{"unknown":true}`, handle: handlers.HandleCreateSnapshotSession, wantError: "snapshot_session_invalid"},
+		{name: "snapshot unknown field", path: "/sync/snapshot-sessions", body: `{"unknown":true}`, handle: handlers.HandleCreateSnapshotSession, wantError: "invalid_request"},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
 			request.Header.Set("Content-Type", "application/json")
+			setTestSchemaGenerationHeaders(request, fixture.svc)
 			request = request.WithContext(ContextWithActor(request.Context(), actor))
 			recorder := httptest.NewRecorder()
 			test.handle(recorder, request)
@@ -151,18 +153,15 @@ func TestAuditProtocolGreen_HTTPRejectsMalformedAndSnapshotUnknownJSON(t *testin
 	}
 }
 
-func TestAuditProtocolGreen_CreatePushSessionAcceptsJSONMediaTypeWithCharset(t *testing.T) {
-	fixture, initializationID := newAuditCreatePushSessionHTTPFixture(t)
-	body := fmt.Sprintf(
-		`{"source_bundle_id":1,"planned_row_count":1,"initialization_id":%q}`,
-		initializationID,
-	)
+func TestAuditProtocolGreen_PushAcceptsJSONMediaTypeWithCharset(t *testing.T) {
+	fixture, _ := newAuditPushHTTPFixture(t)
+	body := auditCompactPushBody(t, fixture, "")
 
-	recorder := runAuditCreatePushSessionRequest(t, fixture, body, "application/json; charset=utf-8")
+	recorder := runAuditPushRequest(t, fixture, body, "application/json; charset=utf-8")
 	require.Equal(t, http.StatusOK, recorder.Code)
 }
 
-func TestAuditProtocolContract_CreatePushSessionRejectsDuplicateOrCaseCollidingFields(t *testing.T) {
+func TestAuditProtocolContract_PushRejectsDuplicateOrCaseCollidingFields(t *testing.T) {
 	tests := []struct {
 		name       string
 		fieldBytes string
@@ -173,14 +172,10 @@ func TestAuditProtocolContract_CreatePushSessionRejectsDuplicateOrCaseCollidingF
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fixture, initializationID := newAuditCreatePushSessionHTTPFixture(t)
-			body := fmt.Sprintf(
-				`{%s,"planned_row_count":1,"initialization_id":%q}`,
-				test.fieldBytes,
-				initializationID,
-			)
+			fixture, _ := newAuditPushHTTPFixture(t)
+			body := `{` + test.fieldBytes + `,"canonical_request_hash":"` + strings.Repeat("0", 64) + `","rows":[]}`
 
-			recorder := runAuditCreatePushSessionRequest(t, fixture, body, "application/json")
+			recorder := runAuditPushRequest(t, fixture, body, "application/json")
 			require.Equal(t, http.StatusBadRequest, recorder.Code, "ambiguous object fields must be rejected")
 		})
 	}
@@ -188,11 +183,13 @@ func TestAuditProtocolContract_CreatePushSessionRejectsDuplicateOrCaseCollidingF
 
 func TestAuditProtocolContract_SnapshotCreateRejectsTrailingJSONDocument(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	fixture := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
 	mustInitializeEmptyScope(t, ctx, fixture.svc, fixture.writer.UserID, fixture.writer.SourceID)
 
 	request := httptest.NewRequest(http.MethodPost, "/sync/snapshot-sessions", strings.NewReader(`{} {"extra":true}`))
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	setTestSchemaGenerationHeaders(request, fixture.svc)
 	request = request.WithContext(ContextWithActor(request.Context(), fixture.writer))
 	recorder := httptest.NewRecorder()
 	handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
@@ -201,53 +198,41 @@ func TestAuditProtocolContract_SnapshotCreateRejectsTrailingJSONDocument(t *test
 	require.Equal(t, http.StatusBadRequest, recorder.Code, "snapshot creation must consume exactly one JSON document")
 }
 
-func TestAuditProtocolContract_PushChunkRejectsDuplicateAndCaseCollidingPayloadKeys(t *testing.T) {
+func TestAuditProtocolContract_PushRejectsDuplicateAndCaseCollidingFieldsBeforePersistence(t *testing.T) {
 	tests := []struct {
 		name          string
 		payloadFields string
 	}{
-		{name: "duplicate payload key", payloadFields: `"name":"one","name":"two"`},
-		{name: "case-colliding payload key", payloadFields: `"name":"one","Name":"two"`},
+		{name: "duplicate request key", payloadFields: `"source_bundle_id":1,"source_bundle_id":1`},
+		{name: "case-colliding request key", payloadFields: `"source_bundle_id":1,"SOURCE_BUNDLE_ID":1`},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
-			fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
-			session := fixture.createSession(t, ctx, 1, 1)
-			rowID := uuid.NewString()
-			body := fmt.Sprintf(
-				`{"start_row_ordinal":0,"rows":[{"schema":%q,"table":"users","key":{"id":%q},"op":"INSERT","base_row_version":0,"payload":{"id":%q,%s,"email":"audit@example.com"}}]}`,
-				fixture.schemaName,
-				rowID,
-				rowID,
-				test.payloadFields,
-			)
+			fixture, initializationID := newAuditPushHTTPFixture(t)
+			body := `{` + test.payloadFields + `,"canonical_request_hash":"` + strings.Repeat("0", 64) + `","initialization_id":` + fmt.Sprintf("%q", initializationID) + `,"rows":[]}`
 
-			request := httptest.NewRequest(http.MethodPost, "/sync/push-sessions/"+session.PushID+"/chunks", strings.NewReader(body))
-			request.SetPathValue("push_id", session.PushID)
-			request.Header.Set("Content-Type", "application/json")
-			request = request.WithContext(ContextWithActor(request.Context(), fixture.writer))
-			recorder := httptest.NewRecorder()
-			handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
-			handlers.HandlePushSessionChunk(recorder, request)
+			recorder := runAuditPushRequest(t, fixture, body, "application/json")
 
-			assert.Equal(t, http.StatusBadRequest, recorder.Code, "ambiguous payload fields must be rejected before staging")
-			assert.Zero(t, fixture.pushSessionRowCount(t, ctx, session.PushID), "rejected ambiguous JSON must leave no staged row")
+			assert.Equal(t, http.StatusBadRequest, recorder.Code, "ambiguous JSON must be rejected before the direct push reaches storage")
+			assert.Zero(t, fixture.businessUserCount(t, ctx), "rejected ambiguous JSON must leave no business rows")
 		})
 	}
 }
 
-func TestAuditProtocolGreen_MalformedBundleSequencePathReturnsBadRequest(t *testing.T) {
-	handlers := NewHTTPSyncHandlers(nil, integrationTestLogger(slog.LevelWarn))
-	request := httptest.NewRequest(http.MethodGet, "/sync/committed-bundles/not-an-integer/rows", nil)
-	request.SetPathValue("bundle_seq", "not-an-integer")
-	request = request.WithContext(ContextWithActor(request.Context(), Actor{UserID: "user", SourceID: "source"}))
+func TestAuditProtocolGreen_MalformedPullCursorReturnsBadRequest(t *testing.T) {
+	ctx := context.Background()
+	fixture := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
+	handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
+	request := httptest.NewRequest(http.MethodGet, "/sync/pull?after_bundle_seq=not-an-integer", nil)
+	request = request.WithContext(ContextWithActor(request.Context(), fixture.reader))
+	setTestSchemaGenerationHeaders(request, fixture.svc)
 	recorder := httptest.NewRecorder()
 
-	handlers.HandleGetCommittedBundleRows(recorder, request)
+	handlers.HandlePull(recorder, request)
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
-	require.Equal(t, "committed_bundle_chunk_invalid", decodeErrorResponse(t, recorder).Error)
+	require.Equal(t, "invalid_request", decodeErrorResponse(t, recorder).Error)
 }
 
 func TestAuditProtocolContract_MalformedUUIDPathIDsReturnBadRequest(t *testing.T) {
@@ -258,15 +243,6 @@ func TestAuditProtocolContract_MalformedUUIDPathIDsReturnBadRequest(t *testing.T
 		path   string
 		key    string
 	}{
-		{
-			name: "push session",
-			handle: func(handlers *HTTPSyncHandlers, w http.ResponseWriter, request *http.Request) {
-				handlers.HandleDeletePushSession(w, request)
-			},
-			method: http.MethodDelete,
-			path:   "/sync/push-sessions/not-a-uuid",
-			key:    "push_id",
-		},
 		{
 			name: "snapshot session",
 			handle: func(handlers *HTTPSyncHandlers, w http.ResponseWriter, request *http.Request) {
@@ -281,7 +257,7 @@ func TestAuditProtocolContract_MalformedUUIDPathIDsReturnBadRequest(t *testing.T
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
-			fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+			fixture := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
 			handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
 			request := httptest.NewRequest(test.method, test.path, nil)
 			request.SetPathValue(test.key, "not-a-uuid")

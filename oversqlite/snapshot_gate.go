@@ -10,9 +10,8 @@ import (
 type snapshotPendingWorkMode string
 
 const (
-	snapshotModeClearAll                snapshotPendingWorkMode = "CLEAR_ALL"
-	snapshotModePreserveCommittedRemote snapshotPendingWorkMode = "PRESERVE_COMMITTED_REMOTE"
-	snapshotModePreserveSourceRecovery  snapshotPendingWorkMode = "PRESERVE_SOURCE_RECOVERY"
+	snapshotModeClearAll               snapshotPendingWorkMode = "CLEAR_ALL"
+	snapshotModePreserveSourceRecovery snapshotPendingWorkMode = "PRESERVE_SOURCE_RECOVERY"
 )
 
 type outboxFingerprint struct {
@@ -21,8 +20,6 @@ type outboxFingerprint struct {
 	SourceBundleID       int64
 	CanonicalRequestHash string
 	RowCount             int64
-	RemoteBundleSeq      int64
-	RemoteBundleHash     string
 	ActualRowCount       int64
 }
 
@@ -49,12 +46,9 @@ type snapshotApplyGuard struct {
 	remoteTargetUserID string
 }
 
-// SnapshotFinalApplyGateError identifies a no-data-loss check that changed
-// after download and before authoritative replacement.
 type SnapshotFinalApplyGateError struct {
-	Mode   string
-	Reason string
-	Cause  error
+	Mode, Reason string
+	Cause        error
 }
 
 func (e *SnapshotFinalApplyGateError) Error() string {
@@ -63,7 +57,6 @@ func (e *SnapshotFinalApplyGateError) Error() string {
 	}
 	return fmt.Sprintf("snapshot final apply gate rejected %s mode: %s: %v", e.Mode, e.Reason, e.Cause)
 }
-
 func (e *SnapshotFinalApplyGateError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -74,9 +67,6 @@ func (e *SnapshotFinalApplyGateError) Unwrap() error {
 func snapshotModeForOptions(options snapshotApplyOptions) snapshotPendingWorkMode {
 	if options.PreserveOutbox || options.ClearSourceRecovery {
 		return snapshotModePreserveSourceRecovery
-	}
-	if options.AdvanceSourceBundleFloor > 0 {
-		return snapshotModePreserveCommittedRemote
 	}
 	return snapshotModeClearAll
 }
@@ -102,22 +92,9 @@ func loadSnapshotGuardState(ctx context.Context, tx sqliteTransaction, mode snap
 		return nil, err
 	}
 	return &snapshotApplyGuard{
-		mode:      mode,
-		dirtyRows: dirtyRows,
-		outbox: outboxFingerprint{
-			State: outbox.State, SourceID: outbox.SourceID, SourceBundleID: outbox.SourceBundleID,
-			CanonicalRequestHash: outbox.CanonicalRequestHash, RowCount: outbox.RowCount,
-			RemoteBundleSeq: outbox.RemoteBundleSeq, RemoteBundleHash: outbox.RemoteBundleHash,
-			ActualRowCount: outboxRows,
-		},
-		lifecycle: snapshotLifecycleFingerprint{
-			BindingState: attachment.BindingState, CurrentSourceID: attachment.CurrentSourceID,
-			AttachedUserID: attachment.AttachedUserID, SchemaName: attachment.SchemaName,
-			LastBundleSeqSeen: attachment.LastBundleSeqSeen, RebuildRequired: attachment.RebuildRequired,
-			PendingInitializationID: attachment.PendingInitializationID,
-			OperationKind:           operation.Kind, TargetUserID: operation.TargetUserID,
-			Reason: operation.Reason, ReplacementSourceID: operation.ReplacementSourceID,
-		},
+		mode: mode, dirtyRows: dirtyRows,
+		outbox:    outboxFingerprint{State: outbox.State, SourceID: outbox.SourceID, SourceBundleID: outbox.SourceBundleID, CanonicalRequestHash: outbox.CanonicalRequestHash, RowCount: outbox.RowCount, ActualRowCount: outboxRows},
+		lifecycle: snapshotLifecycleFingerprint{BindingState: attachment.BindingState, CurrentSourceID: attachment.CurrentSourceID, AttachedUserID: attachment.AttachedUserID, SchemaName: attachment.SchemaName, LastBundleSeqSeen: attachment.LastBundleSeqSeen, RebuildRequired: attachment.RebuildRequired, PendingInitializationID: attachment.PendingInitializationID, OperationKind: operation.Kind, TargetUserID: operation.TargetUserID, Reason: operation.Reason, ReplacementSourceID: operation.ReplacementSourceID},
 	}, nil
 }
 
@@ -134,18 +111,7 @@ func validateSnapshotGuardMode(guard *snapshotApplyGuard) error {
 			if guard.lifecycle.BindingState != attachmentBindingAnonymous || guard.lifecycle.OperationKind != operationKindRemoteReplace || guard.lifecycle.TargetUserID != guard.remoteTargetUserID {
 				return &RebuildRequiredError{}
 			}
-			break
-		}
-		if guard.lifecycle.BindingState != attachmentBindingAttached || !guard.lifecycle.RebuildRequired || guard.lifecycle.OperationKind != operationKindNone {
-			return &RebuildRequiredError{}
-		}
-	case snapshotModePreserveCommittedRemote:
-		if guard.outbox.State != outboxStateCommittedRemote ||
-			guard.outbox.SourceID == "" || guard.outbox.SourceBundleID <= 0 ||
-			guard.outbox.CanonicalRequestHash == "" || guard.outbox.RowCount <= 0 ||
-			guard.outbox.RemoteBundleSeq <= 0 || guard.outbox.RemoteBundleHash == "" ||
-			guard.outbox.ActualRowCount != guard.outbox.RowCount {
-			return &PendingPushReplayError{OutboundCount: int(guard.outbox.ActualRowCount)}
+			return nil
 		}
 		if guard.lifecycle.BindingState != attachmentBindingAttached || !guard.lifecycle.RebuildRequired || guard.lifecycle.OperationKind != operationKindNone {
 			return &RebuildRequiredError{}
@@ -160,9 +126,7 @@ func validateSnapshotGuardMode(guard *snapshotApplyGuard) error {
 				return &PendingPushReplayError{OutboundCount: int(guard.outbox.ActualRowCount)}
 			}
 		case outboxStatePrepared:
-			if guard.outbox.SourceID == "" || guard.outbox.SourceBundleID <= 0 ||
-				guard.outbox.CanonicalRequestHash == "" || guard.outbox.RowCount <= 0 ||
-				guard.outbox.ActualRowCount != guard.outbox.RowCount {
+			if guard.outbox.SourceID == "" || guard.outbox.SourceBundleID <= 0 || guard.outbox.CanonicalRequestHash == "" || guard.outbox.RowCount <= 0 || guard.outbox.ActualRowCount != guard.outbox.RowCount {
 				return &PendingPushReplayError{OutboundCount: int(guard.outbox.ActualRowCount)}
 			}
 		default:
@@ -175,7 +139,7 @@ func validateSnapshotGuardMode(guard *snapshotApplyGuard) error {
 }
 
 func (c *Client) pinSnapshotApplyGuard(ctx context.Context, options snapshotApplyOptions) (*snapshotApplyGuard, error) {
-	tx, err := c.DB.BeginTx(ctx, nil)
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin snapshot guard read transaction: %w", err)
 	}
@@ -184,8 +148,7 @@ func (c *Client) pinSnapshotApplyGuard(ctx context.Context, options snapshotAppl
 	if err != nil {
 		return nil, err
 	}
-	guard.remoteReplace = options.FinalizeRemoteReplace
-	guard.remoteTargetUserID = options.RemoteTargetUserID
+	guard.remoteReplace, guard.remoteTargetUserID = options.FinalizeRemoteReplace, options.RemoteTargetUserID
 	if err := validateSnapshotGuardMode(guard); err != nil {
 		return nil, err
 	}
@@ -195,13 +158,8 @@ func (c *Client) pinSnapshotApplyGuard(ctx context.Context, options snapshotAppl
 	return guard, nil
 }
 
-func snapshotOutboxEqual(a, b outboxFingerprint) bool {
-	return a == b
-}
-
-func snapshotLifecycleEqual(a, b snapshotLifecycleFingerprint) bool {
-	return a == b
-}
+func snapshotOutboxEqual(a, b outboxFingerprint) bool               { return a == b }
+func snapshotLifecycleEqual(a, b snapshotLifecycleFingerprint) bool { return a == b }
 
 func (c *Client) validateFinalSnapshotApplyGate(ctx context.Context, tx sqliteTransaction, pinned *snapshotApplyGuard, session *oversync.SnapshotSession) error {
 	if pinned == nil {
@@ -211,8 +169,7 @@ func (c *Client) validateFinalSnapshotApplyGate(ctx context.Context, tx sqliteTr
 	if err != nil {
 		return err
 	}
-	current.remoteReplace = pinned.remoteReplace
-	current.remoteTargetUserID = pinned.remoteTargetUserID
+	current.remoteReplace, current.remoteTargetUserID = pinned.remoteReplace, pinned.remoteTargetUserID
 	if current.dirtyRows != pinned.dirtyRows {
 		return &SnapshotFinalApplyGateError{Mode: string(pinned.mode), Reason: "dirty row count changed", Cause: &DirtyStateRejectedError{DirtyCount: int(current.dirtyRows)}}
 	}
@@ -220,7 +177,7 @@ func (c *Client) validateFinalSnapshotApplyGate(ctx context.Context, tx sqliteTr
 		return &SnapshotFinalApplyGateError{Mode: string(pinned.mode), Reason: "outbox fingerprint or row count changed", Cause: &PendingPushReplayError{OutboundCount: int(current.outbox.ActualRowCount)}}
 	}
 	if !snapshotLifecycleEqual(current.lifecycle, pinned.lifecycle) {
-		var cause error = &RebuildRequiredError{}
+		cause := error(&RebuildRequiredError{})
 		if pinned.mode == snapshotModePreserveSourceRecovery {
 			cause = &SourceRecoveryRequiredError{Code: SourceRecoverySequenceChanged, Message: "source-recovery lifecycle guard changed during snapshot transfer"}
 		}
@@ -228,12 +185,6 @@ func (c *Client) validateFinalSnapshotApplyGate(ctx context.Context, tx sqliteTr
 	}
 	if err := validateSnapshotGuardMode(current); err != nil {
 		return &SnapshotFinalApplyGateError{Mode: string(pinned.mode), Reason: "pending-work mode is no longer valid", Cause: err}
-	}
-	if pinned.mode == snapshotModePreserveCommittedRemote && session.SnapshotBundleSeq < current.outbox.RemoteBundleSeq {
-		return &SnapshotFinalApplyGateError{
-			Mode: string(pinned.mode), Reason: "snapshot is older than committed remote bundle",
-			Cause: &PendingPushReplayError{OutboundCount: int(current.outbox.ActualRowCount)},
-		}
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -34,6 +35,39 @@ type SnapshotCapacityRetryPolicy struct {
 	JitterFraction float64
 }
 
+// PushCapacityRetryPolicy configures elapsed-time retry for server history
+// projection admission during push requests. It is independent of RetryPolicy
+// so a busy server does not consume the generic transport-attempt budget.
+type PushCapacityRetryPolicy struct {
+	Enabled        bool
+	MaxWait        time.Duration
+	FallbackDelay  time.Duration
+	JitterFraction float64
+}
+
+// PushCapacityRetryExhaustedError reports that push admission remained
+// unavailable for the configured capacity-wait budget.
+type PushCapacityRetryExhaustedError struct {
+	Operation string
+	ErrorCode string
+	Waited    time.Duration
+}
+
+func (e *PushCapacityRetryExhaustedError) Error() string {
+	if e == nil {
+		return "oversqlite push capacity retry exhausted"
+	}
+	return fmt.Sprintf("oversqlite push capacity retry exhausted for %s (%s)", e.Operation, e.ErrorCode)
+}
+
+// RetryFailureClass is a redacted classification of the final retryable
+// failure. It never contains response bodies, SQL details, tokens, or URLs.
+type RetryFailureClass struct {
+	Kind       string
+	Operation  string
+	HTTPStatus int
+}
+
 // SnapshotCapacityRetryExhaustedError reports that snapshot admission remained
 // unavailable for the configured capacity-wait budget.
 type SnapshotCapacityRetryExhaustedError struct {
@@ -51,9 +85,10 @@ func (e *SnapshotCapacityRetryExhaustedError) Error() string {
 
 // RetryExhaustedError reports that the configured retry budget was exhausted for an operation.
 type RetryExhaustedError struct {
-	Operation string
-	Attempts  int
-	LastErr   error
+	Operation   string
+	Attempts    int
+	LastErr     error // Deprecated: retained as nil so remote or local error details cannot escape.
+	LastFailure RetryFailureClass
 }
 
 // Error implements error.
@@ -61,7 +96,17 @@ func (e *RetryExhaustedError) Error() string {
 	if e == nil {
 		return "oversqlite retry policy exhausted"
 	}
-	return fmt.Sprintf("oversqlite retry policy exhausted for %s after %d attempts", e.Operation, e.Attempts)
+	base := fmt.Sprintf("oversqlite retry policy exhausted for %s after %d attempts", e.Operation, e.Attempts)
+	if e.LastFailure.Kind == "http_status" && e.LastFailure.HTTPStatus > 0 {
+		return fmt.Sprintf("%s; last failure was HTTP %d during %s", base, e.LastFailure.HTTPStatus, e.LastFailure.Operation)
+	}
+	if e.LastFailure.Kind != "" {
+		if e.LastFailure.Operation != "" {
+			return fmt.Sprintf("%s; last failure class was %s during %s", base, e.LastFailure.Kind, e.LastFailure.Operation)
+		}
+		return fmt.Sprintf("%s; last failure class was %s", base, e.LastFailure.Kind)
+	}
+	return base
 }
 
 // Unwrap deliberately does not expose the remote retry failure.
@@ -96,6 +141,13 @@ var defaultSnapshotCapacityRetryPolicy = SnapshotCapacityRetryPolicy{
 	JitterFraction: 1,
 }
 
+var defaultPushCapacityRetryPolicy = PushCapacityRetryPolicy{
+	Enabled:        true,
+	MaxWait:        30 * time.Second,
+	FallbackDelay:  time.Second,
+	JitterFraction: 1,
+}
+
 type normalizedRetryPolicy struct {
 	enabled        bool
 	maxAttempts    int
@@ -105,6 +157,13 @@ type normalizedRetryPolicy struct {
 }
 
 type normalizedSnapshotCapacityRetryPolicy struct {
+	enabled        bool
+	maxWait        time.Duration
+	fallbackDelay  time.Duration
+	jitterFraction float64
+}
+
+type normalizedPushCapacityRetryPolicy struct {
 	enabled        bool
 	maxWait        time.Duration
 	fallbackDelay  time.Duration
@@ -198,6 +257,40 @@ func normalizeSnapshotCapacityRetryPolicy(policy *SnapshotCapacityRetryPolicy) n
 	}
 }
 
+func (c *Client) normalizedPushCapacityRetryPolicy() normalizedPushCapacityRetryPolicy {
+	if c == nil || c.config == nil || c.config.PushCapacityRetryPolicy == nil {
+		return normalizePushCapacityRetryPolicy(&defaultPushCapacityRetryPolicy)
+	}
+	return normalizePushCapacityRetryPolicy(c.config.PushCapacityRetryPolicy)
+}
+
+func normalizePushCapacityRetryPolicy(policy *PushCapacityRetryPolicy) normalizedPushCapacityRetryPolicy {
+	if policy == nil {
+		policy = &defaultPushCapacityRetryPolicy
+	}
+	if !policy.Enabled {
+		return normalizedPushCapacityRetryPolicy{}
+	}
+	maxWait := policy.MaxWait
+	if maxWait <= 0 {
+		maxWait = defaultPushCapacityRetryPolicy.MaxWait
+	}
+	fallbackDelay := policy.FallbackDelay
+	if fallbackDelay <= 0 {
+		fallbackDelay = defaultPushCapacityRetryPolicy.FallbackDelay
+	}
+	jitter := policy.JitterFraction
+	if jitter < 0 {
+		jitter = 0
+	}
+	if jitter > 1 {
+		jitter = 1
+	}
+	return normalizedPushCapacityRetryPolicy{
+		enabled: true, maxWait: maxWait, fallbackDelay: fallbackDelay, jitterFraction: jitter,
+	}
+}
+
 func withRetryValue[T any](ctx context.Context, policy normalizedRetryPolicy, operation string, fn func() (T, error)) (T, error) {
 	if !policy.enabled {
 		return fn()
@@ -217,14 +310,42 @@ func withRetryValue[T any](ctx context.Context, policy normalizedRetryPolicy, op
 		}
 		if attempt >= policy.maxAttempts {
 			return zero, &RetryExhaustedError{
-				Operation: operation,
-				Attempts:  attempt,
+				Operation:   operation,
+				Attempts:    attempt,
+				LastFailure: classifyRetryFailure(err),
 			}
 		}
 		if err := waitRetryBackoff(ctx, jitterDuration(backoff, policy.jitterFraction)); err != nil {
 			return zero, err
 		}
 		backoff = nextRetryBackoff(backoff, policy.maxBackoff)
+	}
+}
+
+func classifyRetryFailure(err error) RetryFailureClass {
+	var boundedErr *boundedHTTPFailureError
+	if errors.As(err, &boundedErr) {
+		return RetryFailureClass{Kind: string(boundedErr.stage), Operation: boundedErr.operation}
+	}
+	var httpErr *retryHTTPError
+	if errors.As(err, &httpErr) {
+		return RetryFailureClass{Kind: "http_status", Operation: httpErr.Operation, HTTPStatus: httpErr.StatusCode}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return RetryFailureClass{Kind: "network_timeout"}
+	}
+	switch {
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return RetryFailureClass{Kind: "unexpected_eof"}
+	case errors.Is(err, io.EOF):
+		return RetryFailureClass{Kind: "eof"}
+	case errors.Is(err, syscall.ECONNRESET):
+		return RetryFailureClass{Kind: "connection_reset"}
+	case errors.Is(err, syscall.EPIPE):
+		return RetryFailureClass{Kind: "broken_pipe"}
+	default:
+		return RetryFailureClass{Kind: "retryable"}
 	}
 }
 
@@ -316,10 +437,14 @@ func (c *Client) applyAuthenticatedSyncHeaders(httpReq *http.Request, token stri
 	if c != nil {
 		sourceID = c.sourceID
 	}
-	return applyAuthenticatedSyncHeadersWithSourceID(httpReq, token, sourceID)
+	proof := oversync.SchemaGenerationProof{}
+	if c != nil {
+		proof = c.schemaGenerationProof
+	}
+	return applyAuthenticatedSyncHeadersWithSourceID(httpReq, token, sourceID, proof)
 }
 
-func applyAuthenticatedSyncHeadersWithSourceID(httpReq *http.Request, token string, sourceID string) error {
+func applyAuthenticatedSyncHeadersWithSourceID(httpReq *http.Request, token string, sourceID string, proof oversync.SchemaGenerationProof) error {
 	if httpReq == nil {
 		return nil
 	}
@@ -330,5 +455,13 @@ func applyAuthenticatedSyncHeadersWithSourceID(httpReq *http.Request, token stri
 	if sourceID != "" {
 		httpReq.Header.Set(oversync.SourceIDHeader, sourceID)
 	}
+	if proof.ID < 1 {
+		return fmt.Errorf("schema generation proof ID is invalid")
+	}
+	if !validSchemaGenerationFingerprint(proof.Fingerprint) {
+		return fmt.Errorf("schema generation proof fingerprint is invalid")
+	}
+	httpReq.Header.Set(oversync.SchemaGenerationIDHeader, strconv.FormatInt(int64(proof.ID), 10))
+	httpReq.Header.Set(oversync.SchemaGenerationFingerprintHeader, proof.Fingerprint)
 	return nil
 }

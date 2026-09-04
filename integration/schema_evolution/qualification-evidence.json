@@ -1,0 +1,13 @@
+{
+  "status": "revision 9 seven review corrections; focused proof complete; full frozen qualification tracked in .artifacts/transition/revision9/validation-ledger.md; independent review and owner acceptance pending",
+  "toolchain": "go1.25.12",
+  "database": "PostgreSQL 16; isolated databases",
+  "executions": [
+    {
+      "lane": "focused-final",
+      "result": "PASS",
+      "log": ".artifacts/transition/revision9/focused-final.log",
+      "log_sha256": "0d5417ca5d0fb625bbcfcb15f06c724259a52c4a5f7d03fb1690a8ed06caa2c5"
+    }
+  ]
+}

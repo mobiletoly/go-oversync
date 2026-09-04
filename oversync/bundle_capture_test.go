@@ -27,13 +27,15 @@ func TestBootstrap_InstallsRegisteredTableCaptureTriggers(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-trigger-bootstrap-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bundle-trigger-bootstrap-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	var captureTriggerCount int
@@ -145,12 +147,13 @@ func TestBootstrap_MarkedLayoutPerformsNoRegisteredTriggerDDL(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "truncate-install-rollback-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "truncate-install-rollback-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	eventTriggerName := "reject_c3_trigger_ddl_" + suffix
@@ -197,16 +200,17 @@ func TestBootstrap_ExistingLayoutPreservesDirectWriteAndTruncateGuards(t *testin
 	schemaName := "fast_attach_guards_" + suffix
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
-	config := &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "fast-attach-guards",
+	config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "fast-attach-guards",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}
 	first := newBootstrappedIntegrationService(t, ctx, pool, config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, first.Close(ctx))
-	service, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+	service, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
 	require.NoError(t, service.Bootstrap(ctx))
@@ -247,7 +251,8 @@ func TestBootstrap_ExistingLayoutPreservesDirectWriteAndTruncateGuards(t *testin
 	_, err = pool.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s CASCADE`, tableIdent))
 	requireRegisteredTruncateError(t, err, schemaName, "users")
 
-	pull, err := service.ProcessPull(ctx, Actor{UserID: scopeID, SourceID: "reader"}, 0, 10, 0)
+	mustInitializeEmptyScope(t, ctx, service, scopeID, "reader")
+	pull, err := service.ProcessPull(ctx, Actor{UserID: scopeID, SourceID: "reader"}, testSchemaGenerationProofForService(service), 0, 10, 0)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), pull.StableBundleSeq)
 	require.Len(t, pull.Bundles, 2)
@@ -329,12 +334,13 @@ func TestRegisteredTableGuard_RejectsDirectAndWithinSyncBundleTruncate(t *testin
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "truncate-guard-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "truncate-guard-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	userID := "truncate-guard-user-" + suffix
 	sourceID := "server-app"
@@ -389,10 +395,9 @@ func TestRegisteredTableGuard_RejectsCascadeAndMultiTableTruncate(t *testing.T) 
 		_, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.unregistered_rows (id UUID PRIMARY KEY)`, schemaIdent))
 		return err
 	}())
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "truncate-cascade-test",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}), AppName: "truncate-cascade-test",
+		RegisteredTables:               []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	userID := "truncate-cascade-user-" + suffix
 	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
@@ -443,10 +448,9 @@ func TestRegisteredTableGuard_RejectsPartitionTruncate(t *testing.T) {
 		return err
 	}())
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
-	_ = newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "truncate-partition-test",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "records", SyncKeyColumns: []string{"id"}}},
+	_ = newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{{Schema: schemaName, Table: "records", SyncKeyColumns: []string{"id"}}}), AppName: "truncate-partition-test",
+		RegisteredTables:               []RegisteredTable{{Schema: schemaName, Table: "records", SyncKeyColumns: []string{"id"}}},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	for _, tableName := range []string{"records", "records_p0", "records_p1"} {
@@ -478,12 +482,13 @@ func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-direct-write-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bundle-direct-write-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "bundle-user-" + suffix
@@ -560,11 +565,10 @@ func TestWithinSyncBundle_RejectsReservedActorAndBundleSource(t *testing.T) {
 	schemaName := "bundle_reserved_" + suffix
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-reserved-test",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
-		ReservedServerSourceIDs:   []string{"server-reserved"},
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}), AppName: "bundle-reserved-test",
+		RegisteredTables:               []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+		ReservedServerSourceIDs:        []string{"server-reserved"},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	callbackCalled := false
@@ -599,12 +603,13 @@ func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-rollback-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bundle-rollback-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "bundle-rollback-user-" + suffix
@@ -657,12 +662,13 @@ func TestWithinSyncBundle_RetriesDatabaseOnlyCallbackAndCommitsExactlyOneTransac
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-single-attempt-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bundle-single-attempt-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "bundle-single-attempt-user-" + suffix
@@ -708,12 +714,13 @@ func TestWithinSyncBundle_RetiredSourceFailsClosed(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-retired-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bundle-retired-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "bundle-retired-user-" + suffix
@@ -721,13 +728,14 @@ func TestWithinSyncBundle_RetiredSourceFailsClosed(t *testing.T) {
 	newSourceID := "server-new"
 	mustInitializeEmptyScope(t, ctx, svc, userID, oldSourceID)
 
-	_, err := svc.CreateSnapshotSessionWithRequest(ctx, Actor{UserID: userID, SourceID: oldSourceID}, &SnapshotSessionCreateRequest{
+	_, err := svc.CreateSnapshotSessionWithRequest(ctx, Actor{UserID: userID, SourceID: oldSourceID}, testSchemaGenerationProofForService(svc), &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      newSourceID,
 			Reason:           "history_pruned",
 		},
 	})
+
 	require.NoError(t, err)
 
 	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: oldSourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
@@ -753,13 +761,15 @@ func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-cascade-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bundle-cascade-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "bundle-cascade-user-" + suffix
@@ -850,13 +860,15 @@ func TestWithinSyncBundle_CapturesCascadeUpdates(t *testing.T) {
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-cascade-update-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "parents", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "children", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bundle-cascade-update-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "parents", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "children", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "bundle-cascade-update-user-" + suffix
@@ -989,13 +1001,15 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 	`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "bundle-trigger-write-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "profiles", SyncKeyColumns: []string{"id"}},
+	}), AppName: "bundle-trigger-write-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "profiles", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "bundle-trigger-write-user-" + suffix
@@ -1053,12 +1067,13 @@ func newBundleOwnerGuardFixture(t *testing.T, schemaPrefix, appName string) *bun
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   appName,
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: appName,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	return &bundleOwnerGuardFixture{

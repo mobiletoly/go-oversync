@@ -114,17 +114,20 @@ func newAuditProfileFixture(t *testing.T, maxConns int32) *auditProfileFixture {
 
 	schemaName = "audit_profile_" + strings.ReplaceAll(time.Now().UTC().Format("150405.000000000"), ".", "")
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
-	svc = newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "oversync-audit-phase6-profile",
+	svc = newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "oversync-audit-phase6-profile",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	userID := "audit-profile-user-" + schemaName
 	writer := Actor{UserID: userID, SourceID: "writer"}
 	mustInitializeEmptyScope(t, ctx, svc, userID, writer.SourceID)
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	mustInitializeEmptyScope(t, ctx, svc, userID, reader.SourceID)
 
 	return &auditProfileFixture{
 		ctx:        ctx,
@@ -133,7 +136,7 @@ func newAuditProfileFixture(t *testing.T, maxConns int32) *auditProfileFixture {
 		tracer:     tracer,
 		schemaName: schemaName,
 		writer:     writer,
-		reader:     Actor{UserID: userID, SourceID: "reader"},
+		reader:     reader,
 	}
 }
 
@@ -341,7 +344,7 @@ func TestAuditProfileMetrics_RepresentativeOperations(t *testing.T) {
 	pullSamples := make([]auditProfileSample, 0, auditProfileMeasuredSamples)
 	for i := 0; i < totalSamples; i++ {
 		sample := measureAuditProfileOperation(t, fixture, func() error {
-			response, err := fixture.svc.ProcessPull(fixture.ctx, fixture.reader, 0, 20, 20)
+			response, err := fixture.svc.ProcessPull(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), 0, 20, 20)
 			if err == nil && len(response.Bundles) != 20 {
 				return fmt.Errorf("pull returned %d bundles, want 20", len(response.Bundles))
 			}
@@ -357,7 +360,7 @@ func TestAuditProfileMetrics_RepresentativeOperations(t *testing.T) {
 	for i := 0; i < totalSamples; i++ {
 		var snapshotID string
 		sample := measureAuditProfileOperation(t, fixture, func() error {
-			snapshot, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+			snapshot, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 			if err == nil {
 				snapshotID = snapshot.SnapshotID
 				if snapshot.RowCount != 200 {
@@ -366,7 +369,7 @@ func TestAuditProfileMetrics_RepresentativeOperations(t *testing.T) {
 			}
 			return err
 		})
-		require.NoError(t, fixture.svc.DeleteSnapshotSession(fixture.ctx, fixture.reader, snapshotID))
+		require.NoError(t, fixture.svc.DeleteSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), snapshotID))
 		if i >= auditProfileWarmupSamples {
 			snapshotSamples = append(snapshotSamples, sample)
 		}
@@ -502,10 +505,11 @@ func auditSeedStatusBundleCardinality(t *testing.T, fixture *auditProfileFixture
 		_, err := tx.Exec(fixture.ctx, `
 			INSERT INTO sync.bundle_log (
 				user_pk, bundle_seq, source_id, source_bundle_id,
-				row_count, byte_count, bundle_hash
+				row_count, byte_count, bundle_hash, canonical_request_hash
 			)
 			SELECT $1, item, 'audit-status-scale', item, 0, 128,
-				decode(md5('audit-status-scale-' || item::text), 'hex')
+				decode(md5('audit-status-scale-' || item::text), 'hex'),
+				'audit-status-scale-' || item::text
 			FROM generate_series($3 + 1, $2) AS item
 		`, userPK, target, current)
 		return err
@@ -593,25 +597,22 @@ func TestAuditProfileMetrics_PoolAndAdvisoryLockWait(t *testing.T) {
 	)
 
 	lock := holdAuditScopeLock(t, fixture.ctx, fixture.pool, fixture.writer.UserID)
+	row := auditBenchmarkRows(fixture.schemaName, 1, 1)[0]
+	hash, err := computeGenerationPinnedPushRequestHash(testSchemaGenerationProofForService(fixture.svc), []PushRequestRow{row})
+	require.NoError(t, err)
+	request := &OneShotPushRequest{SourceBundleID: 1, CanonicalRequestHash: hash, Rows: []PushRequestRow{row}}
 	lockWaitCtx, cancelLockWait := context.WithTimeout(fixture.ctx, 100*time.Millisecond)
 	lockStarted := time.Now()
-	_, err = fixture.svc.CreatePushSession(lockWaitCtx, fixture.writer, &PushSessionCreateRequest{
-		SourceBundleID:       1,
-		PlannedRowCount:      1,
-		CanonicalRequestHash: strings.Repeat("0", 64),
-	})
+	_, err = fixture.svc.PushOneShot(lockWaitCtx, fixture.writer, testSchemaGenerationProofForService(fixture.svc), request)
+
 	lockWait := time.Since(lockStarted)
 	cancelLockWait()
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	lock.release(t, fixture.ctx)
 
-	retry, err := fixture.svc.CreatePushSession(fixture.ctx, fixture.writer, &PushSessionCreateRequest{
-		SourceBundleID:       1,
-		PlannedRowCount:      1,
-		CanonicalRequestHash: strings.Repeat("0", 64),
-	})
+	retry, err := pushRowsOneShot(t, fixture.ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{row})
 	require.NoError(t, err)
-	require.NoError(t, fixture.svc.DeletePushSession(fixture.ctx, fixture.writer, retry.PushID))
+	require.NotNil(t, retry)
 	t.Logf("AUDIT_WAIT kind=advisory_lock duration=%s retry=success", lockWait)
 	requireAuditMetadataIntegrity(t, fixture.ctx, fixture.pool)
 }

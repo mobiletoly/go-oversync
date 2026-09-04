@@ -8,8 +8,8 @@ title: Getting Started
 This guide reflects the current contract implemented in this repository:
 
 - PostgreSQL business tables are authoritative
-- clients push one logical dirty set through staged push sessions
-- clients replay the authoritative committed bundle after push commit
+- clients push one logical dirty set through one bounded `POST /sync/push` request
+- clients apply the authoritative response bundle atomically
 - clients pull complete committed bundles only
 - fresh installs and prune recovery rebuild through snapshot sessions
 
@@ -48,6 +48,11 @@ Registered PostgreSQL tables must satisfy these rules:
   transactions
 - partial, predicate, and expression unique indexes are unsupported on registered tables
 
+Those bullets describe the legacy registered-table envelope. A v1 generation-visible foreign key
+is narrower: `set_null` is allowed only for `OnDelete`, the visible child column must be nullable,
+and PostgreSQL must use `ON DELETE SET NULL (visible_child_column)` so `_sync_scope_id` remains
+unchanged. `OnUpdate: set_null` and generation-visible `set_default` are rejected.
+
 If a table violates these rules, `Bootstrap()` fails with an `UnsupportedSchemaError`.
 Persistence validation runs before Oversync creates or accepts `sync.*`, including when an existing
 layout is already marked ready.
@@ -80,7 +85,7 @@ Recommended pattern:
 CREATE TABLE business.users (
     _sync_scope_id TEXT NOT NULL,
     id UUID NOT NULL,
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
     PRIMARY KEY (_sync_scope_id, id)
 );
 
@@ -118,8 +123,6 @@ The server keeps sync metadata in the `sync` schema. The main runtime tables are
 - `sync.row_state`
 - `sync.bundle_log`
 - `sync.bundle_rows`
-- `sync.push_sessions`
-- `sync.push_session_rows`
 - `sync.snapshot_sessions`
 - `sync.snapshot_session_rows`
 
@@ -151,7 +154,7 @@ CREATE TABLE IF NOT EXISTS business.users (
     id UUID NOT NULL,
     name TEXT NOT NULL,
     email TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TEXT NOT NULL,
     PRIMARY KEY (_sync_scope_id, id),
     UNIQUE (_sync_scope_id, email)
 );
@@ -162,7 +165,7 @@ CREATE TABLE IF NOT EXISTS business.posts (
     author_id UUID NOT NULL,
     title TEXT NOT NULL,
     content TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TEXT NOT NULL,
     PRIMARY KEY (_sync_scope_id, id),
     CONSTRAINT posts_author_id_fkey
         FOREIGN KEY (_sync_scope_id, author_id) REFERENCES business.users(_sync_scope_id, id)
@@ -173,6 +176,7 @@ CREATE TABLE IF NOT EXISTS business.posts (
 
 ## Step 3: Create The Server
 
+{% raw %}
 ```go
 package main
 
@@ -183,10 +187,51 @@ import (
     "log/slog"
     "net/http"
     "os"
+    "strings"
 
     "github.com/jackc/pgx/v5/pgxpool"
     "github.com/mobiletoly/go-oversync/oversync"
 )
+
+var registeredTables = []oversync.RegisteredTable{
+    {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
+    {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
+}
+
+var schemaGenerations = []oversync.SchemaGeneration{{
+    ID: 1,
+    Tables: []oversync.GenerationTable{
+        {
+            Schema: "business",
+            Table:  "users",
+            Columns: []oversync.GenerationColumn{
+                {Name: "created_at", WireType: oversync.GenerationWireTypeText},
+                {Name: "email", WireType: oversync.GenerationWireTypeText},
+                {Name: "id", WireType: oversync.GenerationWireTypeUUID},
+                {Name: "name", WireType: oversync.GenerationWireTypeText},
+            },
+        },
+        {
+            Schema: "business",
+            Table:  "posts",
+            Columns: []oversync.GenerationColumn{
+                {Name: "author_id", WireType: oversync.GenerationWireTypeUUID},
+                {Name: "content", WireType: oversync.GenerationWireTypeText, Nullable: true},
+                {Name: "created_at", WireType: oversync.GenerationWireTypeText},
+                {Name: "id", WireType: oversync.GenerationWireTypeUUID},
+                {Name: "title", WireType: oversync.GenerationWireTypeText},
+            },
+            ForeignKeys: []oversync.GenerationForeignKey{{
+                Columns:           []string{"author_id"},
+                ReferencedSchema:  "business",
+                ReferencedTable:   "users",
+                ReferencedColumns: []string{"id"},
+                OnDelete:          oversync.GenerationForeignKeyCascade,
+                OnUpdate:          oversync.GenerationForeignKeyNoAction,
+            }},
+        },
+    },
+}}
 
 func main() {
     ctx := context.Background()
@@ -199,13 +244,12 @@ func main() {
     defer pool.Close()
 
     cfg := &oversync.ServiceConfig{
-        MaxSupportedSchemaVersion: 1,
-        AppName:                   "my-sync-app",
-        RegisteredTables: []oversync.RegisteredTable{
-            {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
-            {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
-        },
-        BundleChangeWatch: oversync.BundleChangeWatchConfig{Enabled: true},
+        Readiness:                     yourApplicationReadiness, // exact deployment contract and database adapter
+        SchemaGenerations:              schemaGenerations, // one or two complete declarations
+        AppName:                        "my-sync-app",
+        RegisteredTables:               registeredTables,
+        RegisteredTableCatalogRevision: 1,
+        BundleChangeWatch:              oversync.BundleChangeWatchConfig{Enabled: true},
     }
 
     svc, err := oversync.NewRuntimeService(pool, cfg, logger)
@@ -215,6 +259,18 @@ func main() {
     if err := svc.Bootstrap(ctx); err != nil {
         log.Fatal(err)
     }
+
+    registry, err := oversync.CompileSchemaGenerationRegistry(registeredTables, schemaGenerations)
+    if err != nil {
+        log.Fatal(err)
+    }
+    contract, ok := registry.Generation(1)
+    if !ok {
+        log.Fatal("generation 1 was not compiled")
+    }
+    logger.Info("registered schema generation",
+        "generation_id", contract.ID(),
+        "generation_fingerprint", contract.Fingerprint())
     listenerCtx, stopListener := context.WithCancel(ctx)
     defer stopListener()
     go func() {
@@ -231,105 +287,186 @@ func main() {
         },
     })
 
-    withSyncActor := func(next http.Handler) http.Handler {
-        return yourAuthMiddleware(syncActorMiddleware(next))
+    withSyncAdmission := func(next http.Handler) http.Handler {
+        return yourSyncClientPolicy(yourAuthMiddleware(syncActorMiddleware(next)))
     }
 
     mux := http.NewServeMux()
-    mux.Handle("POST /sync/connect", withSyncActor(http.HandlerFunc(handlers.HandleConnect)))
-    mux.Handle("POST /sync/push-sessions", withSyncActor(http.HandlerFunc(handlers.HandleCreatePushSession)))
-    mux.Handle("POST /sync/push-sessions/{push_id}/chunks", withSyncActor(http.HandlerFunc(handlers.HandlePushSessionChunk)))
-    mux.Handle("POST /sync/push-sessions/{push_id}/commit", withSyncActor(http.HandlerFunc(handlers.HandleCommitPushSession)))
-    mux.Handle("DELETE /sync/push-sessions/{push_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeletePushSession)))
-    mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", withSyncActor(http.HandlerFunc(handlers.HandleGetCommittedBundleRows)))
-    mux.Handle("GET /sync/pull", withSyncActor(http.HandlerFunc(handlers.HandlePull)))
-    mux.Handle("GET /sync/watch", withSyncActor(http.HandlerFunc(handlers.HandleWatch)))
-    mux.Handle("POST /sync/snapshot-sessions", withSyncActor(http.HandlerFunc(handlers.HandleCreateSnapshotSession)))
-    mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleGetSnapshotChunk)))
-    mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeleteSnapshotSession)))
-    mux.Handle("GET /sync/capabilities", withSyncActor(http.HandlerFunc(handlers.HandleCapabilities)))
+    // Register raw sync handlers. The outer dispatcher below owns admission so
+    // ServeMux cannot clean malformed discovery paths before authentication.
+    mux.HandleFunc("POST /sync/connect", handlers.HandleConnect)
+    mux.HandleFunc("POST /sync/push", handlers.HandlePush)
+    mux.HandleFunc("GET /sync/pull", handlers.HandlePull)
+    mux.HandleFunc("GET /sync/watch", handlers.HandleWatch)
+    mux.HandleFunc("POST /sync/snapshot-sessions", handlers.HandleCreateSnapshotSession)
+    mux.HandleFunc("GET /sync/snapshot-sessions/{snapshot_id}", handlers.HandleGetSnapshotChunk)
+    mux.HandleFunc("DELETE /sync/snapshot-sessions/{snapshot_id}", handlers.HandleDeleteSnapshotSession)
+    generationDiscovery := http.HandlerFunc(handlers.HandleGeneration)
+    mux.Handle("GET /sync/generations/{generation_id}", generationDiscovery)
+    mux.Handle("GET /sync/generations/", generationDiscovery)
     mux.HandleFunc("GET /syncx/health", handlers.HandleHealth)
     mux.HandleFunc("GET /syncx/status", handlers.HandleStatus)
 
-    log.Fatal(http.ListenAndServe(":8080", mux))
+    isGenerationDiscovery := func(r *http.Request) bool {
+        return r.Method == http.MethodGet &&
+            (r.URL.Path == "/sync/generations" || strings.HasPrefix(r.URL.Path, "/sync/generations/"))
+    }
+    admissionTarget := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if isGenerationDiscovery(r) {
+            generationDiscovery.ServeHTTP(w, r)
+            return
+        }
+        mux.ServeHTTP(w, r)
+    })
+    admittedSync := withSyncAdmission(admissionTarget)
+    operationalSync := svc.ReadinessGuard(admittedSync)
+    rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if isGenerationDiscovery(r) {
+            admittedSync.ServeHTTP(w, r)
+            return
+        }
+        if strings.HasPrefix(r.URL.Path, "/sync/") {
+            operationalSync.ServeHTTP(w, r)
+            return
+        }
+        mux.ServeHTTP(w, r)
+    })
+
+    log.Fatal(http.ListenAndServe(":8080", rootHandler))
 }
 ```
+{% endraw %}
+
+`yourApplicationReadiness` is an application-owned `*oversync.ReadinessConfig` that pins
+the deployed migration manifest, registry and generation enablement. Its adapter reads durable
+application evidence; Bootstrap rejects missing or inconsistent evidence. Prepare that evidence
+through your deployment controller before starting the service. The repository’s
+[shared baseline readiness helper](../internal/baselinereadiness/baseline.go) shows the baseline
+contract. Static applications provide a canonical semantic manifest, so only an intentional manifest
+revision changes their durable deployment identity. The repository's
+[schema-evolution harness](../integration/schema_evolution/README.md) supplies the maintenance,
+SQL conversion, census and certificate implementation for migrations.
 
 `yourAuthMiddleware` must authenticate the request and expose trusted `user_id` in request context.
+`yourSyncClientPolicy` applies deployment client policy and shutdown admission. Generation discovery
+bypasses only operational readiness; canonical and malformed generation paths remain authenticated,
+source-validated, policy-admitted, cancellation-aware, and operation-tracked. The outer dispatcher
+reaches the authenticated handler before `http.ServeMux` can clean repeated slashes or dot segments,
+so all malformed discovery paths receive the canonical HTTP 400 error envelope. Every other `/sync/`
+request, including non-GET discovery requests, uses operational readiness admission.
+For accepted discovery responses, the server derives the canonical `SchemaGenerationProof`; callers do not
+author or override that proof.
 `oversync.ActorMiddleware(...)` reads `Oversync-Source-ID` and combines it with that trusted user
 identity into `oversync.Actor{UserID, SourceID}`. The server derives `_sync_scope_id` from
 `Actor.UserID`, so clients must not send `_sync_scope_id` in push payloads.
 
+`schemaGenerations` is required. The client selects one generation ID and discovers its descriptor
+from the server. Discovery includes authentication and `Oversync-Source-ID`, with neither generation
+proof header. The SDK verifies and retains the descriptor, then includes both
+`Oversync-Schema-Generation-ID` and `Oversync-Schema-Generation-Fingerprint` on all subsequent
+`/sync` operations. `/syncx/health` and `/syncx/status` remain exempt.
+
+The v1 generation contract deliberately excludes PostgreSQL date/time types. Store a timestamp as
+application-chosen canonical text, such as RFC3339 with an explicit zone, and send that exact text
+in `created_at`; the server does not invent a default or normalize it. The declarations above cover
+every generation-visible physical column, including nullable `posts.content`, and match the SQL
+surface exactly.
+
 ## Step 4: Create The SQLite Client
 
 Local SQLite managed tables must declare exactly one visible sync key column, and that column
-must also be the local SQLite `PRIMARY KEY` in the current runtime. Supported local key shapes are
-`TEXT PRIMARY KEY` and UUID-backed `BLOB PRIMARY KEY`.
+must also be the local SQLite `PRIMARY KEY` in the current runtime, with `NOT NULL` declared
+explicitly. Supported local key shapes are `TEXT NOT NULL PRIMARY KEY` and UUID-backed
+`BLOB NOT NULL PRIMARY KEY`.
 
 ```go
 package main
 
 import (
     "context"
-    "database/sql"
     "log"
 
     "github.com/mobiletoly/go-oversync/oversqlite"
-    _ "github.com/mattn/go-sqlite3"
 )
+
+type initialSchemaMigrator struct{}
+
+func (initialSchemaMigrator) InstalledVersion(ctx context.Context, reader oversqlite.LocalMigrationReader) (int64, error) {
+    var version int64
+    err := reader.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version)
+    return version, err
+}
+
+func (initialSchemaMigrator) Migrate(ctx context.Context, tx oversqlite.LocalMigrationTx, _ oversqlite.LocalMigrationStep) error {
+    _, err := tx.ExecContext(ctx, `
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT NOT NULL PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS posts (
+            id TEXT NOT NULL PRIMARY KEY,
+            author_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+        );
+        PRAGMA user_version=1;
+    `)
+    return err
+}
 
 func main() {
     ctx := context.Background()
 
-    db, err := sql.Open("sqlite3", "app.db")
-    if err != nil {
-        log.Fatal(err)
+    cfg := &oversqlite.Config{
+        GenerationID: 1,
+        DatabaseID: "app-db",
+        ServiceID: "my-service",
+        LocalVersion: 1,
+        Tables: []oversqlite.SyncTable{
+            {TableName: "users", SyncKeyColumnName: "id"},
+            {TableName: "posts", SyncKeyColumnName: "id"},
+        },
+        UploadLimit: 1000,
+        DownloadLimit: 1000,
+        BundleChangeWatchMode: oversqlite.BundleChangeWatchAuto,
     }
-    defer db.Close()
-
-    _, err = db.Exec(`
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS posts (
-            id TEXT PRIMARY KEY,
-            author_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            content TEXT,
-            FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-    `)
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    cfg := oversqlite.DefaultConfig("business", []oversqlite.SyncTable{
-        {TableName: "users", SyncKeyColumnName: "id"},
-        {TableName: "posts", SyncKeyColumnName: "id"},
-    })
-    cfg.BundleChangeWatchMode = oversqlite.BundleChangeWatchAuto
 
     tokenProvider := func(ctx context.Context) (string, error) {
         return "<jwt>", nil
     }
 
-    client, err := oversqlite.NewClient(
-        db,
-        "http://localhost:8080",
-        tokenProvider,
-        cfg,
-    )
+    opening, err := oversqlite.NewOpening(&oversqlite.OpeningConfig{
+        DatabasePath: "app.db",
+        Plan: &oversqlite.UpgradePlan{
+            PlanID: "fresh-v1", Mode: oversqlite.UpgradeModeFresh,
+            DatabaseID: "app-db", ServiceID: "my-service",
+            TargetGenerationID: 1, TargetVersion: 1,
+            Migrator: initialSchemaMigrator{},
+        },
+        BaseURL: "http://localhost:8080", Token: tokenProvider,
+        TargetClientConfig: cfg,
+    })
     if err != nil {
         log.Fatal(err)
     }
-    defer client.Close()
+    defer opening.Close()
 
-    if err := client.Open(ctx); err != nil {
+    opened, err := opening.Advance(ctx)
+    if err != nil {
         log.Fatal(err)
     }
+    client := opened.Ready
+    if client == nil {
+        log.Fatalf("database is not ready: %s", opened.Status.Outcome)
+    }
+    defer client.Close()
+    db := client.Database()
+    _ = db // borrowed for application SQL after ready
 
     connectResult, err := client.Attach(ctx, "user-123")
     if err != nil {
@@ -391,18 +528,18 @@ Behavior to expect:
 - `Attach()` resolves first-account lifecycle through `POST /sync/connect`.
 - `Open()`, `PushPending()`, `PullToStable()`, `Sync()`, `Detach()`, and `Rebuild()` return
   structured results in addition to `error`.
-- `PushPending()` freezes one outbound snapshot, uploads it through push sessions, fetches the
-  committed authoritative rows, and replays them locally.
-- if a push transaction returns `503 commit_outcome_unknown`, `PushPending()` retries from session
-  creation with the frozen source bundle ID and canonical request hash; an already-committed replay
-  converges without uploading the rows again
+- `PushPending()` freezes one outbound snapshot, sends it once to `/sync/push`, and applies the
+  authoritative response locally.
+- after an ambiguous push reply, `PushPending()` replays the exact same complete request with its
+  frozen source bundle ID and canonical request hash; an already-committed replay converges without
+  recollecting or changing rows.
 - `Attach()` may return `retry_later` as a normal retriable lifecycle outcome before the client
   becomes attached.
 - `PullToStable()` drains complete bundles until the frozen `stable_bundle_seq` is reached.
 - `PullToStable()` rebuilds automatically through snapshot sessions if the server returns
   `history_pruned`.
-- committed-push replay that falls below the retained floor rebuilds from a snapshot while keeping
-  the current source and acknowledging the already committed source tuple locally.
+- an ambiguous push replay that falls below the retained floor rebuilds from a snapshot while
+  preserving the frozen source tuple until recovery establishes its outcome.
 - `Rebuild(ctx)` rebuilds through chunked snapshot sessions.
 - if stale/pruned, out-of-order, changed, or retired source recovery is active, `Rebuild(ctx)`
   internally chooses the rebuild-plus-rotate path and preserves frozen local intent.
@@ -411,6 +548,13 @@ Behavior to expect:
 - local writes made after `Detach()` are captured immediately as anonymous pending rows and can be synced after a later `Attach()`.
 - Go intentionally does not expose reactive progress streams; inspect result structs for final
   lifecycle and sync outcomes instead.
+
+Each data-plane path uses the client's fixed generation proof. The server retains one canonical
+effect history and projects it to that proof for push replay, pull, conflicts, and snapshots.
+Projected empty pull envelopes still advance the checkpoint. Trigger-normalized results are
+accepted, while a push whose uploaded key is suppressed or otherwise uncovered fails atomically
+with `push_effect_coverage_incomplete`. This setup does not switch generations or perform local DDL;
+those remain upgrade responsibilities.
 
 ## Important Client Rules
 
@@ -428,16 +572,12 @@ Behavior to expect:
 The server exposes:
 
 - `POST /sync/connect`
-- `POST /sync/push-sessions`
-- `POST /sync/push-sessions/{push_id}/chunks`
-- `POST /sync/push-sessions/{push_id}/commit`
-- `DELETE /sync/push-sessions/{push_id}`
-- `GET /sync/committed-bundles/{bundle_seq}/rows`
+- `POST /sync/push`
 - `GET /sync/pull`
 - `POST /sync/snapshot-sessions`
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
-- `GET /sync/capabilities`
+- `GET /sync/generations/{generation_id}`
 - `GET /syncx/health`
 - `GET /syncx/status`
 
@@ -478,6 +618,6 @@ Lifecycle-specific sync failures to expect on the HTTP surface:
 
 ## Next Steps
 
-- Run the reference server in `examples/nethttp_server/`.
-- Run the simulator in `examples/mobile_flow/`.
+- Run the maintained sample server in `examples/samplesync_server/`.
+- Use `integration/` only when developing or qualifying this repository.
 - Inspect the API contract in `docs/documentation/api.md`.

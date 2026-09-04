@@ -6,132 +6,110 @@ permalink: /documentation/client/
 
 # Client
 
-`oversqlite` is the SQLite client SDK for the current bundle-based contract.
+`oversqlite` is the SQLite client SDK for the bundle-based sync contract. Applications open a
+database through `NewOpening`. The opening owns the file and its SQLite pool while it creates,
+upgrades, or resumes the database. Application SQL access is published only when
+`OpeningResult.Ready` is non-nil and the durable phase is `ready`.
 
-`NewClient(...)` installs the runtime and metadata tables, but it does not attach a user. The
-startup flow is:
+The startup flow is:
 
-1. `Open(ctx)`
-2. `Attach(ctx, userID)` after sign-in
-3. normal sync operations
+1. Build the desired target `Config`.
+2. Call `NewOpening` with the database path and, when work is pending, the exact `UpgradePlan`.
+3. Call `Advance` until it returns a ready client or an actionable status.
+4. Call `Attach(ctx, userID)` after sign-in, then use the normal sync operations.
 
-`oversqlite` manages source identity internally. Host application code does not provide source ids
-to `Open()`, does not rotate them manually, and does not provide replacement source ids to
-`Rebuild()`.
+An exact already-ready target can be reopened without its historical plan. Fresh databases,
+pending work, and target changes require the exact plan. Fresh and local-only migration can run
+offline. Generation changes use authenticated descriptor discovery and the retained U0-U8 recovery
+state machine.
 
-Authenticated sync requests still carry the runtime's current source through
-`Oversync-Source-ID`. Auth remains separately host-owned.
+```go
+opening, err := oversqlite.NewOpening(&oversqlite.OpeningConfig{
+    DatabasePath:       "app.db",
+    Plan:               plan, // nil only for an exact already-ready target
+    BaseURL:            "https://sync.example.com",
+    Token:              tokenProvider,
+    TargetClientConfig: targetConfig,
+})
+if err != nil {
+    return err
+}
+defer opening.Close()
 
-## SQLite State
+result, err := opening.Advance(ctx)
+if err != nil {
+    // result.Status.Outcome identifies the stable failure class.
+    return err
+}
+if result.Ready == nil {
+    return fmt.Errorf("database is not ready: %s", result.Status.Outcome)
+}
 
-- `_sync_dirty_rows`: one coalesced local dirty row per structured key
-- `_sync_snapshot_stage`: rows staged during rebuild
-- `_sync_outbox_bundle`: singleton frozen push snapshot state
-- `_sync_outbox_rows`: rows belonging to that frozen snapshot
-- `_sync_push_stage`: authoritative committed rows staged before final replay
-- `_sync_row_state`: authoritative replicated row state for managed tables
-- `_sync_managed_tables`: registry of managed tables whose triggers were installed by `oversqlite`
-- `_sync_source_state`: per-source sequencing state and replacement lineage
-- `_sync_attachment_state`: current source, binding state, bundle checkpoint, and rebuild gate
-- `_sync_operation_state`: lifecycle and source-recovery state
-- `_sync_apply_state`: trigger suppression state during authoritative local apply
+client := result.Ready
+defer client.Close()
+db := client.Database()
+```
 
-## Public Operations
+`Database()` returns a borrowed pool. Stop application queries and release rows, transactions, and
+statements before `Client.Close` or successful `UninstallSync`. Those terminal operations stop and
+join package-owned background loops, close the pool, and release file ownership. A successful
+uninstall preserves business tables but intentionally prevents same-file fresh reinstall; adopting
+that file requires a separately designed provenance path.
 
-- `Open(ctx) error`
-- `Attach(ctx, userID) (AttachResult, error)`
-- `Detach(ctx) (DetachResult, error)`
-- `PendingSyncStatus(ctx) (PendingSyncStatus, error)`
-- `SyncStatus(ctx) (SyncStatus, error)`
-- `SyncThenDetach(ctx) (SyncThenDetachResult, error)`
-- `UninstallSync(ctx) error`
-- `PushPending(ctx) (PushReport, error)`
-- `PullToStable(ctx) (RemoteSyncReport, error)`
-- `Sync(ctx) (SyncReport, error)`
-- `Rebuild(ctx) (RemoteSyncReport, error)`
-- `LastBundleSeqSeen(ctx) (int64, error)`
-- `SourceInfo(ctx) (SourceInfo, error)`
+`oversqlite` manages source identity internally. Host code does not provide, persist, or rotate
+source IDs. Auth remains host-owned.
 
-## Optional Watch Wakeups
+## Configuration
 
-`Config.BundleChangeWatchMode` defaults to `BundleChangeWatchOff`. Set it to
-`BundleChangeWatchAuto` to let `Start(ctx)` use `GET /sync/watch` only when the server advertises
-`bundle_change_watch=true`.
+Configure `GenerationID`, the complete managed table/key list, and stable `DatabaseID`, `ServiceID`,
+and `LocalVersion` values. `DefaultConfig(generationID, tables)` supplies transport defaults.
+`NewOpening` deep-copies the plan and target configuration.
 
-Watch mode is a latency optimization. Events never mutate SQLite directly; the client wakes its
-existing pull/sync behavior, so dirty-row checks, outbox replay, source recovery, snapshot recovery,
-and download pause rules still apply. `WatchFallbackInterval` controls low-frequency fallback
-polling while a watch stream is active; `0` means `BackoffMax`, or `60s` when `BackoffMax` is unset.
+The SDK derives the initial local physical declaration from SQLite metadata. During attachment it
+discovers the selected server generation, recomputes its fingerprint, validates local storage, and
+retains the admitted descriptor. Later exact ready reopens are offline. A changed identity or shape
+requires a supported plan; it is never selected silently.
 
-## Preconditions
+## Public lifecycle
 
-Require no prior lifecycle step:
+Before ready, `Opening` exposes only control-plane methods:
 
-- `Open(ctx)`
+- `Advance(ctx) (OpeningResult, error)`
+- `Status(ctx) (OpeningStatus, error)`
+- `ResolvePendingIntent(ctx, resolution) (OpeningResult, error)`
+- `Close() error`
 
-Require successful `Open(ctx)`:
+All non-ready results have `Ready == nil`. Progress callbacks occur only at non-ready durable
+boundaries. They may call `Status` or `Close`; there is no final ready progress callback.
 
-- `Attach(ctx, userID)`
-- `PendingSyncStatus(ctx)`
-- `SourceInfo(ctx)`
-- `UninstallSync(ctx)`
+A ready `Client` provides:
 
-Require successful `Open(ctx)` plus durable attached local state:
+- `Database() *sql.DB`
+- `Attach`, `Detach`, `PendingSyncStatus`, and `SyncThenDetach`
+- `PushPending`, `PullToStable`, `Sync`, and `Rebuild`
+- `Start` and `Stop` for one client-owned uploader/downloader pair
+- `SyncStatus`, `SourceInfo`, and `ApplicationActionRequired`
+- `UninstallSync` and `Close`
 
-- `Detach(ctx)`
+`Attach` discovers and confirms the selected generation before connected sync. Before attachment,
+local writes remain pending and `SyncStatus.ContractConfirmed` is false. Watch mode is optional:
+set `Config.BundleChangeWatchMode` to `BundleChangeWatchAuto`; watch events only wake normal sync
+logic and never mutate SQLite directly.
 
-Require successful `Open(ctx)` plus successful `Attach(ctx, userID)`:
+## Durable state and recovery
 
-- `PushPending(ctx)`
-- `PullToStable(ctx)`
-- `Sync(ctx)`
-- `Rebuild(ctx)`
-- `SyncStatus(ctx)`
-- `LastBundleSeqSeen(ctx)`
-- `SyncThenDetach(ctx)`
+The client persists admitted contracts, dirty rows, frozen outboxes, authoritative replay rows,
+snapshot staging, row state, source lineage, attachment state, lifecycle operations, and apply mode
+in `_sync_*` tables. These tables are package-owned.
 
-## Recovery
+The client retains the exact frozen whole-request tuple until its authoritative response is applied.
+If an ambiguous replay is later pruned, only a complete same-generation snapshot can settle it after
+all source, proof, checkpoint, newer-intent, and transaction guards pass. Source recovery is explicit:
+`PushPending`, `PullToStable`, and `Sync` fail closed while recovery is required, and `Rebuild`
+performs the supported repair while preserving frozen intent.
 
-- `PullToStable()` may rebuild from snapshots while keeping the current source when incremental
-  history is below the retained floor
-- committed-remote replay pruned below the retained floor uses keep-source rebuild behavior,
-  advances local source sequencing past the already committed tuple, and clears committed-remote
-  outbox state only after recovery succeeds
-- stale/pruned, out-of-order, changed, or retired source upload cases enter durable
-  source-recovery-required mode
-- `PushPending()`, `PullToStable()`, and `Sync()` fail closed while source recovery is active
-- `Rebuild(ctx)` is the explicit recovery entry point
-- when source recovery is active, `Rebuild(ctx)` internally chooses rebuild-plus-rotate and
-  preserves frozen outbox intent across that recovery
+`SourceInfo` is diagnostic only. Its source ID is opaque and must not be persisted as an application
+identity.
 
-Source recovery can be entered for:
-
-- `history_pruned`
-- `source_sequence_out_of_order`
-- `source_sequence_changed`
-- `source_retired`
-
-Host code should treat `SourceRecoveryRequiredError` as a durable recovery gate: surface that sync
-requires rebuild, call `Rebuild(ctx)` while authenticated, and let `oversqlite` manage the
-replacement source identity internally.
-
-## Diagnostic Surface
-
-`SourceInfo(ctx)` is debug-only. It exposes:
-
-- `CurrentSourceID`
-- `RebuildRequired`
-- `SourceRecoveryRequired`
-- `SourceRecoveryReason`
-
-`CurrentSourceID` is opaque. Callers must not persist it externally or treat its format as part of
-the host API contract.
-
-## Typed Preconditions And Results
-
-- `OpenRequiredError`
-- `AttachRequiredError`
-- `DestructiveTransitionInProgressError`
-
-Normal lifecycle and sync branches such as retry-later attach, blocked detach, paused push/pull,
-and already-at-target pull are reported as structured result values with `error == nil`.
+See [Go SQLite client upgrades](/client-upgrades/) for plan, migration, resolution, and restart
+behavior.

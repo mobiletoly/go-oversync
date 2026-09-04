@@ -1,0 +1,23 @@
+{
+  "format": "maintenance-conflicts-v2",
+  "revision": 6,
+  "authority": [
+    "baseline contract transition revision-5 amendment",
+    "transition revision 5",
+    "transition revision-9 contract corrections",
+    "baseline contract transition revision-10 final contract corrections",
+    "accepted discovery redesign v1 development cut; typed local capture, unchanged frozen requests and effects"
+  ],
+  "runtime_status": {
+    "Go": "qualification pending",
+    "KMP": "pending_non_go",
+    "Dart/Flutter": "pending_non_go",
+    "Swift": "pending_non_go"
+  },
+  "artifacts": {
+    "runtime-upgrade.json": "d284ed812f146ccfa8127a6e90ed42883af145da9b71601e1664bed186283864",
+    "README.md": "4bc50396e50015103e72d6ac6c856603e367c1f3ed67be8966d11c9f703f8bf3",
+    "cases.json": "3b8c69a5de3255cee1ba34110a7ab06a6bd5e8dfa23f47705e33fcb73b953e74",
+    "scenarios.json": "a0796470388aea99442c4f84a9107c4c25f9229e67c4a03ca6ab3da3719b7574"
+  }
+}

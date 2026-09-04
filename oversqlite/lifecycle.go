@@ -2,12 +2,12 @@ package oversqlite
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mobiletoly/go-oversync/internal/sessionid"
@@ -49,7 +49,7 @@ type PendingSyncStatus struct {
 }
 
 // Open restores local lifecycle state and bootstraps internal source identity if needed.
-func (c *Client) Open(ctx context.Context) error {
+func (c *Client) open(ctx context.Context) error {
 	if err := c.tryBeginSyncOperation(); err != nil {
 		return err
 	}
@@ -60,6 +60,11 @@ func (c *Client) Open(ctx context.Context) error {
 	if err != nil && !errors.As(err, &pendingRemoteReplaceErr) {
 		return err
 	}
+	c.applyOpenedLifecycleState(state)
+	return nil
+}
+
+func (c *Client) applyOpenedLifecycleState(state *lifecycleState) {
 	c.sourceID = state.SourceID
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) != "" {
 		c.UserID = state.BindingScope
@@ -68,7 +73,6 @@ func (c *Client) Open(ctx context.Context) error {
 	}
 	c.pendingInitializationID = state.PendingInitializationID
 	c.sessionConnected = false
-	return nil
 }
 
 // Attach resolves account attachment through the server connect lifecycle.
@@ -98,8 +102,14 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 		return AttachResult{}, err
 	}
 	c.sourceID = state.SourceID
-	if err := c.verifyConnectLifecycleSupported(ctx); err != nil {
+	confirmed, err := c.ensureAdmittedContract(ctx)
+	if err != nil {
 		return AttachResult{}, err
+	}
+	if !confirmed {
+		if err := c.verifyConnectLifecycleSupported(ctx); err != nil {
+			return AttachResult{}, err
+		}
 	}
 
 	if state.PendingTransitionKind == lifecycleTransitionRemote {
@@ -171,6 +181,9 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.sourceID); err != nil {
 			return AttachResult{}, err
 		}
+		if err := c.discardFrozenOutboxForInitializeEmpty(ctx); err != nil {
+			return AttachResult{}, err
+		}
 		c.pendingInitializationID = ""
 		if err := c.persistConnectedLifecycleState(ctx, userID, ""); err != nil {
 			return AttachResult{}, err
@@ -235,6 +248,25 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 	}
 }
 
+// discardFrozenOutboxForInitializeEmpty removes only the immutable request
+// snapshot created for an expired initialization lease. Dirty rows remain so
+// the next direct push can freeze a new request under the fresh lifecycle
+// admission state.
+func (c *Client) discardFrozenOutboxForInitializeEmpty(ctx context.Context) error {
+	tx, err := beginImmediateTx(ctx, c.db)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_outbox_rows`); err != nil {
+		return fmt.Errorf("discard expired initialization outbox rows: %w", err)
+	}
+	if err := clearOutboxBundle(ctx, tx); err != nil {
+		return fmt.Errorf("discard expired initialization outbox bundle: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
 func (c *Client) clearStalePendingInitializationStateLocked(ctx context.Context) error {
 	state, err := c.loadLifecycleState(ctx)
 	if err != nil {
@@ -266,8 +298,22 @@ func (c *Client) Detach(ctx context.Context) (DetachResult, error) {
 	return c.detachLocked(ctx)
 }
 
-func (c *Client) detachLocked(ctx context.Context) (DetachResult, error) {
-	status, err := c.pendingSyncStatusLocked(ctx)
+func (c *Client) detachLocked(ctx context.Context) (result DetachResult, resultErr error) {
+	before, err := c.pendingSyncStatus(ctx, c.db)
+	if err != nil {
+		return DetachResult{}, err
+	}
+	if !before.BlocksDetach {
+		if err = c.clearPushPlanForLifecycle(ctx, false); err != nil {
+			return DetachResult{}, c.withSyncErrorProgress(ctx, err)
+		}
+	}
+	tx, err := beginImmediateTx(ctx, c.db)
+	if err != nil {
+		return DetachResult{}, fmt.Errorf("failed to begin detach transaction: %w", err)
+	}
+	defer tx.rollbackOnReturn(&resultErr, "detach")
+	status, err := c.pendingSyncStatus(ctx, tx)
 	if err != nil {
 		return DetachResult{}, err
 	}
@@ -277,11 +323,6 @@ func (c *Client) detachLocked(ctx context.Context) (DetachResult, error) {
 			PendingRowCount: status.PendingRowCount,
 		}, nil
 	}
-	tx, err := c.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return DetachResult{}, fmt.Errorf("failed to begin detach transaction: %w", err)
-	}
-	defer tx.Rollback()
 
 	if err := c.clearFullLocalSyncStateInTx(ctx, tx); err != nil {
 		return DetachResult{}, err
@@ -293,13 +334,21 @@ func (c *Client) detachLocked(ctx context.Context) (DetachResult, error) {
 	attachment.BindingState = attachmentBindingAnonymous
 	attachment.AttachedUserID = ""
 	attachment.PendingInitializationID = ""
-	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
+	if err := persistAttachmentState(ctx, tx, attachment, true); err != nil {
 		return DetachResult{}, err
 	}
 	if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
 		return DetachResult{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if identity, identityErr := loadUpgradeIdentity(ctx, tx); identityErr != nil {
+		return DetachResult{}, identityErr
+	} else if identity != nil {
+		identity.UserID = ""
+		if err := persistUpgradeIdentity(ctx, tx, *identity); err != nil {
+			return DetachResult{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return DetachResult{}, fmt.Errorf("failed to commit detach transaction: %w", err)
 	}
 	c.pendingInitializationID = ""
@@ -317,60 +366,67 @@ func (c *Client) SyncThenDetach(ctx context.Context) (SyncThenDetachResult, erro
 	if err := c.ensureConnectedSessionLocked(ctx, "SyncThenDetach()"); err != nil {
 		return SyncThenDetachResult{}, err
 	}
-	if err := c.validateProtocolGateLocked(ctx, "sync_then_detach_capabilities"); err != nil {
+	if err := c.validateProtocolGateLocked(ctx, "sync_then_detach_discovery"); err != nil {
 		return SyncThenDetachResult{}, err
 	}
 
-	const maxAttempts = 3
-	var (
-		previousPending int64 = 1<<63 - 1
-		lastSync        SyncReport
-	)
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		syncReport, err := c.syncLocked(ctx)
+	ctx = context.WithValue(ctx, syncInvocationKey{}, &syncInvocation{})
+	var lastSync *SyncReport
+	blocked := func(round int, reason DetachBlockedReason) (SyncThenDetachResult, error) {
+		pending, err := c.pendingSyncStatusLocked(ctx)
 		if err != nil {
 			return SyncThenDetachResult{}, err
 		}
-		lastSync = syncReport
+		return SyncThenDetachResult{
+			LastSync:   lastSync,
+			Detach:     DetachResult{Outcome: DetachOutcomeBlockedUnsyncedData, PendingRowCount: pending.PendingRowCount},
+			SyncRounds: round, RemainingPendingRowCount: pending.PendingRowCount, BlockedReason: reason,
+		}, nil
+	}
+	for round := 1; round <= 3; round++ {
+		if err := ctx.Err(); err != nil {
+			return SyncThenDetachResult{}, err
+		}
+		before, err := c.pendingWorkIdentity(ctx)
+		if err != nil {
+			return SyncThenDetachResult{}, err
+		}
+		syncReport, err := c.syncLocked(ctx)
+		if err != nil {
+			var incomplete *SyncIncompleteError
+			if errors.As(err, &incomplete) {
+				return blocked(round, DetachBlockedReason(incomplete.Reason))
+			}
+			return SyncThenDetachResult{}, err
+		}
+		if syncReport.RemoteOutcome == RemoteSyncOutcomeSkippedPaused {
+			return blocked(round, DetachBlockedDownloadsPaused)
+		}
+		lastSync = &syncReport
+		if err := ctx.Err(); err != nil {
+			return SyncThenDetachResult{}, err
+		}
 		detachResult, err := c.detachLocked(ctx)
 		if err != nil {
 			return SyncThenDetachResult{}, err
 		}
 		if detachResult.Outcome == DetachOutcomeDetached {
 			return SyncThenDetachResult{
-				LastSync:                 syncReport,
+				LastSync:                 lastSync,
 				Detach:                   detachResult,
-				SyncRounds:               attempt + 1,
+				SyncRounds:               round,
 				RemainingPendingRowCount: 0,
 			}, nil
 		}
-		pending, err := c.pendingSyncStatusLocked(ctx)
+		after, err := c.pendingWorkIdentity(ctx)
 		if err != nil {
 			return SyncThenDetachResult{}, err
 		}
-		if pending.PendingRowCount >= previousPending {
-			return SyncThenDetachResult{
-				LastSync:                 syncReport,
-				Detach:                   detachResult,
-				SyncRounds:               attempt + 1,
-				RemainingPendingRowCount: pending.PendingRowCount,
-			}, nil
+		if before == after {
+			return blocked(round, DetachBlockedNoProgress)
 		}
-		previousPending = pending.PendingRowCount
 	}
-	pending, err := c.pendingSyncStatusLocked(ctx)
-	if err != nil {
-		return SyncThenDetachResult{}, err
-	}
-	return SyncThenDetachResult{
-		LastSync: lastSync,
-		Detach: DetachResult{
-			Outcome:         DetachOutcomeBlockedUnsyncedData,
-			PendingRowCount: pending.PendingRowCount,
-		},
-		SyncRounds:               maxAttempts,
-		RemainingPendingRowCount: pending.PendingRowCount,
-	}, nil
+	return blocked(3, DetachBlockedSyncRoundLimit)
 }
 
 // PendingSyncStatus reports pending local sync state and whether it blocks Detach.
@@ -395,11 +451,11 @@ func (c *Client) SourceInfo(ctx context.Context) (SourceInfo, error) {
 	if err := validateSourceID(c.sourceID); err != nil {
 		return SourceInfo{}, err
 	}
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return SourceInfo{}, err
 	}
-	operation, err := loadOperationState(ctx, c.DB)
+	operation, err := loadOperationState(ctx, c.db)
 	if err != nil {
 		return SourceInfo{}, err
 	}
@@ -416,27 +472,31 @@ func (c *Client) SourceInfo(ctx context.Context) (SourceInfo, error) {
 }
 
 func (c *Client) pendingSyncStatusLocked(ctx context.Context) (PendingSyncStatus, error) {
-	dirtyCount, err := c.pendingChangeCount(ctx)
-	if err != nil {
+	return c.pendingSyncStatus(ctx, c.db)
+}
+
+func (c *Client) pendingSyncStatus(ctx context.Context, q sqliteTransaction) (PendingSyncStatus, error) {
+	var total int64
+	if err := q.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM _sync_dirty_rows)+(SELECT count(*) FROM _sync_outbox_rows)`).Scan(&total); err != nil {
 		return PendingSyncStatus{}, err
 	}
-	outboundCount, err := c.pendingPushOutboundCount(ctx)
-	if err != nil {
-		return PendingSyncStatus{}, err
-	}
-	total := dirtyCount + outboundCount
-	state, err := c.loadLifecycleState(ctx)
+	state, err := loadAttachmentState(ctx, q)
 	if err != nil {
 		return PendingSyncStatus{}, err
 	}
 	if state.PendingInitializationID != "" {
 		total++
 	}
-	return PendingSyncStatus{
-		HasPendingSyncData: total > 0,
-		PendingRowCount:    int64(total),
-		BlocksDetach:       state.BindingState == lifecycleBindingAttached && total > 0,
-	}, nil
+	if state.BindingState == attachmentBindingAttached && total == 0 {
+		table, err := unresolvedWorkTable(ctx, q)
+		if err != nil {
+			return PendingSyncStatus{}, err
+		}
+		if table != "" {
+			total++
+		}
+	}
+	return PendingSyncStatus{HasPendingSyncData: total > 0, PendingRowCount: total, BlocksDetach: state.BindingState == attachmentBindingAttached && total > 0}, nil
 }
 
 // SyncStatus reports authority state, pending state, and the last durable bundle checkpoint for the currently connected scope.
@@ -449,17 +509,38 @@ func (c *Client) SyncStatus(ctx context.Context) (SyncStatus, error) {
 }
 
 // UninstallSync removes oversqlite-owned metadata tables and managed-table triggers from the database.
-func (c *Client) UninstallSync(ctx context.Context) error {
+func (c *Client) UninstallSync(ctx context.Context) (resultErr error) {
+	if c == nil || atomic.LoadUint32(&c.closed) == 1 {
+		return &ClientClosedError{}
+	}
+	if !atomic.CompareAndSwapUint32(&c.loopState, clientLoopStateLive, clientLoopStateUninstalling) {
+		if atomic.LoadUint32(&c.loopState) == clientLoopStateTerminal {
+			return &ClientClosedError{}
+		}
+		return fmt.Errorf("oversqlite sync uninstall is already in progress")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			atomic.CompareAndSwapUint32(&c.loopState, clientLoopStateUninstalling, clientLoopStateLive)
+		}
+	}()
+	if err := c.Stop(ctx); err != nil {
+		return err
+	}
 	if err := c.tryBeginSyncOperation(); err != nil {
 		return err
 	}
 	defer c.writeMu.Unlock()
 
-	tx, err := c.DB.BeginTx(ctx, nil)
+	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
 		return fmt.Errorf("failed to begin uninstall transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.rollbackOnReturn(&resultErr, "uninstall")
+	if err := c.requireNoUnresolvedWork(ctx, tx); err != nil {
+		return err
+	}
 
 	managedTables, err := c.loadManagedSyncTablesForUninstall(ctx, tx)
 	if err != nil {
@@ -475,7 +556,7 @@ func (c *Client) UninstallSync(ctx context.Context) error {
 			return fmt.Errorf("failed to drop sync metadata table %s: %w", tableName, err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("failed to commit uninstall transaction: %w", err)
 	}
 
@@ -483,8 +564,16 @@ func (c *Client) UninstallSync(ctx context.Context) error {
 	c.UserID = ""
 	c.pendingInitializationID = ""
 	c.sessionConnected = false
-	c.markClosedAndReleaseOwnershipLocked()
-	return nil
+	atomic.StoreUint32(&c.closed, 1)
+	atomic.StoreUint32(&c.loopState, clientLoopStateTerminal)
+	committed = true
+	if !c.ownsDB {
+		return nil
+	}
+	closeErr := c.db.Close()
+	releaseClientDBOwnership(c.dbOwnershipKey)
+	c.dbOwnershipKey = ""
+	return closeErr
 }
 
 func (c *Client) loadManagedSyncTablesForUninstall(ctx context.Context, tx sqliteTransaction) ([]string, error) {
@@ -548,7 +637,7 @@ func sqliteTableExists(ctx context.Context, tx queryRower, tableName string) (bo
 	return count > 0, nil
 }
 
-func dropManagedTriggersForTableInTx(ctx context.Context, tx *sql.Tx, tableName string) error {
+func dropManagedTriggersForTableInTx(ctx context.Context, tx sqliteTransaction, tableName string) error {
 	tableName = strings.ToLower(strings.TrimSpace(tableName))
 	if tableName == "" {
 		return nil
@@ -590,6 +679,9 @@ func (c *Client) connectRequest(ctx context.Context, userID, sourceID string, ha
 	if statusCode != http.StatusOK {
 		return nil, fmt.Errorf("server returned status %d: %s", statusCode, decodeServerErrorBody(body))
 	}
+	if _, err := requireJSONObjectFieldsWithOptional(body, "connect", []string{"resolution"}, []string{"initialization_id", "lease_expires_at", "retry_after_seconds"}); err != nil {
+		return nil, err
+	}
 
 	var connectResp oversync.ConnectResponse
 	if err := json.Unmarshal(body, &connectResp); err != nil {
@@ -605,20 +697,40 @@ func validateConnectResponse(resp *oversync.ConnectResponse) error {
 	if resp == nil {
 		return fmt.Errorf("connect response is invalid")
 	}
-	if resp.Resolution == "initialize_local" {
+	switch resp.Resolution {
+	case "initialize_local":
 		if err := sessionid.Validate(resp.InitializationID); err != nil {
 			return fmt.Errorf("connect response initialization_id is invalid")
 		}
+		if _, err := time.Parse(time.RFC3339Nano, resp.LeaseExpiresAt); err != nil || resp.RetryAfterSec != 0 {
+			return fmt.Errorf("connect response initialization lease is invalid")
+		}
 		return nil
+	case "retry_later":
+		if resp.InitializationID != "" || resp.RetryAfterSec < 1 {
+			return fmt.Errorf("connect response retry state is invalid")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, resp.LeaseExpiresAt); err != nil {
+			return fmt.Errorf("connect response retry lease is invalid")
+		}
+		return nil
+	case "remote_authoritative", "initialize_empty":
+		if resp.InitializationID != "" || resp.LeaseExpiresAt != "" || resp.RetryAfterSec != 0 {
+			return fmt.Errorf("connect response contains fields invalid for %s", resp.Resolution)
+		}
+		return nil
+	default:
+		return fmt.Errorf("connect response resolution is invalid")
 	}
-	if resp.InitializationID != "" {
-		return fmt.Errorf("connect response initialization_id is invalid")
-	}
-	return nil
 }
 
 func (c *Client) persistConnectedLifecycleState(ctx context.Context, userID, initializationID string) error {
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	attachment, err := loadAttachmentState(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -627,19 +739,33 @@ func (c *Client) persistConnectedLifecycleState(ctx context.Context, userID, ini
 	attachment.AttachedUserID = userID
 	attachment.PendingInitializationID = initializationID
 	if strings.TrimSpace(attachment.SchemaName) == "" {
-		attachment.SchemaName = c.config.Schema
+		attachment.SchemaName = c.config.schema
 	}
-	if err := ensureSourceState(ctx, c.DB, c.sourceID); err != nil {
+	if err := ensureSourceState(ctx, tx, c.sourceID); err != nil {
 		return err
 	}
-	if err := persistAttachmentState(ctx, c.DB, attachment); err != nil {
+	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
 		return err
 	}
-	return persistOperationState(ctx, c.DB, &operationStateRecord{Kind: operationKindNone})
+	if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
+		return err
+	}
+	if identity, identityErr := loadUpgradeIdentity(ctx, tx); identityErr != nil {
+		return identityErr
+	} else if identity != nil {
+		if identity.UserID != "" && identity.UserID != userID {
+			return fmt.Errorf("installed upgrade identity belongs to another user")
+		}
+		identity.UserID = userID
+		if err := persistUpgradeIdentity(ctx, tx, *identity); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (c *Client) beginRemoteReplaceLocked(ctx context.Context, userID, sourceID string) (resultErr error) {
-	tx, err := beginImmediateTx(ctx, c.DB)
+	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
 		return fmt.Errorf("failed to begin remote_replace guard transaction: %w", err)
 	}
@@ -755,7 +881,7 @@ func (c *Client) finalizeRemoteReplaceLocked(ctx context.Context, state *lifecyc
 
 func (c *Client) countSnapshotStageRows(ctx context.Context, snapshotID string) (int64, error) {
 	var count int64
-	if err := c.DB.QueryRowContext(ctx, `
+	if err := c.db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM _sync_snapshot_stage
 		WHERE snapshot_id = ?

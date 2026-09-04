@@ -99,10 +99,9 @@ func newManagedLayoutTestFixture(t *testing.T, prefix string) *managedLayoutTest
 	rowID := uuid.New()
 	h.execf(t, `INSERT INTO %s.records (id, _sync_scope_id, payload) VALUES ('%s', 'managed-owner', 'original')`, h.schemaIdent, rowID)
 	registeredTables := []RegisteredTable{h.registeredTable("records", "id")}
-	service, err := NewRuntimeService(h.pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "managed-layout-initial",
-		RegisteredTables:          registeredTables,
+	service, err := newTestRuntimeService(h.pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(registeredTables), AppName: "managed-layout-initial",
+		RegisteredTables:               registeredTables,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
@@ -117,10 +116,9 @@ func newManagedLayoutTestFixture(t *testing.T, prefix string) *managedLayoutTest
 
 func (f *managedLayoutTestFixture) newService(t *testing.T, appName string) *SyncService {
 	t.Helper()
-	service, err := NewRuntimeService(f.harness.pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   appName,
-		RegisteredTables:          f.registeredTables,
+	service, err := newTestRuntimeService(f.harness.pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(f.registeredTables), AppName: appName,
+		RegisteredTables:               f.registeredTables,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
@@ -181,8 +179,6 @@ func TestManagedLayout_RevisedAndLegacyManifestsRejectEachOther(t *testing.T) {
 	legacyValues := map[managedLayoutFactKey]string{
 		{Kind: "column", Identity: "sync.bundle_log.canonical_request_hash", Attribute: "collation"}:     "pg_catalog.default",
 		{Kind: "column", Identity: "sync.bundle_log.source_id", Attribute: "collation"}:                  "pg_catalog.default",
-		{Kind: "column", Identity: "sync.push_sessions.canonical_request_hash", Attribute: "collation"}:  "pg_catalog.default",
-		{Kind: "column", Identity: "sync.push_sessions.source_id", Attribute: "collation"}:               "pg_catalog.default",
 		{Kind: "column", Identity: "sync.scope_state.initialized_by_source_id", Attribute: "collation"}:  "pg_catalog.default",
 		{Kind: "column", Identity: "sync.scope_state.initializer_source_id", Attribute: "collation"}:     "pg_catalog.default",
 		{Kind: "column", Identity: "sync.source_state.replaced_by_source_id", Attribute: "collation"}:    "pg_catalog.default",
@@ -191,7 +187,6 @@ func TestManagedLayout_RevisedAndLegacyManifestsRejectEachOther(t *testing.T) {
 		{Kind: "function", Identity: "sync.capture_registered_row_change()", Attribute: "source.sha256"}: "3304a5f48a65f815c501e633c7b8645acbd992ac54d6256d0b90c458f1df0049",
 		{Kind: "function", Identity: "sync.enforce_registered_row_owner()", Attribute: "source.sha256"}:  "ea9676345ff44e0978f2621bfe215c2265dc3ed7d34cf88e9b55ebc850e67cd4",
 		{Kind: "index", Identity: "sync.bundle_log_source_tuple_key", Attribute: "attribute.2"}:          `{"role": "key", "column": "source_id", "opclass": "pg_catalog.text_ops", "collation": "pg_catalog.default", "descending": false, "expression": "", "nulls_first": false}`,
-		{Kind: "index", Identity: "sync.push_sessions_source_tuple_key", Attribute: "attribute.2"}:       `{"role": "key", "column": "source_id", "opclass": "pg_catalog.text_ops", "collation": "pg_catalog.default", "descending": false, "expression": "", "nulls_first": false}`,
 		{Kind: "index", Identity: "sync.source_state_pkey", Attribute: "attribute.2"}:                    `{"role": "key", "column": "source_id", "opclass": "pg_catalog.text_ops", "collation": "pg_catalog.default", "descending": false, "expression": "", "nulls_first": false}`,
 		{Kind: "index", Identity: "sync.user_state_user_id_key", Attribute: "attribute.1"}:               `{"role": "key", "column": "user_id", "opclass": "pg_catalog.text_ops", "collation": "pg_catalog.default", "descending": false, "expression": "", "nulls_first": false}`,
 	}
@@ -218,6 +213,7 @@ func TestManagedLayout_RevisedAndLegacyManifestsRejectEachOther(t *testing.T) {
 }
 
 func TestBootstrap_ExistingLayoutRejectsManagedDriftWithoutMutation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		sql  string
@@ -252,8 +248,15 @@ func TestBootstrap_ExistingLayoutRejectsManagedDriftWithoutMutation(t *testing.T
 		{name: "extra rule", sql: `CREATE RULE operator_rule AS ON UPDATE TO sync.snapshot_sessions DO ALSO SELECT 1`},
 		{name: "extra sync trigger", sql: `CREATE FUNCTION sync.operator_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$; CREATE TRIGGER operator_trigger BEFORE UPDATE ON sync.snapshot_sessions FOR EACH ROW EXECUTE FUNCTION sync.operator_trigger()`},
 	}
+	// Every case owns a separate database (caller-managed databases remain
+	// serialized by the integration helper). Bound concurrent fixtures explicitly
+	// so complete drift coverage fits the established aggregate deadline.
+	slots := make(chan struct{}, 4)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			slots <- struct{}{}
+			t.Cleanup(func() { <-slots })
 			fixture := newManagedLayoutTestFixture(t, "managed_drift_")
 			before := fixture.authoritativeCounts(t)
 			_, err := fixture.harness.pool.Exec(fixture.ctx, test.sql)
@@ -270,7 +273,7 @@ func TestBootstrap_ExistingLayoutRejectsManagedDriftWithoutMutation(t *testing.T
 				require.NotContains(t, strings.ToLower(err.Error()), forbidden)
 			}
 			require.Equal(t, before, fixture.authoritativeCounts(t))
-			_, err = second.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, &ConnectRequest{})
+			_, err = second.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, testSchemaGenerationProofForService(second), &ConnectRequest{})
 			require.ErrorIs(t, err, errServiceNotReady)
 		})
 	}
@@ -302,8 +305,8 @@ func TestBootstrap_ExistingLayoutCancellationLeavesDatabaseUnchanged(t *testing.
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 	require.Equal(t, before, fixture.authoritativeCounts(t))
-	require.NoError(t, service.validateManagedLayout(fixture.ctx, fixture.harness.pool))
-	_, err = service.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, &ConnectRequest{})
+	require.NoError(t, fixture.service.validateManagedLayout(fixture.ctx, fixture.harness.pool))
+	_, err = service.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, testSchemaGenerationProofForService(service), &ConnectRequest{})
 	require.ErrorIs(t, err, errServiceNotReady)
 
 	require.NoError(t, lockTx.Rollback(fixture.ctx))
@@ -322,12 +325,12 @@ func TestBootstrap_ManagedLayoutDriftReadinessAndRetry(t *testing.T) {
 	err = service.Bootstrap(fixture.ctx)
 	var schemaErr *UnsupportedSchemaError
 	require.ErrorAs(t, err, &schemaErr)
-	_, err = service.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, &ConnectRequest{})
+	_, err = service.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, testSchemaGenerationProofForService(service), &ConnectRequest{})
 	require.ErrorIs(t, err, errServiceNotReady)
 	_, err = fixture.harness.pool.Exec(fixture.ctx, `CREATE INDEX rs_user_live_snapshot_idx ON sync.row_state(user_pk, table_id, key_bytes) WHERE deleted = FALSE`)
 	require.NoError(t, err)
 	require.NoError(t, service.Bootstrap(fixture.ctx))
-	_, err = service.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, &ConnectRequest{})
+	_, err = service.Connect(fixture.ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, testSchemaGenerationProofForService(service), &ConnectRequest{})
 	require.NoError(t, err)
 	require.NoError(t, fixture.newService(t, "managed-layout-new-instance").Bootstrap(fixture.ctx))
 }
@@ -372,12 +375,13 @@ func TestBootstrap_FreshLayoutSelfValidates(t *testing.T) {
 }
 
 func TestBootstrap_ManagedLayoutSupportedPostgresVersions(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		image string
 		major int
 	}{
-		{image: "postgres:16", major: 16},
-		{image: managedIntegrationPostgresImage, major: 17},
+		{image: managedIntegrationPostgresImage, major: 16},
+		{image: "postgres:17.10", major: 17},
 	}
 	for _, test := range tests {
 		t.Run(strings.ReplaceAll(test.image, ":", "_"), func(t *testing.T) {
@@ -419,16 +423,19 @@ func TestBootstrap_ManagedLayoutSupportedPostgresVersions(t *testing.T) {
 			`, schemaIdent, schemaIdent, schemaIdent))
 			require.NoError(t, err)
 
-			config := &ServiceConfig{
-				MaxSupportedSchemaVersion: 1,
-				AppName:                   "managed-layout-version-" + strconv.Itoa(test.major),
+			config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{{
+				Schema:         schemaName,
+				Table:          "records",
+				SyncKeyColumns: []string{"id"},
+			}}), AppName: "managed-layout-version-" + strconv.Itoa(test.major),
 				RegisteredTables: []RegisteredTable{{
 					Schema:         schemaName,
 					Table:          "records",
 					SyncKeyColumns: []string{"id"},
 				}},
+				RegisteredTableCatalogRevision: 1,
 			}
-			service, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+			service, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = service.Close(context.Background()) })
 			require.NoError(t, service.Bootstrap(ctx))
@@ -438,15 +445,13 @@ func TestBootstrap_ManagedLayoutSupportedPostgresVersions(t *testing.T) {
 			require.NoError(t, err)
 			for _, identity := range []string{
 				"sync.bundle_rows.payload_wire",
-				"sync.push_session_rows.payload_apply",
-				"sync.push_session_rows.payload_request",
 				"sync.snapshot_session_rows.payload_wire",
 			} {
 				require.Equal(t, "pg_catalog.json", managedLayoutFactValue(t, actualFacts, "column", identity, "type"))
 			}
 			require.Equal(
 				t,
-				"pg_catalog.default",
+				"pg_catalog.C",
 				managedLayoutFactValue(t, actualFacts, "column", "sync.meta.layout_name", "collation"),
 			)
 			var indexAttribute map[string]any
@@ -459,21 +464,21 @@ func TestBootstrap_ManagedLayoutSupportedPostgresVersions(t *testing.T) {
 			)
 			require.Equal(t, "pg_catalog.C", indexAttribute["collation"])
 
-			second, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+			second, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = second.Close(context.Background()) })
 			require.NoError(t, second.Bootstrap(ctx))
 
 			_, err = pool.Exec(ctx, `ALTER TABLE sync.snapshot_sessions ALTER COLUMN row_count TYPE integer`)
 			require.NoError(t, err)
-			drifted, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+			drifted, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = drifted.Close(context.Background()) })
 			err = drifted.Bootstrap(ctx)
 			var schemaErr *UnsupportedSchemaError
 			require.ErrorAs(t, err, &schemaErr)
 			require.ErrorContains(t, err, "changed column sync.snapshot_sessions.row_count attribute type")
-			_, err = drifted.Connect(ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, &ConnectRequest{})
+			_, err = drifted.Connect(ctx, Actor{UserID: "managed-owner", SourceID: "reader"}, testSchemaGenerationProofForService(drifted), &ConnectRequest{})
 			require.ErrorIs(t, err, errServiceNotReady)
 		})
 	}
@@ -507,6 +512,7 @@ func TestManagedLayoutValidation_UsesFixedCatalogQueryCount(t *testing.T) {
 }
 
 func TestRegisteredTableTriggers_ValidateWithoutRepair(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		mutation func(tableIdent string) string

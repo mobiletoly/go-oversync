@@ -41,6 +41,41 @@ func gzipResponse(status int, decoded string) *http.Response {
 	}
 }
 
+type repeatedByteReadCloser struct {
+	remaining int64
+	closed    bool
+}
+
+func (r *repeatedByteReadCloser) Read(buffer []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	count := int64(len(buffer))
+	if count > r.remaining {
+		count = r.remaining
+	}
+	for index := int64(0); index < count; index++ {
+		buffer[index] = 'x'
+	}
+	r.remaining -= count
+	return int(count), nil
+}
+
+func (r *repeatedByteReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
+func gzipRepeatedResponse(t *testing.T, decodedBytes int64) *http.Response {
+	t.Helper()
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	_, err := io.Copy(writer, &repeatedByteReadCloser{remaining: decodedBytes})
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Encoding": []string{"gzip"}}, Body: io.NopCloser(bytes.NewReader(compressed.Bytes()))}
+}
+
 func TestSnapshotDecodedBodyLimit_ExactExtraCompressedAndEncoding(t *testing.T) {
 	t.Run("exact limit succeeds", func(t *testing.T) {
 		resp := rawJSONResponse(http.StatusOK, "1234")
@@ -52,7 +87,7 @@ func TestSnapshotDecodedBodyLimit_ExactExtraCompressedAndEncoding(t *testing.T) 
 	t.Run("one extra decoded byte fails", func(t *testing.T) {
 		resp := rawJSONResponse(http.StatusOK, "12345")
 		_, err := readDecodedBodyBounded(context.Background(), "test", resp, 4)
-		var tooLarge *SnapshotResponseBodyTooLargeError
+		var tooLarge *EncodedResponseBodyTooLargeError
 		require.ErrorAs(t, err, &tooLarge)
 	})
 
@@ -72,6 +107,62 @@ func TestSnapshotDecodedBodyLimit_ExactExtraCompressedAndEncoding(t *testing.T) 
 	})
 }
 
+func TestGenerationDataPlaneReaders_ProtocolHardCeilingsAndCeilingPlusOne(t *testing.T) {
+	require.Equal(t, int64(67112960), pushConflictErrorBodyLimit)
+
+	for _, testCase := range []struct {
+		name  string
+		limit int64
+	}{
+		{name: "discovered pull success", limit: 4096},
+		{name: "structured push conflict", limit: pushConflictErrorBodyLimit},
+	} {
+		t.Run(testCase.name+" exact", func(t *testing.T) {
+			reader := &repeatedByteReadCloser{remaining: testCase.limit}
+			body, err := readDecodedBodyBounded(context.Background(), testCase.name, &http.Response{Header: http.Header{}, Body: reader}, testCase.limit)
+			require.NoError(t, err)
+			require.Len(t, body, int(testCase.limit))
+			require.NoError(t, reader.Close())
+			require.True(t, reader.closed)
+		})
+		t.Run(testCase.name+" ceiling plus one", func(t *testing.T) {
+			reader := &repeatedByteReadCloser{remaining: testCase.limit + 1}
+			_, err := readDecodedBodyBounded(context.Background(), testCase.name, &http.Response{Header: http.Header{}, Body: reader}, testCase.limit)
+			var tooLarge *EncodedResponseBodyTooLargeError
+			require.ErrorAs(t, err, &tooLarge)
+			require.NoError(t, reader.Close())
+			require.True(t, reader.closed)
+		})
+	}
+
+	t.Run("gzip is bounded after decompression at the hard conflict ceiling", func(t *testing.T) {
+		response := gzipRepeatedResponse(t, pushConflictErrorBodyLimit+1)
+		_, err := readDecodedBodyBounded(context.Background(), "structured push conflict", response, pushConflictErrorBodyLimit)
+		var tooLarge *SnapshotResponseBodyTooLargeError
+		require.ErrorAs(t, err, &tooLarge)
+	})
+
+	t.Run("duplicate content encoding is rejected", func(t *testing.T) {
+		response := gzipResponse(http.StatusOK, `{}`)
+		response.Header["content-encoding"] = []string{"identity"}
+		_, err := readDecodedBodyBounded(context.Background(), "duplicate encoding", response, 1024)
+		var unsupported *SnapshotUnsupportedContentEncodingError
+		require.ErrorAs(t, err, &unsupported)
+	})
+
+	t.Run("concatenated gzip member is rejected", func(t *testing.T) {
+		first := gzipResponse(http.StatusOK, `{}`)
+		firstBytes, err := io.ReadAll(first.Body)
+		require.NoError(t, err)
+		second := gzipResponse(http.StatusOK, `{}`)
+		secondBytes, err := io.ReadAll(second.Body)
+		require.NoError(t, err)
+		response := &http.Response{Header: http.Header{"Content-Encoding": []string{"gzip"}}, Body: io.NopCloser(bytes.NewReader(append(firstBytes, secondBytes...)))}
+		_, err = readDecodedBodyBounded(context.Background(), "concatenated gzip", response, 1024)
+		var failure *boundedHTTPFailureError
+		require.ErrorAs(t, err, &failure)
+	})
+}
 func TestSnapshotChunkRequest_SendsRowsAndBytesAndRequiresDeclaredCount(t *testing.T) {
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
 
@@ -79,7 +170,7 @@ func TestSnapshotChunkRequest_SendsRowsAndBytesAndRequiresDeclaredCount(t *testi
 		client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 			require.Equal(t, "17", r.URL.Query().Get("max_rows"))
 			require.Equal(t, "2048", r.URL.Query().Get("max_bytes"))
-			return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":4,"rows":[],"next_row_ordinal":0,"has_more":false,"byte_count":0}`), nil
+			return rawJSONResponse(http.StatusOK, `{"rows":[],"next_row_ordinal":0,"has_more":false,"logical_byte_count":0}`), nil
 		})}
 		chunk, _, err := client.fetchSnapshotChunk(context.Background(), "snapshot-1", 4, 0, 17, 2048)
 		require.NoError(t, err)
@@ -88,10 +179,10 @@ func TestSnapshotChunkRequest_SendsRowsAndBytesAndRequiresDeclaredCount(t *testi
 
 	t.Run("missing byte count", func(t *testing.T) {
 		client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-			return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":4,"rows":[],"next_row_ordinal":0,"has_more":false}`), nil
+			return rawJSONResponse(http.StatusOK, `{"rows":[],"next_row_ordinal":0,"has_more":false}`), nil
 		})}
 		_, _, err := client.fetchSnapshotChunk(context.Background(), "snapshot-1", 4, 0, 17, 2048)
-		require.ErrorContains(t, err, "missing required byte_count")
+		require.ErrorContains(t, err, "missing required logical_byte_count")
 	})
 }
 
@@ -132,46 +223,58 @@ func TestSnapshotSessionMissingByteCount_AttemptsRetirement(t *testing.T) {
 		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-invalid","snapshot_bundle_seq":4,"row_count":0,"expires_at":"2030-01-01T00:00:00Z"}`), nil
 	})}
 	_, err := client.createSnapshotSession(context.Background(), nil)
-	require.ErrorContains(t, err, "missing required byte_count")
+	require.ErrorContains(t, err, "missing required logical_byte_count")
 	require.Equal(t, int64(1), retired.Load())
 }
 
-func TestSnapshotCapabilityNegotiation_RequiredRelationshipsAndExactName(t *testing.T) {
-	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
-
-	valid := `{"protocol_version":"v1","schema_version":1,"registered_table_specs":[],"features":{},"bundle_limits":{"default_rows_per_snapshot_chunk":1000,"max_rows_per_snapshot_chunk":2000,"default_bytes_per_snapshot_chunk":4194304,"max_bytes_per_snapshot_chunk":8388608,"max_bytes_per_snapshot_row":1048576,"max_concurrent_snapshot_builds":2,"max_concurrent_snapshot_chunk_requests":3}}`
-	tests := []struct {
-		name string
-		body string
-		want string
+func TestSnapshotResponsePresence_OrdinaryAndRotatedDownloadsRequireExplicitEmptyFraming(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		request    *oversync.SnapshotSessionCreateRequest
+		snapshotID string
+		sourceID   string
+		body       string
+		operation  string
+		want       string
 	}{
-		{name: "valid", body: valid},
-		{name: "alias is rejected", body: strings.Replace(valid, "max_concurrent_snapshot_chunk_requests", "max_concurrent_snapshot_chunks", 1), want: "max_concurrent_snapshot"},
-		{name: "row default exceeds maximum", body: strings.Replace(valid, `"default_rows_per_snapshot_chunk":1000`, `"default_rows_per_snapshot_chunk":3000`, 1), want: "default_rows_per_snapshot_chunk exceeds"},
-		{name: "byte default exceeds maximum", body: strings.Replace(valid, `"default_bytes_per_snapshot_chunk":4194304`, `"default_bytes_per_snapshot_chunk":9437184`, 1), want: "default_bytes_per_snapshot_chunk exceeds"},
-	}
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-				return rawJSONResponse(http.StatusOK, testCase.body), nil
+		{
+			name: "ordinary session omits row_count", sourceID: "bundle-device",
+			body:      `{"snapshot_id":"ordinary","snapshot_bundle_seq":8,"logical_byte_count":0,"expires_at":"2030-01-01T00:00:00Z"}`,
+			operation: "session", want: "missing required row_count",
+		},
+		{
+			name: "rotated session omits row_count", sourceID: "replacement",
+			request: &oversync.SnapshotSessionCreateRequest{SourceReplacement: &oversync.SnapshotSourceReplacement{
+				PreviousSourceID: "bundle-device", NewSourceID: "replacement", Reason: "history_pruned",
+			}},
+			body:      `{"snapshot_id":"rotated","snapshot_bundle_seq":8,"logical_byte_count":0,"expires_at":"2030-01-01T00:00:00Z"}`,
+			operation: "session", want: "missing required row_count",
+		},
+		{
+			name: "ordinary chunk omits rows", snapshotID: "ordinary", sourceID: "bundle-device",
+			body:      `{"next_row_ordinal":0,"has_more":false,"logical_byte_count":0}`,
+			operation: "chunk", want: "missing required rows",
+		},
+		{
+			name: "rotated chunk omits has_more", snapshotID: "rotated", sourceID: "replacement",
+			body:      `{"rows":[],"next_row_ordinal":0,"logical_byte_count":0}`,
+			operation: "chunk", want: "missing required has_more",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
+			client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return rawJSONResponse(http.StatusOK, tc.body), nil
 			})}
-			limits, err := client.negotiateSnapshotLimits(context.Background())
-			if testCase.want != "" {
-				require.ErrorContains(t, err, testCase.want)
-				return
+			var err error
+			if tc.operation == "session" {
+				_, err = client.createSnapshotSession(context.Background(), tc.request)
+			} else {
+				_, _, err = client.fetchSnapshotChunkAsSource(context.Background(), tc.snapshotID, 8, 0, 1, 1024, tc.sourceID)
 			}
-			require.NoError(t, err)
-			require.Equal(t, 1000, limits.maxRows)
-			require.Equal(t, int64(4<<20), limits.maxBytes)
+			require.ErrorContains(t, err, tc.want)
 		})
 	}
-
-	client.config.SnapshotChunkBytes = 512 << 10
-	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return rawJSONResponse(http.StatusOK, valid), nil
-	})}
-	_, err := client.negotiateSnapshotLimits(context.Background())
-	require.ErrorContains(t, err, "below server max_bytes_per_snapshot_row")
 }
 
 func TestSnapshotChunkValidation_CountsOrdinalsIdentityAndEmptyShape(t *testing.T) {
@@ -225,7 +328,7 @@ func TestSnapshotCheckedArithmetic(t *testing.T) {
 func TestSnapshotChunkStructuredErrors_TransientAndActionable(t *testing.T) {
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
 	retryBody := `{"error":"snapshot_chunk_capacity","message":"` + strings.Repeat("x", 2048) + `"}`
-	successBody := `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":4,"rows":[],"next_row_ordinal":0,"has_more":false,"byte_count":0}`
+	successBody := `{"rows":[],"next_row_ordinal":0,"has_more":false,"logical_byte_count":0}`
 
 	var capacityAttempts atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -241,7 +344,7 @@ func TestSnapshotChunkStructuredErrors_TransientAndActionable(t *testing.T) {
 	require.Equal(t, int64(len(retryBody)), client.SnapshotTransferDiagnostics().MaxChunkDecodedBodyBytes)
 
 	client.ResetSnapshotTransferDiagnostics()
-	tooSmallBody := `{"error":"snapshot_chunk_too_small","required_byte_count":2049,"message":"` + strings.Repeat("y", 1024) + `"}`
+	tooSmallBody := `{"error":"snapshot_chunk_too_small","required_decoded_body_bytes":2049,"message":"` + strings.Repeat("y", 1024) + `"}`
 	var tooSmallAttempts atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		tooSmallAttempts.Add(1)
@@ -262,7 +365,7 @@ func TestSnapshotSessionBuildCapacity_RetriesOnlyLockedStructuredCode(t *testing
 		if attempts.Add(1) < 3 {
 			return errorJSONResponse(http.StatusTooManyRequests, oversync.ErrorResponse{Error: "snapshot_build_capacity"}), nil
 		}
-		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":0,"row_count":0,"byte_count":0,"expires_at":"2030-01-01T00:00:00Z"}`), nil
+		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":0,"row_count":0,"logical_byte_count":0,"expires_at":"2030-01-01T00:00:00Z"}`), nil
 	})}
 	_, err := client.createSnapshotSession(context.Background(), nil)
 	require.NoError(t, err)
@@ -283,7 +386,7 @@ func TestSnapshotControlResponsesUseOperationSpecificDecodedLimits(t *testing.T)
 
 	t.Run("session success", func(t *testing.T) {
 		client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-			return gzipResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":0,"row_count":0,"byte_count":0,"expires_at":"2030-01-01T00:00:00Z","padding":"`+strings.Repeat("x", 70<<10)+`"}`), nil
+			return gzipResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":0,"row_count":0,"logical_byte_count":0,"expires_at":"2030-01-01T00:00:00Z","padding":"`+strings.Repeat("x", 70<<10)+`"}`), nil
 		})}
 		_, err := client.createSnapshotSession(context.Background(), nil)
 		var tooLarge *SnapshotResponseBodyTooLargeError
@@ -301,15 +404,6 @@ func TestSnapshotControlResponsesUseOperationSpecificDecodedLimits(t *testing.T)
 		require.Equal(t, snapshotControlBodyLimit, tooLarge.Limit)
 	})
 
-	t.Run("capabilities success", func(t *testing.T) {
-		client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-			return gzipResponse(http.StatusOK, strings.Repeat(" ", int(snapshotCapabilitiesBodyLimit)+1)), nil
-		})}
-		_, err := client.fetchValidatedCapabilities(context.Background(), "test_capabilities")
-		var tooLarge *SnapshotResponseBodyTooLargeError
-		require.ErrorAs(t, err, &tooLarge)
-		require.Equal(t, snapshotCapabilitiesBodyLimit, tooLarge.Limit)
-	})
 }
 
 type closeTrackingBody struct {
@@ -406,12 +500,12 @@ func (b *cancelAndAwaitCloseBody) Close() error {
 
 func TestSnapshotChunkSemanticFailure_ClosesBodyAndRecordsDecodedHighWater(t *testing.T) {
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
-	body := &closeTrackingBody{reader: strings.NewReader(`{"snapshot_id":"wrong","snapshot_bundle_seq":4,"rows":[],"next_row_ordinal":0,"has_more":false,"byte_count":0}`)}
+	body := &closeTrackingBody{reader: strings.NewReader(`{"rows":[],"next_row_ordinal":1,"has_more":false,"logical_byte_count":0}`)}
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: body}, nil
 	})}
 	_, _, err := client.fetchSnapshotChunk(context.Background(), "snapshot-1", 4, 0, 1, 1024)
-	require.ErrorContains(t, err, "snapshot_id")
+	require.ErrorContains(t, err, "next_row_ordinal")
 	require.Equal(t, int64(1), body.closed.Load())
 	require.Greater(t, client.SnapshotTransferDiagnostics().MaxChunkDecodedBodyBytes, int64(0))
 }
@@ -419,7 +513,7 @@ func TestSnapshotChunkSemanticFailure_ClosesBodyAndRecordsDecodedHighWater(t *te
 func TestSnapshotChunkPartialReadError_RetriesAndClosesEveryBody(t *testing.T) {
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
 	badBody := &readErrorBody{reader: strings.NewReader(strings.Repeat("partial", 512))}
-	successBody := `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":4,"rows":[],"next_row_ordinal":0,"has_more":false,"byte_count":0}`
+	successBody := `{"rows":[],"next_row_ordinal":0,"has_more":false,"logical_byte_count":0}`
 	var attempts atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if attempts.Add(1) == 1 {
@@ -436,7 +530,7 @@ func TestSnapshotChunkPartialReadError_RetriesAndClosesEveryBody(t *testing.T) {
 
 func TestPhase3BoundedHTTPFailuresAreRedactedWithRetriesDisabled(t *testing.T) {
 	const hostileText = "private-source-sentinel connection reset by peer"
-	validBody := `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":4,"rows":[],"next_row_ordinal":0,"has_more":false,"byte_count":0}`
+	validBody := `{"rows":[],"next_row_ordinal":0,"has_more":false,"logical_byte_count":0}`
 
 	tests := []struct {
 		name      string
@@ -475,7 +569,7 @@ func TestPhase3BoundedHTTPFailuresAreRedactedWithRetriesDisabled(t *testing.T) {
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+			cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 			cfg.RetryPolicy = &RetryPolicy{Enabled: false}
 			client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
 			client.HTTP = &http.Client{Transport: testCase.transport}
@@ -490,7 +584,7 @@ func TestPhase3BoundedHTTPFailuresAreRedactedWithRetriesDisabled(t *testing.T) {
 }
 
 func TestSnapshotConfigDefaultsAndNegativeValidation(t *testing.T) {
-	config := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	config := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	require.Equal(t, int64(4<<20), config.SnapshotChunkBytes)
 	require.Equal(t, 1000, config.SnapshotChunkRows)
 
@@ -504,9 +598,9 @@ func TestSnapshotConfigDefaultsAndNegativeValidation(t *testing.T) {
 			defer db.Close()
 			_, err = db.Exec(usersTestDDL)
 			require.NoError(t, err)
-			bad := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+			bad := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 			mutate(bad)
-			_, err = NewClient(db, "http://example.invalid", tokenProviderForTests, bad)
+			_, err = newAdmittedFixtureClient(db, "http://example.invalid", tokenProviderForTests, bad)
 			require.ErrorContains(t, err, "must be positive")
 		})
 	}

@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "column-contraction",
+      "table": false,
+      "old_generation": 1,
+      "supported_generation": 3,
+      "pending_outcome": "old_generation_unavailable",
+      "empty_outcome": "ready",
+      "retired_error": "retired_schema_generation",
+      "events": [
+        "coexistence",
+        "offline_edit",
+        "retire",
+        "drop_legacy_column",
+        "restart_old_file",
+        "pending_upgrade_blocked",
+        "empty_old_upgrade",
+        "supported_sync"
+      ]
+    },
+    {
+      "id": "table-contraction-successor",
+      "table": true,
+      "old_generation": 1,
+      "supported_generation": 2,
+      "later_generation": 3,
+      "pending_outcome": "old_generation_unavailable",
+      "empty_outcome": "ready",
+      "retired_error": "retired_schema_generation",
+      "events": [
+        "coexistence",
+        "offline_edit",
+        "retire",
+        "retire_registration",
+        "whole_history_expiry",
+        "bounded_prune",
+        "drop_legacy_table",
+        "restart_old_file",
+        "pending_upgrade_blocked",
+        "empty_old_upgrade",
+        "supported_sync",
+        "later_generation_same_database"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,270 @@
+{
+  "format": "oversync.rollout-retirement.manifest.v1",
+  "artifacts": {
+    "retired-client.json": "008a63aa3ee613e840677c624b80170e392581617274682c59ce78d9617683ac",
+    "http.json": "9a042056da7cd09bc3bdec4bdee29a290d56c4d149468200e72e82ea53e52d2c",
+    "intent.json": "60860e38b60abbdd38184a36539075d55fb35799c4c63a815629456b44884f6f",
+    "boundaries.json": "006bd0e24dde4295d0e4c26a104a7b437f6f428650f7d9a1fe6e85609e3249d5",
+    "journeys.json": "534dc082d315eb11a18a33b709a4fd46037842d5e9435c0e4854657950eb6c62",
+    "schema.json": "d2451af8d939090bf08c5cca4adeaf2196438ebe2f31c4af1b92fb42392253ee"
+  },
+  "consumers": {
+    "retired-upload": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_ConformanceStopsLoopsAndPreservesIntent"
+      ]
+    ],
+    "retired-download": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_ConformanceStopsLoopsAndPreservesIntent"
+      ]
+    ],
+    "retired-watch": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_ConformanceStopsLoopsAndPreservesIntent"
+      ]
+    ],
+    "retired-watch-auto": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_ConformanceStopsLoopsAndPreservesIntent"
+      ]
+    ],
+    "retired-http-1": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-2": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-3": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-4": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-5": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-6": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-7": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-8": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-9": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-10": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-11": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "retired-http-12": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "conflicted-intent": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_ConflictAndUncertainIntentConformance"
+      ]
+    ],
+    "uncertain-commit": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_ConflictAndUncertainIntentConformance"
+      ]
+    ],
+    "retired-create": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_MaintenanceAndUploadBoundaries"
+      ]
+    ],
+    "retired-chunk": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_MaintenanceAndUploadBoundaries"
+      ]
+    ],
+    "retired-commit": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_MaintenanceAndUploadBoundaries"
+      ]
+    ],
+    "retired-replay": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_MaintenanceAndUploadBoundaries"
+      ]
+    ],
+    "maintenance-create": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_MaintenanceAndUploadBoundaries"
+      ]
+    ],
+    "maintenance-chunk": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_MaintenanceAndUploadBoundaries"
+      ]
+    ],
+    "maintenance-commit": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_MaintenanceAndUploadBoundaries"
+      ]
+    ],
+    "maintenance-replay": [
+      [
+        ".",
+        "./oversqlite",
+        "TestRetirement_MaintenanceAndUploadBoundaries"
+      ]
+    ],
+    "column-contraction": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutColumnRetirementSameFiles"
+      ]
+    ],
+    "table-contraction-successor": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_RolloutTableRetirementSameFiles"
+      ]
+    ]
+  },
+  "qualification_scope": "Go only; SQLiteNow implementation and cross-runtime qualification remain separate gates"
+}

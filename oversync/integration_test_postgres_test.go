@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,8 +19,10 @@ import (
 )
 
 const (
-	managedIntegrationPostgresImage    = "postgres:17.10"
-	managedIntegrationPostgresPassword = "oversync_test_password"
+	managedIntegrationPostgresImage        = "postgres:16"
+	managedIntegrationPostgresPassword     = "oversync_test_password"
+	managedIntegrationPostgresTestLabel    = "com.mobiletoly.go-oversync.test=true"
+	managedIntegrationPostgresTestRunLabel = "com.mobiletoly.go-oversync.test-run"
 )
 
 type managedIntegrationPostgresServer struct {
@@ -52,6 +55,9 @@ func provisionIntegrationTestDatabase(t *testing.T, ctx context.Context) (string
 	t.Helper()
 
 	if databaseURL := os.Getenv("TEST_DATABASE_URL"); databaseURL != "" {
+		if os.Getenv("OVERSYNC_TEST_ISOLATE_DATABASES") == "1" {
+			return provisionIsolatedCallerDatabase(t, ctx, databaseURL), true
+		}
 		callerManagedIntegrationDatabaseMu.Lock()
 		t.Cleanup(callerManagedIntegrationDatabaseMu.Unlock)
 		return databaseURL, false
@@ -62,6 +68,43 @@ func provisionIntegrationTestDatabase(t *testing.T, ctx context.Context) (string
 		t.Fatalf("start managed integration PostgreSQL (set TEST_DATABASE_URL to use an existing database): %v", err)
 	}
 	return provisionIntegrationTestDatabaseOnServer(t, ctx, server)
+}
+
+// Qualification fixtures grant CREATE DATABASE. Give each pool its own database
+// in that lane: a test may legitimately own multiple pools simultaneously, which
+// cannot acquire the shared-database mutex twice before its cleanup runs.
+func provisionIsolatedCallerDatabase(t *testing.T, parent context.Context, databaseURL string) string {
+	t.Helper()
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal("parse caller-managed fixture URL")
+	}
+	name := fmt.Sprintf("oversync_test_%d_%d", os.Getpid(), managedIntegrationDatabaseSequence.Add(1))
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatal("connect to caller-managed fixture for database creation")
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		t.Fatalf("create run-owned integration database: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		admin, err := pgx.Connect(cleanupCtx, databaseURL)
+		if err != nil {
+			t.Errorf("connect to drop run-owned database %s", name)
+			return
+		}
+		defer admin.Close(cleanupCtx)
+		if _, err := admin.Exec(cleanupCtx, "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop run-owned database %s: %v", name, err)
+		}
+	})
+	parsed.Path = "/" + name
+	return parsed.String()
 }
 
 func provisionIntegrationTestDatabaseOnServer(
@@ -114,14 +157,26 @@ func startManagedIntegrationPostgres(image string) (*managedIntegrationPostgresS
 	}
 
 	containerName := fmt.Sprintf("go-oversync-test-%d-%d", os.Getpid(), time.Now().UnixNano())
-	containerID, err := dockerOutput(ctx,
+	dockerArgs := []string{
 		"run",
 		"--detach",
 		"--rm",
 		"--name", containerName,
-		"--label", "com.mobiletoly.go-oversync.test=true",
+		"--label", managedIntegrationPostgresTestLabel,
+	}
+	if testRunID := os.Getenv("OVERSYNC_TEST_RUN_ID"); testRunID != "" {
+		dockerArgs = append(dockerArgs, "--label", managedIntegrationPostgresTestRunLabel+"="+testRunID)
+	}
+	// Docker volumes avoid macOS host-filesystem round trips by default.
+	// PostgreSQL's image-provided anonymous volume remains durable across process
+	// restarts; fsync and all database settings are unchanged. Container cleanup explicitly removes anonymous volumes.
+	storageOverride := os.Getenv("OVERSYNC_TEST_DOCKER_VOLUME")
+	useDockerVolume := storageOverride == "1" || storageOverride == "" && runtime.GOOS == "darwin"
+	if !useDockerVolume {
+		dockerArgs = append(dockerArgs, "--mount", "type=bind,source="+dataDir+",target=/var/lib/postgresql/data")
+	}
+	dockerArgs = append(dockerArgs,
 		"--publish", "127.0.0.1::5432",
-		"--mount", "type=bind,source="+dataDir+",target=/var/lib/postgresql/data",
 		"--env", "POSTGRES_USER=postgres",
 		"--env", "POSTGRES_PASSWORD="+managedIntegrationPostgresPassword,
 		"--env", "POSTGRES_DB=postgres",
@@ -131,6 +186,7 @@ func startManagedIntegrationPostgres(image string) (*managedIntegrationPostgresS
 		"--health-retries", "120",
 		image,
 	)
+	containerID, err := dockerOutput(ctx, dockerArgs...)
 	if err != nil {
 		_ = os.RemoveAll(dataDir)
 		return nil, err
@@ -142,7 +198,7 @@ func startManagedIntegrationPostgres(image string) (*managedIntegrationPostgresS
 		if !started {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
-			_, _ = dockerOutput(cleanupCtx, "rm", "--force", containerID)
+			_, _ = dockerOutput(cleanupCtx, "rm", "--force", "--volumes", containerID)
 			_ = os.RemoveAll(dataDir)
 		}
 	}()
@@ -187,7 +243,7 @@ func (s *managedIntegrationPostgresServer) close() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, containerErr := dockerOutput(ctx, "rm", "--force", s.containerID)
+	_, containerErr := dockerOutput(ctx, "rm", "--force", "--volumes", s.containerID)
 	if containerErr != nil && strings.Contains(containerErr.Error(), "No such container") {
 		containerErr = nil
 	}

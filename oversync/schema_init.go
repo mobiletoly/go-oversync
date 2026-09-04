@@ -20,7 +20,7 @@ var _ = lockExistingManagedLayoutRelations
 
 const (
 	syncSchemaProtocolLabel       = "v1"
-	syncSchemaLayoutName          = "server_postgres_sync_v1"
+	syncSchemaLayoutName          = "server_postgres_sync_catalog_v1"
 	syncKeyKindUUIDCode     int16 = 1
 	syncKeyKindTextCode     int16 = 2
 )
@@ -156,12 +156,15 @@ func (s *SyncService) expectedTableCatalogRows() ([]expectedTableCatalogRow, err
 		return nil, nil
 	}
 
-	rows := make([]expectedTableCatalogRow, 0, len(s.registeredTableByID))
-	for tableID := int32(1); tableID <= int32(len(s.registeredTableByID)); tableID++ {
-		info, ok := s.registeredTableByID[tableID]
-		if !ok {
-			return nil, fmt.Errorf("missing registered table runtime info for table_id %d", tableID)
-		}
+	tableIDs := make([]int32, 0, len(s.registeredTableByID))
+	for tableID := range s.registeredTableByID {
+		tableIDs = append(tableIDs, tableID)
+	}
+	sort.Slice(tableIDs, func(i, j int) bool { return tableIDs[i] < tableIDs[j] })
+
+	rows := make([]expectedTableCatalogRow, 0, len(tableIDs))
+	for _, tableID := range tableIDs {
+		info := s.registeredTableByID[tableID]
 		rows = append(rows, expectedTableCatalogRow{
 			TableID:       tableID,
 			SchemaName:    info.schemaName,
@@ -186,6 +189,61 @@ func syncSchemaObjectsExist(ctx context.Context, q syncCatalogQuerier) (bool, er
 			SELECT 1
 			FROM pg_proc p
 			JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_type t
+			JOIN pg_namespace n ON n.oid = t.typnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_collation c
+			JOIN pg_namespace n ON n.oid = c.collnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_conversion c
+			JOIN pg_namespace n ON n.oid = c.connamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_operator o
+			JOIN pg_namespace n ON n.oid = o.oprnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_opclass o
+			JOIN pg_namespace n ON n.oid = o.opcnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_opfamily o
+			JOIN pg_namespace n ON n.oid = o.opfnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_ts_config o
+			JOIN pg_namespace n ON n.oid = o.cfgnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_ts_dict o
+			JOIN pg_namespace n ON n.oid = o.dictnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_ts_parser o
+			JOIN pg_namespace n ON n.oid = o.prsnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_ts_template o
+			JOIN pg_namespace n ON n.oid = o.tmplnamespace
+			WHERE n.nspname = 'sync'
+			UNION ALL
+			SELECT 1
+			FROM pg_statistic_ext o
+			JOIN pg_namespace n ON n.oid = o.stxnamespace
 			WHERE n.nspname = 'sync'
 		)
 	`).Scan(&exists); err != nil {
@@ -352,18 +410,51 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 		// Create dedicated sync schema
 		/*language=postgresql*/ `CREATE SCHEMA IF NOT EXISTS sync`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.meta (
-			singleton_key BOOLEAN PRIMARY KEY CHECK (singleton_key),
-			protocol_label TEXT NOT NULL DEFAULT 'v1',
-			layout_name TEXT NOT NULL
+			singleton_key BOOLEAN PRIMARY KEY,
+			protocol_label TEXT COLLATE "C" NOT NULL,
+			layout_name TEXT COLLATE "C" NOT NULL,
+			catalog_revision BIGINT NOT NULL,
+			next_table_id BIGINT NOT NULL,
+			catalog_fingerprint TEXT COLLATE "C" NOT NULL,
+			CONSTRAINT meta_singleton_key_chk CHECK (singleton_key),
+			CONSTRAINT meta_protocol_label_chk CHECK (protocol_label = 'v1'),
+			CONSTRAINT meta_layout_name_chk CHECK (layout_name = 'server_postgres_sync_catalog_v1'),
+			CONSTRAINT meta_catalog_revision_chk CHECK (catalog_revision >= 1),
+			CONSTRAINT meta_next_table_id_chk CHECK (next_table_id BETWEEN 1 AND 2147483648),
+			CONSTRAINT meta_catalog_fingerprint_chk CHECK (catalog_fingerprint ~ '^[0-9a-f]{64}$')
 		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.table_catalog (
 			table_id INTEGER PRIMARY KEY,
-			schema_name TEXT NOT NULL,
-			table_name TEXT NOT NULL,
-			sync_key_column TEXT NOT NULL,
+			schema_name TEXT COLLATE "C" NOT NULL,
+			table_name TEXT COLLATE "C" NOT NULL,
+			sync_key_column TEXT COLLATE "C" NOT NULL,
 			sync_key_kind SMALLINT NOT NULL,
+			state_code SMALLINT NOT NULL,
+			introduced_revision BIGINT NOT NULL,
+			retired_revision BIGINT,
+			CONSTRAINT table_catalog_table_id_chk CHECK (table_id > 0),
+			CONSTRAINT table_catalog_schema_name_chk CHECK (
+				octet_length(schema_name) BETWEEN 1 AND 63
+				AND schema_name ~ '^[a-z0-9_]+$'
+			),
+			CONSTRAINT table_catalog_table_name_chk CHECK (
+				octet_length(table_name) BETWEEN 1 AND 63
+				AND table_name ~ '^[a-z0-9_]+$'
+			),
+			CONSTRAINT table_catalog_sync_key_column_chk CHECK (
+				octet_length(sync_key_column) BETWEEN 1 AND 63
+				AND sync_key_column ~ '^[a-z0-9_]+$'
+				AND sync_key_column <> '_sync_scope_id'
+			),
 			CONSTRAINT table_catalog_schema_table_key UNIQUE (schema_name, table_name),
-			CONSTRAINT table_catalog_sync_key_kind_chk CHECK (sync_key_kind IN (1, 2))
+			CONSTRAINT table_catalog_sync_key_kind_chk CHECK (sync_key_kind IN (1, 2)),
+			CONSTRAINT table_catalog_state_code_chk CHECK (state_code IN (1, 2)),
+			CONSTRAINT table_catalog_introduced_revision_chk CHECK (introduced_revision >= 1),
+			CONSTRAINT table_catalog_state_revision_chk CHECK (
+				(state_code = 1 AND retired_revision IS NULL)
+				OR
+				(state_code = 2 AND retired_revision > introduced_revision)
+			)
 		)`,
 
 		// Current authoritative sync storage schema. These tables back the active server hot path.
@@ -435,6 +526,23 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 				OR (replaced_by_source_id <> '' AND retirement_reason <> '')
 			)
 		)`,
+		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.source_generation_bindings (
+			user_pk BIGINT NOT NULL,
+			source_id TEXT COLLATE "C" NOT NULL,
+			schema_generation_id INTEGER NOT NULL,
+			schema_generation_fingerprint TEXT COLLATE "C" NOT NULL,
+			PRIMARY KEY (user_pk, source_id),
+			CONSTRAINT source_generation_bindings_source_fk
+				FOREIGN KEY (user_pk, source_id)
+				REFERENCES sync.source_state(user_pk, source_id)
+				ON DELETE CASCADE,
+			CONSTRAINT source_generation_bindings_id_chk
+				CHECK (schema_generation_id BETWEEN 1 AND 2147483647),
+			CONSTRAINT source_generation_bindings_fingerprint_chk
+				CHECK (schema_generation_fingerprint ~ '^[0-9a-f]{64}$'),
+			CONSTRAINT source_generation_bindings_session_key
+				UNIQUE (user_pk, source_id, schema_generation_id, schema_generation_fingerprint)
+		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.row_state (
 			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
 			table_id INTEGER NOT NULL REFERENCES sync.table_catalog(table_id),
@@ -463,13 +571,15 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 			bundle_seq BIGINT NOT NULL,
 			source_id TEXT COLLATE "C" NOT NULL,
 			source_bundle_id BIGINT NOT NULL,
+			planned_row_count BIGINT,
 			row_count BIGINT NOT NULL,
 			byte_count BIGINT NOT NULL,
 			bundle_hash BYTEA NOT NULL,
 			canonical_request_hash TEXT COLLATE "C" NOT NULL,
 			committed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY (user_pk, bundle_seq),
-			CONSTRAINT bundle_log_source_tuple_key UNIQUE (user_pk, source_id, source_bundle_id)
+			CONSTRAINT bundle_log_source_tuple_key UNIQUE (user_pk, source_id, source_bundle_id),
+			CONSTRAINT bundle_log_planned_row_count_chk CHECK (planned_row_count IS NULL OR planned_row_count > 0)
 		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.bundle_rows (
 			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
@@ -489,47 +599,22 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 					OR (op_code IN (1, 2) AND payload_wire IS NOT NULL)
 				)
 		)`,
-		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.push_sessions (
-			push_id UUID PRIMARY KEY,
-			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
-			source_id TEXT COLLATE "C" NOT NULL,
-			source_bundle_id BIGINT NOT NULL,
-			planned_row_count BIGINT NOT NULL,
-			canonical_request_hash TEXT COLLATE "C" NOT NULL,
-			next_expected_row_ordinal BIGINT NOT NULL DEFAULT 0,
-			initialization_id UUID,
-			expires_at TIMESTAMPTZ NOT NULL,
-			CONSTRAINT push_sessions_source_tuple_key UNIQUE (user_pk, source_id, source_bundle_id),
-			CONSTRAINT push_sessions_row_count_chk CHECK (
-				planned_row_count > 0
-				AND next_expected_row_ordinal >= 0
-				AND next_expected_row_ordinal <= planned_row_count
-			)
-		)`,
-		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.push_session_rows (
-			push_id UUID NOT NULL REFERENCES sync.push_sessions(push_id) ON DELETE CASCADE,
-			row_ordinal BIGINT NOT NULL,
-			table_id INTEGER NOT NULL REFERENCES sync.table_catalog(table_id),
-			key_bytes BYTEA NOT NULL,
-			op_code SMALLINT NOT NULL,
-			base_bundle_seq BIGINT NOT NULL,
-			payload_apply JSON,
-			payload_request JSON,
-			PRIMARY KEY (push_id, row_ordinal),
-			CONSTRAINT push_session_rows_op_code_chk CHECK (op_code IN (1, 2, 3)),
-			CONSTRAINT push_session_rows_payload_by_op_chk
-				CHECK (
-					(op_code = 3 AND payload_apply IS NULL)
-					OR (op_code IN (1, 2) AND payload_apply IS NOT NULL)
-				)
-		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.snapshot_sessions (
 			snapshot_id UUID PRIMARY KEY,
 			user_pk BIGINT NOT NULL REFERENCES sync.user_state(user_pk) ON DELETE CASCADE,
+			source_id TEXT COLLATE "C" NOT NULL,
+			schema_generation_id INTEGER NOT NULL,
+			schema_generation_fingerprint TEXT COLLATE "C" NOT NULL,
 			snapshot_bundle_seq BIGINT NOT NULL,
 			row_count BIGINT NOT NULL DEFAULT 0,
 			byte_count BIGINT NOT NULL DEFAULT 0,
-			expires_at TIMESTAMPTZ NOT NULL
+			expires_at TIMESTAMPTZ NOT NULL,
+			CONSTRAINT snapshot_sessions_generation_id_chk CHECK (schema_generation_id BETWEEN 1 AND 2147483647),
+			CONSTRAINT snapshot_sessions_generation_fingerprint_chk CHECK (schema_generation_fingerprint ~ '^[0-9a-f]{64}$'),
+			CONSTRAINT snapshot_sessions_source_generation_fk
+				FOREIGN KEY (user_pk, source_id, schema_generation_id, schema_generation_fingerprint)
+				REFERENCES sync.source_generation_bindings (user_pk, source_id, schema_generation_id, schema_generation_fingerprint)
+				ON DELETE CASCADE
 		)`,
 		/*language=postgresql*/ `CREATE TABLE IF NOT EXISTS sync.snapshot_session_rows (
 			snapshot_id UUID NOT NULL REFERENCES sync.snapshot_sessions(snapshot_id) ON DELETE CASCADE,
@@ -636,6 +721,20 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 			RETURN NULL;
 		END;
 		$$`,
+		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.guard_source_generation_binding()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.user_pk IS NOT DISTINCT FROM OLD.user_pk
+				AND NEW.source_id IS NOT DISTINCT FROM OLD.source_id
+				AND NEW.schema_generation_id IS NOT DISTINCT FROM OLD.schema_generation_id
+				AND NEW.schema_generation_fingerprint IS NOT DISTINCT FROM OLD.schema_generation_fingerprint THEN
+				RETURN NEW;
+			END IF;
+			RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'source generation binding is immutable';
+		END;
+		$$`,
 		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.finalize_scope_write_receipt()
 		RETURNS TRIGGER
 		LANGUAGE plpgsql
@@ -704,6 +803,50 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 				RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'referenced server source reservation cannot be removed';
 			END IF;
 			RETURN OLD;
+		END;
+		$$`,
+		/*language=postgresql*/ `CREATE OR REPLACE FUNCTION sync.guard_table_catalog_identity()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF TG_OP = 'DELETE' THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '55000',
+					MESSAGE = format('registered table catalog row %s cannot be deleted', OLD.table_id);
+			END IF;
+
+			IF NEW.table_id IS DISTINCT FROM OLD.table_id
+			   OR NEW.schema_name IS DISTINCT FROM OLD.schema_name
+			   OR NEW.table_name IS DISTINCT FROM OLD.table_name
+			   OR NEW.sync_key_column IS DISTINCT FROM OLD.sync_key_column
+			   OR NEW.sync_key_kind IS DISTINCT FROM OLD.sync_key_kind
+			   OR NEW.introduced_revision IS DISTINCT FROM OLD.introduced_revision THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '55000',
+					MESSAGE = format('registered table catalog identity is immutable for table_id %s', OLD.table_id);
+			END IF;
+
+			IF OLD.state_code = 2 AND NEW IS DISTINCT FROM OLD THEN
+				RAISE EXCEPTION USING
+					ERRCODE = '55000',
+					MESSAGE = format('retired registered table catalog row %s is immutable', OLD.table_id);
+			END IF;
+
+			IF NEW IS NOT DISTINCT FROM OLD THEN
+				RETURN NEW;
+			END IF;
+
+			IF OLD.state_code = 1
+			   AND OLD.retired_revision IS NULL
+			   AND NEW.state_code = 2
+			   AND NEW.retired_revision > OLD.introduced_revision THEN
+				RETURN NEW;
+			END IF;
+
+			RAISE EXCEPTION USING
+				ERRCODE = '55000',
+				MESSAGE = format('invalid registered table catalog state transition for table_id %s', OLD.table_id);
 		END;
 		$$`,
 	}
@@ -808,6 +951,10 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 				new_key_text TEXT;
 				old_key_bytes BYTEA;
 				new_key_bytes BYTEA;
+				new_payload JSONB;
+				json_column TEXT;
+				json_text TEXT;
+				argument_index INTEGER;
 			BEGIN
 				bundle_user_id := NULLIF(current_setting('oversync.bundle_user_id', true), '');
 				IF bundle_user_id IS NULL THEN
@@ -884,6 +1031,21 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 				ELSE
 					new_key_bytes := convert_to(new_key_text, 'UTF8');
 				END IF;
+				new_payload := to_jsonb(NEW) - '_sync_scope_id';
+				IF TG_NARGS > 3 THEN
+					FOR argument_index IN 3..TG_NARGS - 1 LOOP
+						json_column := TG_ARGV[argument_index];
+						EXECUTE format('SELECT (($1).%I)::text', json_column)
+							INTO json_text
+							USING NEW;
+						new_payload := jsonb_set(
+							new_payload,
+							ARRAY[json_column],
+							COALESCE(to_jsonb(json_text), 'null'::jsonb),
+							false
+						);
+					END LOOP;
+				END IF;
 				IF TG_OP = 'UPDATE' THEN
 					IF OLD._sync_scope_id IS NULL THEN
 						RAISE EXCEPTION 'nullable old scope identity on registered table %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME;
@@ -921,7 +1083,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 							table_id_value,
 							1,
 							new_key_bytes,
-							to_jsonb(NEW) - '_sync_scope_id'
+							new_payload
 						);
 						RETURN NEW;
 				END IF;
@@ -936,7 +1098,7 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 					table_id_value,
 					CASE WHEN TG_OP = 'INSERT' THEN 1 ELSE 2 END,
 					new_key_bytes,
-					to_jsonb(NEW) - '_sync_scope_id'
+					new_payload
 				);
 
 			RETURN NEW;
@@ -956,8 +1118,8 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 	bootstrapIndexes := []string{
 		`CREATE INDEX IF NOT EXISTS bcs_tx_user_ordinal_idx ON sync.bundle_capture_stage(txid, user_pk, capture_ordinal)`,
 		`CREATE INDEX IF NOT EXISTS rs_user_live_snapshot_idx ON sync.row_state(user_pk, table_id, key_bytes) WHERE deleted = FALSE`,
-		`CREATE INDEX IF NOT EXISTS ps_expires_at_idx ON sync.push_sessions(expires_at)`,
 		`CREATE INDEX IF NOT EXISTS ss_expires_at_idx ON sync.snapshot_sessions(expires_at, snapshot_id)`,
+		`CREATE INDEX IF NOT EXISTS ss_source_generation_idx ON sync.snapshot_sessions(user_pk, source_id, schema_generation_id, schema_generation_fingerprint)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS ssr_snapshot_table_key_idx ON sync.snapshot_session_rows(snapshot_id, table_id, key_bytes)`,
 		`CREATE INDEX IF NOT EXISTS scope_write_receipts_cleanup_idx ON sync.scope_write_receipts(receipt_expires_at, user_pk, operation_id) WHERE receipt_state = 'completed'`,
 	}
@@ -969,6 +1131,8 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 	managedTriggers := []string{
 		`CREATE CONSTRAINT TRIGGER scope_write_receipts_finalizer AFTER INSERT OR UPDATE ON sync.scope_write_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sync.finalize_scope_write_receipt()`,
 		`CREATE TRIGGER server_source_reservations_guard BEFORE INSERT OR UPDATE OR DELETE ON sync.server_source_reservations FOR EACH ROW EXECUTE FUNCTION sync.guard_server_source_reservation()`,
+		`CREATE TRIGGER table_catalog_identity_guard BEFORE UPDATE OR DELETE ON sync.table_catalog FOR EACH ROW EXECUTE FUNCTION sync.guard_table_catalog_identity()`,
+		`CREATE TRIGGER source_generation_bindings_identity_guard BEFORE UPDATE ON sync.source_generation_bindings FOR EACH ROW EXECUTE FUNCTION sync.guard_source_generation_binding()`,
 	}
 	for _, stmt := range managedTriggers {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
@@ -981,13 +1145,13 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 }
 
 // discoverSchemaRelationships analyzes registered tables and builds dependency graph
-func (s *SyncService) discoverSchemaRelationships(ctx context.Context) error {
+func (s *SyncService) discoverSchemaRelationships(ctx context.Context, q syncCatalogQuerier) error {
 	if len(s.registeredTables) == 0 {
 		s.logger.Info("No registered tables, skipping schema discovery")
 		return nil
 	}
 
-	discovery := NewSchemaDiscovery(s.pool, s.logger)
+	discovery := newSchemaDiscoveryWithQuerier(q, s.logger)
 	discoveredSchema, err := discovery.DiscoverSchemaWithDependencyOverrides(ctx, s.registeredTables, s.registeredTableInfo, s.config.DependencyOverrides)
 	if err != nil {
 		return fmt.Errorf("failed to discover schema relationships: %w", err)

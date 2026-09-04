@@ -1,0 +1,409 @@
+{
+  "format": "maintenance-conflicts-v2",
+  "scenarios": [
+    {
+      "id": "M6-C01",
+      "name": "ordinary conflicts",
+      "requirements": [
+        "C1"
+      ],
+      "initial": {
+        "cases": [
+          "conflict-g1-INSERT",
+          "conflict-g1-UPDATE",
+          "conflict-g1-DELETE",
+          "conflict-g3-INSERT",
+          "conflict-g3-UPDATE",
+          "conflict-g3-DELETE"
+        ],
+        "initial_state_index": 0,
+        "generations": [
+          1,
+          3
+        ],
+        "operations": [
+          "INSERT",
+          "UPDATE",
+          "DELETE"
+        ]
+      },
+      "actions": [
+        "execute the named case inputs",
+        "assert each captured exchange and ordered state",
+        "reopen the persisted file and assert the restart state"
+      ],
+      "exchanges": [
+        {
+          "artifact": "cases.json",
+          "case": "conflict-g1-INSERT"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "conflict-g1-UPDATE"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "conflict-g1-DELETE"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "conflict-g3-INSERT"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "conflict-g3-UPDATE"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "conflict-g3-DELETE"
+        }
+      ],
+      "expected": {
+        "cases": [
+          "conflict-g1-INSERT",
+          "conflict-g1-UPDATE",
+          "conflict-g1-DELETE",
+          "conflict-g3-INSERT",
+          "conflict-g3-UPDATE",
+          "conflict-g3-DELETE"
+        ],
+        "assertions": "Compare every exchange and each ordered durable state from Expected in cases.json; runtime replacement uses runtime-upgrade.json.",
+        "needs_resolution": true
+      },
+      "go": [
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_OrdinaryConflicts"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_RuntimeReopenAndDestructiveGuards"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_ConcreteVectors"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C02",
+      "name": "explicit decisions",
+      "requirements": [
+        "C2"
+      ],
+      "initial": {
+        "cases": [
+          "newer_delete",
+          "stale_decision",
+          "keep_local",
+          "keep_merged"
+        ],
+        "initial_state_index": 0
+      },
+      "actions": [
+        "execute the named case inputs",
+        "assert each captured exchange and ordered state",
+        "reopen the persisted file and assert the restart state"
+      ],
+      "exchanges": [
+        {
+          "artifact": "cases.json",
+          "case": "newer_delete"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "stale_decision"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "keep_local"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "keep_merged"
+        }
+      ],
+      "expected": {
+        "cases": [
+          "newer_delete",
+          "stale_decision",
+          "keep_local",
+          "keep_merged"
+        ],
+        "assertions": "Compare every exchange and each ordered durable state from Expected in cases.json; runtime replacement uses runtime-upgrade.json."
+      },
+      "go": [
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_StaleDecisionAndNewerEditSurvive"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_DecisionRollbackAndRetry"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_MergeCannotMoveKey"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_ProcessDeathKeepsAtomicDecision"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_ConcreteVectors"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C03",
+      "name": "maintenance boundaries",
+      "requirements": [
+        "R5",
+        "E2"
+      ],
+      "initial": {
+        "cases": [
+          "maintenance"
+        ],
+        "initial_state_index": 0
+      },
+      "actions": [
+        "execute the named case inputs",
+        "assert each captured exchange and ordered state",
+        "reopen the persisted file and assert the restart state"
+      ],
+      "exchanges": [
+        {
+          "status": 503,
+          "body": {
+            "error": "service_not_ready",
+            "message": "Sync service is unavailable; retry later"
+          }
+        }
+      ],
+      "expected": {
+        "cases": [
+          "maintenance"
+        ],
+        "assertions": "Compare every exchange and each ordered durable state from Expected in cases.json; runtime replacement uses runtime-upgrade.json."
+      },
+      "go": [
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_TemporaryRejection"
+        ],
+        [
+          ".",
+          "./integration/schema_evolution",
+          "TestEvolution_MaintenanceRejectsEveryOrdinaryEntry"
+        ],
+        [
+          "integration/mobile_flow",
+          "./simulator",
+          "TestMobileFlow_TransitionPostgreSQLTransitionAndUpgrade"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_ConcreteVectors"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C04",
+      "name": "uncertain commit and session recovery",
+      "requirements": [
+        "C3",
+        "E2"
+      ],
+      "initial": {
+        "cases": [
+          "uncertain",
+          "unsettled",
+          "expired",
+          "resumable-three-chunks"
+        ],
+        "initial_state_index": 0
+      },
+      "actions": [
+        "execute the named case inputs",
+        "assert each captured exchange and ordered state",
+        "reopen the persisted file and assert the restart state"
+      ],
+      "exchanges": [
+        {
+          "artifact": "cases.json",
+          "case": "uncertain"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "unsettled"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "expired"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "resumable-three-chunks"
+        }
+      ],
+      "expected": {
+        "cases": [
+          "uncertain",
+          "unsettled",
+          "expired",
+          "resumable-three-chunks"
+        ],
+        "assertions": "Compare every exchange and each ordered durable state from Expected in cases.json; runtime replacement uses runtime-upgrade.json."
+      },
+      "go": [
+        [
+          "integration/mobile_flow",
+          "./simulator",
+          "TestMobileFlow_TransitionPostgreSQLTransitionAndUpgrade"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPushPending_CommittedRemoteReplayPrunedFallsBackToKeepSourceRebuild"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPushPending_PrunedRecoveryRejectsSnapshotCorruptedByCrossRowTrigger"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_ConcreteVectors"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPushResume_ThreeChunksAcrossMaintenanceAndSameFileReopen"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestPushPending_StagingHashEchoPreservesFrozenIntent"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C05",
+      "name": "destructive-operation guards",
+      "requirements": [
+        "C3"
+      ],
+      "initial": {
+        "cases": [
+          "retry_uninstall",
+          "unsettled"
+        ],
+        "initial_state_index": 0
+      },
+      "actions": [
+        "execute the named case inputs",
+        "assert each captured exchange and ordered state",
+        "reopen the persisted file and assert the restart state"
+      ],
+      "exchanges": [
+        {
+          "artifact": "cases.json",
+          "case": "retry_uninstall"
+        },
+        {
+          "artifact": "cases.json",
+          "case": "unsettled"
+        }
+      ],
+      "expected": {
+        "cases": [
+          "retry_uninstall",
+          "unsettled"
+        ],
+        "assertions": "Compare every exchange and each ordered durable state from Expected in cases.json; runtime replacement uses runtime-upgrade.json."
+      },
+      "go": [
+        [
+          ".",
+          "./oversqlite",
+          "TestPendingConflict_RuntimeReopenAndDestructiveGuards"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestOpening_I03PermanentRejectionRequiresBoundResolution"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestOpening_I03ResolutionDecisionSurvivesProcessDeath"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestMaintenanceConformance_ConcreteVectors"
+        ],
+        [
+          ".",
+          "./oversqlite",
+          "TestUninstall_RejectsRetryAndDirtyDelete"
+        ]
+      ]
+    },
+    {
+      "id": "M6-C06",
+      "name": "deployment compatibility",
+      "requirements": [
+        "C4",
+        "E2"
+      ],
+      "initial": {
+        "cases": [
+          "runtime-upgrade.json"
+        ],
+        "initial_state_index": 0
+      },
+      "actions": [
+        "execute the named case inputs",
+        "assert each captured exchange and ordered state",
+        "reopen the persisted file and assert the restart state"
+      ],
+      "exchanges": [
+        {
+          "artifact": "runtime-upgrade.json"
+        }
+      ],
+      "expected": {
+        "cases": [
+          "runtime-upgrade.json"
+        ],
+        "assertions": "Compare every exchange and each ordered durable state from Expected in cases.json; runtime replacement uses runtime-upgrade.json."
+      },
+      "go": [
+        [
+          "integration/mobile_flow",
+          "./simulator",
+          "TestMobileFlow_TransitionPostgreSQLTransitionAndUpgrade"
+        ]
+      ]
+    }
+  ]
+}

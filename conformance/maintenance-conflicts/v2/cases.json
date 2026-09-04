@@ -1,0 +1,5076 @@
+[
+  {
+    "ID": "conflict-g1-INSERT",
+    "Mode": "conflict",
+    "Op": "INSERT",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "INSERT",
+                "base_row_version": 0,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 2,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "INSERT",
+                "base_row_version": 0,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 2,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "INSERT",
+                "base_row_version": 0,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 2,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "conflict-g1-UPDATE",
+    "Mode": "conflict",
+    "Op": "UPDATE",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              1,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "conflict-g1-DELETE",
+    "Mode": "conflict",
+    "Op": "DELETE",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"36cf6f4419b1739cbe2d8dbed6674ad030408f9f025b12a77de8b6abfc4de5a0\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"36cf6f4419b1739cbe2d8dbed6674ad030408f9f025b12a77de8b6abfc4de5a0\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"DELETE\",\"base_row_version\":1}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"DELETE\",\"base_row_version\":1,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "DELETE",
+              1,
+              null,
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": {
+            "bundle": 1,
+            "hash": "36cf6f4419b1739cbe2d8dbed6674ad030408f9f025b12a77de8b6abfc4de5a0",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "DELETE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "DELETE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              null
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "36cf6f4419b1739cbe2d8dbed6674ad030408f9f025b12a77de8b6abfc4de5a0",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": {
+            "bundle": 1,
+            "hash": "36cf6f4419b1739cbe2d8dbed6674ad030408f9f025b12a77de8b6abfc4de5a0",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "DELETE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "DELETE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              null
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "36cf6f4419b1739cbe2d8dbed6674ad030408f9f025b12a77de8b6abfc4de5a0",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": {
+            "bundle": 1,
+            "hash": "36cf6f4419b1739cbe2d8dbed6674ad030408f9f025b12a77de8b6abfc4de5a0",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "DELETE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "DELETE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              null
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "36cf6f4419b1739cbe2d8dbed6674ad030408f9f025b12a77de8b6abfc4de5a0",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "conflict-g3-INSERT",
+    "Mode": "conflict",
+    "Op": "INSERT",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 3,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"4863e5c5cb45dff429daf730254f20a9594d27cd49bacfb8b862664ce52b1245\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"4863e5c5cb45dff429daf730254f20a9594d27cd49bacfb8b862664ce52b1245\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "4863e5c5cb45dff429daf730254f20a9594d27cd49bacfb8b862664ce52b1245",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "INSERT",
+                "base_row_version": 0,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 2,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "4863e5c5cb45dff429daf730254f20a9594d27cd49bacfb8b862664ce52b1245",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "4863e5c5cb45dff429daf730254f20a9594d27cd49bacfb8b862664ce52b1245",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "INSERT",
+                "base_row_version": 0,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 2,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "4863e5c5cb45dff429daf730254f20a9594d27cd49bacfb8b862664ce52b1245",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "4863e5c5cb45dff429daf730254f20a9594d27cd49bacfb8b862664ce52b1245",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "INSERT",
+                "base_row_version": 0,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 2,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "4863e5c5cb45dff429daf730254f20a9594d27cd49bacfb8b862664ce52b1245",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "conflict-g3-UPDATE",
+    "Mode": "conflict",
+    "Op": "UPDATE",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 3,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"6ccc022aff9644393ec86e008942471161277cd847bb0d0171e01efff9a77040\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"6ccc022aff9644393ec86e008942471161277cd847bb0d0171e01efff9a77040\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              1,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "6ccc022aff9644393ec86e008942471161277cd847bb0d0171e01efff9a77040",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "6ccc022aff9644393ec86e008942471161277cd847bb0d0171e01efff9a77040",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "6ccc022aff9644393ec86e008942471161277cd847bb0d0171e01efff9a77040",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "6ccc022aff9644393ec86e008942471161277cd847bb0d0171e01efff9a77040",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "6ccc022aff9644393ec86e008942471161277cd847bb0d0171e01efff9a77040",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "6ccc022aff9644393ec86e008942471161277cd847bb0d0171e01efff9a77040",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "conflict-g3-DELETE",
+    "Mode": "conflict",
+    "Op": "DELETE",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 3,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"a0ba9d52dd88fbd370860725a020f9fb8e602b6735791cf68df12cc0bd516a2f\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"a0ba9d52dd88fbd370860725a020f9fb8e602b6735791cf68df12cc0bd516a2f\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"DELETE\",\"base_row_version\":1}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"DELETE\",\"base_row_version\":1,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "3",
+          "Fingerprint": "a436a801594043bfb6104f9e57551d7a503741fd88ed2c462e1b298c2c15c95f",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "DELETE",
+              1,
+              null,
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": {
+            "bundle": 1,
+            "hash": "a0ba9d52dd88fbd370860725a020f9fb8e602b6735791cf68df12cc0bd516a2f",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "DELETE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "DELETE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              null
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "a0ba9d52dd88fbd370860725a020f9fb8e602b6735791cf68df12cc0bd516a2f",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": {
+            "bundle": 1,
+            "hash": "a0ba9d52dd88fbd370860725a020f9fb8e602b6735791cf68df12cc0bd516a2f",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "DELETE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "DELETE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              null
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "a0ba9d52dd88fbd370860725a020f9fb8e602b6735791cf68df12cc0bd516a2f",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": {
+            "bundle": 1,
+            "hash": "a0ba9d52dd88fbd370860725a020f9fb8e602b6735791cf68df12cc0bd516a2f",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "DELETE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "DELETE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              null
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "a0ba9d52dd88fbd370860725a020f9fb8e602b6735791cf68df12cc0bd516a2f",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "newer_delete",
+    "Mode": "newer_delete",
+    "Op": "INSERT",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"bed4fedac3b35f7f1bdb25427cd37b4d350021f344aebdc1c1dd062f9382003b\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000002\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"bed4fedac3b35f7f1bdb25427cd37b4d350021f344aebdc1c1dd062f9382003b\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000002/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"DELETE\",\"base_row_version\":2}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000002\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000002/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":152,\"bundle_hash\":\"8181d8082c5e5a1ee16b1ccd40c8c2a2878bf7389e48246ecc062bb80e758edf\",\"canonical_request_hash\":\"bed4fedac3b35f7f1bdb25427cd37b4d350021f344aebdc1c1dd062f9382003b\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":152,\"bundle_hash\":\"8181d8082c5e5a1ee16b1ccd40c8c2a2878bf7389e48246ecc062bb80e758edf\",\"canonical_request_hash\":\"bed4fedac3b35f7f1bdb25427cd37b4d350021f344aebdc1c1dd062f9382003b\",\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"DELETE\",\"row_version\":3}],\"next_row_ordinal\":0,\"has_more\":false}",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "INSERT",
+                "base_row_version": 0,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 2,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "DELETE",
+              2,
+              null,
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              2,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "DELETE",
+              2,
+              null,
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              2,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              3,
+              1
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              2
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "retry_uninstall",
+    "Mode": "retry_uninstall",
+    "Op": "INSERT",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "INSERT",
+                "base_row_version": 0,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 2,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "maintenance",
+    "Mode": "maintenance",
+    "Op": "INSERT",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 503,
+          "Response": "{\"error\":\"service_not_ready\",\"message\":\"Sync service is unavailable; retry later\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":236,\"bundle_hash\":\"2683e38299ac9675044f658a58dc9db67e952494013284e74b92305a9faa15a9\",\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":236,\"bundle_hash\":\"2683e38299ac9675044f658a58dc9db67e952494013284e74b92305a9faa15a9\",\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\",\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"row_version\":3,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}],\"next_row_ordinal\":0,\"has_more\":false}",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              3,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              2
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "uncertain",
+    "Mode": "uncertain",
+    "Op": "INSERT",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 0,
+          "Response": "",
+          "TransportError": "fixture lost commit response"
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 200,
+          "Response": "{\"status\":\"already_committed\",\"planned_row_count\":1,\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"row_count\":1,\"byte_count\":236,\"bundle_hash\":\"2683e38299ac9675044f658a58dc9db67e952494013284e74b92305a9faa15a9\",\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":236,\"bundle_hash\":\"2683e38299ac9675044f658a58dc9db67e952494013284e74b92305a9faa15a9\",\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\",\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"row_version\":3,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}],\"next_row_ordinal\":0,\"has_more\":false}",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              3,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              2
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "expired",
+    "Mode": "expired",
+    "Op": "INSERT",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 410,
+          "Response": "{\"error\":\"push_session_expired\",\"message\":\"Push session expired\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000002\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000002/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000002\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000002/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":236,\"bundle_hash\":\"2683e38299ac9675044f658a58dc9db67e952494013284e74b92305a9faa15a9\",\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":236,\"bundle_hash\":\"2683e38299ac9675044f658a58dc9db67e952494013284e74b92305a9faa15a9\",\"canonical_request_hash\":\"da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635\",\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"INSERT\",\"row_version\":3,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}],\"next_row_ordinal\":0,\"has_more\":false}",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "da893fea8e747854012b9228a06f3a8d9e8c7375f28c158ca164d71eb66a0635",
+              1,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              3,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              2
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "unsettled",
+    "Mode": "unsettled",
+    "Op": "UPDATE",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":241,\"bundle_hash\":\"41a2a5ec7dd180b9f2f629398577a888ded8da6e9e1f095b20c1cbc7c6505073\",\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 0,
+          "Response": "",
+          "TransportError": "fixture lost settlement response"
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "Status": 200,
+          "Response": "{\"status\":\"already_committed\",\"planned_row_count\":1,\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"row_count\":1,\"byte_count\":241,\"bundle_hash\":\"41a2a5ec7dd180b9f2f629398577a888ded8da6e9e1f095b20c1cbc7c6505073\",\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":241,\"bundle_hash\":\"41a2a5ec7dd180b9f2f629398577a888ded8da6e9e1f095b20c1cbc7c6505073\",\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\",\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"row_version\":3,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}],\"next_row_ordinal\":0,\"has_more\":false}",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              1,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "committed_remote",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              3
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "committed_remote",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              3
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "committed_remote",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              3
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              3,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              2
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "stale_decision",
+    "Mode": "stale_decision",
+    "Op": "UPDATE",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              1,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Newer",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+            "newer_op": "UPDATE",
+            "newer_payload": {
+              "email": "original@example.com",
+              "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "name": "Newer"
+            },
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 5,
+            "source": "bundle-device"
+          },
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              1,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Newer\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Newer",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+            "newer_op": "UPDATE",
+            "newer_payload": {
+              "email": "original@example.com",
+              "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "name": "Newer"
+            },
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 5,
+            "source": "bundle-device"
+          },
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              1,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Newer\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "keep_local",
+    "Mode": "keep_local",
+    "Op": "UPDATE",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"2ce2dc985bf2f3b295291e8e8d499735f8f87587cdb4166250294b5d9fa151f1\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000002\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"2ce2dc985bf2f3b295291e8e8d499735f8f87587cdb4166250294b5d9fa151f1\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000002/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":2,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000002\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000002/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":241,\"bundle_hash\":\"41a2a5ec7dd180b9f2f629398577a888ded8da6e9e1f095b20c1cbc7c6505073\",\"canonical_request_hash\":\"2ce2dc985bf2f3b295291e8e8d499735f8f87587cdb4166250294b5d9fa151f1\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":241,\"bundle_hash\":\"41a2a5ec7dd180b9f2f629398577a888ded8da6e9e1f095b20c1cbc7c6505073\",\"canonical_request_hash\":\"2ce2dc985bf2f3b295291e8e8d499735f8f87587cdb4166250294b5d9fa151f1\",\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"row_version\":3,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}],\"next_row_ordinal\":0,\"has_more\":false}",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              1,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              2,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              2,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              2,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              2,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              3,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              2
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "keep_merged",
+    "Mode": "keep_merged",
+    "Op": "UPDATE",
+    "Key": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "Name": "Offline",
+    "Email": "ada@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"payload\":{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 409,
+          "Response": "{\"error\":\"push_conflict\",\"message\":\"bundle conflict\",\"conflict\":{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":1,\"server_row_version\":2,\"server_row_deleted\":false,\"server_row\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Server\"}}}",
+          "TransportError": ""
+        },
+        {
+          "Method": "DELETE",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 204,
+          "Response": "",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":1,\"canonical_request_hash\":\"8d3f052b4983911e8ed58a86ac94a43b327039b0d342dd878a5fc5f5ac337a87\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000002\",\"status\":\"staging\",\"planned_row_count\":1,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"8d3f052b4983911e8ed58a86ac94a43b327039b0d342dd878a5fc5f5ac337a87\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000002/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"base_row_version\":2,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Merged\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000002\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000002/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":235,\"bundle_hash\":\"d022d8b4ce76e21c28fd386a894617fd67aacae9c32c203aa4071b91b0b748b0\",\"canonical_request_hash\":\"8d3f052b4983911e8ed58a86ac94a43b327039b0d342dd878a5fc5f5ac337a87\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":1,\"row_count\":1,\"byte_count\":235,\"bundle_hash\":\"d022d8b4ce76e21c28fd386a894617fd67aacae9c32c203aa4071b91b0b748b0\",\"canonical_request_hash\":\"8d3f052b4983911e8ed58a86ac94a43b327039b0d342dd878a5fc5f5ac337a87\",\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"op\":\"UPDATE\",\"row_version\":3,\"payload\":{\"email\":\"ada@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Merged\"}}],\"next_row_ordinal\":0,\"has_more\":false}",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              1,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline\"},\"email\":{\"storage\":\"text\",\"value\":\"original@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Offline",
+              "original@example.com"
+            ]
+          ],
+          "conflict": {
+            "bundle": 1,
+            "hash": "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+            "newer_op": "",
+            "newer_payload": null,
+            "response": {
+              "error": "push_conflict",
+              "message": "",
+              "conflict": {
+                "schema": "main",
+                "table": "users",
+                "key": {
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                },
+                "op": "UPDATE",
+                "base_row_version": 1,
+                "server_row_version": 2,
+                "server_row_deleted": false,
+                "server_row": {
+                  "email": "ada@example.com",
+                  "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                  "name": "Server"
+                }
+              }
+            },
+            "revision": 4,
+            "source": "bundle-device"
+          },
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "UPDATE",
+              1,
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "{\"email\":\"original@example.com\",\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"name\":\"Offline\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5afa77773c2b8e187df2fa9272b0fd1c8a201ab14f72c73a3a8ef13590022af8",
+              1,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              1,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Merged",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              2,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Merged\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              2,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Merged",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              "UPDATE",
+              2,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"},\"name\":{\"storage\":\"text\",\"value\":\"Merged\"},\"email\":{\"storage\":\"text\",\"value\":\"ada@example.com\"}}",
+              1
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              2,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+              "Merged",
+              "ada@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"}",
+              3,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              2
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  },
+  {
+    "ID": "resumable-three-chunks",
+    "Mode": "resumable_chunks",
+    "Op": "INSERT",
+    "Key": "00000000-0000-4000-8000-000000000001",
+    "Name": "Offline1",
+    "Email": "person1@example.com",
+    "Generation": 1,
+    "Expected": {
+      "Exchanges": [
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":3,\"canonical_request_hash\":\"5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":3,\"next_expected_row_ordinal\":0,\"canonical_request_hash\":\"5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":0,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"00000000-0000-4000-8000-000000000001\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"person1@example.com\",\"id\":\"00000000-0000-4000-8000-000000000001\",\"name\":\"Offline1\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":1}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":1,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"00000000-0000-4000-8000-000000000002\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"person2@example.com\",\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"Offline2\"}}]}",
+          "Status": 503,
+          "Response": "{\"error\":\"service_not_ready\",\"message\":\"Sync service is unavailable; retry later\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"source_bundle_id\":1,\"planned_row_count\":3,\"canonical_request_hash\":\"5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2\"}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"status\":\"staging\",\"planned_row_count\":3,\"next_expected_row_ordinal\":1,\"canonical_request_hash\":\"5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":1,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"00000000-0000-4000-8000-000000000002\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"person2@example.com\",\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"Offline2\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":2}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/chunks",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "{\"start_row_ordinal\":2,\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"00000000-0000-4000-8000-000000000003\"},\"op\":\"INSERT\",\"base_row_version\":0,\"payload\":{\"email\":\"person3@example.com\",\"id\":\"00000000-0000-4000-8000-000000000003\",\"name\":\"Offline3\"}}]}",
+          "Status": 200,
+          "Response": "{\"push_id\":\"00000000-0000-4000-8000-000000000001\",\"next_expected_row_ordinal\":3}",
+          "TransportError": ""
+        },
+        {
+          "Method": "POST",
+          "Path": "/sync/push-sessions/00000000-0000-4000-8000-000000000001/commit",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":3,\"row_count\":3,\"byte_count\":721,\"bundle_hash\":\"efcf0c4e58f5e2df7e48d5279b77e40af226f67cc29f53ebb2567440a84b96d2\",\"canonical_request_hash\":\"5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2\"}",
+          "TransportError": ""
+        },
+        {
+          "Method": "GET",
+          "Path": "/sync/committed-bundles/3/rows?max_rows=1000",
+          "Source": "bundle-device",
+          "Generation": "1",
+          "Fingerprint": "25b9d501ea067fd4c0c33c0bf660359ea8b66afcf9a9dd5555c2f3f954b8ec8d",
+          "Request": "",
+          "Status": 200,
+          "Response": "{\"bundle_seq\":3,\"source_id\":\"bundle-device\",\"source_bundle_id\":1,\"planned_row_count\":3,\"row_count\":3,\"byte_count\":721,\"bundle_hash\":\"efcf0c4e58f5e2df7e48d5279b77e40af226f67cc29f53ebb2567440a84b96d2\",\"canonical_request_hash\":\"5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2\",\"rows\":[{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"00000000-0000-4000-8000-000000000001\"},\"op\":\"INSERT\",\"row_version\":3,\"payload\":{\"email\":\"person1@example.com\",\"id\":\"00000000-0000-4000-8000-000000000001\",\"name\":\"Offline1\"}},{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"00000000-0000-4000-8000-000000000002\"},\"op\":\"INSERT\",\"row_version\":3,\"payload\":{\"email\":\"person2@example.com\",\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"Offline2\"}},{\"schema\":\"main\",\"table\":\"users\",\"key\":{\"id\":\"00000000-0000-4000-8000-000000000003\"},\"op\":\"INSERT\",\"row_version\":3,\"payload\":{\"email\":\"person3@example.com\",\"id\":\"00000000-0000-4000-8000-000000000003\",\"name\":\"Offline3\"}}],\"next_row_ordinal\":2,\"has_more\":false}",
+          "TransportError": ""
+        }
+      ],
+      "States": [
+        {
+          "business": [
+            [
+              "00000000-0000-4000-8000-000000000001",
+              "Offline1",
+              "person1@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000002",
+              "Offline2",
+              "person2@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000003",
+              "Offline3",
+              "person3@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"00000000-0000-4000-8000-000000000001\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"00000000-0000-4000-8000-000000000001\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline1\"},\"email\":{\"storage\":\"text\",\"value\":\"person1@example.com\"}}",
+              1
+            ],
+            [
+              "main",
+              "users",
+              "{\"id\":\"00000000-0000-4000-8000-000000000002\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"00000000-0000-4000-8000-000000000002\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline2\"},\"email\":{\"storage\":\"text\",\"value\":\"person2@example.com\"}}",
+              2
+            ],
+            [
+              "main",
+              "users",
+              "{\"id\":\"00000000-0000-4000-8000-000000000003\"}",
+              "INSERT",
+              0,
+              "{\"id\":{\"storage\":\"text\",\"value\":\"00000000-0000-4000-8000-000000000003\"},\"name\":{\"storage\":\"text\",\"value\":\"Offline3\"},\"email\":{\"storage\":\"text\",\"value\":\"person3@example.com\"}}",
+              3
+            ]
+          ],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "00000000-0000-4000-8000-000000000001",
+              "Offline1",
+              "person1@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000002",
+              "Offline2",
+              "person2@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000003",
+              "Offline3",
+              "person3@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000001\"}",
+              "{\"email\":\"person1@example.com\",\"id\":\"00000000-0000-4000-8000-000000000001\",\"name\":\"Offline1\"}"
+            ],
+            [
+              1,
+              1,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000002\"}",
+              "{\"email\":\"person2@example.com\",\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"Offline2\"}"
+            ],
+            [
+              1,
+              2,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000003\"}",
+              "{\"email\":\"person3@example.com\",\"id\":\"00000000-0000-4000-8000-000000000003\",\"name\":\"Offline3\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2",
+              3,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "00000000-0000-4000-8000-000000000001",
+              "Offline1",
+              "person1@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000002",
+              "Offline2",
+              "person2@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000003",
+              "Offline3",
+              "person3@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000001\"}",
+              "{\"email\":\"person1@example.com\",\"id\":\"00000000-0000-4000-8000-000000000001\",\"name\":\"Offline1\"}"
+            ],
+            [
+              1,
+              1,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000002\"}",
+              "{\"email\":\"person2@example.com\",\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"Offline2\"}"
+            ],
+            [
+              1,
+              2,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000003\"}",
+              "{\"email\":\"person3@example.com\",\"id\":\"00000000-0000-4000-8000-000000000003\",\"name\":\"Offline3\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2",
+              3,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "00000000-0000-4000-8000-000000000001",
+              "Offline1",
+              "person1@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000002",
+              "Offline2",
+              "person2@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000003",
+              "Offline3",
+              "person3@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [
+            [
+              1,
+              0,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000001\"}",
+              "{\"email\":\"person1@example.com\",\"id\":\"00000000-0000-4000-8000-000000000001\",\"name\":\"Offline1\"}"
+            ],
+            [
+              1,
+              1,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000002\"}",
+              "{\"email\":\"person2@example.com\",\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"Offline2\"}"
+            ],
+            [
+              1,
+              2,
+              "INSERT",
+              0,
+              "{\"id\":\"00000000-0000-4000-8000-000000000003\"}",
+              "{\"email\":\"person3@example.com\",\"id\":\"00000000-0000-4000-8000-000000000003\",\"name\":\"Offline3\"}"
+            ]
+          ],
+          "outbox": [
+            [
+              "prepared",
+              "bundle-device",
+              1,
+              "5cddbb84bec2b4c3a83dabfe3cfa1672a0ef77b93711f7ed99e84a2d2712f0f2",
+              3,
+              "00000000-0000-4000-8000-000000000001",
+              0
+            ]
+          ],
+          "row_state": [],
+          "source": [
+            [
+              "bundle-device",
+              1
+            ]
+          ]
+        },
+        {
+          "business": [
+            [
+              "00000000-0000-4000-8000-000000000001",
+              "Offline1",
+              "person1@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000002",
+              "Offline2",
+              "person2@example.com"
+            ],
+            [
+              "00000000-0000-4000-8000-000000000003",
+              "Offline3",
+              "person3@example.com"
+            ]
+          ],
+          "conflict": null,
+          "dirty": [],
+          "frozen_rows": [],
+          "outbox": [
+            [
+              "none",
+              "",
+              0,
+              "",
+              0,
+              "",
+              0
+            ]
+          ],
+          "row_state": [
+            [
+              "main",
+              "users",
+              "{\"id\":\"00000000-0000-4000-8000-000000000001\"}",
+              3,
+              0
+            ],
+            [
+              "main",
+              "users",
+              "{\"id\":\"00000000-0000-4000-8000-000000000002\"}",
+              3,
+              0
+            ],
+            [
+              "main",
+              "users",
+              "{\"id\":\"00000000-0000-4000-8000-000000000003\"}",
+              3,
+              0
+            ]
+          ],
+          "source": [
+            [
+              "bundle-device",
+              2
+            ]
+          ]
+        }
+      ],
+      "UninstallBlocked": true
+    }
+  }
+]

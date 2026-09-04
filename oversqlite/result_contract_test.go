@@ -26,7 +26,7 @@ func TestResultContract_Open(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, client.Close())
 
-		restarted, err := NewClient(db, "http://example.invalid", tokenProviderForTests, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+		restarted, err := newTestClient(t, db, "http://example.invalid", tokenProviderForTests, admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof()))
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, restarted.Close()) })
 
@@ -45,8 +45,9 @@ func TestResultContract_Open(t *testing.T) {
 func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 	t.Run("retry later result shape", func(t *testing.T) {
 		client, _ := newLifecycleTestClient(t, &oversync.ConnectResponse{
-			Resolution:    "retry_later",
-			RetryAfterSec: 7,
+			Resolution:     "retry_later",
+			LeaseExpiresAt: "2030-01-01T00:00:00Z",
+			RetryAfterSec:  7,
 		})
 
 		result, err := client.Attach(context.Background(), "result-user")
@@ -57,10 +58,12 @@ func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 	})
 
 	t.Run("restore result shape", func(t *testing.T) {
+		snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote-1"}, RowVersion: 9, Payload: mustJSONPayload(t, map[string]any{"id": "remote-1", "name": "Remote", "email": "remote@example.com"})}}
+		snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 		client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 			switch r.URL.Path {
-			case "/sync/capabilities":
-				return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+			case "/sync/generations/1":
+				return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 			case "/sync/connect":
 				return jsonResponse(&oversync.ConnectResponse{Resolution: "remote_authoritative"}), nil
 			case "/sync/snapshot-sessions":
@@ -68,6 +71,7 @@ func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 					SnapshotID:        "snapshot-result-contract",
 					SnapshotBundleSeq: 9,
 					RowCount:          1,
+					ByteCount:         snapshotBytes,
 					ExpiresAt:         time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
 				}), nil
 			case "/sync/snapshot-sessions/snapshot-result-contract":
@@ -76,15 +80,9 @@ func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 					return jsonResponse(&oversync.SnapshotChunkResponse{
 						SnapshotID:        "snapshot-result-contract",
 						SnapshotBundleSeq: 9,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "users",
-							Key:        oversync.SyncKey{"id": "remote-1"},
-							RowVersion: 9,
-							Payload:    mustJSONPayload(t, map[string]any{"id": "remote-1", "name": "Remote", "email": "remote@example.com"}),
-						}},
-						NextRowOrdinal: 1,
-						HasMore:        false,
+						Rows:              snapshotRows,
+						NextRowOrdinal:    1,
+						HasMore:           false,
 					}), nil
 				case http.MethodDelete:
 					return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody}, nil
@@ -116,7 +114,7 @@ func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 		_, err = db.Exec(lifecycleUsersDDL)
 		require.NoError(t, err)
 
-		client, err := NewClient(db, "http://example.invalid", tokenProviderForTests, DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}))
+		client, err := newTestClient(t, db, "http://example.invalid", tokenProviderForTests, admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof()))
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, client.Close()) })
 
@@ -125,9 +123,10 @@ func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 		require.ErrorAs(t, err, &openErr)
 
 		mustOpen(t, client, context.Background())
-		_, err = client.SyncStatus(context.Background())
-		var attachErr *AttachRequiredError
-		require.ErrorAs(t, err, &attachErr)
+		localStatus, err := client.SyncStatus(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, AuthorityStatusLocalOnly, localStatus.Authority)
+		require.Zero(t, localStatus.Pending.PendingRowCount)
 
 		attachTestClient(t, client, "result-user", "device-a")
 		_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
@@ -164,7 +163,7 @@ func TestResultContract_PushOutcomes(t *testing.T) {
 		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, lifecycleUsersDDL)
 		_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
 		require.NoError(t, err)
-		client.HTTP = &http.Client{Transport: newMockPushSessionServer(t)}
+		client.HTTP = &http.Client{Transport: newMockPushServer(t)}
 
 		report := mustPushPending(t, client, ctx)
 		require.Equal(t, PushOutcomeCommitted, report.Outcome)
@@ -179,7 +178,7 @@ func TestResultContract_RemoteSyncAndRotationOutcomes(t *testing.T) {
 		client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, lifecycleUsersDDL)
 		client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			require.Equal(t, "/sync/pull", r.URL.Path)
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		})}
 
 		report := mustPullToStable(t, client, ctx)
@@ -225,6 +224,8 @@ func TestResultContract_RemoteSyncAndRotationOutcomes(t *testing.T) {
 
 	t.Run("rebuild snapshot keeps managed source outside source recovery", func(t *testing.T) {
 		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, lifecycleUsersDDL)
+		snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "user-1"}, RowVersion: 5, Payload: mustJSONPayload(t, map[string]any{"id": "user-1", "name": "Ada", "email": "ada@example.com"})}}
+		snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 		client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			switch r.URL.Path {
 			case "/sync/snapshot-sessions":
@@ -232,6 +233,7 @@ func TestResultContract_RemoteSyncAndRotationOutcomes(t *testing.T) {
 					SnapshotID:        "snapshot-result-contract",
 					SnapshotBundleSeq: 5,
 					RowCount:          1,
+					ByteCount:         snapshotBytes,
 					ExpiresAt:         "2030-01-01T00:00:00Z",
 				}), nil
 			case "/sync/snapshot-sessions/snapshot-result-contract":
@@ -240,15 +242,9 @@ func TestResultContract_RemoteSyncAndRotationOutcomes(t *testing.T) {
 					return jsonResponse(oversync.SnapshotChunkResponse{
 						SnapshotID:        "snapshot-result-contract",
 						SnapshotBundleSeq: 5,
-						Rows: []oversync.SnapshotRow{{
-							Schema:     "main",
-							Table:      "users",
-							Key:        oversync.SyncKey{"id": "user-1"},
-							RowVersion: 5,
-							Payload:    mustJSONPayload(t, map[string]any{"id": "user-1", "name": "Ada", "email": "ada@example.com"}),
-						}},
-						NextRowOrdinal: 1,
-						HasMore:        false,
+						Rows:              snapshotRows,
+						NextRowOrdinal:    1,
+						HasMore:           false,
 					}), nil
 				case http.MethodDelete:
 					return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody}, nil
@@ -322,14 +318,17 @@ func TestResultContract_SyncAndSyncThenDetach(t *testing.T) {
 		require.False(t, result.IsSuccess())
 		require.Equal(t, DetachOutcomeBlockedUnsyncedData, result.Detach.Outcome)
 		require.Greater(t, result.RemainingPendingRowCount, int64(0))
+		require.Equal(t, DetachBlockedUploadsPaused, result.BlockedReason)
+		require.Nil(t, result.LastSync)
 	})
 
-	t.Run("sync then detach success", func(t *testing.T) {
+	t.Run("sync then detach blocks when downloads paused", func(t *testing.T) {
 		client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, lifecycleUsersDDL)
 		client.PauseDownloads()
 
 		result := mustSyncThenDetach(t, client, ctx)
-		require.True(t, result.IsSuccess())
-		require.Equal(t, DetachOutcomeDetached, result.Detach.Outcome)
+		require.False(t, result.IsSuccess())
+		require.Equal(t, DetachBlockedDownloadsPaused, result.BlockedReason)
+		require.Nil(t, result.LastSync)
 	})
 }

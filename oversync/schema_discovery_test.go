@@ -1,8 +1,15 @@
 package oversync
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDependencyOverrides_AffectOrdering(t *testing.T) {
@@ -42,6 +49,52 @@ func TestDependencyOverrides_AffectOrdering(t *testing.T) {
 	if idx("public.parents") >= idx("public.children") {
 		t.Fatalf("expected parents before children, got %v", order)
 	}
+}
+
+func TestSchemaDiscovery_ForeignKeysUseObjectIdentityAndExposeDeleteSetColumns(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	schema := "fk_identity_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	ident := pgx.Identifier{schema}.Sanitize()
+	_, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE SCHEMA %s;
+		CREATE TABLE %s.parents (_sync_scope_id text NOT NULL, id uuid NOT NULL, PRIMARY KEY (_sync_scope_id,id));
+		CREATE TABLE %s.a_children (_sync_scope_id text NOT NULL, id uuid NOT NULL, parent_id uuid, PRIMARY KEY (_sync_scope_id,id), CONSTRAINT same_name FOREIGN KEY (_sync_scope_id,parent_id) REFERENCES %s.parents (_sync_scope_id,id) DEFERRABLE);
+		CREATE TABLE %s.z_children (_sync_scope_id text NOT NULL, id uuid NOT NULL, parent_id uuid, PRIMARY KEY (_sync_scope_id,id), CONSTRAINT same_name FOREIGN KEY (_sync_scope_id,parent_id) REFERENCES %s.parents (_sync_scope_id,id) ON DELETE SET NULL (parent_id) DEFERRABLE);
+	`, ident, ident, ident, ident, ident, ident))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schema) })
+	parentID := uuid.New()
+	childID := uuid.New()
+	_, err = pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.parents (_sync_scope_id,id) VALUES ('scope-a',$1)`, ident), parentID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.z_children (_sync_scope_id,id,parent_id) VALUES ('scope-a',$1,$2)`, ident), childID, parentID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.parents WHERE _sync_scope_id = 'scope-a' AND id = $1`, ident), parentID)
+	require.NoError(t, err)
+	var retainedScope string
+	var nulledParent *uuid.UUID
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT _sync_scope_id,parent_id FROM %s.z_children WHERE id = $1
+	`, ident), childID).Scan(&retainedScope, &nulledParent))
+	require.Equal(t, "scope-a", retainedScope)
+	require.Nil(t, nulledParent)
+
+	discovery := newSchemaDiscoveryWithQuerier(pool, integrationTestLogger(slog.LevelWarn))
+	constraints, err := discovery.getForeignKeyConstraints(ctx, map[string]bool{
+		Key(schema, "parents"): true, Key(schema, "a_children"): true, Key(schema, "z_children"): true,
+	})
+	require.NoError(t, err)
+	require.Len(t, constraints, 4)
+	oids := make(map[int64]bool)
+	for _, constraint := range constraints {
+		oids[constraint.constraintOID] = true
+		if constraint.TableName == "z_children" {
+			require.True(t, constraint.deleteSetColumnsSpecified)
+			require.Equal(t, constraint.ColumnName == "parent_id", constraint.deleteSetsThisColumn)
+		}
+	}
+	require.Len(t, oids, 2)
 }
 
 func TestTopologicalSort_GroupsStronglyConnectedComponentsDeterministically(t *testing.T) {

@@ -1,0 +1,34 @@
+{
+  "status": "bounded validation qualification passed; final frozen lanes recorded in revision4; owner requested no further independent reviews",
+  "toolchain": "go1.25.12",
+  "database": "PostgreSQL 16, isolated databases",
+  "executions": [
+    {
+      "log": ".artifacts/table_evolution/revision4/focused-example-final.log",
+      "sha256": "657c386b07d5d3cf948e96e2a0726b077545083c27f66a1bd6e02400697e95f3",
+      "result": "PASS"
+    }
+  ],
+  "prior_candidate_executions": [
+    {
+      "log": ".artifacts/table_evolution/revision2/focused-table-all.log",
+      "sha256": "61532be5440fc1c86afbb82dc194c8f89b1ffbdd9a29a80bd2b0f41db8e04157",
+      "result": "PASS"
+    },
+    {
+      "log": ".artifacts/table_evolution/revision3/focused-final.log",
+      "sha256": "cbb2c21f19dda4d4b93d1bd811b5160bfae2012782d7a70c95c9c17861e0c31a",
+      "result": "PASS"
+    },
+    {
+      "log": ".artifacts/table_evolution/revision3/focused-nullability-1.log",
+      "sha256": "efe5a8e77cc67e9ea668bf681ecf523afad1adc4b3b3b1ee3bddd21683ba4907",
+      "result": "PASS"
+    },
+    {
+      "log": ".artifacts/table_evolution/revision3/focused-table-all.log",
+      "sha256": "6d63a382f2d4e76dca898cc6a03b6c866d767771070e3bd8496ea07ec6864c3a",
+      "result": "PASS"
+    }
+  ]
+}

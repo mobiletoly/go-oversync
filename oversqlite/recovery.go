@@ -162,7 +162,7 @@ func sourceRecoveryCodeFromReason(reason string) SourceRecoveryCode {
 }
 
 func (c *Client) sourceRecoveryRequiredErrorLocked(ctx context.Context) (*SourceRecoveryRequiredError, error) {
-	operation, err := loadOperationState(ctx, c.DB)
+	operation, err := loadOperationState(ctx, c.db)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +211,7 @@ func (c *Client) reserveReplacementSourceIDInTx(ctx context.Context, tx *sql.Tx,
 
 func (c *Client) markSourceRecoveryRequiredLocked(ctx context.Context, code SourceRecoveryCode, message string, replacementSourceID string) error {
 	_ = message
-	tx, err := c.DB.BeginTx(ctx, nil)
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin source recovery transaction: %w", err)
 	}
@@ -243,7 +243,7 @@ func (c *Client) markSourceRecoveryRequiredLocked(ctx context.Context, code Sour
 }
 
 func (c *Client) markCheckpointRecoveryRequiredLocked(ctx context.Context, reason string) error {
-	tx, err := c.DB.BeginTx(ctx, nil)
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin checkpoint recovery transaction: %w", err)
 	}
@@ -298,7 +298,7 @@ func (c *Client) checkpointRecoveryPendingState(ctx context.Context) (dirtyCount
 	if err != nil {
 		return 0, 0, "", err
 	}
-	if err := c.DB.QueryRowContext(ctx, `SELECT state FROM _sync_outbox_bundle WHERE singleton_key = 1`).Scan(&replayState); err != nil {
+	if err := c.db.QueryRowContext(ctx, `SELECT state FROM _sync_outbox_bundle WHERE singleton_key = 1`).Scan(&replayState); err != nil {
 		return 0, 0, "", fmt.Errorf("failed to load checkpoint recovery replay state: %w", err)
 	}
 	return dirtyCount, outboundCount, strings.TrimSpace(replayState), nil
@@ -323,7 +323,7 @@ func (c *Client) clearSourceRecoveryRequiredInTx(ctx context.Context, tx execer)
 
 func (c *Client) pendingChangeCount(ctx context.Context) (int, error) {
 	var count int
-	if err := c.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&count); err != nil {
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("failed to count dirty changes: %w", err)
 	}
 	return count, nil
@@ -331,14 +331,27 @@ func (c *Client) pendingChangeCount(ctx context.Context) (int, error) {
 
 func (c *Client) pendingPushOutboundCount(ctx context.Context) (int, error) {
 	var count int
-	if err := c.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&count); err != nil {
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("failed to count staged outbound push rows: %w", err)
 	}
 	return count, nil
 }
 
+// pendingPushWorkCounts observes both kinds of local work at one SQLite
+// statement snapshot. Sync uses this at its final convergence point.
+func (c *Client) pendingPushWorkCounts(ctx context.Context) (dirty, outbound int, err error) {
+	err = c.db.QueryRowContext(ctx, `
+		SELECT (SELECT COUNT(*) FROM _sync_dirty_rows),
+		       (SELECT COUNT(*) FROM _sync_outbox_rows)
+	`).Scan(&dirty, &outbound)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to count pending push work: %w", err)
+	}
+	return dirty, outbound, nil
+}
+
 func (c *Client) rebuildRequired(ctx context.Context) (bool, error) {
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return false, err
 	}
@@ -349,7 +362,7 @@ func (c *Client) rebuildRequired(ctx context.Context) (bool, error) {
 }
 
 func (c *Client) setRebuildRequired(ctx context.Context, required bool) error {
-	attachment, err := loadAttachmentState(ctx, c.DB)
+	attachment, err := loadAttachmentState(ctx, c.db)
 	if err != nil {
 		return err
 	}
@@ -357,7 +370,7 @@ func (c *Client) setRebuildRequired(ctx context.Context, required bool) error {
 		return &AttachRequiredError{Operation: "Rebuild()"}
 	}
 	attachment.RebuildRequired = required
-	return persistAttachmentState(ctx, c.DB, attachment)
+	return persistAttachmentState(ctx, c.db, attachment)
 }
 
 type clearManagedTablesOptions struct {
@@ -383,7 +396,7 @@ func (c *Client) clearManagedTablesInTxWithOptions(ctx context.Context, tx sqlit
 				return fmt.Errorf("failed to clear managed table %s: %w", tableName, err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_row_state WHERE schema_name = ? AND table_name = ?`, c.config.Schema, tableName); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_row_state WHERE schema_name = ? AND table_name = ?`, c.schemaForTable(tableName), tableName); err != nil {
 			return fmt.Errorf("failed to clear structured row state for %s: %w", tableName, err)
 		}
 	}
@@ -404,11 +417,14 @@ func (c *Client) clearManagedTablesInTxWithOptions(ctx context.Context, tx sqlit
 	return nil
 }
 
-func (c *Client) clearManagedTablesInTx(ctx context.Context, tx *sql.Tx) error {
+func (c *Client) clearManagedTablesInTx(ctx context.Context, tx sqliteTransaction) error {
 	return c.clearManagedTablesInTxWithOptions(ctx, tx, clearManagedTablesOptions{})
 }
 
-func (c *Client) clearFullLocalSyncStateInTx(ctx context.Context, tx *sql.Tx) error {
+func (c *Client) clearFullLocalSyncStateInTx(ctx context.Context, tx sqliteTransaction) error {
+	if err := advanceAttachmentEpoch(ctx, tx); err != nil {
+		return err
+	}
 	if err := setApplyMode(ctx, tx, true); err != nil {
 		return fmt.Errorf("failed to enable apply_mode before full local reset: %w", err)
 	}

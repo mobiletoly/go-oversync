@@ -6,9 +6,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
+	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,9 +47,13 @@ func TestPhase3RetryClassificationUsesTypedCausesOnly(t *testing.T) {
 }
 
 func TestPhase3BufferedControlResponseIsBoundedAndClosed(t *testing.T) {
-	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
+	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
 	client.sourceID = "phase3-source"
-	body := &phase3TrackingBody{Reader: strings.NewReader(strings.Repeat("x", int(snapshotControlBodyLimit+1)))}
+	_, err := db.Exec(`INSERT INTO users(id,name,email) VALUES('phase3-row','Phase 3','phase3@example.com')`)
+	require.NoError(t, err)
+	snapshot, err := client.ensurePushOutboundSnapshot(context.Background())
+	require.NoError(t, err)
+	body := &phase3TrackingBody{Reader: strings.NewReader(strings.Repeat("x", int(client.discovery.Limits.MaxPushDecodedBytes+1)))}
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -55,11 +62,79 @@ func TestPhase3BufferedControlResponseIsBoundedAndClosed(t *testing.T) {
 		}, nil
 	})}
 
-	_, err := client.createPushSession(context.Background(), 1, 0, strings.Repeat("a", 64))
-	var tooLarge *SnapshotResponseBodyTooLargeError
+	_, err = client.commitPushOutboundSnapshot(context.Background(), snapshot)
+	var tooLarge *EncodedResponseBodyTooLargeError
 	require.ErrorAs(t, err, &tooLarge)
-	require.Equal(t, "push_session_create", tooLarge.Operation)
+	require.Equal(t, "push", tooLarge.Operation)
 	require.True(t, body.closed)
+}
+
+func TestAutomaticLoopsStopOnTerminalRepresentationErrorsAndPreserveState(t *testing.T) {
+	t.Run("upload projection overflow", func(t *testing.T) {
+		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
+		client.config.BackoffMin = time.Millisecond
+		client.config.BackoffMax = 2 * time.Millisecond
+		_, err := db.Exec(`INSERT INTO users(id,name,email) VALUES('terminal-row','Terminal','terminal@example.com')`)
+		require.NoError(t, err)
+		var requests atomic.Int64
+		client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return errorJSONResponse(http.StatusUnprocessableEntity, oversync.ErrorResponse{Error: "bundle_projection_too_large"}), nil
+		})}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			client.uploaderLoop(context.Background())
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("uploader loop did not stop on terminal projection overflow")
+		}
+		require.EqualValues(t, 1, requests.Load())
+		var frozenRows, nextSourceBundleID int64
+		require.NoError(t, db.QueryRow(`SELECT count(*) FROM _sync_outbox_rows`).Scan(&frozenRows))
+		require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1)`).Scan(&nextSourceBundleID))
+		require.Equal(t, int64(1), frozenRows)
+		require.Equal(t, int64(1), nextSourceBundleID)
+	})
+
+	t.Run("download committed bundle corruption", func(t *testing.T) {
+		client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
+		client.config.BackoffMin = time.Millisecond
+		client.config.BackoffMax = 2 * time.Millisecond
+		var requests atomic.Int64
+		client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "committed_bundle_unrepresentable"}), nil
+		})}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			client.downloaderLoop(context.Background())
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("downloader loop did not stop on terminal committed-bundle corruption")
+		}
+		require.EqualValues(t, 1, requests.Load())
+		checkpoint, err := client.LastBundleSeqSeen(context.Background())
+		require.NoError(t, err)
+		require.Zero(t, checkpoint)
+	})
+}
+
+func TestAdmittedResponseRowLimitIsTypedAndTerminal(t *testing.T) {
+	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
+	client.discovery.Limits.MaxRowDecodedBytes = 16
+	err := client.validateAdmittedResponseRows("pull response", []oversync.PushRequestRow{{
+		Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "row"}, Op: oversync.OpInsert,
+		Payload: []byte(`{"id":"row","name":"Oversized","email":"oversized@example.com"}`),
+	}})
+	var oversized *AdmittedRowTooLargeError
+	require.ErrorAs(t, err, &oversized)
+	require.True(t, isTerminalProtocolRepresentationError(err))
 }
 
 func TestPhase3SourceRetiredPresenceDistinctions(t *testing.T) {
@@ -124,14 +199,14 @@ func TestPhase3SnapshotSessionLimitErrorIsStructuredAndRedacted(t *testing.T) {
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return rawJSONResponse(
 			http.StatusConflict,
-			`{"error":"snapshot_session_limit_exceeded","message":"`+sentinel+`","dimension":"byte_count","actual":257,"limit":256}`,
+			`{"error":"snapshot_session_limit_exceeded","message":"`+sentinel+`","dimension":"logical_byte_count","actual":257,"limit":256}`,
 		), nil
 	})}
 
 	_, err := client.createSnapshotSession(context.Background(), nil)
 	var limitErr *SnapshotSessionLimitExceededError
 	require.ErrorAs(t, err, &limitErr)
-	require.Equal(t, "byte_count", limitErr.Dimension)
+	require.Equal(t, "logical_byte_count", limitErr.Dimension)
 	require.EqualValues(t, 257, limitErr.Actual)
 	require.EqualValues(t, 256, limitErr.Limit)
 	require.NotContains(t, err.Error(), sentinel)

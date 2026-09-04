@@ -76,11 +76,14 @@ func (s *SyncService) installServerSourceReservations(ctx context.Context, tx pg
 }
 
 func (s *SyncService) validateServerSourceReservations(ctx context.Context, q syncCatalogQuerier) error {
+	expected := append([]string(nil), s.reservedServerSourceIDs()...)
+	sort.Strings(expected)
 	rows, err := q.Query(ctx, `
 		SELECT source_id
 		FROM sync.server_source_reservations
 		ORDER BY source_id COLLATE "C"
-	`)
+		LIMIT $1
+	`, len(expected)+1)
 	if err != nil {
 		return fmt.Errorf("load server source reservations: %w", err)
 	}
@@ -96,8 +99,6 @@ func (s *SyncService) validateServerSourceReservations(ctx context.Context, q sy
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate server source reservations: %w", err)
 	}
-	expected := append([]string(nil), s.reservedServerSourceIDs()...)
-	sort.Strings(expected)
 	if len(actual) != len(expected) {
 		return unsupportedSchemaf("sync.server_source_reservations row count = %d, expected %d", len(actual), len(expected))
 	}
@@ -127,8 +128,6 @@ func (s *SyncService) validateIdentityCollations(ctx context.Context, q syncCata
 		    ('scope_state', 'initialized_by_source_id'),
 		    ('bundle_log', 'source_id'),
 		    ('bundle_log', 'canonical_request_hash'),
-		    ('push_sessions', 'source_id'),
-		    ('push_sessions', 'canonical_request_hash'),
 		    ('scope_write_receipts', 'writer_id'),
 		    ('scope_write_receipts', 'receipt_state'),
 		    ('scope_write_receipts', 'committed_canonical_request_hash'),

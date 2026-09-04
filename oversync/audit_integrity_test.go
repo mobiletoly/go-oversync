@@ -66,23 +66,6 @@ func requireAuditMetadataIntegrity(t *testing.T, ctx context.Context, pool *pgxp
 			`,
 		},
 		{
-			name: "staged push ordinals match session progress",
-			query: `
-				SELECT COUNT(*)
-				FROM sync.push_sessions AS session
-				LEFT JOIN LATERAL (
-					SELECT COUNT(*) AS actual_count,
-						COALESCE(MIN(row_ordinal), 0) AS min_ordinal,
-						COALESCE(MAX(row_ordinal), -1) AS max_ordinal
-					FROM sync.push_session_rows AS row
-					WHERE row.push_id = session.push_id
-				) AS rows ON TRUE
-				WHERE rows.actual_count <> session.next_expected_row_ordinal
-				   OR (rows.actual_count > 0 AND rows.min_ordinal <> 0)
-				   OR rows.max_ordinal <> session.next_expected_row_ordinal - 1
-			`,
-		},
-		{
 			name: "snapshot materialized counts",
 			query: `
 				SELECT COUNT(*)
@@ -106,18 +89,20 @@ func requireAuditMetadataIntegrity(t *testing.T, ctx context.Context, pool *pgxp
 	}
 }
 
-func TestAuditIntegrityOracle_AfterCommittedAndStagedWork(t *testing.T) {
+func TestAuditIntegrityOracle_AfterDirectCommittedWork(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	fixture := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
 
 	committedID := auditUUID(1)
-	_, err := pushRowsViaSession(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
+	_, err := pushRowsOneShot(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
 		fixture.userRow(committedID, "Committed"),
 	})
 	require.NoError(t, err)
 
-	staged := fixture.createSession(t, ctx, 2, 2)
-	fixture.uploadChunk(t, ctx, staged.PushID, 0, fixture.userRow(auditUUID(2), "Staged"))
+	_, err = pushRowsOneShot(t, ctx, fixture.svc, fixture.writer, 2, []PushRequestRow{
+		fixture.userRow(auditUUID(2), "Second"),
+	})
+	require.NoError(t, err)
 
 	requireAuditMetadataIntegrity(t, ctx, fixture.pool)
 }

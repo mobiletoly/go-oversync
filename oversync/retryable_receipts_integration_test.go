@@ -59,13 +59,14 @@ func newRetryableReceiptFixture(t *testing.T) *retryableReceiptFixture {
 	schemaName := "retryable_receipt_" + suffix
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "retryable-receipt-test",
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "retryable-receipt-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
-		ReservedServerSourceIDs: []string{"server-writer", "server-unused"},
+		ReservedServerSourceIDs:        []string{"server-writer", "server-unused"},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	return &retryableReceiptFixture{
 		ctx:        ctx,
@@ -217,24 +218,25 @@ func TestScopeWriteReceipt_DeferredFinalizerRejectsInProgressCommit(t *testing.T
 func TestBootstrap_RequiresExactServerSourceReservationSet(t *testing.T) {
 	f := newRetryableReceiptFixture(t)
 	config := func(reserved []string, appName string) *ServiceConfig {
-		return &ServiceConfig{
-			MaxSupportedSchemaVersion: 1,
-			AppName:                   appName,
+		return &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+			{Schema: f.schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		}), AppName: appName,
 			RegisteredTables: []RegisteredTable{
 				{Schema: f.schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			},
-			ReservedServerSourceIDs: reserved,
+			ReservedServerSourceIDs:        reserved,
+			RegisteredTableCatalogRevision: 1,
 		}
 	}
 
-	mismatched, err := NewRuntimeService(f.service.pool, config([]string{"server-writer"}, "reservation-mismatch"), integrationTestLogger(slog.LevelWarn))
+	mismatched, err := newTestRuntimeService(f.service.pool, config([]string{"server-writer"}, "reservation-mismatch"), integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = mismatched.Close(context.Background()) })
 	err = mismatched.Bootstrap(f.ctx)
 	var schemaErr *UnsupportedSchemaError
 	require.ErrorAs(t, err, &schemaErr)
 
-	reordered, err := NewRuntimeService(f.service.pool, config([]string{"server-unused", "server-writer"}, "reservation-reordered"), integrationTestLogger(slog.LevelWarn))
+	reordered, err := newTestRuntimeService(f.service.pool, config([]string{"server-unused", "server-writer"}, "reservation-reordered"), integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reordered.Close(context.Background()) })
 	require.NoError(t, reordered.Bootstrap(f.ctx))
@@ -548,6 +550,7 @@ func TestScopeReceiptCleanup_FailedBatchRollsBack(t *testing.T) {
 }
 
 func TestScopeReceiptCleanup_RunAppliesFiveSecondBatchTimeout(t *testing.T) {
+	t.Parallel()
 	f := newRetryableReceiptFixture(t)
 	f.service.stopScopeReceiptCleanupWorker()
 	require.NoError(t, f.service.waitScopeReceiptCleanupWorker(f.ctx))
@@ -569,7 +572,7 @@ func TestScopeReceiptCleanup_CloseCancelsActiveRunAndDrainsWorker(t *testing.T) 
 	f.service.stopScopeReceiptCleanupWorker()
 	require.NoError(t, f.service.waitScopeReceiptCleanupWorker(f.ctx))
 	f.insertExpiredCompletedReceipts(t, 1)
-	worker, err := NewRuntimeService(f.service.pool, f.service.config, integrationTestLogger(slog.LevelWarn))
+	worker, err := newTestRuntimeService(f.service.pool, f.service.config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = worker.Close(context.Background()) })
 	worker.mu.Lock()
@@ -604,8 +607,9 @@ func TestScopeReceiptCleanup_CloseCancelsActiveRunAndDrainsWorker(t *testing.T) 
 }
 
 func TestScopeReceiptCleanup_ConcurrentInstancesSplitSkipLockedBatch(t *testing.T) {
+	t.Parallel()
 	f := newRetryableReceiptFixture(t)
-	second, err := NewRuntimeService(f.service.pool, f.service.config, integrationTestLogger(slog.LevelWarn))
+	second, err := newTestRuntimeService(f.service.pool, f.service.config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	require.NoError(t, second.Bootstrap(f.ctx))
 	t.Cleanup(func() { _ = second.Close(context.Background()) })
@@ -642,18 +646,7 @@ func TestScopeReceiptCleanup_ConcurrentInstancesSplitSkipLockedBatch(t *testing.
 func TestServerSourceReservation_OfflineAdditionLocksAndRejectsClientHistory(t *testing.T) {
 	f := newRetryableReceiptFixture(t)
 	mustInitializeEmptyScope(t, f.ctx, f.service, f.userID, "existing-client-source")
-	_, err := f.pool.Exec(f.ctx, `
-		INSERT INTO sync.source_state (
-			user_pk, source_id, state, max_committed_source_bundle_id,
-			replaced_by_source_id, retirement_reason
-		) VALUES (
-			(SELECT user_pk FROM sync.user_state WHERE user_id = $1),
-			'existing-client-source', 'active', 0, '', ''
-		)
-	`, f.userID)
-	require.NoError(t, err)
-
-	_, err = f.pool.Exec(f.ctx, `INSERT INTO sync.server_source_reservations (source_id, ever_used) VALUES ('existing-client-source', FALSE)`)
+	_, err := f.pool.Exec(f.ctx, `INSERT INTO sync.server_source_reservations (source_id, ever_used) VALUES ('existing-client-source', FALSE)`)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "client source history prevents server source reservation")
 	_, err = f.pool.Exec(f.ctx, `
@@ -709,6 +702,7 @@ func TestServerSourceReservation_OfflineUnusedRemovalSucceeds(t *testing.T) {
 }
 
 func TestServerSourceReservation_RemovalRejectsSourceStateAndReceiptReferences(t *testing.T) {
+	t.Parallel()
 	t.Run("source state", func(t *testing.T) {
 		f := newRetryableReceiptFixture(t)
 		_, err := f.service.pool.Exec(f.ctx, `INSERT INTO sync.user_state (user_id) VALUES ($1)`, f.userID)

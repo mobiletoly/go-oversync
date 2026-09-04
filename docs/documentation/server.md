@@ -18,9 +18,10 @@ The server treats registered PostgreSQL business tables as authoritative state.
 
 - schema bootstrap and validation for the supported registered-table envelope
 - first-connect lifecycle state
-- staged push-session creation, chunk upload, and commit
+- one bounded whole-bundle push with exact tuple replay
 - committed bundle capture from business-table transactions
-- pull and snapshot serving
+- deterministic generation-visible push replay, pull, conflict, and snapshot serving from one
+  immutable canonical history
 - optional process-local bundle change watch fanout backed by PostgreSQL `LISTEN`/`NOTIFY`
 - source sequencing, retirement, and retained-history enforcement
 
@@ -39,6 +40,8 @@ Authoritative replication state:
   retained-floor tracking
 - `sync.source_state`: durable per-source committed `source_bundle_id` watermark and source
   retirement/replacement state
+- `sync.source_generation_bindings`: permanent exact `(user_pk, source_id)` bindings to one schema
+  generation ID and fingerprint, including retained, reserved, and retired client sources
 - `sync.row_state`: authoritative current row version and tombstone state keyed by
   `(user_pk, table_id, key_bytes)`
 - `sync.bundle_log`: one row per retained committed sync bundle, with the unique
@@ -56,9 +59,8 @@ Server-originated write authority:
 Transport and lifecycle state:
 
 - `sync.scope_state`: durable first-connect authority state keyed by `user_pk`
-- `sync.push_sessions`: active staging-only push sessions
-- `sync.push_session_rows`: compact staged rows for each push session
-- `sync.snapshot_sessions`: active frozen snapshot session metadata
+- `sync.snapshot_sessions`: active frozen snapshot metadata pinned to its effective source and exact
+  generation pair
 - `sync.snapshot_session_rows`: materialized rows for each snapshot session, ordered by compact
   table/key identity
 
@@ -66,16 +68,33 @@ Row-bearing server tables store compact internal identifiers (`user_pk`, `table_
 and `op_code`). Wire responses reconstruct visible `schema`, `table`, structured `key`, operation
 strings, and payloads from `sync.table_catalog` and the stored row data.
 
-Registered PostgreSQL integer, decimal, and floating business columns use canonical JSON strings
-under `jcs_uniform_numeric_strings_v1`. Floating strings use the shortest finite RFC 8785 binary64
-spelling; Boolean columns emit JSON Booleans. Bootstrap schema discovery owns this mapping, so
-clients do not advertise or configure per-column numeric kinds.
+Generation-visible PostgreSQL integer, decimal, and floating business columns use the exact wire
+type declared for each column. Integers are range-checked canonical strings; decimals are bounded
+non-exponent strings; `float64` uses shortest finite strings for both PostgreSQL `float4` and
+`float8`, with committed `float4` values reflecting storage normalization; and Boolean columns use
+JSON Booleans. Bootstrap joins each generation
+declaration to the canonical PostgreSQL surface and fails the data plane closed when the declared
+surface or its physical codec is not exact. Text and inner-JSON strings reject U+0000 at the raw
+request boundary, and schema-aware JSON capture preserves JSON document `null` separately from SQL
+NULL. The older `jcs_uniform_numeric_strings_v1` SQLite
+storage bridge remains a legacy client fixture, not a generation wire contract or fallback.
+
+Projection is computed on demand under finite canonical row/byte, pull-byte, and concurrency
+limits. It never writes per-generation history or a projection metadata cache. Snapshot sessions
+select only the pinned generation's tables and columns before durable materialization. A push
+requires a final visible captured effect for every uploaded key; failure uses HTTP 422
+`push_effect_coverage_incomplete` and rolls back the entire transaction.
 
 ## Main Flows
 
 ### First Connect
 
 Clients call `POST /sync/connect` to resolve first authority for one scope.
+
+The request supplies both generation-proof headers. Connect is the sole ordinary operation allowed
+to create an initial source binding; later operations must match it exactly. New permanent sources
+are admitted under the configured bounded per-user limit, while an already-bound source remains
+usable when the limit has been reached or subsequently lowered.
 
 Possible outcomes:
 
@@ -91,20 +110,16 @@ Possible outcomes:
 
 ### Push
 
-The normal client write flow is:
-
-- `POST /sync/push-sessions`
-- `POST /sync/push-sessions/{push_id}/chunks`
-- `POST /sync/push-sessions/{push_id}/commit`
-
-Accepted-push recovery fetches authoritative bundle rows through
-`GET /sync/committed-bundles/{bundle_seq}/rows`.
-
-Retained duplicate replay is resolved through `sync.bundle_log`, not through push-session state.
+The normal client write flow is one `POST /sync/push` containing the complete compact frozen
+bundle. Its response carries the complete authoritative effect for immediate local atomic apply.
+Retained duplicate replay is resolved through `sync.bundle_log`.
 If the exact source tuple is older than retained bundle history but `sync.source_state` proves that
 the source bundle id was already committed, the server returns `history_pruned` instead of
 accepting it again. If a source sends a future bundle id, the server returns
 `source_sequence_out_of_order`; commit revalidation can return `source_sequence_changed`.
+The canonical request hash is generation-bound and covers the ordered logical rows supplied by the
+client. The authoritative effect may differ after triggers, cascades, defaults, or transition
+writes.
 
 ### Pull And Snapshot
 
@@ -115,13 +130,13 @@ accepting it again. If a source sends a future bundle id, the server returns
 - if a client checkpoint falls behind the retained bundle floor, the server returns
   `history_pruned`
 
-Pull and committed-bundle replay are only guaranteed above `retained_bundle_floor`. Rows at or
-below that floor are outside the retained-history contract even if physical pruning has not deleted
-them yet. Snapshot creation reads live business tables plus `sync.row_state` from one PostgreSQL
+Pull is only guaranteed above `retained_bundle_floor`. Rows at or below that floor are outside the
+retained-history contract even if physical pruning has not deleted them yet. Snapshot creation reads live business tables plus `sync.row_state` from one PostgreSQL
 transaction snapshot and fails closed if they disagree.
 Materialization uses deterministic keyset pages and bounded PostgreSQL `COPY` batches. Snapshot
-chunk reads are bounded by both row count and exact full-row JSON wire bytes. Non-blocking build
-and chunk admission limits reject excess concurrency with HTTP `429` before opening a transaction.
+chunk reads are bounded by both row count and exact full-row JSON wire bytes. Proof, binding, and
+session ownership checks run before non-blocking build or chunk admission; excess admitted
+concurrency is rejected with HTTP `429` before row materialization or chunk-row reads.
 Expired or explicitly retired sessions are reclaimed by each service's bounded cleanup worker.
 
 ### Bundle Change Watch
@@ -172,6 +187,11 @@ Registered PostgreSQL tables must satisfy these rules before bootstrap:
 - `DEFERRABLE INITIALLY IMMEDIATE` is accepted
 - partial, predicate, and expression unique indexes are unsupported on registered tables
 
+The v1 generation contract is intentionally narrower than this legacy registered-table envelope.
+Its `set_null` action is delete-only, requires a nullable visible child column, and requires the
+PostgreSQL target-list form `ON DELETE SET NULL (visible_child_column)` so the composite FK's hidden
+`_sync_scope_id` is preserved. Generation-visible `OnUpdate: set_null` and `set_default` are invalid.
+
 Bootstrap fails closed with `UnsupportedSchemaError` when the registered schema is outside the
 supported envelope. The persistence preflight runs before Oversync creates or accepts `sync.*`,
 including for an already-marked layout.
@@ -188,7 +208,7 @@ contain authoritative rows. It locks every registered root and current partition
 installs the managed capture and TRUNCATE triggers, and creates one sequence-1 adoption baseline
 bundle per populated scope in the same PostgreSQL transaction. The baseline records the state
 observed at adoption time; it does not claim to recreate earlier modification history. Connect,
-pull, push, and snapshot operations return `503 service_unavailable` until that transaction commits.
+pull, push, and snapshot operations return `503 service_not_ready` until that transaction commits.
 
 For the one-time adoption of an existing populated deployment, back up PostgreSQL, stop every old
 Oversync server and managed writer, start the upgraded server and wait for healthy readiness, then

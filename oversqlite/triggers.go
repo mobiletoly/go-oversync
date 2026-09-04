@@ -5,6 +5,7 @@ package oversqlite
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -50,21 +51,27 @@ var triggerSQLTemplates = []struct {
 
 // TriggerData holds the data needed for trigger template rendering
 type TriggerData struct {
-	SchemaName string
-	TableName  string
-	PKColumn   string
-	NewRowJSON string
-	OldKeyJSON string
-	NewKeyJSON string
-	PKExprNew  string
-	PKExprOld  string
+	SchemaName         string
+	TableName          string
+	PKColumn           string
+	NewRowJSON         string
+	InsertRowJSON      string
+	UpdateRowJSON      string
+	EnsureNewBaseline  string
+	RequireOldBaseline string
+	OldKeyJSON         string
+	NewKeyJSON         string
+	PKExprNew          string
+	PKExprOld          string
 }
 
 const transitionPendingTriggerError = "SYNC_TRANSITION_PENDING"
 
 const guardInsertTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_bi_guard
 BEFORE INSERT ON {{.TableName}}
-WHEN COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+WHEN (COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+	OR COALESCE((SELECT phase FROM _sync_upgrade_journal WHERE singleton_key = 1), 'ready') != 'ready'
+	)
 	AND COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) != 1
 BEGIN
 	SELECT RAISE(ABORT, '` + transitionPendingTriggerError + `');
@@ -72,7 +79,8 @@ END`
 
 const guardUpdateTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_bu_guard
 BEFORE UPDATE ON {{.TableName}}
-WHEN COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+WHEN (COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+	OR COALESCE((SELECT phase FROM _sync_upgrade_journal WHERE singleton_key = 1), 'ready') != 'ready')
 	AND COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) != 1
 BEGIN
 	SELECT RAISE(ABORT, '` + transitionPendingTriggerError + `');
@@ -80,7 +88,8 @@ END`
 
 const guardDeleteTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_bd_guard
 BEFORE DELETE ON {{.TableName}}
-WHEN COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+WHEN (COALESCE((SELECT kind FROM _sync_operation_state WHERE singleton_key = 1), 'none') != 'none'
+	OR COALESCE((SELECT phase FROM _sync_upgrade_journal WHERE singleton_key = 1), 'ready') != 'ready')
 	AND COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) != 1
 BEGIN
 	SELECT RAISE(ABORT, '` + transitionPendingTriggerError + `');
@@ -91,7 +100,8 @@ const insertTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_ai
 AFTER INSERT ON {{.TableName}}
 WHEN COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) = 0
 BEGIN
-	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
+    {{.EnsureNewBaseline}}
+	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, base_kind, base_payload, base_provenance, dirty_ordinal, updated_at)
 	VALUES (
 		'{{.SchemaName}}',
 		'{{.TableName}}',
@@ -100,16 +110,18 @@ BEGIN
 			WHEN EXISTS (
 				SELECT 1
 				FROM _sync_row_state
-				WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}} AND deleted=0
+				WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}} AND server_kind='live'
 			) THEN 'UPDATE'
 			ELSE 'INSERT'
 		END,
 		COALESCE(
-			(SELECT base_row_version FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
 			(SELECT row_version FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
 			0
 		),
-		{{.NewRowJSON}},
+		{{.InsertRowJSON}},
+        (SELECT CASE server_kind WHEN 'live' THEN 'present' WHEN 'deleted' THEN 'deleted' WHEN 'unknown' THEN 'unavailable' ELSE 'absent' END FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+        (SELECT server_payload FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+        (SELECT server_provenance FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
 		COALESCE(
 			(SELECT dirty_ordinal FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
 			(SELECT COALESCE(MAX(dirty_ordinal), 0) + 1 FROM _sync_dirty_rows)
@@ -127,18 +139,22 @@ const updateTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_au
 AFTER UPDATE ON {{.TableName}}
 WHEN COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) = 0
 BEGIN
-	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
+    {{.RequireOldBaseline}}
+    {{.EnsureNewBaseline}}
+	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, base_kind, base_payload, base_provenance, dirty_ordinal, updated_at)
 	SELECT
 		'{{.SchemaName}}',
 		'{{.TableName}}',
 		{{.OldKeyJSON}},
 		'DELETE',
 		COALESCE(
-			(SELECT base_row_version FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
 			(SELECT row_version FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
 			0
 		),
 		NULL,
+        (SELECT CASE server_kind WHEN 'live' THEN 'present' WHEN 'deleted' THEN 'deleted' WHEN 'unknown' THEN 'unavailable' ELSE 'absent' END FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+        (SELECT server_payload FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+        (SELECT server_provenance FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
 		COALESCE(
 			(SELECT dirty_ordinal FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
 			(SELECT COALESCE(MAX(dirty_ordinal), 0) + 1 FROM _sync_dirty_rows)
@@ -150,7 +166,7 @@ BEGIN
 		payload=NULL,
 		updated_at=excluded.updated_at;
 
-	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
+	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, base_kind, base_payload, base_provenance, dirty_ordinal, updated_at)
 	VALUES (
 		'{{.SchemaName}}',
 		'{{.TableName}}',
@@ -159,16 +175,18 @@ BEGIN
 			WHEN EXISTS (
 				SELECT 1
 				FROM _sync_row_state
-				WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}} AND deleted=0
+				WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}} AND server_kind='live'
 			) THEN 'UPDATE'
 			ELSE 'INSERT'
 		END,
 		COALESCE(
-			(SELECT base_row_version FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
 			(SELECT row_version FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
 			0
 		),
-		{{.NewRowJSON}},
+		{{.UpdateRowJSON}},
+        (SELECT CASE server_kind WHEN 'live' THEN 'present' WHEN 'deleted' THEN 'deleted' WHEN 'unknown' THEN 'unavailable' ELSE 'absent' END FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+        (SELECT server_payload FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
+        (SELECT server_provenance FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
 		COALESCE(
 			(SELECT dirty_ordinal FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.NewKeyJSON}}),
 			(SELECT COALESCE(MAX(dirty_ordinal), 0) + 1 FROM _sync_dirty_rows)
@@ -186,18 +204,21 @@ const deleteTriggerTemplate = `CREATE TRIGGER trg_{{.TableName}}_ad
 AFTER DELETE ON {{.TableName}}
 WHEN COALESCE((SELECT apply_mode FROM _sync_apply_state WHERE singleton_key = 1), 0) = 0
 BEGIN
-	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, dirty_ordinal, updated_at)
+    {{.RequireOldBaseline}}
+	INSERT INTO _sync_dirty_rows(schema_name, table_name, key_json, op, base_row_version, payload, base_kind, base_payload, base_provenance, dirty_ordinal, updated_at)
 	VALUES (
 		'{{.SchemaName}}',
 		'{{.TableName}}',
 		{{.OldKeyJSON}},
 		'DELETE',
 		COALESCE(
-			(SELECT base_row_version FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
 			(SELECT row_version FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
 			0
 		),
 		NULL,
+        (SELECT CASE server_kind WHEN 'live' THEN 'present' WHEN 'deleted' THEN 'deleted' WHEN 'unknown' THEN 'unavailable' ELSE 'absent' END FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+        (SELECT server_payload FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
+        (SELECT server_provenance FROM _sync_row_state WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
 		COALESCE(
 			(SELECT dirty_ordinal FROM _sync_dirty_rows WHERE schema_name='{{.SchemaName}}' AND table_name='{{.TableName}}' AND key_json={{.OldKeyJSON}}),
 			(SELECT COALESCE(MAX(dirty_ordinal), 0) + 1 FROM _sync_dirty_rows)
@@ -210,26 +231,16 @@ BEGIN
 		updated_at=excluded.updated_at;
 END`
 
-// buildJsonObjectExprHexAware creates a SQLite json_object() call that uses hex encoding for BLOB columns
+// Capture storage classes before any server contract is known. Values remain
+// SQLite primitives; no UUID, Boolean, JSON or decimal meaning is inferred here.
 func buildJsonObjectExprHexAware(tableInfo *TableInfo, prefix string) string {
-	var pairs []string
+	pairs := make([]string, 0, len(tableInfo.Columns))
 	for _, col := range tableInfo.Columns {
-		name := strings.ToLower(col.Name)
-		var expr string
-		if col.IsBlob() {
-			// Preserve NULL blobs as JSON null instead of collapsing them to empty hex text.
-			expr = fmt.Sprintf("CASE WHEN %s.%s IS NULL THEN NULL ELSE lower(hex(%s.%s)) END", prefix, col.Name, prefix, col.Name)
-		} else if col.IsInteger() {
-			expr = fmt.Sprintf("CASE WHEN %s.%s IS NULL THEN NULL ELSE CAST(%s.%s AS TEXT) END", prefix, col.Name, prefix, col.Name)
-		} else if col.IsReal() {
-			expr = fmt.Sprintf("CASE WHEN %s.%s IS NULL THEN NULL ELSE printf('%%!.17g', %s.%s) END", prefix, col.Name, prefix, col.Name)
-		} else {
-			// Use column value directly for non-BLOB columns
-			expr = fmt.Sprintf("%s.%s", prefix, col.Name)
-		}
-		pairs = append(pairs, fmt.Sprintf("'%s', %s", name, expr))
+		value := prefix + "." + quoteIdent(col.Name)
+		encoded := fmt.Sprintf("CASE typeof(%[1]s) WHEN 'blob' THEN lower(hex(%[1]s)) WHEN 'integer' THEN CAST(%[1]s AS TEXT) WHEN 'real' THEN printf('%%!.26g', %[1]s) ELSE %[1]s END", value)
+		pairs = append(pairs, fmt.Sprintf("'%s', json_object('storage', typeof(%s), 'value', %s)", col.Name, value, encoded))
 	}
-	return fmt.Sprintf("json_object(%s)", strings.Join(pairs, ", "))
+	return "json_object(" + strings.Join(pairs, ", ") + ")"
 }
 
 func buildKeyJSONObjectExprHexAware(tableInfo *TableInfo, keyColumn, prefix string) string {
@@ -281,7 +292,13 @@ func createTriggersForTable(db *sql.DB, args ...any) error {
 	return createTriggersForTableWithInfo(db, schemaName, syncTable, tableInfo)
 }
 
-func createTriggersForTableWithInfo(db *sql.DB, schemaName string, syncTable SyncTable, tableInfo *TableInfo) error {
+type triggerSQLDB interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func createTriggersForTableWithInfo(db triggerSQLDB, schemaName string, syncTable SyncTable, tableInfo *TableInfo) error {
 	tableName := syncTable.TableName
 	tableLc := strings.ToLower(tableName)
 	if tableInfo == nil {
@@ -293,35 +310,7 @@ func createTriggersForTableWithInfo(db *sql.DB, schemaName string, syncTable Syn
 		return err
 	}
 
-	// Check if primary key is BLOB
-	pkIsBlob := isPrimaryKeyBlob(tableInfo, pkColumn)
-
-	// Build primary key expressions for NEW and OLD rows
-	var pkExprNew, pkExprOld string
-	if pkIsBlob {
-		pkExprNew = fmt.Sprintf("lower(hex(NEW.%s))", pkColumn)
-		pkExprOld = fmt.Sprintf("lower(hex(OLD.%s))", pkColumn)
-	} else {
-		pkExprNew = fmt.Sprintf("NEW.%s", pkColumn)
-		pkExprOld = fmt.Sprintf("OLD.%s", pkColumn)
-	}
-
-	// Build BLOB-aware payload expression
-	payloadExpr := buildJsonObjectExprHexAware(tableInfo, "NEW")
-	oldKeyExpr := buildKeyJSONObjectExprHexAware(tableInfo, pkColumn, "OLD")
-	newKeyExpr := buildKeyJSONObjectExprHexAware(tableInfo, pkColumn, "NEW")
-
-	// Prepare template data
-	data := TriggerData{
-		SchemaName: schemaName,
-		TableName:  tableLc,
-		PKColumn:   pkColumn,
-		NewRowJSON: payloadExpr,
-		OldKeyJSON: oldKeyExpr,
-		NewKeyJSON: newKeyExpr,
-		PKExprNew:  pkExprNew,
-		PKExprOld:  pkExprOld,
-	}
+	data := triggerRenderData(schemaName, tableLc, pkColumn, tableInfo)
 
 	existingSQLByName, err := loadExistingTriggerSQLs(db, tableLc)
 	if err != nil {
@@ -340,16 +329,109 @@ func createTriggersForTableWithInfo(db *sql.DB, schemaName string, syncTable Syn
 			continue
 		}
 		if exists {
-			if _, err := db.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s", quoteIdent(triggerName))); err != nil {
-				return fmt.Errorf("failed to drop %s trigger for table %s: %w", tmpl.name, tableName, err)
-			}
+			return fmt.Errorf("incompatible managed capture trigger %s; recreate the development database", triggerName)
 		}
+
 		if _, err := db.Exec(triggerSQL); err != nil {
 			return fmt.Errorf("failed to create %s trigger for table %s: %w", tmpl.name, tableName, err)
 		}
 	}
 
 	return nil
+}
+
+func validateRuntimeTriggerInventory(db triggerSQLDB, client *Client, validatedTables *validatedSyncTables) error {
+	ownedTables := make(map[string]struct{}, len(syncMetadataTableNames))
+	for _, name := range syncMetadataTableNames {
+		ownedTables[name] = struct{}{}
+	}
+	allowed := map[string]string{
+		"_sync_conflict_revision_insert": "",
+		"_sync_conflict_revision_update": "",
+		"_sync_conflict_revision_delete": "",
+	}
+	for name := range baselineMetadataTriggerSQL() {
+		allowed[name] = ""
+	}
+	for name, sqlText := range stageAccountingDDL() {
+		allowed[name] = sqlText
+	}
+	for _, syncTable := range client.config.Tables {
+		tableName := strings.ToLower(strings.TrimSpace(syncTable.TableName))
+		expected, err := expectedTriggerSQLByName(client.schemaForTable(tableName), syncTable, validatedTables.tableInfoByKey[tableName])
+		if err != nil {
+			return err
+		}
+		for name, sqlText := range expected {
+			allowed[strings.ToLower(name)] = sqlText
+		}
+
+	}
+	rows, err := db.Query(`SELECT name,COALESCE(sql,'') FROM sqlite_master WHERE type='trigger' ORDER BY name`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, sqlText string
+		if err := rows.Scan(&name, &sqlText); err != nil {
+			return err
+		}
+		_, reserved := allowed[strings.ToLower(name)]
+		if !reserved && !triggerReferencesRetainedTable(sqlText, ownedTables) {
+			continue
+		}
+		expectedSQL, ok := allowed[strings.ToLower(name)]
+		if !ok || (expectedSQL != "" && !sameTriggerSQL(sqlText, expectedSQL)) {
+			return fmt.Errorf("trigger %s has unauthorized access to retained runtime tables", name)
+		}
+	}
+	return rows.Err()
+}
+
+func triggerRenderData(schemaName, tableName, pkColumn string, tableInfo *TableInfo) TriggerData {
+	pkExprNew := fmt.Sprintf("NEW.%s", pkColumn)
+	pkExprOld := fmt.Sprintf("OLD.%s", pkColumn)
+	if isPrimaryKeyBlob(tableInfo, pkColumn) {
+		pkExprNew = fmt.Sprintf("lower(hex(NEW.%s))", pkColumn)
+		pkExprOld = fmt.Sprintf("lower(hex(OLD.%s))", pkColumn)
+	}
+	data := TriggerData{
+		SchemaName: schemaName,
+		TableName:  tableName,
+		PKColumn:   pkColumn,
+		NewRowJSON: buildJsonObjectExprHexAware(tableInfo, "NEW"),
+		OldKeyJSON: buildKeyJSONObjectExprHexAware(tableInfo, pkColumn, "OLD"),
+		NewKeyJSON: buildKeyJSONObjectExprHexAware(tableInfo, pkColumn, "NEW"),
+		PKExprNew:  pkExprNew,
+		PKExprOld:  pkExprOld,
+	}
+	data.InsertRowJSON = data.NewRowJSON
+	data.UpdateRowJSON = data.NewRowJSON
+
+	lookup := " FROM _sync_row_state WHERE schema_name='" + schemaName + "' AND table_name='" + tableName + "' AND key_json="
+	data.RequireOldBaseline = "SELECT CASE WHEN NOT EXISTS(SELECT 1" + lookup + data.OldKeyJSON + ") THEN RAISE(ABORT,'SYNC_BASELINE_MISSING') END;"
+	data.EnsureNewBaseline = "INSERT INTO _sync_row_state(schema_name,table_name,key_json,row_version,server_kind,server_payload,server_provenance,relationships_known) SELECT '" + schemaName + "','" + tableName + "'," + data.NewKeyJSON + ",0,'unpublished',NULL," + baselineProvenanceSQL("'never_published'", "0", "NULL") + ",1 WHERE true ON CONFLICT(schema_name,table_name,key_json) DO NOTHING;"
+
+	return data
+}
+
+func expectedTriggerSQLByName(schemaName string, syncTable SyncTable, tableInfo *TableInfo) (map[string]string, error) {
+	tableName := strings.ToLower(syncTable.TableName)
+	pkColumn, err := configuredPrimaryKeyColumn(tableInfo, syncTable)
+	if err != nil {
+		return nil, err
+	}
+	data := triggerRenderData(schemaName, tableName, pkColumn, tableInfo)
+	expected := make(map[string]string, len(triggerSQLTemplates))
+	for _, tmpl := range triggerSQLTemplates {
+		sqlText, err := renderTriggerSQL(tmpl.tmpl, data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to render %s trigger template for table %s: %w", tmpl.name, tableName, err)
+		}
+		expected[fmt.Sprintf("trg_%s_%s", tableName, tmpl.suffix)] = sqlText
+	}
+	return expected, nil
 }
 
 func renderTriggerSQL(tmpl *template.Template, data TriggerData) (string, error) {
@@ -360,7 +442,7 @@ func renderTriggerSQL(tmpl *template.Template, data TriggerData) (string, error)
 	return buf.String(), nil
 }
 
-func loadExistingTriggerSQLs(db *sql.DB, tableName string) (map[string]string, error) {
+func loadExistingTriggerSQLs(db triggerSQLDB, tableName string) (map[string]string, error) {
 	rows, err := db.Query(`SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?`, tableName)
 	if err != nil {
 		return nil, err

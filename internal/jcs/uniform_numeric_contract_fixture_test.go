@@ -12,7 +12,11 @@ import (
 	"testing"
 )
 
-func TestUniformNumericStringContract(t *testing.T) {
+// TestLegacyUniformNumericStringBridgeFixture keeps the pre-generation SQLite
+// storage bridge fixture readable. It is not the active generation wire
+// contract; generation exactness is covered by the wirevalue and Oversync
+// generation tests.
+func TestLegacyUniformNumericStringBridgeFixture(t *testing.T) {
 	path := filepath.Join("..", "..", "..", "sqlitenow-kmp", "oversqlite-contracts", "canonical-json", "jcs-uniform-numeric-strings.json")
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {

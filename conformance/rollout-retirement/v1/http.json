@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "cases": [
+    {"id":"retired-http-1","method":"GET","path":"/sync/generations/1","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-2","method":"POST","path":"/sync/connect","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-3","method":"POST","path":"/sync/push","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-4","method":"GET","path":"/sync/pull","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-5","method":"GET","path":"/sync/watch","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-6","method":"POST","path":"/sync/snapshot-sessions","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-7","method":"GET","path":"/sync/snapshot-sessions/00000000-0000-4000-8000-000000000008","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-8","method":"DELETE","path":"/sync/snapshot-sessions/00000000-0000-4000-8000-000000000008","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-9","method":"POST","path":"/sync/push","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-10","method":"GET","path":"/sync/pull?after_bundle_seq=0","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-11","method":"GET","path":"/sync/watch?after_bundle_seq=0","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401},
+    {"id":"retired-http-12","method":"GET","path":"/sync/generations/1","body":"{}","status":426,"error":"retired_schema_generation","retryable":false,"remediation":"upgrade_application","unauthenticated_status":401}
+  ],
+  "source_id": "never-connected-retired-client"
+}

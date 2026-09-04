@@ -75,7 +75,7 @@ func newBootstrappedIntegrationService(
 	if logger == nil {
 		logger = slog.Default()
 	}
-	svc, err := NewRuntimeService(pool, config, logger)
+	svc, err := newTestRuntimeService(pool, config, logger)
 	if err != nil {
 		t.Fatalf("create runtime service: %v", err)
 	}
@@ -150,6 +150,7 @@ func resetTestBusinessSchema(ctx context.Context, pool *pgxpool.Pool, schema str
 		)`, schemaIdent, schemaIdent)); err != nil {
 		return fmt.Errorf("create %s.file_reviews: %w", schema, err)
 	}
+	recordTestBusinessSchemaGeneration(schema)
 
 	return nil
 }
@@ -183,10 +184,10 @@ func loadCommittedBundleForUser(t *testing.T, ctx context.Context, svc *SyncServ
 	return bundle
 }
 
-func resolveConnectForPushSession(t *testing.T, ctx context.Context, svc *SyncService, actor Actor, hasLocalPendingRows bool) string {
+func resolveConnectForPush(t *testing.T, ctx context.Context, svc *SyncService, actor Actor, hasLocalPendingRows bool) string {
 	t.Helper()
 
-	resp, err := svc.Connect(ctx, actor, &ConnectRequest{HasLocalPendingRows: hasLocalPendingRows})
+	resp, err := svc.Connect(ctx, actor, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: hasLocalPendingRows})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 
@@ -205,20 +206,20 @@ func resolveConnectForPushSession(t *testing.T, ctx context.Context, svc *SyncSe
 func mustInitializeEmptyScope(t *testing.T, ctx context.Context, svc *SyncService, userID, sourceID string) {
 	t.Helper()
 
-	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: sourceID}, &ConnectRequest{HasLocalPendingRows: false})
+	resp, err := svc.Connect(ctx, Actor{UserID: userID, SourceID: sourceID}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.Contains(t, []string{"initialize_empty", "remote_authoritative"}, resp.Resolution)
 }
 
-func mustCanonicalPushRequestHash(t *testing.T, rows []PushRequestRow) string {
+func mustCanonicalPushRequestHash(t *testing.T, svc *SyncService, rows []PushRequestRow) string {
 	t.Helper()
-	hash, err := computeCanonicalPushRequestHash(rows)
+	hash, err := computeGenerationPinnedPushRequestHash(testSchemaGenerationProofForService(svc), rows)
 	require.NoError(t, err)
 	return hash
 }
 
-func pushRowsViaSession(
+func pushRowsOneShot(
 	t *testing.T,
 	ctx context.Context,
 	svc *SyncService,
@@ -228,40 +229,21 @@ func pushRowsViaSession(
 ) (*Bundle, error) {
 	t.Helper()
 
-	initializationID := resolveConnectForPushSession(t, ctx, svc, actor, len(rows) > 0)
-	canonicalRequestHash, hashErr := computeCanonicalPushRequestHash(rows)
+	initializationID := resolveConnectForPush(t, ctx, svc, actor, len(rows) > 0)
+	canonicalRequestHash, hashErr := computeGenerationPinnedPushRequestHash(testSchemaGenerationProofForService(svc), rows)
 	if hashErr != nil {
 		return nil, hashErr
 	}
-	createResp, err := svc.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
+	response, err := svc.PushOneShot(ctx, actor, testSchemaGenerationProofForService(svc), &OneShotPushRequest{
 		SourceBundleID:       sourceBundleID,
-		PlannedRowCount:      int64(len(rows)),
 		CanonicalRequestHash: canonicalRequestHash,
 		InitializationID:     initializationID,
+		Rows:                 rows,
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	switch createResp.Status {
-	case "already_committed":
-		return loadCommittedBundleForUser(t, ctx, svc, actor.UserID, createResp.BundleSeq), nil
-	case "staging":
-		_, err = svc.UploadPushChunk(ctx, actor, createResp.PushID, &PushSessionChunkRequest{
-			StartRowOrdinal: 0,
-			Rows:            rows,
-		})
-		if err != nil {
-			return nil, err
-		}
-		commitResp, err := svc.CommitPushSession(ctx, actor, createResp.PushID)
-		if err != nil {
-			return nil, err
-		}
-		return loadCommittedBundleForUser(t, ctx, svc, actor.UserID, commitResp.BundleSeq), nil
-	default:
-		return nil, fmt.Errorf("unexpected push session status %q", createResp.Status)
-	}
+	return response.Bundle, nil
 }
 
 func mustCompactStorageIdentity(

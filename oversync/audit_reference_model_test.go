@@ -176,12 +176,13 @@ func TestAuditReferenceModel_SeededMultiScopeSequence(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "audit-reference-model",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "audit-reference-model",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	model := newAuditReferenceModel(3)
@@ -196,7 +197,7 @@ func TestAuditReferenceModel_SeededMultiScopeSequence(t *testing.T) {
 		scope := scopes[rng.Intn(len(scopes))]
 		request := scope.nextOperation(rng, schemaName)
 
-		bundle, err := pushRowsViaSession(
+		bundle, err := pushRowsOneShot(
 			t,
 			ctx,
 			svc,
@@ -334,7 +335,7 @@ func assertAuditReferenceRowState(
 func assertAuditReferencePull(t *testing.T, ctx context.Context, svc *SyncService, scope *auditReferenceScope) {
 	t.Helper()
 
-	response, err := svc.ProcessPull(ctx, scope.actor, 0, 100, 0)
+	response, err := svc.ProcessPull(ctx, scope.actor, testSchemaGenerationProofForService(svc), 0, 100, 0)
 	require.NoError(t, err)
 	require.Equal(t, scope.latestBundleSeq, response.StableBundleSeq)
 	require.Len(t, response.Bundles, int(scope.latestBundleSeq))
@@ -352,9 +353,11 @@ func assertAuditReferencePull(t *testing.T, ctx context.Context, svc *SyncServic
 func assertAuditReferenceSnapshot(t *testing.T, ctx context.Context, svc *SyncService, scope *auditReferenceScope) {
 	t.Helper()
 
-	session, err := svc.CreateSnapshotSession(ctx, scope.actor)
+	session, err := svc.CreateSnapshotSession(ctx, scope.actor, testSchemaGenerationProofForService(svc))
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = svc.DeleteSnapshotSession(context.Background(), scope.actor, session.SnapshotID) })
+	t.Cleanup(func() {
+		_ = svc.DeleteSnapshotSession(context.Background(), scope.actor, testSchemaGenerationProofForService(svc), session.SnapshotID)
+	})
 
 	rows, snapshotBundleSeq := collectSnapshotChunkRows(t, ctx, svc, scope.actor, session.SnapshotID, 7)
 	require.Equal(t, scope.latestBundleSeq, snapshotBundleSeq)
@@ -383,5 +386,5 @@ func assertAuditReferenceSnapshot(t *testing.T, ctx context.Context, svc *SyncSe
 	}
 	require.Len(t, rows, expectedLiveCount)
 	require.Len(t, seen, expectedLiveCount)
-	require.NoError(t, svc.DeleteSnapshotSession(ctx, scope.actor, session.SnapshotID))
+	require.NoError(t, svc.DeleteSnapshotSession(ctx, scope.actor, testSchemaGenerationProofForService(svc), session.SnapshotID))
 }

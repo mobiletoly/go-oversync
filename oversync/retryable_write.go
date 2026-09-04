@@ -138,6 +138,9 @@ func rejectRetryableCallbackContext(ctx context.Context, operation string) error
 	if ctx != nil && ctx.Value(retryableCallbackContextKey{}) != nil {
 		return &RetryableCallbackViolationError{Message: operation + " cannot own a transaction from a retryable database-write callback"}
 	}
+	if ctx != nil {
+		return ctx.Err()
+	}
 	return nil
 }
 
@@ -765,6 +768,9 @@ func runRetryableWriteTransaction[T any](
 ) (T, error) {
 	return runRetryableWriteTransactionWithDriver(ctx, retryableWriteDriver{
 		begin: func(beginCtx context.Context) (pgx.Tx, error) {
+			if err := attestOriginSession(beginCtx, conn); err != nil {
+				return nil, err
+			}
 			return conn.BeginTx(beginCtx, syncMutationTxOptions())
 		},
 		commitRollbackProven: commitRollbackProven,
@@ -815,7 +821,7 @@ func runRetryableWriteTransactionWithDriver[T any](
 			rollbackErr := tx.Rollback(rollbackCtx)
 			cancel()
 			if rollbackErr != nil {
-				return zero, attemptErr
+				return zero, &WriteRollbackUnconfirmedError{Err: errors.Join(attemptErr, rollbackErr)}
 			}
 			if !isRetryablePGTxError(attemptErr) || attempt == 2 {
 				return zero, attemptErr
@@ -857,3 +863,10 @@ func validateWriterID(writerID string) error {
 	}
 	return nil
 }
+
+// WriteRollbackUnconfirmedError prevents callers from checkpointing failure when
+// cleanup did not establish that the database transaction has stopped.
+type WriteRollbackUnconfirmedError struct{ Err error }
+
+func (e *WriteRollbackUnconfirmedError) Error() string { return "database write rollback unconfirmed" }
+func (e *WriteRollbackUnconfirmedError) Unwrap() error { return e.Err }

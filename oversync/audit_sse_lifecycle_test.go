@@ -4,6 +4,7 @@ package oversync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -33,7 +34,7 @@ func TestAuditSSELifecycle_BoundedSubscriberPressureCoalescesAndCleansUp(t *test
 	subscriptions := make([]subscription, 0, auditSSESubscriberCount)
 	for range auditSSESubscriberCount {
 		subCtx, cancel := context.WithCancel(ctx)
-		events, err := fixture.svc.SubscribeBundleChanges(subCtx, actor, 0)
+		events, err := fixture.svc.SubscribeBundleChanges(subCtx, actor, testSchemaGenerationProofForService(fixture.svc), 0)
 		require.NoError(t, err)
 		subscriptions = append(subscriptions, subscription{cancel: cancel, events: events})
 	}
@@ -97,13 +98,15 @@ func TestAuditSSELifecycle_DuplicateListenersCoalesceNotificationsAndReleasePool
 	userPK := fixture.userPK(t, actor)
 
 	cancelFirst := startBundleChangeListenerForTest(t, fixture.svc)
-	cancelSecond := startBundleChangeListenerForTest(t, fixture.svc)
 	require.Eventually(t, func() bool {
-		return fixture.pool.Stat().AcquiredConns() == 2
+		fixture.svc.mu.RLock()
+		defer fixture.svc.mu.RUnlock()
+		return fixture.svc.bundleChangeListenerRunning
 	}, 2*time.Second, 10*time.Millisecond)
+	require.ErrorContains(t, fixture.svc.RunBundleChangeListener(ctx), "already running")
 
 	subCtx, cancelSubscription := context.WithCancel(ctx)
-	events, err := fixture.svc.SubscribeBundleChanges(subCtx, actor, 0)
+	events, err := fixture.svc.SubscribeBundleChanges(subCtx, actor, testSchemaGenerationProofForService(fixture.svc), 0)
 	require.NoError(t, err)
 	bundle := fixture.pushOne(t, actor, 1, "DuplicateListener")
 	event := receiveBundleChangeEvent(t, events)
@@ -112,12 +115,11 @@ func TestAuditSSELifecycle_DuplicateListenersCoalesceNotificationsAndReleasePool
 
 	cancelSubscription()
 	cancelFirst()
-	cancelSecond()
 	require.Eventually(t, func() bool {
 		return fixture.svc.bundleChangeSubscriberCount(userPK) == 0 && fixture.pool.Stat().AcquiredConns() == 0
 	}, 2*time.Second, 10*time.Millisecond)
 	requireAuditMetadataIntegrity(t, ctx, fixture.pool)
-	t.Log("duplicate listeners consume independent pool slots, while subscriber sequence filtering coalesces duplicate notifications")
+	t.Log("a service admits one listener, while subscriber sequence filtering coalesces duplicate notifications")
 }
 
 func TestAuditSSELifecycle_ListenerReconnectsAfterBackendTermination(t *testing.T) {
@@ -131,7 +133,7 @@ func TestAuditSSELifecycle_ListenerReconnectsAfterBackendTermination(t *testing.
 	firstPID := requireAuditBundleChangeListenerPID(t, ctx, fixture)
 	subCtx, cancelSubscription := context.WithCancel(ctx)
 	t.Cleanup(cancelSubscription)
-	events, err := fixture.svc.SubscribeBundleChanges(subCtx, actor, 0)
+	events, err := fixture.svc.SubscribeBundleChanges(subCtx, actor, testSchemaGenerationProofForService(fixture.svc), 0)
 	require.NoError(t, err)
 
 	var terminated bool
@@ -163,7 +165,7 @@ func TestAuditSSELifecycle_MalformedNotificationsAreIgnoredWithoutStoppingListen
 
 	subCtx, cancelSubscription := context.WithCancel(ctx)
 	t.Cleanup(cancelSubscription)
-	events, err := fixture.svc.SubscribeBundleChanges(subCtx, actor, 0)
+	events, err := fixture.svc.SubscribeBundleChanges(subCtx, actor, testSchemaGenerationProofForService(fixture.svc), 0)
 	require.NoError(t, err)
 	invalidPayloads := []string{
 		`{`,
@@ -211,14 +213,14 @@ func TestAuditSSELifecycle_ShutdownAndClosedHTTPMappings(t *testing.T) {
 		return state == serviceLifecycleShuttingDown && inFlight == 1
 	}, time.Second, 5*time.Millisecond)
 
-	assertAuditLifecycleHTTPError(t, handlers, actor, "create", http.StatusServiceUnavailable, "service_unavailable")
-	assertAuditLifecycleHTTPError(t, handlers, actor, "watch", http.StatusServiceUnavailable, "service_unavailable")
+	assertAuditLifecycleHTTPError(t, handlers, actor, "create", http.StatusServiceUnavailable, "service_not_ready")
+	assertAuditLifecycleHTTPError(t, handlers, actor, "watch", http.StatusServiceUnavailable, "service_not_ready")
 	done()
 	require.NoError(t, <-closeErr)
 
-	assertAuditLifecycleHTTPError(t, handlers, actor, "create", http.StatusInternalServerError, "push_session_create_failed")
-	assertAuditLifecycleHTTPError(t, handlers, actor, "watch", http.StatusInternalServerError, "bundle_change_watch_failed")
-	t.Log("OS-AUD-015 confirmed dynamically: shutting-down requests map to stable 503, but requests after Close map to operation-specific 500 responses")
+	assertAuditLifecycleHTTPError(t, handlers, actor, "create", http.StatusServiceUnavailable, "service_not_ready")
+	assertAuditLifecycleHTTPError(t, handlers, actor, "watch", http.StatusServiceUnavailable, "service_not_ready")
+	t.Log("shutting-down and closed requests both map to stable service-not-ready responses")
 }
 
 func TestAuditSSELifecycle_StatusAndHealthDatabaseFailuresHaveStableErrors(t *testing.T) {
@@ -226,7 +228,7 @@ func TestAuditSSELifecycle_StatusAndHealthDatabaseFailuresHaveStableErrors(t *te
 	failurePool, err := pgxpool.New(context.Background(), fixture.pool.Config().ConnString())
 	require.NoError(t, err)
 	t.Cleanup(failurePool.Close)
-	failureService, err := NewRuntimeService(failurePool, fixture.svc.config, integrationTestLogger(slog.LevelWarn))
+	failureService, err := newTestRuntimeService(failurePool, fixture.svc.config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = failureService.Close(context.Background()) })
 	handlers := NewHTTPSyncHandlers(failureService, integrationTestLogger(slog.LevelWarn))
@@ -235,17 +237,20 @@ func TestAuditSSELifecycle_StatusAndHealthDatabaseFailuresHaveStableErrors(t *te
 	tests := []struct {
 		name      string
 		handle    func(http.ResponseWriter, *http.Request)
+		status    int
 		errorCode string
 	}{
-		{name: "status", handle: handlers.HandleStatus, errorCode: "status_failed"},
-		{name: "health", handle: handlers.HandleHealth, errorCode: "health_failed"},
+		{name: "status", handle: handlers.HandleStatus, status: http.StatusOK},
+		{name: "health", handle: handlers.HandleHealth, status: http.StatusServiceUnavailable},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			test.handle(recorder, httptest.NewRequest(http.MethodGet, "/sync/"+test.name, nil))
-			require.Equal(t, http.StatusInternalServerError, recorder.Code)
-			require.Equal(t, test.errorCode, decodeErrorResponse(t, recorder).Error)
+			require.Equal(t, test.status, recorder.Code)
+			var status StatusResponse
+			require.NoError(t, json.NewDecoder(recorder.Body).Decode(&status))
+			require.Equal(t, "unhealthy", status.Status)
 		})
 	}
 	requireAuditMetadataIntegrity(t, context.Background(), fixture.pool)
@@ -285,7 +290,7 @@ func TestAuditExpectedLifecycle_RequestsAfterCloseReturnStableUnavailable(t *tes
 			handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
 			require.NoError(t, fixture.svc.Close(ctx))
 
-			assertAuditLifecycleHTTPError(t, handlers, actor, operation, http.StatusServiceUnavailable, "service_unavailable")
+			assertAuditLifecycleHTTPError(t, handlers, actor, operation, http.StatusServiceUnavailable, "service_not_ready")
 		})
 	}
 }
@@ -313,9 +318,14 @@ func (w *auditFailingResponseWriter) WriteHeader(statusCode int) {
 
 func requireAuditBundleChangeListenerPID(t *testing.T, ctx context.Context, fixture *bundleChangeWatchFixture) int32 {
 	t.Helper()
+	return requireAuditBundleChangeListenerPIDForPool(t, ctx, fixture.pool)
+}
+
+func requireAuditBundleChangeListenerPIDForPool(t *testing.T, ctx context.Context, pool *pgxpool.Pool) int32 {
+	t.Helper()
 	var pid int32
 	require.Eventually(t, func() bool {
-		err := fixture.pool.QueryRow(ctx, `
+		err := pool.QueryRow(ctx, `
 			SELECT pid
 			FROM pg_stat_activity
 			WHERE datname = current_database()
@@ -342,15 +352,20 @@ func assertAuditLifecycleHTTPError(
 	recorder := httptest.NewRecorder()
 	switch operation {
 	case "create":
-		request = httptest.NewRequest(http.MethodPost, "/sync/push-sessions", strings.NewReader(`{"source_bundle_id":1,"planned_row_count":0}`))
+		request = httptest.NewRequest(http.MethodPost, "/sync/push", strings.NewReader(`{}`))
+		request.Header.Set("Content-Type", "application/json")
 		request = request.WithContext(ContextWithActor(request.Context(), actor))
-		handlers.HandleCreatePushSession(recorder, request)
 	case "watch":
 		request = httptest.NewRequest(http.MethodGet, "/sync/watch?after_bundle_seq=0", nil)
 		request = request.WithContext(ContextWithActor(request.Context(), actor))
-		handlers.HandleWatch(recorder, request)
 	default:
 		t.Fatalf("unsupported lifecycle HTTP operation %q", operation)
+	}
+	setTestSchemaGenerationHeaders(request, handlers.service)
+	if operation == "create" {
+		handlers.HandlePush(recorder, request)
+	} else {
+		handlers.HandleWatch(recorder, request)
 	}
 	require.Equal(t, wantStatus, recorder.Code)
 	require.Equal(t, wantCode, decodeErrorResponse(t, recorder).Error)

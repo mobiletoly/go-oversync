@@ -22,6 +22,7 @@ type ColumnInfo struct {
 	IsPrimaryKey bool
 	NotNull      bool
 	DefaultValue *string
+	Hidden       int
 }
 
 // IsBlob returns true if this column should be treated as BLOB data
@@ -113,8 +114,9 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 		return info, nil
 	}
 
-	// Query table info using PRAGMA table_info
-	rows, err := queryer.Query(fmt.Sprintf("PRAGMA table_info(%s)", key.table))
+	// table_xinfo includes generated and hidden columns. Silently omitting them
+	// would let a managed physical table have a wider surface than its contract.
+	rows, err := queryer.Query(fmt.Sprintf("PRAGMA table_xinfo(%s)", key.table))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get table info for %s: %w", tableName, err)
 	}
@@ -128,10 +130,10 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 	for rows.Next() {
 		var cid int
 		var name, declaredType string
-		var notNull, pk int
+		var notNull, pk, hidden int
 		var defaultValue sql.NullString
 
-		err := rows.Scan(&cid, &name, &declaredType, &notNull, &defaultValue, &pk)
+		err := rows.Scan(&cid, &name, &declaredType, &notNull, &defaultValue, &pk, &hidden)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan column info: %w", err)
 		}
@@ -148,6 +150,7 @@ func (p *TableInfoProvider) Get(queryer tableInfoQueryer, tableName string) (*Ta
 			IsPrimaryKey: isPrimaryKey,
 			NotNull:      notNull == 1,
 			DefaultValue: defaultVal,
+			Hidden:       hidden,
 		}
 
 		columns = append(columns, column)

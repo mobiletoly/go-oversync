@@ -32,6 +32,7 @@ type registeredTableTriggerTarget struct {
 type BundleSource struct {
 	SourceID             string
 	SourceBundleID       int64
+	PlannedRowCount      *int64
 	CanonicalRequestHash string
 }
 
@@ -71,11 +72,18 @@ func quoteSQLLiteral(s string) string {
 }
 
 func (s *SyncService) installRegisteredTableCaptureTriggersInTx(ctx context.Context, tx pgx.Tx) error {
-	if s == nil || s.config == nil || len(s.config.RegisteredTables) == 0 {
+	if s == nil {
 		return nil
 	}
+	return s.installRegisteredTableCaptureTriggersForTablesInTx(ctx, tx, s.activeRegisteredTableDeclarations())
+}
 
-	for _, table := range s.config.RegisteredTables {
+func (s *SyncService) installRegisteredTableCaptureTriggersForTablesInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	tables []RegisteredTable,
+) error {
+	for tableIndex, table := range tables {
 		keyColumns := table.normalizedSyncKeyColumns()
 		if len(keyColumns) != 1 {
 			return fmt.Errorf("registered table %s requires exactly one sync key column to install capture trigger", table.normalizedKey())
@@ -90,15 +98,11 @@ func (s *SyncService) installRegisteredTableCaptureTriggersInTx(ctx context.Cont
 		if err != nil {
 			return err
 		}
-		for _, target := range truncateTargets {
+		for targetIndex, target := range truncateTargets {
 			targetIdent := pgx.Identifier{target.schemaName, target.tableName}.Sanitize()
-			stmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableTruncateGuardTrigger, targetIdent)
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("drop truncate guard trigger for %s on %s.%s: %w", table.normalizedKey(), target.schemaName, target.tableName, err)
+			if err := rejectReservedRegisteredTrigger(ctx, tx, target.schemaName, target.tableName, registeredTableTruncateGuardTrigger); err != nil {
+				return err
 			}
-		}
-		for _, target := range truncateTargets {
-			targetIdent := pgx.Identifier{target.schemaName, target.tableName}.Sanitize()
 			stmt := fmt.Sprintf(
 				`CREATE TRIGGER %s BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION sync.reject_registered_table_truncate(%s, %s)`,
 				registeredTableTruncateGuardTrigger,
@@ -109,18 +113,16 @@ func (s *SyncService) installRegisteredTableCaptureTriggersInTx(ctx context.Cont
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("create truncate guard trigger for %s on %s.%s: %w", table.normalizedKey(), target.schemaName, target.tableName, err)
 			}
+			if err := s.runRegisteredTableCatalogMutationHook("after_truncate_trigger", targetIndex); err != nil {
+				return err
+			}
 		}
 
-		stmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableCaptureTriggerName, tableIdent)
-		if _, err := tx.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("drop capture trigger for %s: %w", table.normalizedKey(), err)
-		}
-		stmt = fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, registeredTableOwnerGuardTrigger, tableIdent)
-		if _, err := tx.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("drop owner guard trigger for %s: %w", table.normalizedKey(), err)
+		if err := rejectReservedRegisteredTrigger(ctx, tx, table.Schema, table.Table, registeredTableOwnerGuardTrigger, registeredTableCaptureTriggerName); err != nil {
+			return err
 		}
 
-		stmt = fmt.Sprintf(
+		stmt := fmt.Sprintf(
 			`CREATE TRIGGER %s BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.enforce_registered_row_owner()`,
 			registeredTableOwnerGuardTrigger,
 			tableIdent,
@@ -128,18 +130,86 @@ func (s *SyncService) installRegisteredTableCaptureTriggersInTx(ctx context.Cont
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("create owner guard trigger for %s: %w", table.normalizedKey(), err)
 		}
+		if err := s.runRegisteredTableCatalogMutationHook("after_owner_trigger", tableIndex); err != nil {
+			return err
+		}
 
-		stmt = fmt.Sprintf(
-			`CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s, %s, %s)`,
-			registeredTableCaptureTriggerName,
-			tableIdent,
+		triggerArguments := []string{
 			quoteSQLLiteral(keyColumns[0]),
 			quoteSQLLiteral(strconv.Itoa(int(info.syncKeyKind))),
 			quoteSQLLiteral(strconv.Itoa(int(info.tableID))),
+		}
+		for _, columnName := range databaseJSONColumnNames(s.columnTypesForTable(table.normalizedSchema(), table.normalizedTable())) {
+			triggerArguments = append(triggerArguments, quoteSQLLiteral(columnName))
+		}
+		stmt = fmt.Sprintf(
+			`CREATE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION sync.capture_registered_row_change(%s)`,
+			registeredTableCaptureTriggerName,
+			tableIdent,
+			strings.Join(triggerArguments, ", "),
 		)
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("create capture trigger for %s: %w", table.normalizedKey(), err)
 		}
+		if err := s.runRegisteredTableCatalogMutationHook("after_capture_trigger", tableIndex); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateNoReservedRegisteredTriggersForTables(
+	ctx context.Context,
+	tx pgx.Tx,
+	tables []RegisteredTable,
+) error {
+	for _, table := range tables {
+		targets, err := loadRegisteredTableTriggerTargets(ctx, tx, table)
+		if err != nil {
+			return err
+		}
+		for _, target := range targets {
+			if err := rejectReservedRegisteredTrigger(ctx, tx, target.schemaName, target.tableName, registeredTableTruncateGuardTrigger); err != nil {
+				return err
+			}
+		}
+		if err := rejectReservedRegisteredTrigger(ctx, tx, table.Schema, table.Table, registeredTableOwnerGuardTrigger, registeredTableCaptureTriggerName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectReservedRegisteredTrigger(
+	ctx context.Context,
+	tx pgx.Tx,
+	schemaName string,
+	tableName string,
+	triggerNames ...string,
+) error {
+	var triggerName string
+	err := tx.QueryRow(ctx, `
+		SELECT trigger.tgname
+		FROM pg_trigger AS trigger
+		JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+		JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = $1
+		  AND relation.relname = $2
+		  AND trigger.tgname = ANY($3::text[])
+		  AND NOT trigger.tgisinternal
+		ORDER BY trigger.tgname
+		LIMIT 1
+	`, schemaName, tableName, triggerNames).Scan(&triggerName)
+	if err == nil {
+		return unsupportedSchemaf(
+			"registered table %s.%s already uses reserved managed trigger name %s",
+			schemaName,
+			tableName,
+			triggerName,
+		)
+	}
+	if err != pgx.ErrNoRows {
+		return fmt.Errorf("inspect reserved managed triggers on %s.%s: %w", schemaName, tableName, err)
 	}
 	return nil
 }
@@ -241,7 +311,7 @@ func (s *SyncService) WithinSyncBundle(
 		return err
 	}
 
-	done, err := s.beginOperation()
+	done, err := s.beginOperation(ctx)
 	if err != nil {
 		return err
 	}
@@ -344,6 +414,9 @@ func (s *SyncService) withinSyncBundleAttempt(
 	if err := fn(callbackCtx, capability); err != nil {
 		return err
 	}
+	if err := finishDeferredBundleEffects(ctx, tx); err != nil {
+		return err
+	}
 	bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, scopeState.UserPK, source)
 	if err != nil {
 		return err
@@ -364,22 +437,63 @@ func (s *SyncService) withinSyncBundleAttempt(
 	return nil
 }
 
+// finishDeferredBundleEffects forces application-owned deferred constraint
+// triggers to run while the transaction can still capture, validate, and bound
+// every registered-table effect they produce.
+func finishDeferredBundleEffects(ctx context.Context, tx pgx.Tx) error {
+	rows, err := tx.Query(ctx, `
+		SELECT n.nspname, c.conname
+		FROM pg_catalog.pg_constraint AS c
+		JOIN pg_catalog.pg_namespace AS n ON n.oid=c.connamespace
+		WHERE c.condeferrable
+		  AND n.nspname <> 'sync'
+		ORDER BY n.nspname, c.conname
+	`)
+	if err != nil {
+		return fmt.Errorf("list deferred application constraints: %w", err)
+	}
+	var constraints []string
+	for rows.Next() {
+		var schemaName, constraintName string
+		if err := rows.Scan(&schemaName, &constraintName); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan deferred application constraint: %w", err)
+		}
+		constraints = append(constraints, pgx.Identifier{schemaName, constraintName}.Sanitize())
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate deferred application constraints: %w", err)
+	}
+	rows.Close()
+	if len(constraints) == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `SET CONSTRAINTS `+strings.Join(constraints, ",")+` IMMEDIATE`); err != nil {
+		return fmt.Errorf("finish deferred bundle effects: %w", err)
+	}
+	return nil
+}
+
 func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, source BundleSource) (*Bundle, error) {
+	return s.finalizeCapturedBundleWithLimit(ctx, tx, actor, userPK, source, 0)
+}
+
+func (s *SyncService) finalizeCapturedBundleWithLimit(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, source BundleSource, byteLimit int) (*Bundle, error) {
+	if byteLimit == 0 {
+		byteLimit = s.config.MaxBytesPerBundle
+	}
+
 	var txid int64
 	if err := tx.QueryRow(ctx, `SELECT txid_current()`).Scan(&txid); err != nil {
 		return nil, fmt.Errorf("read current txid for bundle capture: %w", err)
 	}
 
-	events, err := loadCapturedBundleEvents(ctx, tx, txid, userPK)
+	hasRows, err := hasNormalizedCapturedBundleRows(ctx, tx, txid, userPK)
 	if err != nil {
 		return nil, err
 	}
-	if len(events) == 0 {
-		return nil, nil
-	}
-
-	rows := normalizeCapturedBundleEvents(events)
-	if len(rows) == 0 {
+	if !hasRows {
 		if _, err := tx.Exec(ctx, `DELETE FROM sync.bundle_capture_stage WHERE txid = $1 AND user_pk = $2`, txid, userPK); err != nil {
 			return nil, fmt.Errorf("clear empty captured bundle stage rows: %w", err)
 		}
@@ -390,10 +504,37 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 	if err != nil {
 		return nil, err
 	}
+	queryRows, err := s.queryNormalizedCapturedBundleRows(ctx, tx, txid, userPK)
+	if err != nil {
+		return nil, err
+	}
+	defer queryRows.Close()
+	if !queryRows.Next() {
+		if err := queryRows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate normalized captured bundle rows: %w", err)
+		}
+		return nil, projectionError(GenerationProjectionIntegrityError, "capture", "captured bundle changed during finalization")
+	}
 
-	storageRows := make([]committedBundleStorageRow, 0, len(rows))
-	bundleRows := make([]BundleRow, 0, len(rows))
-	for _, row := range rows {
+	storageRows := make([]committedBundleStorageRow, 0, min(s.config.MaxRowsPerBundle, 1024))
+	bundleRows := make([]BundleRow, 0, min(s.config.MaxRowsPerBundle, 1024))
+	hasher := protocolhash.NewCommittedBundleHasher()
+	for {
+		if len(bundleRows) >= s.config.MaxRowsPerBundle {
+			return nil, projectionError(BundleLimitExceeded, "capture", "committed bundle exceeds configured limits")
+		}
+		var row normalizedBundleRow
+		var firstOpCode int16
+		if err := queryRows.Scan(&row.firstOrdinal, &row.tableID, &row.keyBytes, &firstOpCode, &row.opCode, &row.payloadDB); err != nil {
+			return nil, fmt.Errorf("scan normalized captured bundle row: %w", err)
+		}
+		if row.opCode == opCodeDelete {
+			row.payloadDB = nil
+		} else if firstOpCode == opCodeInsert {
+			row.opCode = opCodeInsert
+		} else {
+			row.opCode = opCodeUpdate
+		}
 		info, err := s.tableInfoForID(row.tableID)
 		if err != nil {
 			return nil, err
@@ -421,6 +562,15 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 			}
 			bundleRow.Payload = payloadWire
 		}
+		if err := hasher.Add(protocolhash.BundleRow{
+			Schema: bundleRow.Schema, Table: bundleRow.Table, Key: bundleRow.Key,
+			Op: bundleRow.Op, RowVersion: bundleRow.RowVersion, Payload: bundleRow.Payload,
+		}); err != nil {
+			return nil, fmt.Errorf("compute committed bundle hash: %w", err)
+		}
+		if hasher.CurrentByteCount() > int64(byteLimit) {
+			return nil, projectionError(BundleLimitExceeded, "capture", "committed bundle exceeds configured limits")
+		}
 		storageRows = append(storageRows, committedBundleStorageRow{
 			tableID:     row.tableID,
 			keyBytes:    append([]byte(nil), row.keyBytes...),
@@ -428,22 +578,47 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 			payloadWire: append([]byte(nil), payloadWire...),
 		})
 		bundleRows = append(bundleRows, bundleRow)
+		if !queryRows.Next() {
+			break
+		}
 	}
+	if err := queryRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate normalized captured bundle rows: %w", err)
+	}
+	queryRows.Close()
 
-	bundleHash, byteCount, err := computeCommittedBundleHash(bundleRows)
+	bundleHashText, byteCount, err := hasher.Sum()
 	if err != nil {
 		return nil, fmt.Errorf("compute committed bundle hash: %w", err)
+	}
+	bundleHash, err := hex.DecodeString(bundleHashText)
+	if err != nil {
+		return nil, fmt.Errorf("decode committed bundle hash: %w", err)
+	}
+	candidate := &Bundle{
+		BundleSeq:            bundleSeq,
+		SourceID:             source.SourceID,
+		SourceBundleID:       source.SourceBundleID,
+		RowCount:             int64(len(bundleRows)),
+		ByteCount:            byteCount,
+		BundleHash:           renderBundleHash(bundleHash),
+		CanonicalRequestHash: source.CanonicalRequestHash,
+		Rows:                 bundleRows,
+	}
+	if err := s.validateFutureBundleRepresentations(candidate); err != nil {
+		return nil, err
 	}
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO sync.bundle_log (
-			user_pk, bundle_seq, source_id, source_bundle_id, row_count, byte_count, bundle_hash, canonical_request_hash, committed_at
+			user_pk, bundle_seq, source_id, source_bundle_id, planned_row_count, row_count, byte_count, bundle_hash, canonical_request_hash, committed_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-	`, userPK, bundleSeq, source.SourceID, source.SourceBundleID, len(bundleRows), byteCount, bundleHash, source.CanonicalRequestHash); err != nil {
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+	`, userPK, bundleSeq, source.SourceID, source.SourceBundleID, source.PlannedRowCount, len(bundleRows), byteCount, bundleHash, source.CanonicalRequestHash); err != nil {
 		return nil, fmt.Errorf("insert bundle_log row: %w", err)
 	}
-	if err := s.emitBundleChangeNotify(ctx, tx, userPK, BundleChangeEvent{
+	if err := s.emitBundleChangeNotify(ctx, tx, bundleChangeNotification{
+		UserPK:         userPK,
 		BundleSeq:      bundleSeq,
 		SourceID:       source.SourceID,
 		SourceBundleID: source.SourceBundleID,
@@ -458,15 +633,109 @@ func (s *SyncService) finalizeCapturedBundle(ctx context.Context, tx pgx.Tx, act
 	if _, err := tx.Exec(ctx, `DELETE FROM sync.bundle_capture_stage WHERE txid = $1 AND user_pk = $2`, txid, userPK); err != nil {
 		return nil, fmt.Errorf("delete captured bundle stage rows: %w", err)
 	}
-	return &Bundle{
-		BundleSeq:            bundleSeq,
-		SourceID:             source.SourceID,
-		SourceBundleID:       source.SourceBundleID,
-		RowCount:             int64(len(bundleRows)),
-		BundleHash:           renderBundleHash(bundleHash),
-		CanonicalRequestHash: source.CanonicalRequestHash,
-		Rows:                 bundleRows,
-	}, nil
+	return candidate, nil
+}
+
+func hasNormalizedCapturedBundleRows(ctx context.Context, tx pgx.Tx, txid, userPK int64) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+		WITH normalized AS (
+			SELECT
+				first_value(op_code) OVER complete AS first_op_code,
+				last_value(op_code) OVER complete AS last_op_code,
+				row_number() OVER (PARTITION BY table_id, key_bytes ORDER BY capture_ordinal DESC) AS reverse_ordinal
+			FROM sync.bundle_capture_stage
+			WHERE txid = $1 AND user_pk = $2
+			WINDOW complete AS (
+				PARTITION BY table_id, key_bytes
+				ORDER BY capture_ordinal
+				ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+			)
+		)
+		SELECT EXISTS (
+			SELECT 1 FROM normalized
+			WHERE reverse_ordinal = 1
+			  AND NOT (first_op_code = $3 AND last_op_code = $4)
+		)
+	`, txid, userPK, opCodeInsert, opCodeDelete).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check normalized captured bundle rows: %w", err)
+	}
+	return exists, nil
+}
+
+func (s *SyncService) queryNormalizedCapturedBundleRows(ctx context.Context, tx pgx.Tx, txid, userPK int64) (pgx.Rows, error) {
+	tableIDs := make([]int, 0, len(s.registeredTableByID))
+	physicalLimitByTableID := make(map[int32]int64, len(s.registeredTableByID))
+	for tableID, info := range s.registeredTableByID {
+		columnTypes := s.columnTypesForTable(info.schemaName, info.tableName)
+		tableLimit, limitErr := physicalDatabasePayloadByteLimitForColumnTypes(int64(s.config.MaxBytesPerBundle), columnTypes)
+		if limitErr != nil {
+			return nil, limitErr
+		}
+		tableIDs = append(tableIDs, int(tableID))
+		physicalLimitByTableID[tableID] = tableLimit
+	}
+	sort.Ints(tableIDs)
+	var physicalLimitCase strings.Builder
+	if len(tableIDs) == 0 {
+		physicalLimitCase.WriteByte('0')
+	} else {
+		physicalLimitCase.WriteString("CASE table_id")
+		for _, rawTableID := range tableIDs {
+			tableID := int32(rawTableID)
+			fmt.Fprintf(&physicalLimitCase, " WHEN %d THEN %d", tableID, physicalLimitByTableID[tableID])
+		}
+		physicalLimitCase.WriteString(" ELSE 0 END")
+	}
+	var oversized bool
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM sync.bundle_capture_stage
+			WHERE txid = $1
+			  AND user_pk = $2
+			  AND (
+				octet_length(key_bytes) > $3
+				OR COALESCE(octet_length(payload_db::text), 0) > (%s)
+			  )
+		)`, physicalLimitCase.String()), txid, userPK, s.config.MaxBytesPerBundle).Scan(&oversized); err != nil {
+		return nil, fmt.Errorf("check captured bundle input limits: %w", err)
+	}
+	if oversized {
+		return nil, projectionError(BundleLimitExceeded, "capture", "committed bundle exceeds configured limits")
+	}
+	queryRows, err := tx.Query(ctx, `
+		WITH normalized AS (
+			SELECT
+				first_value(capture_ordinal) OVER complete AS first_ordinal,
+				table_id,
+				key_bytes,
+				first_value(op_code) OVER complete AS first_op_code,
+				last_value(op_code) OVER complete AS last_op_code,
+				last_value(payload_db) OVER complete AS last_payload_db,
+				row_number() OVER (
+					PARTITION BY table_id, key_bytes ORDER BY capture_ordinal DESC
+				) AS reverse_ordinal
+			FROM sync.bundle_capture_stage
+			WHERE txid = $1 AND user_pk = $2
+			WINDOW complete AS (
+				PARTITION BY table_id, key_bytes
+				ORDER BY capture_ordinal
+				ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+			)
+		)
+		SELECT first_ordinal, table_id, key_bytes, first_op_code, last_op_code, last_payload_db
+		FROM normalized
+		WHERE reverse_ordinal = 1
+		  AND NOT (first_op_code = $3 AND last_op_code = $4)
+		ORDER BY first_ordinal, table_id, key_bytes
+		LIMIT $5
+	`, txid, userPK, opCodeInsert, opCodeDelete, s.config.MaxRowsPerBundle+1)
+	if err != nil {
+		return nil, fmt.Errorf("query normalized captured bundle rows: %w", err)
+	}
+	return queryRows, nil
 }
 
 func renderBundleHash(bundleHash []byte) string {

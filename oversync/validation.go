@@ -14,7 +14,7 @@ func isValidTableName(name string) bool {
 }
 
 func isValidIdentifierName(name string) bool {
-	if len(name) == 0 {
+	if len(name) == 0 || len(name) > 63 {
 		return false
 	}
 	for _, r := range name {

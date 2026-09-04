@@ -19,7 +19,7 @@ import (
 func mustPushUserBundle(t *testing.T, ctx context.Context, svc *SyncService, actor Actor, schemaName string, sourceBundleID int64, rowID uuid.UUID, name string) *Bundle {
 	t.Helper()
 
-	bundle, err := pushRowsViaSession(t, ctx, svc, actor, sourceBundleID, []PushRequestRow{{
+	bundle, err := pushRowsOneShot(t, ctx, svc, actor, sourceBundleID, []PushRequestRow{{
 		Schema:         schemaName,
 		Table:          "users",
 		Key:            SyncKey{"id": rowID.String()},
@@ -42,12 +42,13 @@ func TestProcessPull_FreezesStableBundleSeqAndPagesByBundleCount(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "pull-bundles-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "pull-bundles-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "pull-bundles-user-" + suffix
@@ -62,11 +63,12 @@ func TestProcessPull_FreezesStableBundleSeqAndPagesByBundleCount(t *testing.T) {
 	resp1 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, row1, "One")
 	resp2 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Two")
 	resp3 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 3, row3, "Three")
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
 	require.Equal(t, int64(1), resp1.BundleSeq)
 	require.Equal(t, int64(2), resp2.BundleSeq)
 	require.Equal(t, int64(3), resp3.BundleSeq)
 
-	page1, err := svc.ProcessPull(ctx, reader, 0, 1, 0)
+	page1, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), 0, 1, 0)
 	require.NoError(t, err)
 	require.Equal(t, int64(3), page1.StableBundleSeq)
 	require.Len(t, page1.Bundles, 1)
@@ -77,19 +79,48 @@ func TestProcessPull_FreezesStableBundleSeqAndPagesByBundleCount(t *testing.T) {
 	resp4 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 4, row4, "Four")
 	require.Equal(t, int64(4), resp4.BundleSeq)
 
-	page2, err := svc.ProcessPull(ctx, reader, page1.Bundles[0].BundleSeq, 1, page1.StableBundleSeq)
+	page2, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), page1.Bundles[0].BundleSeq, 1, page1.StableBundleSeq)
 	require.NoError(t, err)
 	require.Equal(t, page1.StableBundleSeq, page2.StableBundleSeq)
 	require.Len(t, page2.Bundles, 1)
 	require.Equal(t, int64(2), page2.Bundles[0].BundleSeq)
 	require.True(t, page2.HasMore)
 
-	page3, err := svc.ProcessPull(ctx, reader, page2.Bundles[0].BundleSeq, 5, page1.StableBundleSeq)
+	page3, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), page2.Bundles[0].BundleSeq, 5, page1.StableBundleSeq)
 	require.NoError(t, err)
 	require.Equal(t, page1.StableBundleSeq, page3.StableBundleSeq)
 	require.Len(t, page3.Bundles, 1)
 	require.Equal(t, int64(3), page3.Bundles[0].BundleSeq)
 	require.False(t, page3.HasMore)
+}
+
+func TestProcessPull_RejectsMissingRetainedCanonicalEnvelope(t *testing.T) {
+	ctx := context.Background()
+	pool := newIntegrationTestPool(t, ctx)
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaName := "pull_gap_" + suffix
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
+		SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}),
+		RegisteredTables:  []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}, RegisteredTableCatalogRevision: 1,
+	}, integrationTestLogger(slog.LevelWarn))
+	userID := "pull-gap-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	for sourceBundleID := int64(1); sourceBundleID <= 3; sourceBundleID++ {
+		mustPushUserBundle(t, ctx, service, writer, schemaName, sourceBundleID, uuid.New(), fmt.Sprintf("User%d", sourceBundleID))
+	}
+	mustInitializeEmptyScope(t, ctx, service, userID, reader.SourceID)
+	userPK, err := lookupUserPK(ctx, pool, userID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `DELETE FROM sync.bundle_log WHERE user_pk=$1 AND bundle_seq=2`, userPK)
+	require.NoError(t, err)
+
+	_, err = service.ProcessPull(ctx, reader, testSchemaGenerationProofForService(service), 0, 10, 0)
+	var integrity *GenerationProjectionError
+	require.ErrorAs(t, err, &integrity)
+	require.Equal(t, GenerationProjectionIntegrityError, integrity.Code)
 }
 
 func TestProcessPull_RejectsCheckpointBelowRetainedBundleFloor(t *testing.T) {
@@ -102,12 +133,13 @@ func TestProcessPull_RejectsCheckpointBelowRetainedBundleFloor(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "pull-pruned-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "pull-pruned-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "pull-pruned-user-" + suffix
@@ -118,11 +150,12 @@ func TestProcessPull_RejectsCheckpointBelowRetainedBundleFloor(t *testing.T) {
 
 	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, row1, "One")
 	mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Two")
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
 
 	_, err := pool.Exec(ctx, `UPDATE sync.user_state SET retained_bundle_floor = 2 WHERE user_id = $1`, userID)
 	require.NoError(t, err)
 
-	_, err = svc.ProcessPull(ctx, reader, 1, 10, 0)
+	_, err = svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), 1, 10, 0)
 	var prunedErr *HistoryPrunedError
 	require.ErrorAs(t, err, &prunedErr)
 	require.Equal(t, int64(1), prunedErr.ProvidedSeq)
@@ -139,12 +172,13 @@ func TestProcessPull_CheckpointAndTargetBoundaryMatrix(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "pull-boundaries-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "pull-boundaries-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "pull-boundaries-user-" + suffix
@@ -153,6 +187,7 @@ func TestProcessPull_CheckpointAndTargetBoundaryMatrix(t *testing.T) {
 	for sourceBundleID := int64(1); sourceBundleID <= 3; sourceBundleID++ {
 		mustPushUserBundle(t, ctx, svc, writer, schemaName, sourceBundleID, uuid.New(), fmt.Sprintf("User%d", sourceBundleID))
 	}
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
 	_, err := pool.Exec(ctx, `UPDATE sync.user_state SET retained_bundle_floor = 2 WHERE user_id = $1`, userID)
 	require.NoError(t, err)
 
@@ -178,7 +213,7 @@ func TestProcessPull_CheckpointAndTargetBoundaryMatrix(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			response, err := svc.ProcessPull(ctx, reader, test.after, 10, test.target)
+			response, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), test.after, 10, test.target)
 			if test.errType != nil {
 				require.Error(t, err)
 				switch test.errType.(type) {
@@ -214,18 +249,20 @@ func TestHTTPSyncHandlers_HandlePullMapsCheckpointBoundaryErrors(t *testing.T) {
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "pull-http-boundaries-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "pull-http-boundaries-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	actor := Actor{UserID: "pull-http-user-" + suffix, SourceID: "reader"}
 	writer := Actor{UserID: actor.UserID, SourceID: "writer"}
 	for sourceBundleID := int64(1); sourceBundleID <= 3; sourceBundleID++ {
 		mustPushUserBundle(t, ctx, svc, writer, schemaName, sourceBundleID, uuid.New(), fmt.Sprintf("HTTPUser%d", sourceBundleID))
 	}
+	mustInitializeEmptyScope(t, ctx, svc, actor.UserID, actor.SourceID)
 	handlers := NewHTTPSyncHandlers(svc, logger)
 
 	tests := []struct {
@@ -242,6 +279,7 @@ func TestHTTPSyncHandlers_HandlePullMapsCheckpointBoundaryErrors(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, "/sync/pull?"+test.query, nil)
+			setTestSchemaGenerationHeaders(request, svc)
 			request = request.WithContext(ContextWithActor(request.Context(), actor))
 			recorder := httptest.NewRecorder()
 			handlers.HandlePull(recorder, request)
@@ -260,10 +298,13 @@ func TestGetStatus_ReportsRetentionAndHistoryPrunedVisibility(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
+	schemaName := "status_visibility_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
+	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "status-visibility-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}), AppName: "status-visibility-test",
+		RegisteredTables:               []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	var prunedBefore int64
@@ -288,7 +329,7 @@ func TestGetStatus_ReportsRetentionAndHistoryPrunedVisibility(t *testing.T) {
 	require.NoError(t, err)
 	mustInitializeEmptyScope(t, ctx, svc, userID, "reader")
 
-	_, err = svc.ProcessPull(ctx, Actor{UserID: userID, SourceID: "reader"}, retainedFloor-1, 10, 0)
+	_, err = svc.ProcessPull(ctx, Actor{UserID: userID, SourceID: "reader"}, testSchemaGenerationProofForService(svc), retainedFloor-1, 10, 0)
 	var prunedErr *HistoryPrunedError
 	require.ErrorAs(t, err, &prunedErr)
 
@@ -312,12 +353,13 @@ func TestProcessPull_RepeatableReadSnapshotDoesNotMixWithConcurrentPrune(t *test
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "pull-repeatable-prune-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "pull-repeatable-prune-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "pull-repeatable-prune-user-" + suffix
@@ -328,6 +370,7 @@ func TestProcessPull_RepeatableReadSnapshotDoesNotMixWithConcurrentPrune(t *test
 
 	mustPushUserBundle(t, ctx, svc, writer, schemaName, 1, row1, "One")
 	bundle2 := mustPushUserBundle(t, ctx, svc, writer, schemaName, 2, row2, "Two")
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
 
 	tx, err := svc.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	require.NoError(t, err)
@@ -359,7 +402,7 @@ func TestProcessPull_RepeatableReadSnapshotDoesNotMixWithConcurrentPrune(t *test
 	require.Len(t, page.Bundles, 1)
 	require.Equal(t, bundle2.BundleSeq, page.Bundles[0].BundleSeq)
 
-	_, err = svc.ProcessPull(ctx, reader, 1, 10, 0)
+	_, err = svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), 1, 10, 0)
 	var prunedErr *HistoryPrunedError
 	require.ErrorAs(t, err, &prunedErr)
 	require.Equal(t, int64(2), prunedErr.RetainedFloor)
@@ -372,10 +415,9 @@ func TestRecordHistoryPrunedError_OverridesReadOnlySerializableSessionDefaults(t
 	schemaName := "history_pruned_modes_" + suffix
 	require.NoError(t, resetTestBusinessSchema(ctx, basePool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), basePool, schemaName) })
-	_ = newBootstrappedIntegrationService(t, ctx, basePool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "history-pruned-mutation-mode-bootstrap",
-		RegisteredTables:          []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+	_ = newBootstrappedIntegrationService(t, ctx, basePool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}), AppName: "history-pruned-mutation-mode-bootstrap",
+		RegisteredTables:               []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	config, err := pgxpool.ParseConfig(basePool.Config().ConnString())
 	require.NoError(t, err)
@@ -388,7 +430,9 @@ func TestRecordHistoryPrunedError_OverridesReadOnlySerializableSessionDefaults(t
 	t.Cleanup(pool.Close)
 	require.NoError(t, pool.Ping(ctx))
 
-	service, err := NewRuntimeService(pool, &ServiceConfig{AppName: "history-pruned-mutation-mode-test"}, integrationTestLogger(slog.LevelWarn))
+	service, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}), AppName: "history-pruned-mutation-mode-test",
+		RegisteredTables:               []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}},
+		RegisteredTableCatalogRevision: 1}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	require.NoError(t, service.recordHistoryPrunedError(ctx))
 }

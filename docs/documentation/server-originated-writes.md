@@ -27,7 +27,7 @@ unknown commit result. Do not generate a new identity inside a retry loop.
 Persist the deadline in application-owned durable storage before the first public write attempt.
 The Oversync receipt is not that storage: a definitely rolled-back attempt, or a lost response from
 an attempt that later proves rolled back, leaves no receipt from which a restarted caller could
-recover the original deadline. The example server's `server_operation_deadlines` table demonstrates
+recover the original deadline. The integration server's `server_operation_deadlines` table demonstrates
 the required pre-attempt persistence pattern.
 
 ## `ScopeManager.ExecWrite` example

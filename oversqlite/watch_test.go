@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,7 +19,7 @@ import (
 )
 
 func TestDefaultConfig_BundleChangeWatchDefaultsOff(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 
 	require.Equal(t, BundleChangeWatchOff, cfg.BundleChangeWatchMode)
 	require.Zero(t, cfg.WatchFallbackInterval)
@@ -31,6 +32,25 @@ func TestWatchRemoteChanges_ParsesBundleEvent(t *testing.T) {
 
 	require.ErrorIs(t, err, io.EOF)
 	require.EqualValues(t, 7, (<-events).BundleSeq)
+}
+
+func TestWatchRemoteChanges_ConflatesBurstToLatestBundle(t *testing.T) {
+	events := make(chan oversync.BundleChangeEvent, 1)
+	stream := "event: bundle\ndata: {\"bundle_seq\":7}\n\n" +
+		"event: bundle\ndata: {\"bundle_seq\":8}\n\n" +
+		"event: bundle\ndata: {\"bundle_seq\":9}\n\n"
+
+	err := parseBundleChangeWatchStream(context.Background(), strings.NewReader(stream), events)
+
+	require.ErrorIs(t, err, io.EOF)
+	require.Len(t, events, 1)
+	require.EqualValues(t, 9, (<-events).BundleSeq)
+}
+
+func TestWatchRemoteChanges_RejectsLegacySourceFields(t *testing.T) {
+	events := make(chan oversync.BundleChangeEvent, 1)
+	err := parseBundleChangeWatchStream(context.Background(), strings.NewReader("event: bundle\ndata: {\"bundle_seq\":7,\"source_id\":\"legacy\"}\n\n"), events)
+	require.ErrorContains(t, err, "exactly bundle_seq")
 }
 
 func TestWatchRemoteChanges_IgnoresHeartbeatComments(t *testing.T) {
@@ -98,6 +118,67 @@ type hostileWatchBody struct {
 func (b *hostileWatchBody) Read([]byte) (int, error) { return 0, b.err }
 func (b *hostileWatchBody) Close() error             { return nil }
 
+type joiningWatchBody struct {
+	data    []byte
+	blocked chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *joiningWatchBody) Read(dst []byte) (int, error) {
+	if len(b.data) != 0 {
+		n := copy(dst, b.data)
+		b.data = b.data[n:]
+		return n, nil
+	}
+	b.once.Do(func() { close(b.blocked) })
+	<-b.release
+	return 0, io.EOF
+}
+
+func (b *joiningWatchBody) Close() error { return nil }
+
+func TestClient_WatchAttemptJoinsParserBeforeReturn(t *testing.T) {
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
+	cfg.RetryPolicy = &RetryPolicy{Enabled: false}
+	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+	body := &joiningWatchBody{
+		data:    []byte("event: bundle\ndata: {\"bundle_seq\":1}\n\n"),
+		blocked: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	primaryErr := errors.New("primary pull failure")
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/sync/watch":
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body}, nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
+		case "/sync/pull":
+			return nil, primaryErr
+		default:
+			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
+		}
+	})}
+	done := make(chan error, 1)
+	go func() { done <- client.watchRemoteChanges(context.Background(), 0, time.Hour) }()
+	<-body.blocked
+	select {
+	case err := <-done:
+		t.Fatalf("watch returned before its parser joined: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(body.release)
+	select {
+	case err := <-done:
+		var pullErr *bundleChangeWatchPullError
+		require.ErrorAs(t, err, &pullErr)
+		require.ErrorContains(t, err, "pull request")
+	case <-time.After(time.Second):
+		t.Fatal("watch did not return after parser release")
+	}
+}
+
 type lockedWatchLogBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -117,7 +198,7 @@ func (b *lockedWatchLogBuffer) String() string {
 
 func TestWatchAwareDownloaderLoop_RedactsStreamReaderErrorLog(t *testing.T) {
 	const hostileText = "HOSTILE_WATCH_READER_SECRET"
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BackoffMin = time.Millisecond
 	cfg.BackoffMax = 2 * time.Millisecond
@@ -135,7 +216,7 @@ func TestWatchAwareDownloaderLoop_RedactsStreamReaderErrorLog(t *testing.T) {
 				Body:       &hostileWatchBody{err: errors.New(hostileText)},
 			}, nil
 		case "/sync/pull":
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -165,7 +246,7 @@ func TestWatchAwareDownloaderLoop_RedactsStreamReaderErrorLog(t *testing.T) {
 
 func TestWatchAwareDownloaderLoop_RedactsFallbackPullTransportErrorLog(t *testing.T) {
 	const hostileText = "private-source-sentinel connection reset by peer"
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = &RetryPolicy{Enabled: false}
 	cfg.BackoffMin = time.Millisecond
 	cfg.BackoffMax = 2 * time.Millisecond
@@ -182,10 +263,10 @@ func TestWatchAwareDownloaderLoop_RedactsFallbackPullTransportErrorLog(t *testin
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 				Body:       io.NopCloser(strings.NewReader("")),
 			}, nil
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{
 				ProtocolVersion: requiredProtocolVersion,
-				Features:        map[string]bool{"bundle_change_watch": true},
+				WatchEnabled:    true,
 			}), nil
 		case "/sync/pull":
 			return nil, phase3RetryableHostileError{}
@@ -223,13 +304,13 @@ func TestStart_DoesNotCallWatchWhenClientWatchOffEvenIfServerAdvertises(t *testi
 	var watchRequests atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion, WatchEnabled: true}), nil
 		case "/sync/watch":
 			watchRequests.Add(1)
 			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_watch"}), nil
 		case "/sync/pull":
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -244,7 +325,7 @@ func TestStart_DoesNotCallWatchWhenClientWatchOffEvenIfServerAdvertises(t *testi
 }
 
 func TestStart_DoesNotCallWatchWhenServerDoesNotAdvertise(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	cfg.BackoffMin = time.Millisecond
@@ -254,13 +335,13 @@ func TestStart_DoesNotCallWatchWhenServerDoesNotAdvertise(t *testing.T) {
 	var watchRequests atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": false}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion, WatchEnabled: false}), nil
 		case "/sync/watch":
 			watchRequests.Add(1)
 			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_watch"}), nil
 		case "/sync/pull":
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -274,22 +355,21 @@ func TestStart_DoesNotCallWatchWhenServerDoesNotAdvertise(t *testing.T) {
 	require.Zero(t, watchRequests.Load())
 }
 
-func TestStart_StopsAutomaticDownloadsWhenWatchCapabilityProtocolChanges(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+func TestStart_UsesCachedDisabledWatchCapabilityWithoutRefresh(t *testing.T) {
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	cfg.BackoffMin = time.Millisecond
 	cfg.BackoffMax = 2 * time.Millisecond
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+	client.discovery.WatchEnabled = false
 
-	var syncRequests atomic.Int64
+	var watchRequests atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: "v0", Features: map[string]bool{"bundle_change_watch": true}}), nil
-		case "/sync/watch", "/sync/pull":
-			syncRequests.Add(1)
-			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_sync"}), nil
+		case "/sync/watch":
+			watchRequests.Add(1)
+			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_watch"}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -300,22 +380,23 @@ func TestStart_StopsAutomaticDownloadsWhenWatchCapabilityProtocolChanges(t *test
 	time.Sleep(15 * time.Millisecond)
 	cancel()
 
-	require.Zero(t, syncRequests.Load())
+	require.Zero(t, watchRequests.Load())
 }
 
 func TestStart_UsesWatchWhenClientAutoAndServerAdvertises(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	cfg.BackoffMin = time.Millisecond
 	cfg.BackoffMax = 2 * time.Millisecond
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+	client.discovery.WatchEnabled = true
 
 	watchRequest := make(chan *http.Request, 1)
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion, WatchEnabled: true}), nil
 		case "/sync/watch":
 			watchRequest <- r
 			pr, pw := io.Pipe()
@@ -325,7 +406,7 @@ func TestStart_UsesWatchWhenClientAutoAndServerAdvertises(t *testing.T) {
 			}()
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: pr}, nil
 		case "/sync/pull":
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -346,20 +427,21 @@ func TestStart_UsesWatchWhenClientAutoAndServerAdvertises(t *testing.T) {
 }
 
 func TestStart_WatchSetupWaitsForStartupSyncContention(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	cfg.BackoffMin = time.Millisecond
 	cfg.BackoffMax = 2 * time.Millisecond
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+	client.discovery.WatchEnabled = true
 	client.PauseUploads()
 
 	var pullRequests atomic.Int64
 	watchRequest := make(chan *http.Request, 1)
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion, WatchEnabled: true}), nil
 		case "/sync/watch":
 			watchRequest <- r
 			pr, pw := io.Pipe()
@@ -370,7 +452,7 @@ func TestStart_WatchSetupWaitsForStartupSyncContention(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: pr}, nil
 		case "/sync/pull":
 			pullRequests.Add(1)
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -394,7 +476,7 @@ func TestStart_WatchSetupWaitsForStartupSyncContention(t *testing.T) {
 }
 
 func TestStart_WatchReconnectUsesCurrentSourceIDAfterRotation(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	client, db := newBundleClientWithConfig(t, cfg, usersTestDDL)
@@ -430,7 +512,7 @@ func TestStart_WatchBundleEventTriggersExistingRemoteSync(t *testing.T) {
 			case pullRequests <- struct{}{}:
 			default:
 			}
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -446,19 +528,76 @@ func TestStart_WatchBundleEventTriggersExistingRemoteSync(t *testing.T) {
 	}
 }
 
+func TestWatchRemoteChanges_ConflatesBurstWhileOnePullIsActive(t *testing.T) {
+	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
+	watchReader, watchWriter := io.Pipe()
+	firstPullStarted := make(chan struct{})
+	releaseFirstPull := make(chan struct{})
+	var pullRequests atomic.Int64
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/sync/watch":
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: watchReader}, nil
+		case "/sync/pull":
+			requestNumber := pullRequests.Add(1)
+			if requestNumber == 1 {
+				close(firstPullStarted)
+				select {
+				case <-releaseFirstPull:
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				}
+			}
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
+		default:
+			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
+		}
+	})}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- client.watchRemoteChanges(ctx, 0, time.Hour) }()
+	require.NoError(t, writeWatchEvent(watchWriter, 1))
+	select {
+	case <-firstPullStarted:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for first watch-triggered pull")
+	}
+	for bundleSeq := int64(2); bundleSeq <= 100; bundleSeq++ {
+		require.NoError(t, writeWatchEvent(watchWriter, bundleSeq))
+	}
+	close(releaseFirstPull)
+	require.Eventually(t, func() bool { return pullRequests.Load() == 2 }, time.Second, time.Millisecond)
+	require.NoError(t, watchWriter.Close())
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, io.EOF)
+	case <-ctx.Done():
+		t.Fatal("watch did not finish after stream close")
+	}
+	require.EqualValues(t, 2, pullRequests.Load(), "a burst during one active pull must schedule only one trailing pull")
+}
+
+func writeWatchEvent(w io.Writer, bundleSeq int64) error {
+	_, err := fmt.Fprintf(w, "event: bundle\ndata: {\"bundle_seq\":%d}\n\n", bundleSeq)
+	return err
+}
+
 func TestStart_WatchDisconnectReconnectsWithBackoff(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	cfg.BackoffMin = 5 * time.Millisecond
 	cfg.BackoffMax = 10 * time.Millisecond
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+	client.discovery.WatchEnabled = true
 
 	watchRequests := make(chan *http.Request, 2)
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion, WatchEnabled: true}), nil
 		case "/sync/watch":
 			watchRequests <- r
 			if len(watchRequests) == 1 {
@@ -471,7 +610,7 @@ func TestStart_WatchDisconnectReconnectsWithBackoff(t *testing.T) {
 			}()
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: pr}, nil
 		case "/sync/pull":
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -494,19 +633,20 @@ func TestStart_WatchDisconnectReconnectsWithBackoff(t *testing.T) {
 }
 
 func TestStart_WatchSetupFailureStillPolls(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	cfg.BackoffMin = 5 * time.Millisecond
 	cfg.BackoffMax = 10 * time.Millisecond
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+	client.discovery.WatchEnabled = true
 
 	watchRequests := make(chan struct{}, 1)
 	pullRequests := make(chan struct{}, 1)
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion, WatchEnabled: true}), nil
 		case "/sync/watch":
 			select {
 			case watchRequests <- struct{}{}:
@@ -518,7 +658,7 @@ func TestStart_WatchSetupFailureStillPolls(t *testing.T) {
 			case pullRequests <- struct{}{}:
 			default:
 			}
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -541,19 +681,20 @@ func TestStart_WatchSetupFailureStillPolls(t *testing.T) {
 }
 
 func TestStart_WatchForbiddenSwitchesToPolling(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	cfg.BackoffMin = 5 * time.Millisecond
 	cfg.BackoffMax = 10 * time.Millisecond
 	client, _ := newBundleClientWithConfig(t, cfg, usersTestDDL)
+	client.discovery.WatchEnabled = true
 
 	var watchRequests atomic.Int64
 	pullRequests := make(chan struct{}, 2)
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion, WatchEnabled: true}), nil
 		case "/sync/watch":
 			watchRequests.Add(1)
 			return errorJSONResponse(http.StatusForbidden, oversync.ErrorResponse{
@@ -565,7 +706,7 @@ func TestStart_WatchForbiddenSwitchesToPolling(t *testing.T) {
 			case pullRequests <- struct{}{}:
 			default:
 			}
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -613,7 +754,7 @@ func TestStart_WatchFallbackPollingUsesConfiguredInterval(t *testing.T) {
 			default:
 			}
 			cancel()
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}
@@ -630,7 +771,7 @@ func TestStart_WatchFallbackPollingUsesConfiguredInterval(t *testing.T) {
 }
 
 func TestStart_WatchRespectsPausedDownloads(t *testing.T) {
-	cfg := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	cfg := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	cfg.RetryPolicy = newTestRetryPolicy()
 	cfg.BundleChangeWatchMode = BundleChangeWatchAuto
 	cfg.BackoffMin = 5 * time.Millisecond
@@ -642,14 +783,14 @@ func TestStart_WatchRespectsPausedDownloads(t *testing.T) {
 	var pullRequests atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"bundle_change_watch": true}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion, WatchEnabled: true}), nil
 		case "/sync/watch":
 			watchRequests.Add(1)
 			return errorJSONResponse(http.StatusInternalServerError, oversync.ErrorResponse{Error: "unexpected_watch"}), nil
 		case "/sync/pull":
 			pullRequests.Add(1)
-			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, HasMore: false}), nil
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 0, Bundles: []oversync.Bundle{}, HasMore: false}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
 		}

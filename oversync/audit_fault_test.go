@@ -14,7 +14,7 @@ import (
 
 func TestAuditFault_TerminatedUploadConnectionReleasesLockAndPoolSlot(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
+	fixture := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
 
 	conn, releaseConn, err := fixture.svc.acquireUserUploadConn(ctx, fixture.writer.UserID)
 	require.NoError(t, err)
@@ -35,19 +35,19 @@ func TestAuditFault_TerminatedUploadConnectionReleasesLockAndPoolSlot(t *testing
 	}, 5*time.Second, 10*time.Millisecond, "terminated upload connection leaked a pool slot")
 	require.NoError(t, fixture.pool.Ping(ctx))
 
-	bundle, err := pushRowsViaSession(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
-		fixture.userRow(uuid.New(), "Recovered"),
-	})
+	response, err := fixture.push(t, ctx, fixture.writer, 1, []PushRequestRow{fixture.userRow(uuid.New(), "Recovered")})
 	require.NoError(t, err)
-	require.NotNil(t, bundle)
-	require.Equal(t, int64(1), bundle.BundleSeq)
+	require.NotNil(t, response)
+	require.Equal(t, int64(1), response.Bundle.BundleSeq)
 	requireAuditMetadataIntegrity(t, ctx, fixture.pool)
 }
 
 func TestAuditFault_CancelledAdvisoryLockWaitLeavesRetryableState(t *testing.T) {
 	ctx := context.Background()
-	fixture := newPushSessionFixture(t, ctx, pushSessionFixtureOptions{})
-	initializationID := resolveConnectForPushSession(t, ctx, fixture.svc, fixture.writer, true)
+	fixture := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
+	initializationID := resolveConnectForPush(t, ctx, fixture.svc, fixture.writer, true)
+	blockedRow := fixture.userRow(uuid.New(), "Blocked")
+	blockedRequest := &OneShotPushRequest{SourceBundleID: 1, CanonicalRequestHash: mustCanonicalPushRequestHash(t, fixture.svc, []PushRequestRow{blockedRow}), InitializationID: initializationID, Rows: []PushRequestRow{blockedRow}}
 
 	lockConn, err := fixture.pool.Acquire(ctx)
 	require.NoError(t, err)
@@ -74,12 +74,7 @@ func TestAuditFault_CancelledAdvisoryLockWaitLeavesRetryableState(t *testing.T) 
 	waitCtx, cancelWait := context.WithCancel(ctx)
 	result := make(chan error, 1)
 	go func() {
-		_, createErr := fixture.svc.CreatePushSession(waitCtx, fixture.writer, &PushSessionCreateRequest{
-			SourceBundleID:       1,
-			PlannedRowCount:      1,
-			CanonicalRequestHash: strings.Repeat("0", 64),
-			InitializationID:     initializationID,
-		})
+		_, createErr := fixture.svc.PushOneShot(waitCtx, fixture.writer, testSchemaGenerationProofForService(fixture.svc), blockedRequest)
 		result <- createErr
 	}()
 
@@ -95,7 +90,7 @@ func TestAuditFault_CancelledAdvisoryLockWaitLeavesRetryableState(t *testing.T) 
 			)
 		`).Scan(&waiting)
 		return queryErr == nil && waiting
-	}, 5*time.Second, 10*time.Millisecond, "push session never reached the advisory lock wait")
+	}, 5*time.Second, 10*time.Millisecond, "direct push never reached the advisory lock wait")
 
 	cancelWait()
 	select {
@@ -120,16 +115,8 @@ func TestAuditFault_CancelledAdvisoryLockWaitLeavesRetryableState(t *testing.T) 
 	}, 5*time.Second, 10*time.Millisecond, "cancelled lock waiter leaked a pool slot")
 
 	row := fixture.userRow(uuid.New(), "Retry")
-	session, err := fixture.svc.CreatePushSession(ctx, fixture.writer, &PushSessionCreateRequest{
-		SourceBundleID:       1,
-		PlannedRowCount:      1,
-		CanonicalRequestHash: mustCanonicalPushRequestHash(t, []PushRequestRow{row}),
-		InitializationID:     initializationID,
-	})
+	commit, err := fixture.push(t, ctx, fixture.writer, 1, []PushRequestRow{row})
 	require.NoError(t, err)
-	require.Equal(t, "staging", session.Status)
-	fixture.uploadChunk(t, ctx, session.PushID, 0, row)
-	commit := fixture.commitSession(t, ctx, session.PushID)
-	require.Equal(t, int64(1), commit.BundleSeq)
+	require.Equal(t, int64(1), commit.Bundle.BundleSeq)
 	requireAuditMetadataIntegrity(t, ctx, fixture.pool)
 }

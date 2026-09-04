@@ -23,7 +23,7 @@ func TestSnapshotCapacityRetry_UsesElapsedBudgetIndependentOfTransientAttempts(t
 		if attempts.Add(1) == 1 {
 			return errorJSONResponse(http.StatusTooManyRequests, oversync.ErrorResponse{Error: "snapshot_build_capacity"}), nil
 		}
-		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":0,"row_count":0,"byte_count":0,"expires_at":"2030-01-01T00:00:00Z"}`), nil
+		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":0,"row_count":0,"logical_byte_count":0,"expires_at":"2030-01-01T00:00:00Z"}`), nil
 	})}
 
 	_, err := client.createSnapshotSession(context.Background(), nil)

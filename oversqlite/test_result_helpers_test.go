@@ -9,7 +9,7 @@ import (
 
 func mustOpen(t *testing.T, client *Client, ctx context.Context) {
 	t.Helper()
-	err := client.Open(ctx)
+	err := client.open(ctx)
 	require.NoError(t, err)
 }
 

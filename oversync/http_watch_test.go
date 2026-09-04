@@ -20,6 +20,7 @@ func newWatchHTTPTestServer(t *testing.T, svc *SyncService, actor Actor) *httpte
 	t.Helper()
 	handlers := NewHTTPSyncHandlers(svc, integrationTestLogger(slog.LevelWarn))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setTestSchemaGenerationHeaders(r, svc)
 		r = r.WithContext(ContextWithActor(r.Context(), actor))
 		handlers.HandleWatch(w, r)
 	}))
@@ -58,11 +59,11 @@ func readSSEUntil(t *testing.T, body io.Reader, contains string) string {
 }
 
 func TestHTTPSyncHandlers_HandleWatchRequiresAuthenticatedActor(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "watch-auth-test",
+	svc, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(watchTestRegisteredTables()), AppName: "watch-auth-test", RegisteredTables: watchTestRegisteredTables(),
 		BundleChangeWatch: BundleChangeWatchConfig{
 			Enabled: true,
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, slog.Default())
 	require.NoError(t, err)
 	h := NewHTTPSyncHandlers(svc, slog.Default())
@@ -76,16 +77,11 @@ func TestHTTPSyncHandlers_HandleWatchRequiresAuthenticatedActor(t *testing.T) {
 }
 
 func TestHTTPSyncHandlers_HandleWatchRejectsInvalidAfterBundleSeq(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "watch-invalid-after-handler-test",
-		BundleChangeWatch: BundleChangeWatchConfig{
-			Enabled: true,
-		},
-	}, slog.Default())
-	require.NoError(t, err)
-	h := NewHTTPSyncHandlers(svc, slog.Default())
+	f := newBundleChangeWatchFixture(t, true)
+	h := NewHTTPSyncHandlers(f.svc, slog.Default())
 
 	req := httptest.NewRequest(http.MethodGet, "/sync/watch?after_bundle_seq=-1", nil)
+	setTestSchemaGenerationHeaders(req, f.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
 	h.HandleWatch(rec, req)
@@ -95,12 +91,14 @@ func TestHTTPSyncHandlers_HandleWatchRejectsInvalidAfterBundleSeq(t *testing.T) 
 }
 
 func TestHTTPSyncHandlers_HandleWatchRejectsDisabledFeature(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{AppName: "watch-disabled-handler-test"}, slog.Default())
-	require.NoError(t, err)
-	h := NewHTTPSyncHandlers(svc, slog.Default())
+	f := newBundleChangeWatchFixture(t, false)
+	h := NewHTTPSyncHandlers(f.svc, slog.Default())
 
 	req := httptest.NewRequest(http.MethodGet, "/sync/watch", nil)
+	setTestSchemaGenerationHeaders(req, f.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "device-a"}))
+	_, err := f.svc.Connect(req.Context(), Actor{UserID: "user", SourceID: "device-a"}, testSchemaGenerationProofForService(f.svc), &ConnectRequest{HasLocalPendingRows: false})
+	require.NoError(t, err)
 	rec := httptest.NewRecorder()
 	h.HandleWatch(rec, req)
 
@@ -109,20 +107,15 @@ func TestHTTPSyncHandlers_HandleWatchRejectsDisabledFeature(t *testing.T) {
 }
 
 func TestHTTPSyncHandlers_HandleWatchRejectsForbiddenActor(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "watch-forbidden-handler-test",
-		BundleChangeWatch: BundleChangeWatchConfig{
-			Enabled: true,
-		},
-	}, slog.Default())
-	require.NoError(t, err)
-	h := NewHTTPSyncHandlersWithConfig(svc, slog.Default(), HTTPSyncHandlersConfig{
+	f := newBundleChangeWatchFixture(t, true)
+	h := NewHTTPSyncHandlersWithConfig(f.svc, slog.Default(), HTTPSyncHandlersConfig{
 		BundleChangeWatchAllowed: func(context.Context, Actor) bool {
 			return false
 		},
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/sync/watch", nil)
+	setTestSchemaGenerationHeaders(req, f.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
 	h.HandleWatch(rec, req)
@@ -178,6 +171,7 @@ func TestHTTPSyncHandlers_HandleWatchUnregistersSubscriberOnWriteFailure(t *test
 	h := NewHTTPSyncHandlers(f.svc, integrationTestLogger(slog.LevelWarn))
 
 	req := httptest.NewRequest(http.MethodGet, "/sync/watch?after_bundle_seq=0", nil)
+	setTestSchemaGenerationHeaders(req, f.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), actor))
 	writer := &failingWatchResponseWriter{header: make(http.Header)}
 	h.HandleWatch(writer, req)

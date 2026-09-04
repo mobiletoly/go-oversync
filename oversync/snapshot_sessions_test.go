@@ -38,7 +38,7 @@ func collectSnapshotChunkRows(
 	seen := make([]SnapshotRow, 0)
 	stableSnapshotBundleSeq := int64(0)
 	for {
-		chunk, err := svc.GetSnapshotChunk(ctx, actor, snapshotID, afterRowOrdinal, maxRows, defaultBytesPerSnapshotChunk)
+		chunk, err := svc.GetSnapshotChunk(ctx, actor, testSchemaGenerationProofForService(svc), snapshotID, afterRowOrdinal, maxRows, defaultBytesPerSnapshotChunk)
 		require.NoError(t, err)
 		if stableSnapshotBundleSeq == 0 {
 			stableSnapshotBundleSeq = chunk.SnapshotBundleSeq
@@ -81,8 +81,10 @@ type snapshotSessionFixtureOptions struct {
 	snapshotMaterializationBatchRows   int
 	snapshotMaterializationBatchBytes  int64
 	maxBytesPerSnapshotRow             int64
+	maxConcurrentSnapshotBuilds        int
 	maxConcurrentSnapshotChunkRequests int
 	registeredTables                   []RegisteredTable
+	schemaGenerations                  func(string) []SchemaGeneration
 }
 
 func newSnapshotSessionFixture(t *testing.T, scenario string, opts snapshotSessionFixtureOptions) *snapshotSessionFixture {
@@ -110,9 +112,14 @@ func newSnapshotSessionFixture(t *testing.T, scenario string, opts snapshotSessi
 			}
 		}
 	}
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:          1,
-		AppName:                            scenarioID + "-test",
+	var schemaGenerations []SchemaGeneration
+	if opts.schemaGenerations != nil {
+		schemaGenerations = opts.schemaGenerations(schemaName)
+	}
+	if len(schemaGenerations) == 0 {
+		schemaGenerations = testSchemaGenerationsForRegisteredTables(registeredTables)
+	}
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: schemaGenerations, AppName: scenarioID + "-test",
 		DefaultRowsPerSnapshotChunk:        opts.defaultRowsPerSnapshotChunk,
 		MaxRowsPerSnapshotChunk:            opts.maxRowsPerSnapshotChunk,
 		MaxRowsPerSnapshotSession:          opts.maxRowsPerSnapshotSession,
@@ -125,9 +132,12 @@ func newSnapshotSessionFixture(t *testing.T, scenario string, opts snapshotSessi
 		SnapshotMaterializationBatchRows:   opts.snapshotMaterializationBatchRows,
 		SnapshotMaterializationBatchBytes:  opts.snapshotMaterializationBatchBytes,
 		MaxBytesPerSnapshotRow:             opts.maxBytesPerSnapshotRow,
+		MaxConcurrentSnapshotBuilds:        opts.maxConcurrentSnapshotBuilds,
 		MaxConcurrentSnapshotChunkRequests: opts.maxConcurrentSnapshotChunkRequests,
 		RegisteredTables:                   registeredTables,
+		RegisteredTableCatalogRevision:     1,
 	}, logger)
+	mustInitializeEmptyScope(t, ctx, svc, userID, "reader")
 
 	return &snapshotSessionFixture{
 		ctx:        ctx,
@@ -159,7 +169,7 @@ func (f *snapshotSessionFixture) createSessionWithUser(t *testing.T, rowID uuid.
 	t.Helper()
 	f.pushUser(t, 1, rowID, name)
 
-	session, err := f.svc.CreateSnapshotSession(f.ctx, f.reader)
+	session, err := f.svc.CreateSnapshotSession(f.ctx, f.reader, testSchemaGenerationProofForService(f.svc))
 	require.NoError(t, err)
 	return session
 }
@@ -214,6 +224,7 @@ func (f *snapshotSessionFixture) snapshotSessionRowCount(t *testing.T, snapshotI
 }
 
 func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "chunks", snapshotSessionFixtureOptions{
 		defaultRowsPerSnapshotChunk: 2,
 		maxRowsPerSnapshotChunk:     2,
@@ -226,12 +237,12 @@ func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
 	resp2 := fixture.pushUser(t, 2, row2, "Bravo")
 	resp3 := fixture.pushUser(t, 3, row3, "Charlie")
 
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Equal(t, resp3.BundleSeq, session.SnapshotBundleSeq)
 	require.Equal(t, int64(3), session.RowCount)
 
-	chunk1, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 2, defaultBytesPerSnapshotChunk)
+	chunk1, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 2, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Equal(t, session.SnapshotID, chunk1.SnapshotID)
 	require.Equal(t, session.SnapshotBundleSeq, chunk1.SnapshotBundleSeq)
@@ -243,7 +254,7 @@ func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
 	resp4 := fixture.pushUser(t, 4, uuid.New(), "Delta")
 	require.Equal(t, int64(4), resp4.BundleSeq)
 
-	chunk2, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, chunk1.NextRowOrdinal, 2, defaultBytesPerSnapshotChunk)
+	chunk2, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, chunk1.NextRowOrdinal, 2, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Equal(t, session.SnapshotID, chunk2.SnapshotID)
 	require.Equal(t, session.SnapshotBundleSeq, chunk2.SnapshotBundleSeq)
@@ -266,6 +277,7 @@ func TestSnapshotSessions_CreateAndFetchChunksAtFrozenBundleSeq(t *testing.T) {
 }
 
 func TestSnapshotSessions_OneThousandRowsAcrossMaterializationAndChunkBoundaries(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "thousand", snapshotSessionFixtureOptions{
 		snapshotMaterializationBatchRows: 128,
 		defaultRowsPerSnapshotChunk:      137,
@@ -280,9 +292,9 @@ func TestSnapshotSessions_OneThousandRowsAcrossMaterializationAndChunkBoundaries
 			Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"User %d","email":"user-%d@example.com"}`, rowID, i, i)),
 		}
 	}
-	_, err := pushRowsViaSession(t, fixture.ctx, fixture.svc, fixture.writer, 1, pushRows)
+	_, err := pushRowsOneShot(t, fixture.ctx, fixture.svc, fixture.writer, 1, pushRows)
 	require.NoError(t, err)
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Equal(t, int64(1_000), session.RowCount)
 	rows, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session.SnapshotID, 137)
@@ -304,6 +316,7 @@ func TestSnapshotSessions_OneThousandRowsAcrossMaterializationAndChunkBoundaries
 }
 
 func TestSnapshotSessions_MultiTableSnapshotUsesDeterministicTableOrder(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "multi_table", snapshotSessionFixtureOptions{
 		registeredTables: []RegisteredTable{
 			{Table: "users", SyncKeyColumns: []string{"id"}},
@@ -311,7 +324,7 @@ func TestSnapshotSessions_MultiTableSnapshotUsesDeterministicTableOrder(t *testi
 		},
 	})
 	userID, fileID := uuid.New(), uuid.New()
-	_, err := pushRowsViaSession(t, fixture.ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
+	_, err := pushRowsOneShot(t, fixture.ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
 		{
 			Schema: fixture.schemaName, Table: "users", Key: SyncKey{"id": userID.String()}, Op: OpInsert,
 			BaseRowVersion: 0,
@@ -324,7 +337,7 @@ func TestSnapshotSessions_MultiTableSnapshotUsesDeterministicTableOrder(t *testi
 		},
 	})
 	require.NoError(t, err)
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	rows, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session.SnapshotID, 1)
 	require.Len(t, rows, 2)
@@ -332,6 +345,7 @@ func TestSnapshotSessions_MultiTableSnapshotUsesDeterministicTableOrder(t *testi
 }
 
 func TestSnapshotSessions_ReadCommittedFenceHasNoSnapshotPullGap(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "visibility_fence", snapshotSessionFixtureOptions{})
 	beforeID, afterID := uuid.New(), uuid.New()
 	before := fixture.pushUser(t, 1, beforeID, "Before")
@@ -344,7 +358,7 @@ func TestSnapshotSessions_ReadCommittedFenceHasNoSnapshotPullGap(t *testing.T) {
 	}
 	created := make(chan result, 1)
 	go func() {
-		session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+		session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 		created <- result{session, err}
 	}()
 	<-reached
@@ -357,7 +371,7 @@ func TestSnapshotSessions_ReadCommittedFenceHasNoSnapshotPullGap(t *testing.T) {
 	rows, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, resultValue.session.SnapshotID, 10)
 	require.Len(t, rows, 1)
 	require.Equal(t, beforeID.String(), rows[0].Key["id"])
-	pull, err := fixture.svc.ProcessPull(fixture.ctx, fixture.reader, resultValue.session.SnapshotBundleSeq, 10, 0)
+	pull, err := fixture.svc.ProcessPull(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), resultValue.session.SnapshotBundleSeq, 10, 0)
 	require.NoError(t, err)
 	require.Len(t, pull.Bundles, 1)
 	require.Equal(t, after.BundleSeq, pull.Bundles[0].BundleSeq)
@@ -365,6 +379,7 @@ func TestSnapshotSessions_ReadCommittedFenceHasNoSnapshotPullGap(t *testing.T) {
 }
 
 func TestSnapshotSessions_CreateUsesRequiredMutationTransactionModes(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "mutation_modes", snapshotSessionFixtureOptions{})
 	fixture.pushUser(t, 1, uuid.New(), "Before")
 
@@ -395,11 +410,12 @@ func TestSnapshotSessions_CreateUsesRequiredMutationTransactionModes(t *testing.
 		_, _ = fixture.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS sync.assert_snapshot_mutation_modes()`)
 	})
 
-	_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 }
 
 func TestSnapshotSessions_OneChunkStillUsesSessionStorage(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "one_chunk", snapshotSessionFixtureOptions{
 		defaultRowsPerSnapshotChunk: 1000,
 		maxRowsPerSnapshotChunk:     5000,
@@ -407,14 +423,14 @@ func TestSnapshotSessions_OneChunkStillUsesSessionStorage(t *testing.T) {
 	rowID := uuid.New()
 
 	resp := fixture.pushUser(t, 1, rowID, "Solo")
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Equal(t, resp.BundleSeq, session.SnapshotBundleSeq)
 	require.Equal(t, int64(1), session.RowCount)
 
 	require.Equal(t, 1, fixture.snapshotSessionRowCount(t, session.SnapshotID))
 
-	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 1000, defaultBytesPerSnapshotChunk)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 1000, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Len(t, chunk.Rows, 1)
 	require.False(t, chunk.HasMore)
@@ -423,6 +439,7 @@ func TestSnapshotSessions_OneChunkStillUsesSessionStorage(t *testing.T) {
 }
 
 func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "gapless", snapshotSessionFixtureOptions{
 		defaultRowsPerSnapshotChunk: 2,
 		maxRowsPerSnapshotChunk:     2,
@@ -434,7 +451,7 @@ func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
 		fixture.pushUser(t, int64(i+1), rowID, fmt.Sprintf("User%d", i))
 	}
 
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	rows, stableBundleSeq := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session.SnapshotID, 2)
 	require.Equal(t, session.SnapshotBundleSeq, stableBundleSeq)
@@ -450,7 +467,7 @@ func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
 	require.Len(t, seenSet, 5)
 	require.ElementsMatch(t, insertedIDs, seenIDs)
 
-	deterministicChunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 2, defaultBytesPerSnapshotChunk)
+	deterministicChunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 2, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Len(t, deterministicChunk.Rows, 2)
 	require.Equal(t, snapshotRowIdentity(rows[0]), snapshotRowIdentity(deterministicChunk.Rows[0]))
@@ -458,6 +475,7 @@ func TestSnapshotSessions_NoGapsOrDuplicatesAcrossChunkFetches(t *testing.T) {
 }
 
 func TestSnapshotSessions_ActiveSessionRemainsReadableAfterHistoryPrune(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "prune_session", snapshotSessionFixtureOptions{
 		defaultRowsPerSnapshotChunk: 10,
 		maxRowsPerSnapshotChunk:     10,
@@ -470,7 +488,7 @@ func TestSnapshotSessions_ActiveSessionRemainsReadableAfterHistoryPrune(t *testi
 	fixture.pushUser(t, 2, row2, "Two")
 	bundle3 := fixture.pushUser(t, 3, row3, "Three")
 
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Equal(t, bundle3.BundleSeq, session.SnapshotBundleSeq)
 
@@ -498,13 +516,14 @@ func TestSnapshotSessions_ActiveSessionRemainsReadableAfterHistoryPrune(t *testi
 	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `SELECT COUNT(*) FROM sync.source_state WHERE user_pk = $1`, userPK).Scan(&sourceStateCountAfter))
 	require.Equal(t, sourceStateCountBefore, sourceStateCountAfter)
 
-	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Equal(t, session.SnapshotBundleSeq, chunk.SnapshotBundleSeq)
 	require.Len(t, chunk.Rows, 3)
 }
 
 func TestSnapshotSessions_RepeatedSessionCreationUsesDeterministicRowOrdering(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "ordering", snapshotSessionFixtureOptions{
 		defaultRowsPerSnapshotChunk: 10,
 		maxRowsPerSnapshotChunk:     10,
@@ -515,11 +534,11 @@ func TestSnapshotSessions_RepeatedSessionCreationUsesDeterministicRowOrdering(t 
 	fixture.pushUser(t, 2, ids[0], "Alpha")
 	fixture.pushUser(t, 3, ids[1], "Mike")
 
-	session1, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session1, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	rows1, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session1.SnapshotID, 10)
 
-	session2, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session2, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	rows2, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session2.SnapshotID, 10)
 
@@ -532,6 +551,7 @@ func TestSnapshotSessions_RepeatedSessionCreationUsesDeterministicRowOrdering(t 
 }
 
 func TestSnapshotSessions_TextKeysUseCanonicalByteOrderAcrossPages(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	pool := newIntegrationTestPool(t, ctx)
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
@@ -552,15 +572,19 @@ func TestSnapshotSessions_TextKeysUseCanonicalByteOrderAcrossPages(t *testing.T)
 	`, schemaIdent))
 	require.NoError(t, err)
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion:        1,
-		AppName:                          "snapshot-text-key-test",
+	tables := []RegisteredTable{
+		{Schema: schemaName, Table: "docs", SyncKeyColumns: []string{"doc_id"}},
+	}
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, tables, map[string]GenerationWireType{
+		Key(schemaName, "docs") + ".doc_id": GenerationWireTypeText,
+	}), AppName: "snapshot-text-key-test",
 		SnapshotMaterializationBatchRows: 2,
 		DefaultRowsPerSnapshotChunk:      2,
 		MaxRowsPerSnapshotChunk:          2,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "docs", SyncKeyColumns: []string{"doc_id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	userID := "snapshot-text-key-user-" + suffix
@@ -568,7 +592,7 @@ func TestSnapshotSessions_TextKeysUseCanonicalByteOrderAcrossPages(t *testing.T)
 	for index, key := range []string{"ä", "z", "A", " a"} {
 		payload, marshalErr := json.Marshal(map[string]string{"doc_id": key, "body": "Body " + key})
 		require.NoError(t, marshalErr)
-		_, err = pushRowsViaSession(t, ctx, svc, writer, int64(index+1), []PushRequestRow{{
+		_, err = pushRowsOneShot(t, ctx, svc, writer, int64(index+1), []PushRequestRow{{
 			Schema: schemaName, Table: "docs", Key: SyncKey{"doc_id": key}, Op: OpInsert,
 			BaseRowVersion: 0, Payload: payload,
 		}})
@@ -576,7 +600,9 @@ func TestSnapshotSessions_TextKeysUseCanonicalByteOrderAcrossPages(t *testing.T)
 	}
 
 	reader := Actor{UserID: userID, SourceID: "reader"}
-	session, err := svc.CreateSnapshotSession(ctx, reader)
+	_, err = svc.Connect(ctx, reader, testSchemaGenerationProofForService(svc), &ConnectRequest{})
+	require.NoError(t, err)
+	session, err := svc.CreateSnapshotSession(ctx, reader, testSchemaGenerationProofForService(svc))
 	require.NoError(t, err)
 	require.Equal(t, int64(4), session.RowCount)
 	rows, _ := collectSnapshotChunkRows(t, ctx, svc, reader, session.SnapshotID, 2)
@@ -605,12 +631,13 @@ func TestSnapshotSessions_TextKeysUseCanonicalByteOrderAcrossPages(t *testing.T)
 }
 
 func TestSnapshotSessions_DeleteInvalidatesFurtherChunkFetches(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "delete", snapshotSessionFixtureOptions{})
 
 	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
-	require.NoError(t, fixture.svc.DeleteSnapshotSession(fixture.ctx, fixture.reader, session.SnapshotID))
+	require.NoError(t, fixture.svc.DeleteSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID))
 
-	_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	var notFoundErr *SnapshotSessionNotFoundError
 	var expiredErr *SnapshotSessionExpiredError
 	require.True(t, errors.As(err, &notFoundErr) || errors.As(err, &expiredErr), "retired snapshot must be unreadable: %v", err)
@@ -618,39 +645,45 @@ func TestSnapshotSessions_DeleteInvalidatesFurtherChunkFetches(t *testing.T) {
 }
 
 func TestSnapshotSessions_InvalidCursorRejected(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "invalid_cursor", snapshotSessionFixtureOptions{})
 
 	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
 
-	_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, -1, 10, defaultBytesPerSnapshotChunk)
+	_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, -1, 10, defaultBytesPerSnapshotChunk)
 	var invalidErr *SnapshotChunkInvalidError
 	require.ErrorAs(t, err, &invalidErr)
 	require.Contains(t, invalidErr.Error(), "after_row_ordinal")
 
-	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 0, defaultBytesPerSnapshotChunk)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 0, defaultBytesPerSnapshotChunk)
 	require.ErrorAs(t, err, &invalidErr)
 	require.Contains(t, invalidErr.Error(), "max_rows")
 }
 
 func TestSnapshotSessions_WrongUserRejected(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "wrong_user", snapshotSessionFixtureOptions{})
 	writer := fixture.writer
 	readerA := Actor{UserID: writer.UserID, SourceID: "reader-a"}
 	readerB := Actor{UserID: "snapshot-wrong-user-b-" + fixture.suffix, SourceID: "reader-b"}
 	fixture.pushUserAs(t, writer, 1, uuid.New(), "Alpha")
+	_, err := fixture.svc.Connect(fixture.ctx, readerA, testSchemaGenerationProofForService(fixture.svc), &ConnectRequest{})
+	require.NoError(t, err)
+	mustInitializeEmptyScope(t, fixture.ctx, fixture.svc, readerB.UserID, readerB.SourceID)
 
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, readerA)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, readerA, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 
-	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, readerB, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, readerB, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	var forbiddenErr *SnapshotSessionForbiddenError
 	require.ErrorAs(t, err, &forbiddenErr)
 
-	err = fixture.svc.DeleteSnapshotSession(fixture.ctx, readerB, session.SnapshotID)
+	err = fixture.svc.DeleteSnapshotSession(fixture.ctx, readerB, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID)
 	require.ErrorAs(t, err, &forbiddenErr)
 }
 
 func TestSnapshotSessions_ExpiredSessionRejected(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "expired", snapshotSessionFixtureOptions{})
 
 	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
@@ -661,12 +694,13 @@ func TestSnapshotSessions_ExpiredSessionRejected(t *testing.T) {
 	`, session.SnapshotID)
 	require.NoError(t, err)
 
-	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	var expiredErr *SnapshotSessionExpiredError
 	require.ErrorAs(t, err, &expiredErr)
 }
 
 func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "after_image", snapshotSessionFixtureOptions{})
 	actor := fixture.writer
 	row1 := uuid.New()
@@ -679,7 +713,7 @@ func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
 		return err
 	}))
 
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	rows, stableBundleSeq := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.reader, session.SnapshotID, 10)
 	require.Equal(t, int64(3), stableBundleSeq)
@@ -695,14 +729,15 @@ func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
 }
 
 func TestSnapshotSessions_CreateEmptySnapshot(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "empty", snapshotSessionFixtureOptions{})
 	mustInitializeEmptyScope(t, fixture.ctx, fixture.svc, fixture.reader.UserID, fixture.reader.SourceID)
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Zero(t, session.RowCount)
 	require.Zero(t, session.ByteCount)
 
-	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Empty(t, chunk.Rows)
 	require.False(t, chunk.HasMore)
@@ -710,19 +745,21 @@ func TestSnapshotSessions_CreateEmptySnapshot(t *testing.T) {
 }
 
 func TestSnapshotSessions_RotatedCreateRetiresPreviousAndReservesReplacement(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "rotate", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-old"
 	newSourceID := "writer-new"
 	writer := fixture.actor(oldSourceID)
 	fixture.pushUserAs(t, writer, 1, uuid.New(), "Alpha")
 
-	session, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, &SnapshotSessionCreateRequest{
+	session, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      newSourceID,
 			Reason:           "history_pruned",
 		},
 	})
+
 	require.NoError(t, err)
 	require.NotEmpty(t, session.SnapshotID)
 
@@ -761,18 +798,20 @@ func TestSnapshotSessions_RotatedCreateRetiresPreviousAndReservesReplacement(t *
 }
 
 func TestSnapshotSessions_RotatedCreateForNeverCommittedSourceCreatesRetiredZeroFloor(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "rotate_empty", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-empty-old"
 	newSourceID := "writer-empty-new"
 	mustInitializeEmptyScope(t, fixture.ctx, fixture.svc, fixture.userID, oldSourceID)
 
-	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, fixture.actor(oldSourceID), &SnapshotSessionCreateRequest{
+	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, fixture.actor(oldSourceID), testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      newSourceID,
 			Reason:           "source_sequence_changed",
 		},
 	})
+
 	require.NoError(t, err)
 
 	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
@@ -800,6 +839,7 @@ func TestSnapshotSessions_RotatedCreateForNeverCommittedSourceCreatesRetiredZero
 }
 
 func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "rotate_repeat", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-repeat-old"
 	newSourceID := "writer-repeat-new"
@@ -813,9 +853,9 @@ func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t
 			Reason:           "history_pruned",
 		},
 	}
-	session1, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, req)
+	session1, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, testSchemaGenerationProofForService(fixture.svc), req)
 	require.NoError(t, err)
-	session2, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, req)
+	session2, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, testSchemaGenerationProofForService(fixture.svc), req)
 	require.NoError(t, err)
 	require.NotEqual(t, session1.SnapshotID, session2.SnapshotID)
 
@@ -828,7 +868,8 @@ func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t
 		FROM sync.source_state
 		WHERE user_pk = $1
 	`, userPK).Scan(&sourceStateCount))
-	require.Equal(t, 2, sourceStateCount)
+	// The fixture's reader binding plus the permanent old/new replacement witnesses remain.
+	require.Equal(t, 3, sourceStateCount)
 
 	var oldState, oldReplacedBySourceID string
 	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
@@ -848,7 +889,8 @@ func TestSnapshotSessions_RepeatedEquivalentRotationIsIdempotentForSourceState(t
 	require.Equal(t, sourceStateReserved, newState)
 }
 
-func TestSnapshotSessions_ConcurrentOldSourceCommitSerializesBehindReplacement(t *testing.T) {
+func TestSnapshotSessions_ReplacementDoesNotObserveUnsubmittedPushRows(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "rot_concurrent", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-concurrent-old"
 	newSourceID := "writer-concurrent-new"
@@ -861,86 +903,24 @@ func TestSnapshotSessions_ConcurrentOldSourceCommitSerializesBehindReplacement(t
 		BaseRowVersion: 0,
 		Payload:        json.RawMessage(fmt.Sprintf(`{"id":"%s","name":"Concurrent","email":"concurrent@example.com"}`, row2)),
 	}}
-	requestHash, err := computeCanonicalPushRequestHash(stagedRows)
+	requestHash, err := computeGenerationPinnedPushRequestHash(testSchemaGenerationProofForService(fixture.svc), stagedRows)
 	require.NoError(t, err)
-	pushSession, err := fixture.svc.CreatePushSession(fixture.ctx, oldActor, &PushSessionCreateRequest{
-		SourceBundleID: 2, PlannedRowCount: 1, CanonicalRequestHash: requestHash,
+	replacement, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{PreviousSourceID: oldSourceID, NewSourceID: newSourceID, Reason: "history_pruned"},
 	})
 	require.NoError(t, err)
-	require.Equal(t, "staging", pushSession.Status)
-	_, err = fixture.svc.UploadPushChunk(fixture.ctx, oldActor, pushSession.PushID, &PushSessionChunkRequest{StartRowOrdinal: 0, Rows: stagedRows})
-	require.NoError(t, err)
-
-	replacementReached := make(chan struct{})
-	releaseReplacement := make(chan struct{})
-	replacementReleased := false
-	defer func() {
-		if !replacementReleased {
-			close(releaseReplacement)
-		}
-	}()
-	fixture.svc.snapshotHooks = &snapshotTestHooks{afterSnapshotFence: func(context.Context) error {
-		close(replacementReached)
-		<-releaseReplacement
-		return nil
-	}}
-	type createResult struct {
-		session *SnapshotSession
-		err     error
-	}
-	createDone := make(chan createResult, 1)
-	go func() {
-		session, createErr := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, &SnapshotSessionCreateRequest{
-			SourceReplacement: &SnapshotSourceReplacement{PreviousSourceID: oldSourceID, NewSourceID: newSourceID, Reason: "history_pruned"},
-		})
-		createDone <- createResult{session: session, err: createErr}
-	}()
-	<-replacementReached
-
-	commitDone := make(chan error, 1)
-	go func() {
-		_, commitErr := fixture.svc.CommitPushSession(fixture.ctx, oldActor, pushSession.PushID)
-		commitDone <- commitErr
-	}()
-	require.Eventually(t, func() bool {
-		var waiting bool
-		queryErr := fixture.pool.QueryRow(fixture.ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM pg_stat_activity
-				WHERE datname=current_database()
-				  AND pid<>pg_backend_pid()
-				  AND wait_event_type='Lock'
-			)
-		`).Scan(&waiting)
-		return queryErr == nil && waiting
-	}, 5*time.Second, 10*time.Millisecond)
-	close(releaseReplacement)
-	replacementReleased = true
-
-	replacement := <-createDone
-	require.NoError(t, replacement.err)
-	require.NotNil(t, replacement.session)
-	commitErr := <-commitDone
-	require.Error(t, commitErr)
-	_, retryErr := fixture.svc.CommitPushSession(fixture.ctx, oldActor, pushSession.PushID)
-	require.Error(t, retryErr)
-
-	rows, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, oldActor, replacement.session.SnapshotID, 10)
+	require.NotNil(t, replacement)
+	_, err = fixture.svc.PushOneShot(fixture.ctx, oldActor, testSchemaGenerationProofForService(fixture.svc), &OneShotPushRequest{
+		SourceBundleID: 2, CanonicalRequestHash: requestHash, Rows: stagedRows,
+	})
+	var retiredErr *SourceRetiredError
+	require.ErrorAs(t, err, &retiredErr)
+	rows, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.actor(newSourceID), replacement.SnapshotID, 10)
 	require.Len(t, rows, 1)
-	require.Equal(t, row1.String(), rows[0].Key["id"])
-	var businessRow2, committedBundle2 int
-	tableIdent := pgx.Identifier{fixture.schemaName, "users"}.Sanitize()
-	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE _sync_scope_id=$1 AND id=$2`, tableIdent), fixture.userID, row2).Scan(&businessRow2))
-	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
-		SELECT COUNT(*) FROM sync.bundle_log b
-		JOIN sync.user_state u ON u.user_pk=b.user_pk
-		WHERE u.user_id=$1 AND b.source_id=$2 AND b.source_bundle_id=2
-	`, fixture.userID, oldSourceID).Scan(&committedBundle2))
-	require.Zero(t, businessRow2)
-	require.Zero(t, committedBundle2)
 }
 
 func TestSnapshotSessions_LostReplacementResponseRetriesSameIdentity(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "rotate_lost_response", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-lost-old"
 	newSourceID := "writer-lost-new"
@@ -952,17 +932,17 @@ func TestSnapshotSessions_LostReplacementResponseRetriesSameIdentity(t *testing.
 	}}
 	lostResponse := errors.New("simulated lost replacement response")
 	fixture.svc.snapshotHooks = &snapshotTestHooks{afterSnapshotCommit: func(context.Context) error { return lostResponse }}
-	first, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, req)
+	first, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, testSchemaGenerationProofForService(fixture.svc), req)
 	require.ErrorIs(t, err, lostResponse)
 	require.Nil(t, first)
 	require.Equal(t, 1, fixture.snapshotSessionCountForUser(t))
 
 	fixture.svc.snapshotHooks = nil
-	retry, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, req)
+	retry, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, testSchemaGenerationProofForService(fixture.svc), req)
 	require.NoError(t, err)
 	require.NotNil(t, retry)
 	require.Equal(t, 2, fixture.snapshotSessionCountForUser(t))
-	rows, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, oldActor, retry.SnapshotID, 10)
+	rows, _ := collectSnapshotChunkRows(t, fixture.ctx, fixture.svc, fixture.actor(newSourceID), retry.SnapshotID, 10)
 	require.Len(t, rows, 1)
 	require.Equal(t, rowID.String(), rows[0].Key["id"])
 
@@ -976,7 +956,184 @@ func TestSnapshotSessions_LostReplacementResponseRetriesSameIdentity(t *testing.
 	require.Equal(t, sourceStateReserved, newState)
 }
 
+func TestSnapshotSessions_RetiredSourceIsRejectedByEveryOrdinaryOperation(t *testing.T) {
+	t.Parallel()
+	fixture := newSnapshotSessionFixture(t, "retired_ops", snapshotSessionFixtureOptions{})
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	oldActor := fixture.actor("retired-old")
+	newSourceID := "retired-new"
+	fixture.pushUserAs(t, oldActor, 1, uuid.New(), "Before retirement")
+	oldSnapshot, err := fixture.svc.CreateSnapshotSession(fixture.ctx, oldActor, proof)
+	require.NoError(t, err)
+	_, err = fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, proof, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{PreviousSourceID: oldActor.SourceID, NewSourceID: newSourceID, Reason: "history_pruned"},
+	})
+	require.NoError(t, err)
+
+	assertRetired := func(name string, call func() error) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			var retired *SourceRetiredError
+			require.ErrorAs(t, call(), &retired)
+			require.Equal(t, oldActor.SourceID, retired.SourceID)
+			require.Equal(t, newSourceID, retired.ReplacedBySourceID)
+		})
+	}
+	assertRetired("connect", func() error {
+		_, err := fixture.svc.Connect(fixture.ctx, oldActor, proof, &ConnectRequest{})
+		return err
+	})
+	assertRetired("pull", func() error { _, err := fixture.svc.ProcessPull(fixture.ctx, oldActor, proof, 0, 1, 0); return err })
+	assertRetired("push", func() error {
+		rowID := uuid.NewString()
+		rows := []PushRequestRow{{
+			Schema: fixture.schemaName, Table: "users", Key: SyncKey{"id": rowID}, Op: OpInsert,
+			Payload: json.RawMessage(fmt.Sprintf(`{"id":%q,"name":"retired","email":"retired@example.com"}`, rowID)),
+		}}
+		requestHash, err := computeGenerationPinnedPushRequestHash(proof, rows)
+		if err != nil {
+			return err
+		}
+		_, err = fixture.svc.PushOneShot(fixture.ctx, oldActor, proof, &OneShotPushRequest{SourceBundleID: 2, CanonicalRequestHash: requestHash, Rows: rows})
+		return err
+	})
+	assertRetired("snapshot create", func() error { _, err := fixture.svc.CreateSnapshotSession(fixture.ctx, oldActor, proof); return err })
+	assertRetired("snapshot get", func() error {
+		_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, oldActor, proof, oldSnapshot.SnapshotID, 0, 1, 1)
+		return err
+	})
+	assertRetired("snapshot delete", func() error {
+		return fixture.svc.DeleteSnapshotSession(fixture.ctx, oldActor, proof, oldSnapshot.SnapshotID)
+	})
+	assertRetired("watch", func() error {
+		_, err := fixture.svc.SubscribeBundleChanges(fixture.ctx, oldActor, proof, 0)
+		return err
+	})
+
+	discovery, err := fixture.svc.GetGeneration(fixture.ctx, oldActor, proof.ID)
+	require.NoError(t, err)
+	require.Equal(t, canonicalSchemaGenerationID(proof.ID), discovery.SchemaGeneration.ID)
+}
+
+func TestSnapshotSessions_SourceReplacementCanUpgradeGenerationAtomically(t *testing.T) {
+	t.Parallel()
+	fixture := newSnapshotSessionFixture(t, "replacement_upgrade", snapshotSessionFixtureOptions{
+		schemaGenerations: func(schema string) []SchemaGeneration {
+			table := GenerationTable{Schema: schema, Table: "users", Columns: []GenerationColumn{
+				{Name: "email", WireType: GenerationWireTypeText},
+				{Name: "id", WireType: GenerationWireTypeUUID},
+				{Name: "name", WireType: GenerationWireTypeText},
+			}}
+			return []SchemaGeneration{{ID: 1, Tables: []GenerationTable{table}}, {ID: 2, Tables: []GenerationTable{table}}}
+		},
+	})
+	proof1 := proofForGeneration(t, fixture.svc, 1)
+	proof2 := proofForGeneration(t, fixture.svc, 2)
+	oldActor := fixture.actor("upgrade-old")
+	newActor := fixture.actor("upgrade-new")
+	_, err := fixture.svc.Connect(fixture.ctx, oldActor, proof1, &ConnectRequest{})
+	require.NoError(t, err)
+
+	snapshot, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, proof2, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{PreviousSourceID: oldActor.SourceID, NewSourceID: newActor.SourceID, Reason: "schema_generation_upgrade"},
+	})
+	require.NoError(t, err)
+
+	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
+	require.NoError(t, err)
+	var generationID int32
+	var fingerprint string
+	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `SELECT schema_generation_id,schema_generation_fingerprint FROM sync.source_generation_bindings WHERE user_pk=$1 AND source_id=$2`, userPK, newActor.SourceID).Scan(&generationID, &fingerprint))
+	require.Equal(t, int32(proof2.ID), generationID)
+	require.Equal(t, proof2.Fingerprint, fingerprint)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, newActor, proof2, snapshot.SnapshotID, 0, 1, 1)
+	require.NoError(t, err)
+	_, err = fixture.svc.ProcessPull(fixture.ctx, oldActor, proof1, 0, 1, 0)
+	var retired *SourceRetiredError
+	require.ErrorAs(t, err, &retired)
+
+	retry, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, proof2, &SnapshotSessionCreateRequest{
+		SourceReplacement: &SnapshotSourceReplacement{PreviousSourceID: oldActor.SourceID, NewSourceID: newActor.SourceID, Reason: "schema_generation_upgrade"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, retry)
+}
+
+func TestSnapshotSessions_DeleteSerializesWithSourceReplacement(t *testing.T) {
+	fixture := newSnapshotSessionFixture(t, "delete_replace_race", snapshotSessionFixtureOptions{})
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	oldActor := fixture.actor("delete-race-old")
+	newActor := fixture.actor("delete-race-new")
+	_, err := fixture.svc.Connect(fixture.ctx, oldActor, proof, &ConnectRequest{})
+	require.NoError(t, err)
+	snapshot, err := fixture.svc.CreateSnapshotSession(fixture.ctx, oldActor, proof)
+	require.NoError(t, err)
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	fixture.svc.snapshotHooks = &snapshotTestHooks{afterDeleteSessionRead: func(context.Context) error {
+		close(reached)
+		<-release
+		return nil
+	}}
+	deleteResult := make(chan error, 1)
+	go func() {
+		deleteResult <- fixture.svc.DeleteSnapshotSession(fixture.ctx, oldActor, proof, snapshot.SnapshotID)
+	}()
+	<-reached
+
+	replacementResult := make(chan error, 1)
+	go func() {
+		_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, proof, &SnapshotSessionCreateRequest{SourceReplacement: &SnapshotSourceReplacement{
+			PreviousSourceID: oldActor.SourceID,
+			NewSourceID:      newActor.SourceID,
+			Reason:           "history_pruned",
+		}})
+		replacementResult <- err
+	}()
+	select {
+	case err := <-replacementResult:
+		t.Fatalf("source replacement completed before delete released its source lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	require.NoError(t, <-deleteResult)
+	require.NoError(t, <-replacementResult)
+	fixture.svc.snapshotHooks = nil
+
+	_, err = fixture.svc.ProcessPull(fixture.ctx, oldActor, proof, 0, 1, 0)
+	var retired *SourceRetiredError
+	require.ErrorAs(t, err, &retired)
+}
+
+func TestSnapshotSessions_CorruptStoredGenerationPrecedesBindingChecks(t *testing.T) {
+	t.Parallel()
+	fixture := newSnapshotSessionFixture(t, "corrupt_gen", snapshotSessionFixtureOptions{})
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	_, err := fixture.svc.Connect(fixture.ctx, fixture.reader, proof, &ConnectRequest{})
+	require.NoError(t, err)
+	snapshot, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, proof)
+	require.NoError(t, err)
+	for _, statement := range []string{
+		`ALTER TABLE sync.snapshot_sessions DROP CONSTRAINT snapshot_sessions_source_generation_fk`,
+		`ALTER TABLE sync.snapshot_sessions DROP CONSTRAINT snapshot_sessions_generation_fingerprint_chk`,
+	} {
+		_, err = fixture.pool.Exec(fixture.ctx, statement)
+		require.NoError(t, err)
+	}
+	_, err = fixture.pool.Exec(fixture.ctx, `UPDATE sync.snapshot_sessions SET schema_generation_fingerprint='bad' WHERE snapshot_id=$1::uuid`, snapshot.SnapshotID)
+	require.NoError(t, err)
+
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, proof, snapshot.SnapshotID, 0, 1, 1)
+	var corrupt *SessionGenerationError
+	require.ErrorAs(t, err, &corrupt)
+	require.Equal(t, SessionGenerationStateCorrupt, corrupt.Code)
+	require.Equal(t, "snapshot", corrupt.SessionKind)
+	require.Equal(t, "schema_generation_fingerprint", corrupt.Field)
+}
+
 func TestSnapshotSessions_RotatedCreateRejectsConflictingReplacementTargets(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "rotate_conflict", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-conflict-old"
 	firstNewSourceID := "writer-conflict-new-a"
@@ -987,34 +1144,37 @@ func TestSnapshotSessions_RotatedCreateRejectsConflictingReplacementTargets(t *t
 	fixture.pushUserAs(t, writer, 1, uuid.New(), "Alpha")
 	fixture.pushUserAs(t, otherWriter, 1, uuid.New(), "Bravo")
 
-	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, &SnapshotSessionCreateRequest{
+	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      firstNewSourceID,
 			Reason:           "history_pruned",
 		},
 	})
+
 	require.NoError(t, err)
 
-	_, err = fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, &SnapshotSessionCreateRequest{
+	_, err = fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, writer, testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      secondNewSourceID,
 			Reason:           "history_pruned",
 		},
 	})
+
 	var retiredErr *SourceRetiredError
 	require.ErrorAs(t, err, &retiredErr)
 	require.Equal(t, oldSourceID, retiredErr.SourceID)
 	require.Equal(t, firstNewSourceID, retiredErr.ReplacedBySourceID)
 
-	_, err = fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, otherWriter, &SnapshotSessionCreateRequest{
+	_, err = fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, otherWriter, testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: otherOldSourceID,
 			NewSourceID:      firstNewSourceID,
 			Reason:           "history_pruned",
 		},
 	})
+
 	var replacementErr *SourceReplacementInvalidError
 	require.ErrorAs(t, err, &replacementErr)
 	require.Equal(t, "source replacement is invalid", replacementErr.Error())
@@ -1022,6 +1182,7 @@ func TestSnapshotSessions_RotatedCreateRejectsConflictingReplacementTargets(t *t
 }
 
 func TestSnapshotSessions_FirstCommitUnderReservedReplacementActivatesSource(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "rotate_activate", snapshotSessionFixtureOptions{})
 	oldSourceID := "writer-activate-old"
 	newSourceID := "writer-activate-new"
@@ -1029,13 +1190,14 @@ func TestSnapshotSessions_FirstCommitUnderReservedReplacementActivatesSource(t *
 	newWriter := fixture.actor(newSourceID)
 	fixture.pushUserAs(t, oldWriter, 1, uuid.New(), "Alpha")
 
-	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldWriter, &SnapshotSessionCreateRequest{
+	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldWriter, testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{
 		SourceReplacement: &SnapshotSourceReplacement{
 			PreviousSourceID: oldSourceID,
 			NewSourceID:      newSourceID,
 			Reason:           "history_pruned",
 		},
 	})
+
 	require.NoError(t, err)
 
 	fixture.pushUserAs(t, newWriter, 1, uuid.New(), "Bravo")
@@ -1055,6 +1217,7 @@ func TestSnapshotSessions_FirstCommitUnderReservedReplacementActivatesSource(t *
 }
 
 func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "no_update", snapshotSessionFixtureOptions{})
 	rowID := uuid.New()
 
@@ -1086,13 +1249,14 @@ func TestSnapshotSessions_GetChunkDoesNotIssueSnapshotSessionUpdate(t *testing.T
 	`)
 	require.NoError(t, err)
 
-	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Len(t, chunk.Rows, 1)
 	require.Equal(t, rowID.String(), chunk.Rows[0].Key["id"])
 }
 
 func TestSnapshotSessions_CreateRejectsConfiguredLimitsAndRollsBack(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name                 string
 		scenario             string
@@ -1118,7 +1282,7 @@ func TestSnapshotSessions_CreateRejectsConfiguredLimitsAndRollsBack(t *testing.T
 			scenario:          "byte_cap",
 			maxBytes:          1,
 			rowNames:          []string{"Alpha"},
-			dimension:         "byte_count",
+			dimension:         "logical_byte_count",
 			actualGreaterThan: 1,
 		},
 	}
@@ -1133,7 +1297,7 @@ func TestSnapshotSessions_CreateRejectsConfiguredLimitsAndRollsBack(t *testing.T
 				fixture.pushUser(t, int64(i+1), uuid.New(), name)
 			}
 
-			_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+			_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 			var limitErr *SnapshotSessionLimitExceededError
 			require.ErrorAs(t, err, &limitErr)
 			require.Equal(t, tc.dimension, limitErr.Dimension)
@@ -1153,6 +1317,7 @@ func TestSnapshotSessions_CreateRejectsConfiguredLimitsAndRollsBack(t *testing.T
 }
 
 func TestSnapshotSessions_IntegrityMismatchRollsBackWithoutVisibleSession(t *testing.T) {
+	t.Parallel()
 	t.Run("live row missing row state", func(t *testing.T) {
 		fixture := newSnapshotSessionFixture(t, "missing_state", snapshotSessionFixtureOptions{})
 		fixture.pushUser(t, 1, uuid.New(), "Alpha")
@@ -1160,7 +1325,7 @@ func TestSnapshotSessions_IntegrityMismatchRollsBackWithoutVisibleSession(t *tes
 		require.NoError(t, err)
 		_, err = fixture.pool.Exec(fixture.ctx, `DELETE FROM sync.row_state WHERE user_pk=$1`, userPK)
 		require.NoError(t, err)
-		_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+		_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 		require.ErrorContains(t, err, "integrity mismatch")
 		require.Zero(t, fixture.snapshotSessionCountForUser(t))
 		require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
@@ -1180,7 +1345,7 @@ func TestSnapshotSessions_IntegrityMismatchRollsBackWithoutVisibleSession(t *tes
 			_, err := fixture.pool.Exec(fixture.ctx, fmt.Sprintf(`ALTER TABLE %s ENABLE TRIGGER %s`, table, pgx.Identifier{trigger}.Sanitize()))
 			require.NoError(t, err)
 		}
-		_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+		_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 		require.ErrorContains(t, err, "integrity mismatch")
 		require.Zero(t, fixture.snapshotSessionCountForUser(t))
 		require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
@@ -1192,14 +1357,48 @@ func TestSnapshotSessions_IntegrityMismatchRollsBackWithoutVisibleSession(t *tes
 		require.NoError(t, err)
 		_, err = fixture.pool.Exec(fixture.ctx, `UPDATE sync.row_state SET deleted=TRUE WHERE user_pk=$1`, userPK)
 		require.NoError(t, err)
-		_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+		_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 		require.ErrorContains(t, err, "integrity mismatch")
 		require.Zero(t, fixture.snapshotSessionCountForUser(t))
 		require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
 	})
+	t.Run("row version beyond checkpoint rolls back source replacement", func(t *testing.T) {
+		fixture := newSnapshotSessionFixture(t, "future_row_version", snapshotSessionFixtureOptions{})
+		oldSourceID := "future-version-old"
+		newSourceID := "future-version-new"
+		oldActor := fixture.actor(oldSourceID)
+		fixture.pushUserAs(t, oldActor, 1, uuid.New(), "Alpha")
+		userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
+		require.NoError(t, err)
+		_, err = fixture.pool.Exec(fixture.ctx, `UPDATE sync.row_state SET bundle_seq=2 WHERE user_pk=$1`, userPK)
+		require.NoError(t, err)
+
+		_, err = fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{
+			SourceReplacement: &SnapshotSourceReplacement{PreviousSourceID: oldSourceID, NewSourceID: newSourceID, Reason: "history_pruned"},
+		})
+		var integrity *GenerationProjectionError
+		require.ErrorAs(t, err, &integrity)
+		require.Equal(t, GenerationProjectionIntegrityError, integrity.Code)
+		require.Zero(t, fixture.snapshotSessionCountForUser(t))
+		require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
+
+		var oldState, replacedBy string
+		require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
+			SELECT state, replaced_by_source_id FROM sync.source_state
+			WHERE user_pk=$1 AND source_id=$2
+		`, userPK, oldSourceID).Scan(&oldState, &replacedBy))
+		require.Equal(t, sourceStateActive, oldState)
+		require.Empty(t, replacedBy)
+		var newCount int
+		require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
+			SELECT COUNT(*) FROM sync.source_state WHERE user_pk=$1 AND source_id=$2
+		`, userPK, newSourceID).Scan(&newCount))
+		require.Zero(t, newCount)
+	})
 }
 
 func TestSnapshotSessions_DuplicateLogicalKeysAreRejectedByManagedIdentity(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "duplicate_identity", snapshotSessionFixtureOptions{})
 	rowID := uuid.New()
 	fixture.pushUser(t, 1, rowID, "Alpha")
@@ -1220,64 +1419,130 @@ func TestSnapshotSessions_DuplicateLogicalKeysAreRejectedByManagedIdentity(t *te
 	`, tableIdent), fixture.userID, rowID)
 	require.Error(t, err)
 
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Equal(t, int64(1), session.RowCount)
 }
 
 func TestSnapshotSessions_RowWireLimitRejectsAndRollsBack(t *testing.T) {
-	fixture := newSnapshotSessionFixture(t, "row_wire_limit", snapshotSessionFixtureOptions{
-		maxBytesPerSnapshotRow: 128, snapshotMaterializationBatchBytes: 128,
-	})
+	t.Parallel()
+	fixture := newSnapshotSessionFixture(t, "row_wire_limit", snapshotSessionFixtureOptions{})
 	fixture.pushUser(t, 1, uuid.New(), strings.Repeat("x", 512))
-	_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	fixture.svc.config.MaxBytesPerSnapshotRow = 128
+	fixture.svc.config.SnapshotMaterializationBatchBytes = 128
+	_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	var limit *SnapshotSessionLimitExceededError
 	require.ErrorAs(t, err, &limit)
-	require.Equal(t, "row_byte_count", limit.Dimension)
+	require.Equal(t, "row_decoded_body_bytes", limit.Dimension)
 	require.Greater(t, limit.Actual, limit.Limit)
 	require.Zero(t, fixture.snapshotSessionCountForUser(t))
 	require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
 }
 
-func TestSnapshotSessions_RowWireLimitAcceptsExactAndRejectsOneByteOver(t *testing.T) {
-	probe := newSnapshotSessionFixture(t, "wirelimitprobe", snapshotSessionFixtureOptions{})
-	probe.pushUser(t, 1, uuid.New(), "Alpha")
-	probeSession, err := probe.svc.CreateSnapshotSession(probe.ctx, probe.reader)
+func TestSnapshotSessions_ExpandedKeyPlusPayloadRowLimitRollsBack(t *testing.T) {
+	fixture := newSnapshotSessionFixture(t, "expanded_row_limit", snapshotSessionFixtureOptions{})
+	bundle := fixture.pushUser(t, 1, uuid.New(), "Expanded")
+	require.Len(t, bundle.Rows, 1)
+	row := bundle.Rows[0]
+	expandedBytes, err := ExpandedRowDecodedBytes(PushRequestRow{
+		Schema: row.Schema, Table: row.Table, Key: row.Key, Op: row.Op,
+		BaseRowVersion: row.RowVersion, Payload: row.Payload,
+	})
 	require.NoError(t, err)
-	var exactWireBytes int64
-	require.NoError(t, probe.pool.QueryRow(probe.ctx, `
-		SELECT wire_byte_count FROM sync.snapshot_session_rows
-		WHERE snapshot_id=$1::uuid
-	`, probeSession.SnapshotID).Scan(&exactWireBytes))
-	require.Greater(t, exactWireBytes, int64(1))
+	require.Greater(t, expandedBytes, int64(len(row.Payload)))
+	fixture.svc.config.MaxBytesPerSnapshotRow = expandedBytes - 1
 
-	t.Run("exact limit", func(t *testing.T) {
-		fixture := newSnapshotSessionFixture(t, "wirelimitexact", snapshotSessionFixtureOptions{
-			maxBytesPerSnapshotRow: exactWireBytes, snapshotMaterializationBatchBytes: exactWireBytes,
-		})
-		fixture.pushUser(t, 1, uuid.New(), "Alpha")
-		session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
-		require.NoError(t, err)
-		require.Equal(t, exactWireBytes, session.ByteCount)
-	})
+	_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
+	var limit *SnapshotSessionLimitExceededError
+	require.ErrorAs(t, err, &limit)
+	require.Equal(t, "row_decoded_body_bytes", limit.Dimension)
+	require.Equal(t, expandedBytes, limit.Actual)
+	require.Equal(t, expandedBytes-1, limit.Limit)
+	require.Zero(t, fixture.snapshotSessionCountForUser(t))
+	require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
+}
 
-	t.Run("one byte over limit", func(t *testing.T) {
-		fixture := newSnapshotSessionFixture(t, "wirelimitoverx", snapshotSessionFixtureOptions{
-			maxBytesPerSnapshotRow: exactWireBytes - 1, snapshotMaterializationBatchBytes: exactWireBytes - 1,
-		})
-		fixture.pushUser(t, 1, uuid.New(), "Alpha")
-		_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
-		var limit *SnapshotSessionLimitExceededError
-		require.ErrorAs(t, err, &limit)
-		require.Equal(t, "row_byte_count", limit.Dimension)
-		require.Equal(t, exactWireBytes, limit.Actual)
-		require.Equal(t, exactWireBytes-1, limit.Limit)
-		require.Zero(t, fixture.snapshotSessionCountForUser(t))
-		require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
-	})
+func TestSnapshotSessions_OversizedRowsAreSuppressedBeforeMaterialization(t *testing.T) {
+	fixture := newSnapshotSessionFixture(t, "row_preflight", snapshotSessionFixtureOptions{})
+	fixture.pushUser(t, 1, uuid.New(), strings.Repeat("x", 512))
+	fixture.svc.config.MaxBytesPerSnapshotRow = 128
+	fixture.svc.config.SnapshotMaterializationBatchBytes = 128
+	var observation snapshotPayloadScanObservation
+	fixture.svc.snapshotHooks = &snapshotTestHooks{afterSnapshotMaterializedRowScan: func(actual snapshotPayloadScanObservation) {
+		observation = actual
+	}}
+	_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
+	var limit *SnapshotSessionLimitExceededError
+	require.ErrorAs(t, err, &limit)
+	require.Greater(t, observation.ReportedPayloadByteCount, fixture.svc.maxBytesPerSnapshotRow())
+	require.False(t, observation.PayloadMaterialized)
+	require.Zero(t, observation.MaterializedPayloadBytes)
+	require.Zero(t, fixture.snapshotSessionCountForUser(t))
+}
+
+func TestSnapshotSessions_OversizedRetainedRowsAreSuppressedBeforeChunkDecode(t *testing.T) {
+	fixture := newSnapshotSessionFixture(t, "chunk_preflight", snapshotSessionFixtureOptions{})
+	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
+	fixture.svc.config.MaxBytesPerSnapshotRow = 128
+	_, err := fixture.pool.Exec(fixture.ctx, `
+		UPDATE sync.snapshot_session_rows
+		SET payload_wire = $2::json, wire_byte_count = 100
+		WHERE snapshot_id = $1::uuid
+	`, session.SnapshotID, fmt.Sprintf(`{"id":"x","name":"%s"}`, strings.Repeat("x", 512)))
+	require.NoError(t, err)
+	var observation snapshotPayloadScanObservation
+	fixture.svc.snapshotHooks = &snapshotTestHooks{afterSnapshotChunkRowScan: func(actual snapshotPayloadScanObservation) {
+		observation = actual
+	}}
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, 1024)
+	var integrity *GenerationProjectionError
+	require.ErrorAs(t, err, &integrity)
+	require.Equal(t, GenerationProjectionIntegrityError, integrity.Code)
+	require.Greater(t, observation.ReportedPayloadByteCount, fixture.svc.maxBytesPerSnapshotRow())
+	require.False(t, observation.PayloadMaterialized)
+	require.Zero(t, observation.MaterializedPayloadBytes)
+}
+
+func TestSnapshotSessions_OversizedRetainedKeysAreSuppressedBeforeChunkDecode(t *testing.T) {
+	fixture := newSnapshotSessionFixture(t, "chunk_key_preflight", snapshotSessionFixtureOptions{})
+	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
+	fixture.svc.config.MaxBytesPerSnapshotRow = 128
+	_, err := fixture.pool.Exec(fixture.ctx, `
+		UPDATE sync.snapshot_session_rows
+		SET key_bytes = decode(repeat('61', 512), 'hex'), wire_byte_count = 100
+		WHERE snapshot_id = $1::uuid
+	`, session.SnapshotID)
+	require.NoError(t, err)
+	var observation snapshotPayloadScanObservation
+	fixture.svc.snapshotHooks = &snapshotTestHooks{afterSnapshotChunkRowScan: func(actual snapshotPayloadScanObservation) {
+		observation = actual
+	}}
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, 1024)
+	var integrity *GenerationProjectionError
+	require.ErrorAs(t, err, &integrity)
+	require.Equal(t, GenerationProjectionIntegrityError, integrity.Code)
+	require.Greater(t, observation.ReportedKeyByteCount, fixture.svc.maxBytesPerSnapshotRow())
+	require.False(t, observation.KeyMaterialized)
+	require.Zero(t, observation.MaterializedKeyBytes)
+}
+
+func TestSnapshotSessions_RowDecodedLimitRejectsOversizePayload(t *testing.T) {
+	t.Parallel()
+	fixture := newSnapshotSessionFixture(t, "rowdecodedlimit", snapshotSessionFixtureOptions{})
+	fixture.pushUser(t, 1, uuid.New(), strings.Repeat("x", 512))
+	fixture.svc.config.MaxBytesPerSnapshotRow = 128
+	fixture.svc.config.SnapshotMaterializationBatchBytes = 128
+	_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
+	var limit *SnapshotSessionLimitExceededError
+	require.ErrorAs(t, err, &limit)
+	require.Equal(t, "row_decoded_body_bytes", limit.Dimension)
+	require.Greater(t, limit.Actual, limit.Limit)
+	require.Zero(t, fixture.snapshotSessionCountForUser(t))
+	require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
 }
 
 func TestSnapshotSessions_DatabaseWriteAndCommitFailuresRollBack(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		scenario   string
@@ -1319,7 +1584,7 @@ func TestSnapshotSessions_DatabaseWriteAndCommitFailuresRollBack(t *testing.T) {
 			_, err = fixture.pool.Exec(fixture.ctx, tc.triggerSQL)
 			require.NoError(t, err)
 
-			_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+			_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 			require.ErrorContains(t, err, "injected snapshot write failure")
 			require.Zero(t, fixture.snapshotSessionCountForUser(t))
 			require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
@@ -1328,6 +1593,7 @@ func TestSnapshotSessions_DatabaseWriteAndCommitFailuresRollBack(t *testing.T) {
 }
 
 func TestSnapshotSessions_CancellationAtBoundedStagesRollsBackEarlierPages(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		install func(*snapshotTestHooks)
@@ -1378,7 +1644,7 @@ func TestSnapshotSessions_CancellationAtBoundedStagesRollsBackEarlierPages(t *te
 			hooks := &snapshotTestHooks{}
 			tc.install(hooks)
 			fixture.svc.snapshotHooks = hooks
-			_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+			_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 			require.ErrorIs(t, err, context.Canceled)
 			require.Zero(t, fixture.snapshotSessionCountForUser(t))
 			require.Zero(t, fixture.snapshotSessionRowCountForUser(t))
@@ -1387,12 +1653,13 @@ func TestSnapshotSessions_CancellationAtBoundedStagesRollsBackEarlierPages(t *te
 }
 
 func TestSnapshotSessions_CancelledRotationLeavesPreviousSourceActive(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "cancel_rotation", snapshotSessionFixtureOptions{})
 	oldSource := "writer-old"
 	oldActor := fixture.actor(oldSource)
 	fixture.pushUserAs(t, oldActor, 1, uuid.New(), "Alpha")
 	fixture.svc.snapshotHooks = &snapshotTestHooks{afterSnapshotFence: func(context.Context) error { return context.Canceled }}
-	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, &SnapshotSessionCreateRequest{SourceReplacement: &SnapshotSourceReplacement{PreviousSourceID: oldSource, NewSourceID: "writer-new", Reason: "history_pruned"}})
+	_, err := fixture.svc.CreateSnapshotSessionWithRequest(fixture.ctx, oldActor, testSchemaGenerationProofForService(fixture.svc), &SnapshotSessionCreateRequest{SourceReplacement: &SnapshotSourceReplacement{PreviousSourceID: oldSource, NewSourceID: "writer-new", Reason: "history_pruned"}})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, fixture.snapshotSessionCountForUser(t))
 	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.userID)
@@ -1407,6 +1674,7 @@ func TestSnapshotSessions_CancelledRotationLeavesPreviousSourceActive(t *testing
 }
 
 func TestSnapshotSessions_CreateSucceedsUnderConfiguredLimits(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "under_cap", snapshotSessionFixtureOptions{
 		maxRowsPerSnapshotSession:  10,
 		maxBytesPerSnapshotSession: 1 << 20,
@@ -1419,10 +1687,11 @@ func TestSnapshotSessions_CreateSucceedsUnderConfiguredLimits(t *testing.T) {
 }
 
 func TestSnapshotSessions_ExactWireByteCountsAndByteBoundedChunks(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "wire_bytes", snapshotSessionFixtureOptions{})
 	fixture.pushUser(t, 1, uuid.New(), "Alpha")
 	fixture.pushUser(t, 2, uuid.New(), "Bravo")
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 
 	rows, err := fixture.pool.Query(fixture.ctx, `
@@ -1441,26 +1710,45 @@ func TestSnapshotSessions_ExactWireByteCountsAndByteBoundedChunks(t *testing.T) 
 	require.Len(t, wireCounts, 2)
 	require.Equal(t, wireCounts[0]+wireCounts[1], session.ByteCount)
 
-	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, wireCounts[0])
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, proof, session.SnapshotID, 0, 10, 1<<20)
 	require.NoError(t, err)
-	require.Len(t, chunk.Rows, 1)
-	require.True(t, chunk.HasMore)
-	require.Equal(t, wireCounts[0], chunk.ByteCount)
-	encoded, err := json.Marshal(chunk.Rows[0])
+	require.Len(t, chunk.Rows, 2)
+	require.False(t, chunk.HasMore)
+	require.Equal(t, wireCounts[0]+wireCounts[1], chunk.ByteCount)
+	contract, ok := fixture.svc.schemaGenerationRegistry.Generation(proof.ID)
+	require.True(t, ok)
+	groups, logicalBytes, err := CompactGroupsForSnapshotRowsAt(generationDescriptor(contract), chunk.Rows[:1], 1)
 	require.NoError(t, err)
-	require.Equal(t, wireCounts[0], int64(len(encoded)))
+	require.Equal(t, wireCounts[0], logicalBytes)
+	encoded, err := json.Marshal(CompactSnapshotChunkResponse{Rows: groups, NextRowOrdinal: 1, LogicalByteCount: logicalBytes, HasMore: true})
+	require.NoError(t, err)
+	require.Greater(t, int64(len(encoded)), wireCounts[0])
 
-	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, wireCounts[0]-1)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, proof, session.SnapshotID, 0, 10, int64(len(encoded))-1)
 	var tooSmall *SnapshotChunkTooSmallError
 	require.ErrorAs(t, err, &tooSmall)
-	require.Equal(t, wireCounts[0], tooSmall.RequiredByteCount)
+	require.Equal(t, int64(len(encoded)), tooSmall.RequiredDecodedBodyBytes)
+
+	finalGroups, finalLogicalBytes, err := CompactGroupsForSnapshotRowsAt(generationDescriptor(contract), chunk.Rows[1:], 2)
+	require.NoError(t, err)
+	finalEncoded, err := json.Marshal(CompactSnapshotChunkResponse{Rows: finalGroups, NextRowOrdinal: 2, LogicalByteCount: finalLogicalBytes, HasMore: false})
+	require.NoError(t, err)
+	finalChunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, proof, session.SnapshotID, 1, 10, int64(len(finalEncoded)))
+	require.NoError(t, err)
+	require.Len(t, finalChunk.Rows, 1)
+	require.False(t, finalChunk.HasMore)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, proof, session.SnapshotID, 1, 10, int64(len(finalEncoded))-1)
+	require.ErrorAs(t, err, &tooSmall)
+	require.Equal(t, int64(len(finalEncoded)), tooSmall.RequiredDecodedBodyBytes)
 	metrics := fixture.svc.snapshotRuntimeMetricsSnapshot()
-	require.Equal(t, wireCounts[0], metrics.ChunkBytesHighWater)
+	require.Equal(t, wireCounts[0]+wireCounts[1], metrics.ChunkBytesHighWater)
 	require.Equal(t, wireCounts[0]+wireCounts[1], metrics.ChunkRetainedBytesHighWater)
 }
 
 func TestSnapshotConfig_DefaultsRelationshipsAndCapacityAreFailClosed(t *testing.T) {
-	service, err := NewRuntimeService(nil, &ServiceConfig{}, nil)
+	t.Parallel()
+	service, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), RegisteredTables: runtimeServiceTestRegisteredTables(), RegisteredTableCatalogRevision: 1}, nil)
 	require.NoError(t, err)
 	require.Equal(t, defaultSnapshotMaterializationBatchRows, service.config.SnapshotMaterializationBatchRows)
 	require.Equal(t, defaultSnapshotMaterializationBatchBytes, service.config.SnapshotMaterializationBatchBytes)
@@ -1471,32 +1759,39 @@ func TestSnapshotConfig_DefaultsRelationshipsAndCapacityAreFailClosed(t *testing
 		{SnapshotMaterializationBatchBytes: 1, MaxBytesPerSnapshotRow: 2},
 		{DefaultBytesPerSnapshotChunk: 2, MaxBytesPerSnapshotChunk: 1, MaxBytesPerSnapshotRow: 1, SnapshotMaterializationBatchBytes: 2},
 		{MaxBytesPerSnapshotRow: 2, MaxBytesPerSnapshotChunk: 1, SnapshotMaterializationBatchBytes: 2},
+		{MaxBytesPerBundle: 4096, MaxBytesPerPullResponse: 8192, MaxBytesPerSnapshotRow: 4096, MaxBytesPerSnapshotChunk: 4096, SnapshotMaterializationBatchBytes: 8192},
+		{MaxBytesPerBundle: 4096, MaxBytesPerPullResponse: 4096, MaxBytesPerSnapshotRow: 4096, MaxBytesPerSnapshotChunk: 8192, SnapshotMaterializationBatchBytes: 8192},
+		{MaxBytesPerBundle: 4095, MaxBytesPerPullResponse: 8192, MaxBytesPerSnapshotRow: 4096, MaxBytesPerSnapshotChunk: 8192, SnapshotMaterializationBatchBytes: 8192},
 		{MaxConcurrentSnapshotBuilds: -1},
 		{MaxRowsPerSnapshotSession: -1},
 	}
 	for i := range invalid {
-		_, err := NewRuntimeService(nil, &invalid[i], nil)
+		invalid[i].RegisteredTables = runtimeServiceTestRegisteredTables()
+		invalid[i].RegisteredTableCatalogRevision = 1
+		_, err := newTestRuntimeService(nil, &invalid[i], nil)
 		require.Error(t, err, "case %d", i)
 	}
 
 	for range cap(service.snapshotBuildPermits) {
 		service.snapshotBuildPermits <- struct{}{}
 	}
-	_, err = service.CreateSnapshotSession(context.Background(), Actor{UserID: "u", SourceID: "s"})
-	var buildCapacity *SnapshotCapacityError
-	require.ErrorAs(t, err, &buildCapacity)
+	require.False(t, service.tryAcquireSnapshotBuild(), "a full build semaphore must fail closed")
 	for range cap(service.snapshotChunkPermits) {
 		service.snapshotChunkPermits <- struct{}{}
 	}
-	_, err = service.GetSnapshotChunk(context.Background(), Actor{UserID: "u", SourceID: "s"}, uuid.NewString(), 0, 1, 1)
-	var chunkCapacity *SnapshotCapacityError
-	require.ErrorAs(t, err, &chunkCapacity)
+	require.False(t, service.tryAcquireSnapshotChunk(), "a full chunk semaphore must fail closed")
 }
 
-func TestSnapshotCapacity_ConcurrentLimitsRejectBeforeDatabaseAndCancellationReleasesPermits(t *testing.T) {
-	service, err := NewRuntimeService(nil, &ServiceConfig{MaxConcurrentSnapshotBuilds: 2, MaxConcurrentSnapshotChunkRequests: 4}, nil)
+func TestSnapshotCapacity_ConcurrentLimitsAndCancellationReleasePermits(t *testing.T) {
+	t.Parallel()
+	fixture := newSnapshotSessionFixture(t, "concurrent_capacity", snapshotSessionFixtureOptions{
+		maxConcurrentSnapshotBuilds:        2,
+		maxConcurrentSnapshotChunkRequests: 4,
+	})
+	service := fixture.svc
+	actor := fixture.reader
+	session, err := service.CreateSnapshotSession(fixture.ctx, actor, testSchemaGenerationProofForService(service))
 	require.NoError(t, err)
-	actor := Actor{UserID: "u", SourceID: "s"}
 	buildStarted := make(chan struct{}, 2)
 	chunkStarted := make(chan struct{}, 4)
 	service.snapshotHooks = &snapshotTestHooks{
@@ -1509,12 +1804,15 @@ func TestSnapshotCapacity_ConcurrentLimitsRejectBeforeDatabaseAndCancellationRel
 	for i := 0; i < 2; i++ {
 		var ctx context.Context
 		ctx, buildCancel[i] = context.WithCancel(context.Background())
-		go func() { _, err := service.CreateSnapshotSession(ctx, actor); buildDone <- err }()
+		go func(ctx context.Context) {
+			_, err := service.CreateSnapshotSession(ctx, actor, testSchemaGenerationProofForService(service))
+			buildDone <- err
+		}(ctx)
 	}
 	for i := 0; i < 2; i++ {
 		<-buildStarted
 	}
-	_, err = service.CreateSnapshotSession(context.Background(), actor)
+	_, err = service.CreateSnapshotSession(context.Background(), actor, testSchemaGenerationProofForService(service))
 	var capacity *SnapshotCapacityError
 	require.ErrorAs(t, err, &capacity)
 	for _, cancel := range buildCancel {
@@ -1531,12 +1829,15 @@ func TestSnapshotCapacity_ConcurrentLimitsRejectBeforeDatabaseAndCancellationRel
 	for i := 0; i < 4; i++ {
 		var ctx context.Context
 		ctx, chunkCancel[i] = context.WithCancel(context.Background())
-		go func() { _, err := service.GetSnapshotChunk(ctx, actor, uuid.NewString(), 0, 1, 1); chunkDone <- err }()
+		go func(ctx context.Context) {
+			_, err := service.GetSnapshotChunk(ctx, actor, testSchemaGenerationProofForService(service), session.SnapshotID, 0, 1, 1)
+			chunkDone <- err
+		}(ctx)
 	}
 	for i := 0; i < 4; i++ {
 		<-chunkStarted
 	}
-	_, err = service.GetSnapshotChunk(context.Background(), actor, uuid.NewString(), 0, 1, 1)
+	_, err = service.GetSnapshotChunk(context.Background(), actor, testSchemaGenerationProofForService(service), session.SnapshotID, 0, 1, 1)
 	require.ErrorAs(t, err, &capacity)
 	for _, cancel := range chunkCancel {
 		cancel()
@@ -1549,11 +1850,12 @@ func TestSnapshotCapacity_ConcurrentLimitsRejectBeforeDatabaseAndCancellationRel
 }
 
 func TestSnapshotChunk_CancellationReleasesPermitAndRetryPreservesOrdinals(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "chunk_capacity_retry", snapshotSessionFixtureOptions{})
 	for i, name := range []string{"Alpha", "Bravo", "Charlie"} {
 		fixture.pushUser(t, int64(i+1), uuid.New(), name)
 	}
-	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 
 	started := make(chan struct{})
@@ -1565,14 +1867,14 @@ func TestSnapshotChunk_CancellationReleasesPermitAndRetryPreservesOrdinals(t *te
 	ctx, cancel := context.WithCancel(fixture.ctx)
 	done := make(chan error, 1)
 	go func() {
-		_, err := fixture.svc.GetSnapshotChunk(ctx, fixture.reader, session.SnapshotID, 0, 1, defaultBytesPerSnapshotChunk)
+		_, err := fixture.svc.GetSnapshotChunk(ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 1, defaultBytesPerSnapshotChunk)
 		done <- err
 	}()
 	<-started
 	for i := 0; i < defaultMaxConcurrentSnapshotChunkRequests-1; i++ {
 		fixture.svc.snapshotChunkPermits <- struct{}{}
 	}
-	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 1, defaultBytesPerSnapshotChunk)
+	_, err = fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 1, defaultBytesPerSnapshotChunk)
 	var capacity *SnapshotCapacityError
 	require.ErrorAs(t, err, &capacity)
 	for i := 0; i < defaultMaxConcurrentSnapshotChunkRequests-1; i++ {
@@ -1585,7 +1887,7 @@ func TestSnapshotChunk_CancellationReleasesPermitAndRetryPreservesOrdinals(t *te
 	fixture.svc.snapshotHooks = nil
 	var ordinals []int64
 	for after := int64(0); ; {
-		chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, after, 1, defaultBytesPerSnapshotChunk)
+		chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, after, 1, defaultBytesPerSnapshotChunk)
 		require.NoError(t, err)
 		for range chunk.Rows {
 			after++
@@ -1599,13 +1901,13 @@ func TestSnapshotChunk_CancellationReleasesPermitAndRetryPreservesOrdinals(t *te
 }
 
 func TestSnapshotHTTP_ByteAndCapacityErrorsAreStructured(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "http_errors", snapshotSessionFixtureOptions{})
 	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
-	var requiredBytes int64
-	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `SELECT wire_byte_count FROM sync.snapshot_session_rows WHERE snapshot_id=$1::uuid`, session.SnapshotID).Scan(&requiredBytes))
 	handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
 
-	request := httptest.NewRequest(http.MethodGet, "/sync/snapshot-sessions/"+session.SnapshotID+"?max_rows=10&max_bytes="+fmt.Sprint(requiredBytes-1), nil)
+	request := httptest.NewRequest(http.MethodGet, "/sync/snapshot-sessions/"+session.SnapshotID+"?max_rows=10&max_bytes=1", nil)
+	setTestSchemaGenerationHeaders(request, fixture.svc)
 	request.SetPathValue("snapshot_id", session.SnapshotID)
 	request = request.WithContext(ContextWithActor(request.Context(), fixture.reader))
 	recorder := httptest.NewRecorder()
@@ -1614,12 +1916,13 @@ func TestSnapshotHTTP_ByteAndCapacityErrorsAreStructured(t *testing.T) {
 	var response ErrorResponse
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
 	require.Equal(t, "snapshot_chunk_too_small", response.Error)
-	require.Equal(t, requiredBytes, response.RequiredByteCount)
+	require.Greater(t, response.RequiredDecodedBodyBytes, int64(1))
 
 	for i := 0; i < cap(fixture.svc.snapshotBuildPermits); i++ {
 		fixture.svc.snapshotBuildPermits <- struct{}{}
 	}
 	request = httptest.NewRequest(http.MethodPost, "/sync/snapshot-sessions", nil)
+	setTestSchemaGenerationHeaders(request, fixture.svc)
 	request = request.WithContext(ContextWithActor(request.Context(), fixture.reader))
 	recorder = httptest.NewRecorder()
 	handlers.HandleCreateSnapshotSession(recorder, request)
@@ -1635,6 +1938,7 @@ func TestSnapshotHTTP_ByteAndCapacityErrorsAreStructured(t *testing.T) {
 		fixture.svc.snapshotChunkPermits <- struct{}{}
 	}
 	request = httptest.NewRequest(http.MethodGet, "/sync/snapshot-sessions/"+session.SnapshotID, nil)
+	setTestSchemaGenerationHeaders(request, fixture.svc)
 	request.SetPathValue("snapshot_id", session.SnapshotID)
 	request = request.WithContext(ContextWithActor(request.Context(), fixture.reader))
 	recorder = httptest.NewRecorder()
@@ -1649,6 +1953,7 @@ func TestSnapshotHTTP_ByteAndCapacityErrorsAreStructured(t *testing.T) {
 }
 
 func TestSnapshotSessions_CleanupExpiredSessionsRemovesRows(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "cleanup", snapshotSessionFixtureOptions{})
 
 	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
@@ -1670,17 +1975,18 @@ func TestSnapshotSessions_CleanupExpiredSessionsRemovesRows(t *testing.T) {
 }
 
 func TestSnapshotCleanup_BatchesAreBoundedAndPreserveUnexpiredAndAuthoritativeState(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "cleanup_bounds", snapshotSessionFixtureOptions{
 		snapshotCleanupInterval: time.Hour, snapshotCleanupBatchRows: 2, snapshotCleanupBatchSessions: 2, snapshotCleanupMaxBatches: 1,
 	})
 	fixture.pushUser(t, 1, uuid.New(), "Alpha")
 	var expired []string
 	for i := 0; i < 3; i++ {
-		session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+		session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 		require.NoError(t, err)
 		expired = append(expired, session.SnapshotID)
 	}
-	unexpired, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	unexpired, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	_, err = fixture.pool.Exec(fixture.ctx, `UPDATE sync.snapshot_sessions SET expires_at=now()-interval '1 second' WHERE snapshot_id=ANY($1::uuid[])`, expired)
 	require.NoError(t, err)
@@ -1699,23 +2005,24 @@ func TestSnapshotCleanup_BatchesAreBoundedAndPreserveUnexpiredAndAuthoritativeSt
 }
 
 func TestSnapshotCleanup_PeriodicPostCreateAndPostBootstrapTriggers(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "cleanup_triggers", snapshotSessionFixtureOptions{snapshotCleanupInterval: 20 * time.Millisecond})
 	first := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
 	_, err := fixture.pool.Exec(fixture.ctx, `UPDATE sync.snapshot_sessions SET expires_at=now()-interval '1 second' WHERE snapshot_id=$1::uuid`, first.SnapshotID)
 	require.NoError(t, err)
-	second, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	second, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return fixture.snapshotSessionCount(t, first.SnapshotID) == 0 }, 5*time.Second, 10*time.Millisecond)
 	_, err = fixture.pool.Exec(fixture.ctx, `UPDATE sync.snapshot_sessions SET expires_at=now()-interval '1 second' WHERE snapshot_id=$1::uuid`, second.SnapshotID)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return fixture.snapshotSessionCount(t, second.SnapshotID) == 0 }, 5*time.Second, 10*time.Millisecond)
 
-	third, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+	third, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	_, err = fixture.pool.Exec(fixture.ctx, `UPDATE sync.snapshot_sessions SET expires_at=now()-interval '1 second' WHERE snapshot_id=$1::uuid`, third.SnapshotID)
 	require.NoError(t, err)
 	require.NoError(t, fixture.svc.Close(fixture.ctx))
-	restarted, err := NewRuntimeService(fixture.pool, fixture.svc.config, integrationTestLogger(slog.LevelWarn))
+	restarted, err := newTestRuntimeService(fixture.pool, fixture.svc.config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = restarted.Close(context.Background()) })
 	fixture.svc = restarted
@@ -1724,13 +2031,14 @@ func TestSnapshotCleanup_PeriodicPostCreateAndPostBootstrapTriggers(t *testing.T
 }
 
 func TestSnapshotCleanup_TwoInstancesUseSkipLocked(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "cleanup_instances", snapshotSessionFixtureOptions{snapshotCleanupInterval: time.Hour, snapshotCleanupBatchRows: 2, snapshotCleanupBatchSessions: 2})
 	fixture.pushUser(t, 1, uuid.New(), "Alpha")
 	for i := 0; i < 4; i++ {
-		_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+		_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 		require.NoError(t, err)
 	}
-	second, err := NewRuntimeService(fixture.pool, fixture.svc.config, integrationTestLogger(slog.LevelWarn))
+	second, err := newTestRuntimeService(fixture.pool, fixture.svc.config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	require.NoError(t, second.Bootstrap(fixture.ctx))
 	t.Cleanup(func() { _ = second.Close(context.Background()) })
@@ -1747,6 +2055,7 @@ func TestSnapshotCleanup_TwoInstancesUseSkipLocked(t *testing.T) {
 }
 
 func TestSnapshotCleanup_SkippedLockedSessionIsDeletedOnRetry(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "cleanup_retry", snapshotSessionFixtureOptions{
 		snapshotCleanupInterval: time.Hour,
 	})
@@ -1772,6 +2081,7 @@ func TestSnapshotCleanup_SkippedLockedSessionIsDeletedOnRetry(t *testing.T) {
 }
 
 func TestSnapshotChunk_InFlightRepeatableReadFinishesAcrossRetirement(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "chunk_retirement", snapshotSessionFixtureOptions{snapshotCleanupInterval: time.Hour})
 	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
 	reached := make(chan struct{})
@@ -1783,23 +2093,24 @@ func TestSnapshotChunk_InFlightRepeatableReadFinishesAcrossRetirement(t *testing
 	}
 	done := make(chan result, 1)
 	go func() {
-		chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+		chunk, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 		done <- result{chunk, err}
 	}()
 	<-reached
-	require.NoError(t, fixture.svc.DeleteSnapshotSession(fixture.ctx, fixture.reader, session.SnapshotID))
+	require.NoError(t, fixture.svc.DeleteSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID))
 	close(release)
 	inFlight := <-done
 	require.NoError(t, inFlight.err)
 	require.Len(t, inFlight.chunk.Rows, 1)
 	fixture.svc.snapshotHooks = nil
-	_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	_, err := fixture.svc.GetSnapshotChunk(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	var expired *SnapshotSessionExpiredError
 	var missing *SnapshotSessionNotFoundError
 	require.True(t, errors.As(err, &expired) || errors.As(err, &missing), "later read must observe retirement: %v", err)
 }
 
 func TestSnapshotSessions_CreateQueryPlanUsesRowStateSnapshotIndex(t *testing.T) {
+	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "plan", snapshotSessionFixtureOptions{})
 	for i := 0; i < 8; i++ {
 		fixture.pushUser(t, int64(i+1), uuid.New(), fmt.Sprintf("User%d", i))
