@@ -849,36 +849,19 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 	if err != nil {
 		return nil, release, err
 	}
-	wireGeneration := generationDescriptor(view.contract)
 	selection, err := selectionFromResolvedGeneration(proof, view)
 	if err != nil {
 		return nil, release, err
 	}
-	if snapshotID == "" {
-		return nil, release, &SnapshotChunkInvalidError{Message: "snapshot_id must be provided"}
-	}
-	if afterRowOrdinal < 0 {
-		return nil, release, &SnapshotChunkInvalidError{Message: "after_row_ordinal must be >= 0"}
-	}
-	if maxRows <= 0 {
-		return nil, release, &SnapshotChunkInvalidError{Message: "max_rows must be > 0"}
-	}
-	if maxBytes <= 0 {
-		return nil, release, &SnapshotChunkInvalidError{Message: "max_bytes must be > 0"}
+	effectiveMaxRows, effectiveMaxBytes, err := s.snapshotChunkLimits(snapshotID, afterRowOrdinal, maxRows, maxBytes)
+	if err != nil {
+		return nil, release, err
 	}
 	if err := withOriginTransaction(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
 		_, _, err := validateSnapshotSessionAccess(ctx, tx, actor, proof, snapshotID)
 		return err
 	}); err != nil {
 		return nil, release, err
-	}
-	effectiveMaxRows := maxRows
-	if effectiveMaxRows > s.maxRowsPerSnapshotChunk() {
-		effectiveMaxRows = s.maxRowsPerSnapshotChunk()
-	}
-	effectiveMaxBytes := maxBytes
-	if effectiveMaxBytes > s.maxBytesPerSnapshotChunk() {
-		effectiveMaxBytes = s.maxBytesPerSnapshotChunk()
 	}
 	physicalStoredPayloadLimit, err := physicalStoredWirePayloadByteLimit(s.maxBytesPerSnapshotRow())
 	if err != nil {
@@ -938,148 +921,10 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 		s.snapshotMetrics.chunkQueries.Add(1)
 		defer queryRows.Close()
 
-		chunkRows := make([]SnapshotRow, 0, effectiveMaxRows)
-		var chunkBytes int64
-		hasMore := false
-		nextRowOrdinal := afterRowOrdinal
-		expectedRowOrdinal := afterRowOrdinal + 1
-		for queryRows.Next() {
-			var (
-				row              SnapshotRow
-				tableID          int32
-				keyBytes         []byte
-				rowOrdinal       int64
-				keyByteCount     int64
-				payloadByteCount int64
-				wireByteCount    int64
-			)
-			if err := queryRows.Scan(&rowOrdinal, &tableID, &keyByteCount, &keyBytes, &row.RowVersion, &payloadByteCount, &row.Payload, &wireByteCount); err != nil {
-				return fmt.Errorf("scan snapshot chunk row: %w", err)
-			}
-			if s.snapshotHooks != nil && s.snapshotHooks.afterSnapshotChunkRowScan != nil {
-				s.snapshotHooks.afterSnapshotChunkRowScan(snapshotPayloadScanObservation{
-					ReportedKeyByteCount: keyByteCount, ReportedPayloadByteCount: payloadByteCount,
-					KeyMaterialized: keyBytes != nil, PayloadMaterialized: row.Payload != nil,
-					MaterializedKeyBytes: len(keyBytes), MaterializedPayloadBytes: len(row.Payload),
-				})
-			}
-			if keyByteCount < 0 || keyByteCount > s.maxBytesPerSnapshotRow() || payloadByteCount < 0 || payloadByteCount > physicalStoredPayloadLimit || keyBytes == nil || row.Payload == nil {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot row payload exceeds its bounded representation")
-			}
-			if rowOrdinal != expectedRowOrdinal {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot row ordinals are invalid")
-			}
-			expectedRowOrdinal++
-			info, err := s.tableInfoForID(tableID)
-			if err != nil {
-				return err
-			}
-			visibleTable, visible := selection.view.tables[Key(info.schemaName, info.tableName)]
-			if !visible || visibleTable.tableID != tableID {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot table is not visible to the generation")
-			}
-			if info.schemaName != visibleTable.contract.Schema || info.tableName != visibleTable.contract.Table {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot table identity is invalid")
-			}
-			row.Schema = info.schemaName
-			row.Table = info.tableName
-			row.Key, err = wireSyncKeyFromBytes(info, keyBytes)
-			if err != nil {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot key is invalid")
-			}
-			if row.RowVersion <= 0 || row.RowVersion > snapshotBundleSeq || wireByteCount <= 0 {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot row metadata is invalid")
-			}
-			payloadObject, err := jcs.DecodeObjectLossless(row.Payload)
-			if err != nil || len(payloadObject) != len(visibleTable.contract.Columns) {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot payload is invalid")
-			}
-			for _, column := range visibleTable.contract.Columns {
-				value, ok := payloadObject[column.Name]
-				if !ok || validateGenerationWireValue(column, value) != nil {
-					return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot payload is invalid")
-				}
-			}
-			if len(visibleTable.contract.SyncKeyColumns) != 1 {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot key contract is invalid")
-			}
-			keyName := visibleTable.contract.SyncKeyColumns[0]
-			keyCanonical, keyErr := jcs.Marshal(row.Key[keyName])
-			payloadCanonical, payloadErr := jcs.Marshal(payloadObject[keyName])
-			if keyErr != nil || payloadErr != nil || string(keyCanonical) != string(payloadCanonical) {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot key does not match payload")
-			}
-			expandedBytes, err := ExpandedRowDecodedBytes(PushRequestRow{
-				Schema: row.Schema, Table: row.Table, Key: row.Key,
-				Op: OpInsert, BaseRowVersion: row.RowVersion, Payload: row.Payload,
-			})
-			if err != nil || expandedBytes > s.maxBytesPerSnapshotRow() {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot row exceeds max_row_decoded_bytes")
-			}
-			_, rowLogicalBytes, err := CompactGroupsForSnapshotRowsAt(wireGeneration, []SnapshotRow{row}, rowOrdinal)
-			if err != nil || rowLogicalBytes != wireByteCount {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot logical byte count is invalid")
-			}
-			candidateRetainedRows := int64(len(chunkRows) + 1)
-			candidateRows := append(append([]SnapshotRow(nil), chunkRows...), row)
-			candidateGroups, candidateLogicalBytes, err := CompactGroupsForSnapshotRowsAt(wireGeneration, candidateRows, afterRowOrdinal+1)
-			if err != nil {
-				return projectionError(GenerationProjectionIntegrityError, "snapshot", "stored snapshot rows cannot be compact encoded")
-			}
-			// Size against the longer final-chunk representation. If the row is not
-			// final, has_more:true can only make the emitted response smaller.
-			candidateBody, err := json.Marshal(CompactSnapshotChunkResponse{Rows: candidateGroups, NextRowOrdinal: rowOrdinal, LogicalByteCount: candidateLogicalBytes, HasMore: false})
-			if err != nil {
-				return fmt.Errorf("encode compact snapshot chunk candidate: %w", err)
-			}
-			candidateRetainedBytes := candidateLogicalBytes
-			if candidateRetainedRows > observation.retainedRowsHighWater {
-				observation.retainedRowsHighWater = candidateRetainedRows
-			}
-			if candidateRetainedBytes > observation.retainedBytesHighWater {
-				observation.retainedBytesHighWater = candidateRetainedBytes
-			}
-			if len(chunkRows) >= effectiveMaxRows || int64(len(candidateBody)) > effectiveMaxBytes {
-				hasMore = true
-				if len(chunkRows) == 0 {
-					moreRows := queryRows.Next()
-					if queryRows.Err() != nil {
-						return fmt.Errorf("determine compact snapshot chunk continuation: %w", queryRows.Err())
-					}
-					candidateBody, err = json.Marshal(CompactSnapshotChunkResponse{Rows: candidateGroups, NextRowOrdinal: rowOrdinal, LogicalByteCount: candidateLogicalBytes, HasMore: moreRows})
-					if err != nil {
-						return fmt.Errorf("encode minimal compact snapshot chunk: %w", err)
-					}
-					if int64(len(candidateBody)) > effectiveMaxBytes {
-						return &SnapshotChunkTooSmallError{RequiredDecodedBodyBytes: int64(len(candidateBody))}
-					}
-					hasMore = moreRows
-					chunkRows = append(chunkRows, row)
-					chunkBytes = candidateLogicalBytes
-					nextRowOrdinal = rowOrdinal
-					break
-				}
-				break
-			}
-			chunkRows = append(chunkRows, row)
-			chunkBytes = candidateLogicalBytes
-			observation.selectedRowsHighWater = int64(len(chunkRows))
-			observation.selectedBytesHighWater = chunkBytes
-			nextRowOrdinal = rowOrdinal
-		}
-		if err := queryRows.Err(); err != nil {
-			return fmt.Errorf("iterate snapshot chunk rows: %w", err)
-		}
-
 		resp = &SnapshotChunkResponse{
-			SnapshotID:        snapshotID,
-			SnapshotBundleSeq: snapshotBundleSeq,
-			Rows:              chunkRows,
-			NextRowOrdinal:    nextRowOrdinal,
-			HasMore:           hasMore,
-			ByteCount:         chunkBytes,
+			SnapshotID: snapshotID, SnapshotBundleSeq: snapshotBundleSeq, NextRowOrdinal: afterRowOrdinal,
 		}
-		return nil
+		return s.selectSnapshotChunkRows(ctx, queryRows, selection, resp, effectiveMaxRows, effectiveMaxBytes, physicalStoredPayloadLimit, &observation)
 	})
 	if err != nil {
 		return nil, release, err
