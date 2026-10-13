@@ -394,10 +394,8 @@ func (c *Client) prepareApplySurvivors(ctx context.Context, tx sqliteTransaction
 		p.unit, p.guard, p.phase = unit, guard, "clear"
 		p.kind = kind
 	}
-	// Old snapshot plans reached ready without traversing the existing scope.
-	// A completed indexed traversal retains its exhausted table cursor.
-	if kind == "snapshot" && p.phase == "ready" && p.table < int64(len(c.config.Tables)) {
-		p.phase, p.table, p.fk, p.cursor, p.atomicWork = "index", 0, -1, sql.NullString{}, 0
+	if kind == "snapshot" && (p.phase == "index" || p.phase == "walk") {
+		return fmt.Errorf("obsolete snapshot count phase requires fresh installation")
 	}
 	if err := saveApplyPlan(ctx, tx, p); err != nil {
 		return err
@@ -454,6 +452,9 @@ func (c *Client) advanceApplySurvivors(ctx context.Context, tx sqliteTransaction
 	case "roots":
 		if p.root == int64(roots) {
 			p.phase, p.fk = "index", -1
+			if p.kind == "snapshot" {
+				p.phase = "ready"
+			}
 			return nil
 		}
 		row, err := seed(int(p.root))
@@ -466,89 +467,12 @@ func (c *Client) advanceApplySurvivors(ctx context.Context, tx sqliteTransaction
 		p.root++
 		return nil
 	case "index":
-		if p.kind == "snapshot" {
-			return c.countSnapshotBusinessStep(ctx, tx, p)
-		}
 		return c.indexApplyStep(ctx, tx, p)
 	case "walk":
-		if p.kind == "snapshot" {
-			return c.countSnapshotBaselineStep(ctx, tx, p)
-		}
 		return c.walkApplyStep(ctx, tx, p)
 	default:
 		return fmt.Errorf("invalid survivor plan phase %q", p.phase)
 	}
-}
-
-// The caller admits 16 units before each cursor step and saves the resulting
-// allowance with the existing plan. No business or checkpoint writes occur.
-func (c *Client) addSnapshotCount(p *applyPlan) error {
-	if p.atomicWork > int64(^uint64(0)>>1)-32 {
-		return &SyncWorkspaceLimitError{Unit: p.unit, Dimension: "atomic_apply_work",
-			Limit: c.config.MaxSyncWorkUnitsPerInvocation, Used: c.syncWorkUsed, Reserved: int64(^uint64(0) >> 1)}
-	}
-	p.atomicWork += 32
-	return nil
-}
-
-func (c *Client) countSnapshotBusinessStep(ctx context.Context, tx sqliteTransaction, p *applyPlan) error {
-	if p.table >= int64(len(c.config.Tables)) {
-		p.phase, p.table, p.fk, p.cursor = "walk", 0, 0, sql.NullString{}
-		return nil
-	}
-	before := p.table
-	table := strings.ToLower(c.config.Tables[p.table].TableName)
-	info, err := c.getTableInfoTx(tx, table)
-	if err != nil {
-		return err
-	}
-	if err = c.nextApplyIndexKey(ctx, tx, p, table, info); err != nil {
-		return err
-	}
-	if p.table == before {
-		return c.addSnapshotCount(p)
-	}
-	return nil
-}
-
-func (c *Client) countSnapshotBaselineStep(ctx context.Context, tx sqliteTransaction, p *applyPlan) error {
-	if p.table >= int64(len(c.config.Tables)) {
-		p.phase = "ready"
-		return nil
-	}
-	table := strings.ToLower(c.config.Tables[p.table].TableName)
-	tail := ` FROM _sync_row_state WHERE schema_name=? AND table_name=?`
-	args := []any{c.schemaForTable(table), table}
-	if p.cursor.Valid {
-		tail += ` AND key_json>?`
-		args = append(args, p.cursor.String)
-	}
-	tail += ` ORDER BY key_json LIMIT 1`
-	var size int64
-	err := scanTransactionRow(ctx, tx, `SELECT length(CAST(key_json AS BLOB))`+tail, args, &size)
-	if errors.Is(err, sql.ErrNoRows) {
-		p.table++
-		p.cursor = sql.NullString{}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	bytes, err := c.workspaceScale(p.unit, size, 18)
-	if err != nil {
-		return err
-	}
-	charge, err := c.addWorkspaceCharge(p.unit, workspaceCharge{3, bytes}, workspaceCharge{0, 128})
-	if err != nil {
-		return err
-	}
-	if err = c.checkApplyWorkspace(p, charge.entries, charge.bytes); err != nil {
-		return err
-	}
-	if err = scanTransactionRow(ctx, tx, `SELECT key_json`+tail, args, &p.cursor); err != nil {
-		return err
-	}
-	return c.addSnapshotCount(p)
 }
 
 // Reserve final apply work and simultaneous copies before business mutation.
@@ -565,7 +489,7 @@ func (c *Client) preflightApplySurvivors(ctx context.Context, tx sqliteTransacti
 		if err := cache.pool.reserveAtomic(ctx, work); err != nil {
 			return err
 		}
-	} else if err := c.reserveSyncWork(ctx, p.unit, work); err != nil {
+	} else if err := c.reserveReadySyncWork(ctx, p.unit, work); err != nil {
 		return err
 	}
 	// Preflight simultaneous intended/live copies before business mutation.

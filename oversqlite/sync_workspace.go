@@ -35,7 +35,7 @@ func workspaceIdentityValid(value string) bool {
 // Scalar counters and the finite allocation records are one writer-owned
 // snapshot. Opening a Client or starting a transaction never reclaims it.
 func (c *Client) loadWorkspaceReservations(ctx context.Context, tx sqliteTransaction) ([]workspaceReservation, error) {
-	if err := c.validateWorkspaceReservationMetadata(ctx, tx, false); err != nil {
+	if err := c.validateWorkspaceReservationMetadata(ctx, tx); err != nil {
 		return nil, err
 	}
 	var text string
@@ -280,7 +280,7 @@ func reconcileWorkspaceOwners(ctx context.Context, q upgradeQueryer, config *Con
 		cursor := int64(math.MinInt64)
 		total := workspaceCharge{}
 		for {
-			if err := c.reserveSyncWork(ctx, unit, 8); err != nil {
+			if err := ctx.Err(); err != nil {
 				return err
 			}
 			var ordinal, stored, expected int64
@@ -328,7 +328,7 @@ func reclaimWorkspaceReservations(ctx context.Context, tx sqliteTransaction, con
 
 // Reclamation needs no host copy of an abandoned JSON ledger. Inspect bounded
 // scalar records using a single streaming cursor, with work/cancellation checks.
-func (c *Client) validateWorkspaceReservationMetadata(ctx context.Context, tx sqliteTransaction, meter ...bool) (resultErr error) {
+func (c *Client) validateWorkspaceReservationMetadata(ctx context.Context, tx sqliteTransaction) (resultErr error) {
 	var entries, bytes, empty, valid int64
 	err := scanTransactionRow(ctx, tx, `SELECT reserved_entries,reserved_bytes,workspace_context='',CASE WHEN workspace_context='' THEN 1 ELSE json_valid(workspace_context) END FROM _sync_operation_state WHERE singleton_key=1`, nil, &entries, &bytes, &empty, &valid)
 	if err != nil {
@@ -363,10 +363,8 @@ func (c *Client) validateWorkspaceReservationMetadata(ctx context.Context, tx sq
 	total := workspaceCharge{}
 	count := 0
 	for rows.Next() {
-		if len(meter) == 0 || meter[0] {
-			if err = c.reserveSyncWork(ctx, applyUnit("reservation-reconciliation", 0, ""), 16); err != nil {
-				return err
-			}
+		if err = ctx.Err(); err != nil {
+			return err
 		}
 		var kind, entryKind, byteKind string
 		var fields, a, b, d, hexA, hexB, hexD int64
@@ -403,7 +401,7 @@ func (c *Client) validateWorkspaceReservationMetadata(ctx context.Context, tx sq
 }
 
 const (
-	defaultSyncWorkspaceEntries = 100000
+	defaultSyncWorkspaceEntries = 131072
 	defaultSyncWorkspaceBytes   = 256 << 20
 	defaultSyncWorkUnits        = 1000000
 )
@@ -434,20 +432,45 @@ func (e *SyncWorkspaceLimitError) Error() string {
 }
 
 func (c *Client) reserveSyncWork(ctx context.Context, unit string, work int64) error {
+	return c.reserveSyncWorkKind(ctx, unit, work, false)
+}
+
+func (c *Client) reserveReadySyncWork(ctx context.Context, unit string, work int64) error {
+	return c.reserveSyncWorkKind(ctx, unit, work, true)
+}
+
+func saturatingWorkAdd(used, work int64) int64 {
+	if work > math.MaxInt64-used {
+		return math.MaxInt64
+	}
+	return used + work
+}
+
+func saturatingWorkMultiply(count, weight int64) int64 {
+	if count > math.MaxInt64/weight {
+		return math.MaxInt64
+	}
+	return count * weight
+}
+
+func (c *Client) reserveSyncWorkKind(ctx context.Context, unit string, work int64, readyAtomic bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	limit := c.config.MaxSyncWorkUnitsPerInvocation
-	if work < 0 || c.syncWorkUsed < 0 || c.syncWorkUsed > limit {
+	if work < 0 || c.syncWorkUsed < 0 {
 		return fmt.Errorf("invalid sync work accounting")
 	}
-	if work > limit {
-		return &SyncWorkspaceLimitError{Unit: unit, Dimension: "atomic_apply_work", Limit: limit, Used: c.syncWorkUsed, Reserved: work}
+	if work == 0 {
+		return nil
 	}
-	if work > limit-c.syncWorkUsed {
+	if c.syncWorkUsed >= limit && (!readyAtomic || c.readyAtomicUnitDispatched) {
 		return &SyncWorkLimitError{Unit: unit, Limit: limit, Used: c.syncWorkUsed}
 	}
-	c.syncWorkUsed += work
+	if readyAtomic {
+		c.readyAtomicUnitDispatched = true
+	}
+	c.syncWorkUsed = saturatingWorkAdd(c.syncWorkUsed, work)
 	return nil
 }
 
@@ -964,22 +987,19 @@ func (p *statementReservation) release(ctx context.Context) error {
 	return nil
 }
 func (p *statementReservation) reserveAtomic(ctx context.Context, original int64) error {
-	extra, err := p.client.workspaceScale(p.scope.unit, original, 8)
-	if err != nil {
+	if original < 0 {
+		return fmt.Errorf("invalid atomic work estimate")
+	}
+	extra := int64(math.MaxInt64)
+	if original <= math.MaxInt64/8 {
+		extra = original * 8
+	}
+	credits := saturatingWorkAdd(extra, 4096)
+	if err := p.client.reserveReadySyncWork(ctx, p.scope.unit, saturatingWorkAdd(original, credits)); err != nil {
 		return err
 	}
-	total, err := p.client.sumWorkspaceCharges(p.scope.unit, workspaceCharge{0, original}, workspaceCharge{0, extra}, workspaceCharge{0, 4096 + p.cleanupWork})
-	if err != nil {
-		return err
-	}
-	if total.bytes > p.client.config.MaxSyncWorkUnitsPerInvocation {
-		return &SyncWorkspaceLimitError{Unit: p.scope.unit, Dimension: "atomic_apply_work", Limit: p.client.config.MaxSyncWorkUnitsPerInvocation, Used: p.client.syncWorkUsed, Reserved: total.bytes}
-	}
-	if err = p.client.reserveSyncWork(ctx, p.scope.unit, original+extra+4096); err != nil {
-		return err
-	}
-	p.scope.statementWork += extra + 4096
+	p.scope.statementWork = saturatingWorkAdd(p.scope.statementWork, credits)
 	p.atomic = true
-	p.credits = extra + 4096
+	p.credits = credits
 	return nil
 }

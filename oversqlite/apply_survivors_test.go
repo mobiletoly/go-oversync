@@ -82,7 +82,7 @@ func TestA1PullResumesDiscoveryAfterReopen(t *testing.T) {
 }
 
 func TestA1CapacityFailurePreservesBusinessAndCheckpoint(t *testing.T) {
-	for _, dimension := range []string{"entries", "bytes", "atomic_apply_work"} {
+	for _, dimension := range []string{"entries", "bytes"} {
 		t.Run(dimension, func(t *testing.T) {
 			c, db := newA1SurvivorClient(t)
 			switch dimension {
@@ -90,8 +90,6 @@ func TestA1CapacityFailurePreservesBusinessAndCheckpoint(t *testing.T) {
 				c.config.MaxSyncWorkspaceEntries = 2
 			case "bytes":
 				c.config.MaxSyncWorkspaceBytes = 600
-			case "atomic_apply_work":
-				c.config.MaxSyncWorkUnitsPerInvocation = 100
 			}
 			for attempt := 0; attempt < 8; attempt++ {
 				setPullResponses(t, c, oversync.PullResponse{StableBundleSeq: 2, Bundles: []oversync.Bundle{pullBundle(2, "peer", 1, a1NormalizedEffects(t)...)}})
@@ -109,9 +107,35 @@ func TestA1CapacityFailurePreservesBusinessAndCheckpoint(t *testing.T) {
 				require.Equal(t, 4, count)
 				return
 			}
-			t.Fatal("intrinsically oversized atomic apply must not spin")
+			t.Fatal("hard workspace refusal did not occur")
 		})
 	}
+}
+
+func TestA1SmallWorkTargetEventuallyApplies(t *testing.T) {
+	c, db := newA1SurvivorClient(t)
+	c.config.MaxSyncWorkUnitsPerInvocation = 100
+	for attempt := 0; attempt < 32; attempt++ {
+		setPullResponses(t, c, oversync.PullResponse{StableBundleSeq: 2, Bundles: []oversync.Bundle{pullBundle(2, "peer", 1, a1NormalizedEffects(t)...)}})
+		_, err := c.PullToStable(context.Background())
+		if err == nil {
+			requireA1Survivors(t, db)
+			requireLastBundleSeqSeen(t, c, context.Background(), 2)
+			return
+		}
+		var work *SyncWorkLimitError
+		require.ErrorAs(t, err, &work)
+		checkpoint := countA3(t, db, `SELECT last_bundle_seq_seen FROM _sync_attachment_state`)
+		switch checkpoint {
+		case 1:
+			require.EqualValues(t, 4, countA3(t, db, `SELECT count(*) FROM nodes`))
+		case 2:
+			requireA1Survivors(t, db)
+		default:
+			t.Fatalf("unexpected checkpoint %d after work yield", checkpoint)
+		}
+	}
+	t.Fatal("small work target did not make useful progress to atomic apply")
 }
 
 func a1NormalizedEffects(t *testing.T) []oversync.BundleRow {

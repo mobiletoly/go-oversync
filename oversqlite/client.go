@@ -37,26 +37,27 @@ type Client struct {
 	db *sql.DB
 	// ownsDB is false only for package-internal lower-level test fixtures.
 	// Every client published by Opening owns its pool.
-	ownsDB       bool
-	BaseURL      string
-	Token        func(context.Context) (string, error) // returns JWT
-	UserID       string
-	Resolver     Resolver
-	HTTP         *http.Client
-	config       *Config
-	a3Stats      a3AccountingStats
-	syncWorkUsed int64 // owned by writeMu; one allowance across all bundles in an invocation
-	logger       *slog.Logger
-	writeMu      sync.Mutex // Serialize write operations to prevent SQLite locking issues
-	pkByTable    map[string]string
-	keyByTable   map[string][]string
-	tableOrder   map[string]int
-	tableInfo    *TableInfoProvider
-	closed       uint32
-	loopState    uint32
-	loopMu       sync.Mutex
-	loopCancel   context.CancelFunc
-	loopDone     chan struct{}
+	ownsDB                    bool
+	BaseURL                   string
+	Token                     func(context.Context) (string, error) // returns JWT
+	UserID                    string
+	Resolver                  Resolver
+	HTTP                      *http.Client
+	config                    *Config
+	a3Stats                   a3AccountingStats
+	syncWorkUsed              int64 // owned by writeMu; one allowance across all bundles in an invocation
+	readyAtomicUnitDispatched bool
+	logger                    *slog.Logger
+	writeMu                   sync.Mutex // Serialize write operations to prevent SQLite locking issues
+	pkByTable                 map[string]string
+	keyByTable                map[string][]string
+	tableOrder                map[string]int
+	tableInfo                 *TableInfoProvider
+	closed                    uint32
+	loopState                 uint32
+	loopMu                    sync.Mutex
+	loopCancel                context.CancelFunc
+	loopDone                  chan struct{}
 
 	// Pause switches (atomic): allow callers to suspend sync activity deterministically
 	uploadPaused             int32
@@ -220,6 +221,7 @@ func (c *Client) tryBeginSyncOperation() error {
 		return &ClientClosedError{}
 	}
 	c.syncWorkUsed = 0
+	c.readyAtomicUnitDispatched = false
 	c.a3Stats = a3AccountingStats{}
 	return nil
 }
@@ -550,7 +552,7 @@ const (
 
 // Config holds configuration for the SQLite sync client
 type Config struct {
-	MaxSyncWorkspaceEntries       int64                                 // zero selects 100000
+	MaxSyncWorkspaceEntries       int64                                 // zero selects 131072
 	MaxSyncWorkspaceBytes         int64                                 // zero selects 256 MiB
 	MaxSyncWorkUnitsPerInvocation int64                                 // zero selects 1000000
 	GenerationID                  oversync.SchemaGenerationID           // Explicit generation resolved on attachment; no network during construction.

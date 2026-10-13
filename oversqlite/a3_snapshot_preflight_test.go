@@ -13,7 +13,6 @@ type snapshotCountingTx struct {
 	sqliteTransaction
 	fullCounts int
 	visits     int
-	cancel     context.CancelFunc
 }
 
 func (tx *snapshotCountingTx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
@@ -24,9 +23,6 @@ func (tx *snapshotCountingTx) QueryRowContext(ctx context.Context, query string,
 	if strings.Contains(query, "ORDER BY") && strings.Contains(query, "LIMIT 1") &&
 		(strings.Contains(query, "FROM \"nodes\"") || strings.Contains(query, "FROM _sync_row_state")) {
 		tx.visits++
-		if tx.cancel != nil {
-			tx.cancel()
-		}
 	}
 	return tx.sqliteTransaction.QueryRowContext(ctx, query, args...)
 }
@@ -42,6 +38,7 @@ func TestA3SnapshotPreflight_BoundedResume(t *testing.T) {
 	unit := applyUnit("snapshot", 2, "bounded-empty")
 	prepare := func(used int64) (*applyPlan, int, int, error) {
 		c.syncWorkUsed = used
+		c.readyAtomicUnitDispatched = false
 		tx, e := db.BeginTx(context.Background(), nil)
 		require.NoError(t, e)
 		tracked := &snapshotCountingTx{sqliteTransaction: tx}
@@ -52,37 +49,39 @@ func TestA3SnapshotPreflight_BoundedResume(t *testing.T) {
 		return p, tracked.fullCounts, tracked.visits, e
 	}
 	p, counts, visits, err := prepare(100000 - 128)
-	require.Zero(t, counts, "scope counting must follow admitted indexed steps")
-	var limit *SyncWorkLimitError
-	require.ErrorAs(t, err, &limit)
-	require.Greater(t, p.atomicWork, int64(0))
-	require.LessOrEqual(t, visits, 16)
-	require.NotEqual(t, "ready", p.phase)
-	retained := p.cursor.String
-	require.NotEmpty(t, retained)
+	require.NoError(t, err)
+	require.Zero(t, counts, "snapshot preparation must not scan old business or A scope")
+	require.Zero(t, visits)
+	require.Equal(t, "ready", p.phase)
+	require.Zero(t, p.atomicWork)
+	require.Greater(t, c.syncWorkUsed, c.config.MaxSyncWorkUnitsPerInvocation-128,
+		"first ready atomic unit must proceed after retained preparation")
 	p, counts, visits, err = prepare(0)
 	require.NoError(t, err)
 	require.Zero(t, counts)
-	require.EqualValues(t, 208*32, p.atomicWork)
-	require.EqualValues(t, len(c.config.Tables), p.table)
-	require.Less(t, visits, 208*2, "resume must not recount the retained prefix")
+	require.Zero(t, p.atomicWork)
+	require.Zero(t, visits, "ready plan must not traverse old scope")
 	_, counts, visits, err = prepare(0)
 	require.NoError(t, err)
 	require.Zero(t, counts)
-	require.Zero(t, visits, "a ready plan reuses its admitted scope count")
+	require.Zero(t, visits, "ready plan must not traverse old scope")
 	require.EqualValues(t, 104, countA3(t, db, "SELECT count(*) FROM nodes"))
 	require.EqualValues(t, 104, countA3(t, db, "SELECT count(*) FROM _sync_row_state"))
 	requireLastBundleSeqSeen(t, c, context.Background(), 1)
 }
 
-func TestA3SnapshotPreflight_CancelDuringCounting(t *testing.T) {
+func TestA3SnapshotPreflight_CancelDuringPreparation(t *testing.T) {
 	c, db := newA1SurvivorClient(t, 100)
 	tx, err := db.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	tracked := &snapshotCountingTx{sqliteTransaction: tx, cancel: cancel}
-	err = c.prepareApplySurvivors(ctx, tracked, applyUnit("snapshot", 2, "cancel-count"), 0, nil, "snapshot")
+	tracked := &snapshotCountingTx{sqliteTransaction: tx}
+	err = c.prepareApplySurvivors(ctx, tracked, applyUnit("snapshot", 2, "cancel-preparation"), 1,
+		func(int) (applySurvivor, error) {
+			cancel()
+			return applySurvivor{table: "nodes", pk: "new", role: "intended"}, nil
+		}, "snapshot")
 	require.ErrorIs(t, err, context.Canceled)
 	require.NoError(t, tx.Rollback())
 	require.EqualValues(t, 104, countA3(t, db, "SELECT count(*) FROM nodes"))

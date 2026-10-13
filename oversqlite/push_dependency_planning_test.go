@@ -56,32 +56,33 @@ func TestPushDependencyPlanning_EntryLookupIsBoundedAndCharged(t *testing.T) {
 				require.NoError(t, err)
 				tx := &pushEntryObservedTx{sqliteTransaction: base, t: t, client: c, stepWork: step}
 				_, ready, err := c.advancePushPlanInTx(context.Background(), tx)
-				if oneStep {
-					require.NoError(t, err)
-					require.Equal(t, count == 0, ready)
-					require.NoError(t, base.Commit())
-					require.Equal(t, step, c.syncWorkUsed)
-					expectedQueries := 3
-					if count == 0 {
-						expectedQueries = 1
-					}
-					require.Len(t, tx.dirtyQueries, expectedQueries)
-				} else {
+				require.NoError(t, err)
+				require.Equal(t, count == 0, ready)
+				require.NoError(t, base.Commit())
+				require.Equal(t, step, c.syncWorkUsed)
+				expectedQueries := 3
+				if count == 0 {
+					expectedQueries = 1
+				}
+				require.Len(t, tx.dirtyQueries, expectedQueries)
+				if !oneStep {
+					next, e := db.Begin()
+					require.NoError(t, e)
+					_, _, e = c.advancePushPlanInTx(context.Background(), next)
 					var work *SyncWorkLimitError
-					require.ErrorAs(t, err, &work)
-					require.NoError(t, base.Rollback())
-					require.Empty(t, tx.dirtyQueries)
-					require.Zero(t, c.syncWorkUsed)
+					require.ErrorAs(t, e, &work)
+					require.Equal(t, step, work.Used)
+					require.NoError(t, next.Rollback())
 				}
 				require.Equal(t, before, qualificationState(t, db, "users"))
 				var nodes int
 				require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_nodes`).Scan(&nodes))
 				expectedNodes := 0
-				if oneStep && count > 0 {
+				if count > 0 {
 					expectedNodes = 1
 				}
 				require.Equal(t, expectedNodes, nodes)
-				if oneStep {
+				{
 					rows, e := db.Query("EXPLAIN " + tx.dirtyQueries[0])
 					require.NoError(t, e)
 					var opcodes []string

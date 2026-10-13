@@ -59,14 +59,24 @@ func TestA3Workspace_Boundaries(t *testing.T) {
 	c.config.MaxSyncWorkUnitsPerInvocation = 17
 	for _, work := range []int64{16, 17, 18} {
 		c.syncWorkUsed = 0
+		c.readyAtomicUnitDispatched = false
 		err = c.reserveSyncWork(context.Background(), unit, work)
-		if work > 17 {
-			require.ErrorAs(t, err, &limit)
-			require.Equal(t, "atomic_apply_work", limit.Dimension)
-		} else {
-			require.NoError(t, err)
+		require.NoError(t, err)
+		require.Equal(t, work, c.syncWorkUsed)
+		if work == 16 {
+			require.NoError(t, c.reserveSyncWork(context.Background(), unit, 1))
 		}
+		var pending *SyncWorkLimitError
+		require.ErrorAs(t, c.reserveSyncWork(context.Background(), unit, 1), &pending)
+		require.EqualValues(t, 17, pending.Limit)
 	}
+	c.syncWorkUsed = 17
+	c.readyAtomicUnitDispatched = false
+	require.NoError(t, c.reserveReadySyncWork(context.Background(), unit, 1_000_000))
+	require.EqualValues(t, 1_000_017, c.syncWorkUsed)
+	var later *SyncWorkLimitError
+	require.ErrorAs(t, c.reserveReadySyncWork(context.Background(), unit, 1), &later)
+	require.EqualValues(t, 1_000_017, later.Used)
 	c.config.MaxSyncWorkUnitsPerInvocation = 1000000
 	_, err = db.Exec(`UPDATE _sync_snapshot_stage SET payload='{}'`)
 	require.NoError(t, err)

@@ -418,12 +418,8 @@ func (c *Client) prepareSettlementIntent(ctx context.Context, tx sqliteTransacti
 		if err = c.preserveSettlementException(ctx, tx, p, desired, size); err != nil {
 			return finishApplyPreparationStep(ctx, tx, p, err)
 		}
-		// All 64 allowed comparisons/restores, final verification, and keyset
-		// metadata visits are prepaid before the atomic mutation starts.
-		if p.atomicWork > int64(^uint64(0)>>1)-1024 {
-			return &SyncWorkspaceLimitError{Unit: p.unit, Dimension: "atomic_apply_work", Limit: c.config.MaxSyncWorkUnitsPerInvocation, Used: c.syncWorkUsed, Reserved: int64(^uint64(0) >> 1)}
-		}
-		p.atomicWork += 1024
+		// Keep an approximate saturated estimate for the ready atomic unit.
+		p.atomicWork = saturatingWorkAdd(p.atomicWork, 1024)
 		p.preserve = key
 		if err = finishApplyPreparationStep(ctx, tx, p, nil); err != nil {
 			return err
@@ -461,10 +457,10 @@ func (c *Client) atomicApplyWork(p *applyPlan, roots int64) (int64, error) {
 		terms = [][2]int64{{roots, 32}, {p.entries, 1024}, {p.edgeEntries, 4}, {1, 64}}
 	}
 	for _, term := range terms {
-		if term[0] < 0 || term[0] > (int64(^uint64(0)>>1)-work)/term[1] {
-			return 0, &SyncWorkspaceLimitError{Unit: p.unit, Dimension: "atomic_apply_work", Limit: c.config.MaxSyncWorkUnitsPerInvocation, Used: c.syncWorkUsed, Reserved: int64(^uint64(0) >> 1)}
+		if term[0] < 0 {
+			return 0, fmt.Errorf("invalid atomic work estimate")
 		}
-		work += term[0] * term[1]
+		work = saturatingWorkAdd(work, saturatingWorkMultiply(term[0], term[1]))
 	}
 	return work, nil
 }

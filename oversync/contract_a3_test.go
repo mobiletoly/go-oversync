@@ -115,9 +115,9 @@ func TestContractCorpus_A3Workspace(t *testing.T) {
 	// Canonical JSON pins all physical fields, checks, indexes, charge formula and ownership.
 	inventory, err := json.Marshal(f["physicalInventory"])
 	require.NoError(t, err)
-	require.Equal(t, "9d32f6a618ebc62691bbe78c138f7778f68df9ea7bc269dcf25347728ea98259", fmt.Sprintf("%x", sha256.Sum256(inventory)))
+	require.Equal(t, "8580a0f75f18fc4eebd3604bc9c2142b866eb85af07f40b368752f27f45117b0", fmt.Sprintf("%x", sha256.Sum256(inventory)))
 	require.Equal(t, []any{"second-supported-handle", "live-buffer-cancellation", "physical-owner-death-and-reacquisition", "old-partial-tampered-format-rejection", "paged-settlement-backlog", "trigger-live-deviation-preservation"}, f["runtimeObligations"])
-	a3Cases(t, f, []string{"aggregate-exact", "aggregate-entries-first", "aggregate-bytes", "aggregate-below", "aggregate-overflow", "work-remaining", "work-intrinsic", "work-exact", "work-cancelled", "transfer-release-once", "page-row-cap", "page-byte-cap", "page-large-one", "guard-exact", "guard-changed-limits", "guard-changed-dirty", "guard-changed-baseline", "guard-changed-attachment", "guard-changed-input"}, a3WorkspaceResult)
+	a3Cases(t, f, []string{"aggregate-exact", "aggregate-entries-first", "aggregate-bytes", "aggregate-below", "aggregate-overflow", "work-remaining", "work-intrinsic", "work-exact", "work-cancelled", "work-ready-after-validation", "work-after-overshoot", "work-saturates", "transfer-release-once", "page-row-cap", "page-byte-cap", "page-large-one", "guard-exact", "guard-changed-limits", "guard-changed-dirty", "guard-changed-baseline", "guard-changed-attachment", "guard-changed-input"}, a3WorkspaceResult)
 }
 
 func a3WorkspaceResult(t *testing.T, kind string, in a3Object) a3Object {
@@ -125,24 +125,28 @@ func a3WorkspaceResult(t *testing.T, kind string, in a3Object) a3Object {
 	case "aggregate":
 		return a3Aggregate(t, in)
 	case "work":
-		a3Fields(t, in, "limit used required cancelled")
+		a3Fields(t, in, "limit used required cancelled firstReady")
 		limit, used, requested := a3Int(t, in, "limit"), a3Int(t, in, "used"), a3Int(t, in, "required")
 		cancelled, ok := in["cancelled"].(bool)
 		require.True(t, ok)
-		require.LessOrEqual(t, used, limit)
-		result, ready := "fits", true
+		firstReady, ok := in["firstReady"].(bool)
+		require.True(t, ok)
+		require.Positive(t, limit)
+		result := "fits"
 		switch {
 		case cancelled:
 			result = "cancelled"
-		case requested > limit:
-			result, ready = "atomic_apply_work", false
-		case requested > limit-used:
+		case !firstReady && used >= limit:
 			result = "sync_work_limit"
 		}
 		if result == "fits" {
-			used += requested
+			if requested > math.MaxInt64-used {
+				used = math.MaxInt64
+			} else {
+				used += requested
+			}
 		}
-		return a3Object{"result": result, "used": used, "reserved": requested, "ready": ready, "businessChanged": result == "fits"}
+		return a3Object{"result": result, "used": used, "reserved": requested, "ready": true, "businessChanged": result == "fits"}
 	case "reservation":
 		return a3Reservation(t, in)
 	case "page":

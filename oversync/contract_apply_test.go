@@ -40,8 +40,8 @@ func TestContractCorpus_LocalApply(t *testing.T) {
 	}
 	readContractFixture(t, root, "local-apply/a1.json", &fixture)
 	require.Equal(t, 1, fixture.FormatVersion)
-	require.Equal(t, map[string]int64{"entries": 100000, "bytes": 256 << 20, "work": 1000000}, fixture.Defaults)
-	require.Len(t, fixture.Results, 4)
+	require.Equal(t, map[string]int64{"entries": 131072, "bytes": 256 << 20, "work": 1000000}, fixture.Defaults)
+	require.Len(t, fixture.Results, 3)
 	for _, result := range fixture.Results {
 		require.False(t, result.AdvancesCheckpoint)
 		require.Equal(t, result.Reason == "sync_work_limit", result.Resumable)
@@ -49,7 +49,7 @@ func TestContractCorpus_LocalApply(t *testing.T) {
 			require.Equal(t, "work", result.Dimension)
 		} else {
 			require.Equal(t, "sync_workspace_limit", result.Reason)
-			require.Contains(t, []string{"entries", "bytes", "atomic_apply_work"}, result.Dimension)
+			require.Contains(t, []string{"entries", "bytes"}, result.Dimension)
 		}
 	}
 	for _, revision := range fixture.RevisionCases {

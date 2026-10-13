@@ -178,15 +178,7 @@ func newPushUnit() (string, error) {
 	return fmt.Sprintf("%x", bytes), err
 }
 func (c *Client) chargePushWork(ctx context.Context, unit string, units int64) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	limit := c.config.MaxSyncWorkUnitsPerInvocation
-	if units > limit-c.syncWorkUsed {
-		return &SyncWorkLimitError{Unit: unit, Limit: limit, Used: c.syncWorkUsed}
-	}
-	c.syncWorkUsed += units
-	return nil
+	return c.reserveSyncWork(ctx, unit, units)
 }
 func (c *Client) pushWorkspace(ctx context.Context, tx sqliteTransaction, p *pushPlan, entries, bytes int64) error {
 	stateBytes, err := c.workspaceScale(p.Unit, int64(len(p.Unit)+len(p.Guard)+len(p.SeedSchema)+len(p.SeedTable)+len(p.SeedKey)+len(p.InitializationID)), 6)
@@ -1108,10 +1100,11 @@ func (c *Client) reserveSelectedPushCopies(ctx context.Context, tx sqliteTransac
 	if e != nil {
 		return e
 	}
-	if p.CandidateRows > (math.MaxInt64-32)/rowWork {
-		return &SyncWorkspaceLimitError{Unit: p.Unit, Dimension: "atomic_apply_work", Limit: c.config.MaxSyncWorkUnitsPerInvocation, Reserved: math.MaxInt64}
+	if p.CandidateRows < 0 {
+		return fmt.Errorf("invalid candidate row count")
 	}
-	if err := c.reserveSyncWork(ctx, p.Unit, 32+p.CandidateRows*rowWork); err != nil {
+	readyWork := saturatingWorkAdd(32, saturatingWorkMultiply(p.CandidateRows, rowWork))
+	if err := c.reserveReadySyncWork(ctx, p.Unit, readyWork); err != nil {
 		return err
 	}
 	var copyBytes int64

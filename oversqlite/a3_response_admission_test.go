@@ -28,12 +28,11 @@ func TestA3ResponseAdmission_ReadPhases(t *testing.T) {
 			require.Same(t, err, c.withSyncErrorProgress(ctx, err))
 			// Exercise encoded page/join and decoded page/join respectively.
 			if allowance == 15 {
-				var space *SyncWorkspaceLimitError
-				require.ErrorAs(t, err, &space)
-				require.Equal(t, "atomic_apply_work", space.Dimension)
-				require.Equal(t, unit, space.Unit)
-				require.EqualValues(t, 16, space.Reserved)
-				require.EqualValues(t, 1, space.Progress.DirtyRows)
+				var work *SyncWorkLimitError
+				require.ErrorAs(t, err, &work)
+				require.Equal(t, unit, work.Unit)
+				require.EqualValues(t, 16, work.Used, "the admitted bounded step crosses the soft target")
+				require.EqualValues(t, 1, work.Progress.DirtyRows)
 			} else {
 				var work *SyncWorkLimitError
 				require.ErrorAs(t, err, &work)

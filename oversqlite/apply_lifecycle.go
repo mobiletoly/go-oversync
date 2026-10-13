@@ -18,10 +18,10 @@ type applyInputSequenceKey struct{}
 
 func (c *Client) lifecycleAtomicWork(ctx context.Context, tx sqliteTransaction, p *applyPlan, work int64) (int64, error) {
 	add := func(count, weight int64) error {
-		if count < 0 || weight <= 0 || count > (int64(^uint64(0)>>1)-work)/weight {
-			return &SyncWorkspaceLimitError{Unit: p.unit, Dimension: "atomic_apply_work", Limit: c.config.MaxSyncWorkUnitsPerInvocation, Used: c.syncWorkUsed, Reserved: int64(^uint64(0) >> 1)}
+		if count < 0 || weight <= 0 {
+			return fmt.Errorf("invalid atomic work estimate")
 		}
-		work += count * weight
+		work = saturatingWorkAdd(work, saturatingWorkMultiply(count, weight))
 		return nil
 	}
 	var maxFKs int64

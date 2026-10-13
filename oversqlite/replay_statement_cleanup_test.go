@@ -514,11 +514,13 @@ func TestReplayStatementCleanup_PlanSaveWorkBoundary(t *testing.T) {
 				err = saveApplyPlan(ctx, q, &reset)
 				charged, statementCharged := c.syncWorkUsed-used, lease.statementWork-statementWork
 				want := &reset
-				if remaining < 30 {
+				if remaining == 0 {
 					var refusal *SyncWorkLimitError
 					require.ErrorAs(t, err, &refusal)
 					want = old
 				} else {
+					// The complete save is one bounded preparation step. Positive
+					// room admits it even when its 30 units cross the soft target.
 					require.NoError(t, err)
 				}
 				require.NoError(t, cache.closeAndRelease(ctx))
@@ -540,7 +542,7 @@ func TestReplayStatementCleanup_PlanSaveWorkBoundary(t *testing.T) {
 					return p
 				}
 				require.Equal(t, want, load(durable), "all 18 durable fields must come from one complete save")
-				if remaining < 30 {
+				if remaining == 0 {
 					require.Zero(t, charged, "refusal must precede both writes and their work debit")
 					require.Zero(t, statementCharged)
 				} else {
