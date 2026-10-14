@@ -437,23 +437,8 @@ func (c *Client) doAuthenticatedBoundedRequestWithRetryAsSource(
 			if err != nil {
 				return boundedResponsePayload{}, err
 			}
-			retryable := result.statusCode == http.StatusBadGateway || result.statusCode == http.StatusServiceUnavailable || result.statusCode == http.StatusGatewayTimeout
-			if result.statusCode == http.StatusTooManyRequests {
-				if transientErrorCodes == nil {
-					retryable = true
-				} else if errorResp, ok := decodeServerErrorResponse(result.body); ok {
-					if _, capacity := transientErrorCodes[errorResp.Error]; capacity {
-						return boundedResponsePayload{}, &snapshotCapacityHTTPError{
-							errorCode:  errorResp.Error,
-							retryAfter: parseRetryAfterDeltaSeconds(result.retryAfter),
-						}
-					}
-				}
-			}
-			if retryable {
-				return boundedResponsePayload{}, &retryHTTPError{
-					Operation: operation, StatusCode: result.statusCode,
-				}
+			if err := classifyBoundedRetryResponse(result, operation, transientErrorCodes); err != nil {
+				return boundedResponsePayload{}, err
 			}
 			return result, nil
 		})
@@ -491,6 +476,29 @@ func (c *Client) doAuthenticatedBoundedRequestWithRetryAsSource(
 		}
 		atomic.AddInt64(&c.snapshotStats.capacityWaitNanos, int64(time.Since(waitStarted)))
 	}
+}
+
+// Classify a decoded HTTP failure before retry scheduling. Snapshot capacity keeps
+// its separate elapsed budget; ordinary history capacity retains transport attempts.
+func classifyBoundedRetryResponse(result boundedResponsePayload, operation string, transientErrorCodes map[string]struct{}) error {
+	retryable := result.statusCode == http.StatusBadGateway || result.statusCode == http.StatusServiceUnavailable || result.statusCode == http.StatusGatewayTimeout
+	if result.statusCode == http.StatusTooManyRequests {
+		if transientErrorCodes == nil {
+			retryable = true
+		} else if response, ok := decodeServerErrorResponse(result.body); ok {
+			if _, capacity := transientErrorCodes[response.Error]; capacity {
+				return &snapshotCapacityHTTPError{errorCode: response.Error, retryAfter: parseRetryAfterDeltaSeconds(result.retryAfter)}
+			}
+		}
+	}
+	if !retryable {
+		return nil
+	}
+	var retryAfter time.Duration
+	if isHistoryProjectionCapacityResponse(result) {
+		retryAfter = parseRetryAfterDeltaSeconds(result.retryAfter)
+	}
+	return &retryHTTPError{Operation: operation, StatusCode: result.statusCode, retryAfter: retryAfter}
 }
 
 func parseRetryAfterDeltaSeconds(value string) time.Duration {

@@ -24,7 +24,11 @@ func TestA3ResponseAdmission_ReadPhases(t *testing.T) {
 			c.syncWorkUsed = 0
 			c.config.MaxSyncWorkUnitsPerInvocation = allowance
 			c.HTTP = &http.Client{Transport: a3ResponseTransport{}}
-			_, err = c.executeBoundedRequest(ctx, "push", mustA3Request(t), 4096, 4096, nil)
+			// The raw admission kernel still refuses at the same exact step.
+			for c.syncWorkUsed < allowance {
+				require.NoError(t, c.growPushHTTPBuffersSlice(ctx, 1, 1))
+			}
+			err = c.growPushHTTPBuffersSlice(ctx, 1, 1)
 			require.Same(t, err, c.withSyncErrorProgress(ctx, err))
 			// Exercise encoded page/join and decoded page/join respectively.
 			if allowance == 15 {
@@ -40,6 +44,12 @@ func TestA3ResponseAdmission_ReadPhases(t *testing.T) {
 				require.Equal(t, allowance, work.Used)
 				require.EqualValues(t, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`), work.Progress.DirtyRows)
 			}
+			// The complete transport owns its local admission phases and consumes
+			// this same tiny target without reopening the HTTP operation.
+			c.syncWorkUsed = 0
+			response, err := c.executeBoundedRequest(ctx, "push", mustA3Request(t), 4096, 4096, nil)
+			require.NoError(t, err)
+			require.Equal(t, []byte(`{}`), response.body)
 			require.NoError(t, c.releaseWorkspace(context.Background(), token))
 			require.Zero(t, countA3(t, db, `SELECT reserved_entries+reserved_bytes+length(workspace_context) FROM _sync_operation_state`))
 		})

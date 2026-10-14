@@ -462,7 +462,8 @@ func TestPushDependencyPlanning_FreshProcessResume(t *testing.T) {
 		c.config.MaxSyncWorkUnitsPerInvocation = 2 * step
 		server := newMockPushServer(t)
 		c.HTTP = &http.Client{Transport: server}
-		_, err = c.PushPending(context.Background())
+		_, err = c.preparePushPlanSlice(context.Background())
+		err = c.withSyncErrorProgress(context.Background(), err)
 		var work *SyncWorkLimitError
 		require.ErrorAs(t, err, &work)
 		var nodes int64
@@ -486,7 +487,8 @@ func TestPushDependencyPlanning_FreshProcessResume(t *testing.T) {
 	step, err := c.pushPreparationStepWork()
 	require.NoError(t, err)
 	c.config.MaxSyncWorkUnitsPerInvocation = 2 * step
-	_, err = c.PushPending(context.Background())
+	_, err = c.preparePushPlanSlice(context.Background())
+	err = c.withSyncErrorProgress(context.Background(), err)
 	var work *SyncWorkLimitError
 	require.ErrorAs(t, err, &work)
 	var unit string
@@ -560,7 +562,8 @@ func TestPushDependencyPlanning_WorkResumePreservesPrimaryState(t *testing.T) {
 	stepWork, e := c.pushPreparationStepWork()
 	require.NoError(t, e)
 	c.config.MaxSyncWorkUnitsPerInvocation = 2 * stepWork
-	_, err := c.PushPending(context.Background())
+	_, err := c.preparePushPlanSlice(context.Background())
+	err = c.withSyncErrorProgress(context.Background(), err)
 	var work *SyncWorkLimitError
 	require.ErrorAs(t, err, &work)
 	require.Equal(t, SyncProgress{DirtyRows: 8}, work.Progress)
@@ -598,8 +601,10 @@ func TestPushDependencyPlanning_ChargedDiagnosticCleanupResumes(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT (SELECT COUNT(*) FROM _sync_push_nodes)+(SELECT COUNT(*) FROM _sync_push_edges)`).Scan(&last))
 	require.Greater(t, last, int64(1))
 	interruptions := 0
+	var clearingUnit string
 	for i := 0; i < 16; i++ {
-		err = c.ReleasePushDependencyDiagnostic(context.Background(), blocked.DiagnosticID)
+		c.syncWorkUsed = 0
+		err = c.clearPushPlanForLifecycleSlice(context.Background(), &clearingUnit, false, blocked.DiagnosticID)
 		var count int64
 		require.NoError(t, db.QueryRow(`SELECT (SELECT COUNT(*) FROM _sync_push_nodes)+(SELECT COUNT(*) FROM _sync_push_edges)`).Scan(&count))
 		require.Equal(t, before, qualificationState(t, db, "teams"))

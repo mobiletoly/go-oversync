@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/mobiletoly/go-oversync/oversync"
@@ -44,6 +45,10 @@ type pushOutboundSnapshot struct {
 }
 
 func (c *Client) ensurePushOutboundSnapshot(ctx context.Context) (*pushOutboundSnapshot, error) {
+	return completeWorkPhase(ctx, c, "outbox freeze", c.ensurePushOutboundSnapshotSlice)
+}
+
+func (c *Client) ensurePushOutboundSnapshotSlice(ctx context.Context) (*pushOutboundSnapshot, error) {
 	snapshot, err := c.loadPushOutboundSnapshot(ctx)
 	if err != nil {
 		return nil, err
@@ -68,21 +73,20 @@ func (c *Client) ensurePushOutboundSnapshot(ctx context.Context) (*pushOutboundS
 	}
 	currentOutbox, err := loadOutboxBundle(ctx, tx)
 	if err != nil {
-		tx.Rollback()
-		return nil, err
+		return nil, errors.Join(err, tx.Rollback())
 	}
 	if currentOutbox.State != outboxStateNone {
-		tx.Rollback()
+		if err := tx.Rollback(); err != nil {
+			return nil, err
+		}
 		return c.loadPushOutboundSnapshot(ctx)
 	}
 	guard, _, _, err := c.pushGuard(ctx, tx, plan)
 	if err != nil {
-		tx.Rollback()
-		return nil, err
+		return nil, errors.Join(err, tx.Rollback())
 	}
 	if guard != plan.Guard {
-		tx.Rollback()
-		return nil, &SyncWorkLimitError{Unit: plan.Unit, Limit: c.config.MaxSyncWorkUnitsPerInvocation, Used: c.syncWorkUsed}
+		return nil, errors.Join(&SyncWorkLimitError{Unit: plan.Unit, Limit: c.config.MaxSyncWorkUnitsPerInvocation, Used: c.syncWorkUsed}, tx.Rollback())
 	}
 	defer tx.Rollback()
 	defer c.releasePushTableInfoScope(tx)
@@ -109,7 +113,11 @@ func (c *Client) ensurePushOutboundSnapshot(ctx context.Context) (*pushOutboundS
 }
 
 func (c *Client) loadPushOutboundSnapshot(ctx context.Context) (*pushOutboundSnapshot, error) {
-	tx, err := beginImmediateTx(ctx,c.db)
+	return completeWorkPhase(ctx, c, "outbox read", c.loadPushOutboundSnapshotSlice)
+}
+
+func (c *Client) loadPushOutboundSnapshotSlice(ctx context.Context) (*pushOutboundSnapshot, error) {
+	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin outbound snapshot read transaction: %w", err)
 	}
@@ -122,7 +130,9 @@ func (c *Client) loadPushOutboundSnapshot(ctx context.Context) (*pushOutboundSna
 	if outboxBundle.State == outboxStateNone {
 		return nil, nil
 	}
-	if err:=c.measureOutboxBufferCopies(ctx,tx); err!=nil { return nil,err }
+	if err := c.measureOutboxBufferCopies(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	rows, err := tx.QueryContext(ctx, `
 		SELECT source_bundle_id, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, row_ordinal, base_kind, base_payload, base_provenance
@@ -185,20 +195,33 @@ func (c *Client) loadPushOutboundSnapshot(ctx context.Context) (*pushOutboundSna
 }
 
 func (c *Client) measureOutboxBufferCopies(ctx context.Context, tx sqliteTransaction) error {
-	if ctx.Value(workspaceBufferKey{})==nil { return nil }
+	if ctx.Value(workspaceBufferKey{}) == nil {
+		return nil
+	}
 	var cursor int64 = -1
-	charge:=workspaceCharge{64,256*1024}
+	charge := workspaceCharge{64, 256 * 1024}
 	for {
-		if err:=c.reserveSyncWork(ctx,applyUnit("outbox-copies",0,""),8); err!=nil { return err }
-		var ordinal,size int64
-		err:=tx.QueryRowContext(ctx,`SELECT row_ordinal,2048+64*(length(CAST(COALESCE(local_payload,'') AS BLOB))+
+		if err := c.reserveSyncWork(ctx, applyUnit("outbox-copies", 0, ""), 8); err != nil {
+			return err
+		}
+		var ordinal, size int64
+		err := tx.QueryRowContext(ctx, `SELECT row_ordinal,2048+64*(length(CAST(COALESCE(local_payload,'') AS BLOB))+
             length(CAST(COALESCE(wire_payload,'') AS BLOB))+length(CAST(COALESCE(base_payload,'') AS BLOB))+
             length(CAST(base_provenance AS BLOB))+length(CAST(key_json AS BLOB))+length(CAST(wire_key_json AS BLOB)))
-            FROM _sync_outbox_rows WHERE row_ordinal>? ORDER BY row_ordinal LIMIT 1`,cursor).Scan(&ordinal,&size)
-		if err==sql.ErrNoRows { break }; if err!=nil { return err }
-		charge,err=c.addWorkspaceCharge(applyUnit("outbox-copies",0,""),charge,workspaceCharge{32,size}); if err!=nil { return err }; cursor=ordinal
+            FROM _sync_outbox_rows WHERE row_ordinal>? ORDER BY row_ordinal LIMIT 1`, cursor).Scan(&ordinal, &size)
+		if err == sql.ErrNoRows {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		charge, err = c.addWorkspaceCharge(applyUnit("outbox-copies", 0, ""), charge, workspaceCharge{32, size})
+		if err != nil {
+			return err
+		}
+		cursor = ordinal
 	}
-	return c.admitPushBufferCopies(ctx,tx,charge)
+	return c.admitPushBufferCopies(ctx, tx, charge)
 }
 
 func (c *Client) buildPushRequestRows(rows []dirtyRowCapture) ([]oversync.PushRequestRow, error) {

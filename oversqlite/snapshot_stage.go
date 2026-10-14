@@ -23,7 +23,13 @@ func (c *Client) stageSnapshotChunk(ctx context.Context, chunk *oversync.Snapsho
 	return c.stageSnapshotChunkWithFinalizer(ctx, chunk, afterRowOrdinal, nil)
 }
 
-func (c *Client) stageSnapshotChunkWithFinalizer(
+func (c *Client) stageSnapshotChunkWithFinalizer(ctx context.Context, chunk *oversync.SnapshotChunkResponse, afterRowOrdinal int64, finalize func(context.Context, *immediateTx) error) error {
+	return c.completeWork(ctx, "snapshot chunk stage", func(ctx context.Context) error {
+		return c.stageSnapshotChunkWithFinalizerSlice(ctx, chunk, afterRowOrdinal, finalize)
+	})
+}
+
+func (c *Client) stageSnapshotChunkWithFinalizerSlice(
 	ctx context.Context,
 	chunk *oversync.SnapshotChunkResponse,
 	afterRowOrdinal int64,

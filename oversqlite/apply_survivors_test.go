@@ -46,15 +46,12 @@ func TestA1PullResumesDiscoveryAfterReopen(t *testing.T) {
 	c, db := newA1SurvivorClient(t, 250)
 	c.config.MaxSyncWorkUnitsPerInvocation = 1800
 	response := oversync.PullResponse{StableBundleSeq: 2, Bundles: []oversync.Bundle{pullBundle(2, "peer", 1, a1NormalizedEffects(t)...)}}
-	completed := false
+	fillTestBundleDescriptor(&response.Bundles[0])
 	interruptions := 0
-	for invocation := 0; invocation < 12; invocation++ {
-		setPullResponses(t, c, response)
-		_, err := c.PullToStable(context.Background())
-		if err == nil {
-			completed = true
-			break
-		}
+	for invocation := 0; invocation < 2; invocation++ {
+		c.syncWorkUsed = 0
+		c.readyAtomicUnitDispatched = false
+		err := c.applyPulledBundleLockedSlice(context.Background(), &response.Bundles[0])
 		var limit *SyncWorkLimitError
 		require.ErrorAs(t, err, &limit)
 		interruptions++
@@ -73,7 +70,10 @@ func TestA1PullResumesDiscoveryAfterReopen(t *testing.T) {
 		attachTestClient(t, c, old.UserID, "bundle-device")
 		t.Cleanup(func() { require.NoError(t, c.Close()) })
 	}
-	require.True(t, completed, "saved traversal must make progress across invocations")
+	setPullResponses(t, c, response)
+	_, err := c.PullToStable(context.Background())
+	require.NoError(t, err, "one public call resumes the exact saved traversal")
+	require.Positive(t, c.a3Stats.workSlices)
 	require.Greater(t, interruptions, 1)
 	requireA1Survivors(t, db)
 	var remaining int
@@ -306,8 +306,10 @@ func TestA1RevisionMismatchRestartsSavedDiscovery(t *testing.T) {
 	c, db := newA1SurvivorClient(t, 250)
 	c.config.MaxSyncWorkUnitsPerInvocation = 1800
 	response := oversync.PullResponse{StableBundleSeq: 2, Bundles: []oversync.Bundle{pullBundle(2, "peer", 1, a1NormalizedEffects(t)...)}}
-	setPullResponses(t, c, response)
-	_, err := c.PullToStable(context.Background())
+	fillTestBundleDescriptor(&response.Bundles[0])
+	c.syncWorkUsed = 0
+	c.readyAtomicUnitDispatched = false
+	err := c.applyPulledBundleLockedSlice(context.Background(), &response.Bundles[0])
 	var limit *SyncWorkLimitError
 	require.ErrorAs(t, err, &limit)
 	var before string
@@ -316,13 +318,13 @@ func TestA1RevisionMismatchRestartsSavedDiscovery(t *testing.T) {
 	// the writer lock. Inject that durable boundary without altering wire history.
 	_, err = db.Exec(`UPDATE _sync_conflict_state SET revision=revision+1`)
 	require.NoError(t, err)
-	setPullResponses(t, c, response)
-	_, err = c.PullToStable(context.Background())
+	c.syncWorkUsed = 0
+	c.readyAtomicUnitDispatched = false
+	err = c.applyPulledBundleLockedSlice(context.Background(), &response.Bundles[0])
 	require.ErrorAs(t, err, &limit)
 	var after string
 	require.NoError(t, db.QueryRow(`SELECT guard FROM _sync_apply_plan`).Scan(&after))
 	require.NotEqual(t, before, after)
-	c.config.MaxSyncWorkUnitsPerInvocation = 1000000
 	setPullResponses(t, c, response)
 	_, err = c.PullToStable(context.Background())
 	require.NoError(t, err)
@@ -552,8 +554,9 @@ func TestA1ReviewReopenReorderedRegistrationInvalidatesTraversal(t *testing.T) {
 	require.NoError(t, err)
 	response := oversync.CompactPullResponse{StableBundleSeq: 2, Bundles: []oversync.CompactBundle{{BundleSeq: 2, SourceID: "peer", SourceBundleID: 1, BundleHash: bundle.BundleHash, Rows: groups}}}
 	c.config.MaxSyncWorkUnitsPerInvocation = 1800
-	setPullResponses(t, c, response)
-	_, err = c.PullToStable(context.Background())
+	c.syncWorkUsed = 0
+	c.readyAtomicUnitDispatched = false
+	err = c.applyPulledBundleLockedSlice(context.Background(), &bundle)
 	var limit *SyncWorkLimitError
 	require.ErrorAs(t, err, &limit)
 	var before string
@@ -565,13 +568,13 @@ func TestA1ReviewReopenReorderedRegistrationInvalidatesTraversal(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
 	attachTestClient(t, reopened, c.UserID, "bundle-device")
-	setPullResponses(t, reopened, response)
-	_, err = reopened.PullToStable(context.Background())
+	reopened.syncWorkUsed = 0
+	reopened.readyAtomicUnitDispatched = false
+	err = reopened.applyPulledBundleLockedSlice(context.Background(), &bundle)
 	require.ErrorAs(t, err, &limit)
 	var after string
 	require.NoError(t, db.QueryRow(`SELECT guard FROM _sync_apply_plan`).Scan(&after))
 	require.NotEqual(t, before, after)
-	reopened.config.MaxSyncWorkUnitsPerInvocation = 1000000
 	setPullResponses(t, reopened, response)
 	_, err = reopened.PullToStable(context.Background())
 	require.NoError(t, err)

@@ -141,7 +141,12 @@ func TestA3Workspace_AtomicResume(t *testing.T) {
 	protected := a3ProtectedPrimaryVector(t, db)
 	c.config.MaxSyncWorkUnitsPerInvocation = 100
 	c.HTTP = &http.Client{Transport: a1SettlementServer(t)}
-	_, err = c.PushPending(context.Background())
+	frozen, err := c.loadPushOutboundSnapshot(context.Background())
+	require.NoError(t, err)
+	committed, err := c.obtainCommittedPushBundleLocked(context.Background(), frozen)
+	require.NoError(t, err)
+	c.syncWorkUsed = 0
+	err = c.applyStagedPushBundleLockedSlice(context.Background(), frozen.Rows, committed, workspaceCharge{})
 	require.Error(t, err)
 	var work *SyncWorkLimitError
 	var space *SyncWorkspaceLimitError
@@ -154,7 +159,6 @@ func TestA3Workspace_AtomicResume(t *testing.T) {
 	require.Equal(t, before.SourceBundleID, after.SourceBundleID)
 	require.EqualValues(t, 0, countA3(t, db, `SELECT reserved_entries FROM _sync_operation_state`))
 	require.EqualValues(t, 1, countA3(t, db, `SELECT last_bundle_seq_seen FROM _sync_attachment_state`))
-	c.config.MaxSyncWorkUnitsPerInvocation = 1000000
 	_, err = c.PushPending(context.Background())
 	require.NoError(t, err)
 	requireA1Survivors(t, db)

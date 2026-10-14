@@ -24,7 +24,7 @@ type sqliteTransaction interface {
 type statementCacheKey struct{}
 type statementAccountingKey struct{}
 
-// statementTransaction forwards every settlement write to the same owner.
+// statementTransaction forwards every opted-in write to the same writer owner.
 // QueryRowContext stays concrete; opted-in callers use scanTransactionRow.
 type statementTransaction struct {
 	sqliteTransaction
@@ -40,6 +40,7 @@ type txStmtCache struct {
 	stmts          map[string]*sql.Stmt
 	order          []string
 	closed, active bool
+	planningWrites bool
 	rowsActive     bool
 	pool           *statementReservation
 	queryBytes     int64
@@ -87,8 +88,27 @@ func (c *txStmtCache) ExecContext(ctx context.Context, query string, args ...any
 		}
 		return s.ExecContext(ctx, args...)
 	}
+	if c.planningWrites {
+		return c.execPlanningStatement(ctx, query, args...)
+	}
 	if err := c.pool.work(ctx, 2); err != nil {
 		return nil, err
+	}
+	// Ready writes debit the existing atomic credits and admitted statement pool.
+	if c.pool.atomic {
+		if err := c.pool.work(ctx, int64(4+len(args))); err != nil {
+			return nil, err
+		}
+		values, within, err := boundedStatementArguments(args)
+		if err == nil && within {
+			stmt, admitted, err := c.retainedStatement(ctx, query)
+			if err != nil {
+				return nil, err
+			}
+			if admitted {
+				return stmt.ExecContext(ctx, values...)
+			}
+		}
 	}
 	return c.execOneShot(ctx, query, args...)
 }
@@ -260,8 +280,8 @@ func (c *txStmtCache) execApplyPlan(ctx context.Context, work int64, query strin
 	return c.execOneShot(ctx, query, args...)
 }
 
-// Only saveApplyPlan's two statements call this opt-in. Other writes keep
-// ExecContext's one-shot policy and other transaction owners keep their path.
+// Apply-plan saves use this opt-in before the ready atomic unit.
+// Private planning writers opt into their separately charged scalar dispatcher.
 func executeApplyPlanStatement(ctx context.Context, tx sqliteTransaction, work int64, query string, args ...any) (sql.Result, error) {
 	if c := statementCacheFrom(ctx, tx); c != nil && c.active {
 		return c.execApplyPlan(ctx, work, query, args...)
@@ -430,4 +450,27 @@ func executeSingleStatement(ctx context.Context, tx sqliteTransaction, query str
 	}()
 	_, resultErr = s.ExecContext(ctx, args...)
 	return resultErr
+}
+
+func (c *txStmtCache) execPlanningStatement(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if err := c.pool.work(ctx, int64(4+len(args))); err != nil {
+		return nil, err
+	}
+	values, within, err := boundedStatementArguments(args)
+	if err != nil {
+		return nil, err
+	}
+	if within {
+		stmt, admitted, err := c.retainedStatement(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		if admitted {
+			return stmt.ExecContext(ctx, values...)
+		}
+	}
+	if err := c.pool.work(ctx, 2); err != nil {
+		return nil, err
+	}
+	return c.execOneShot(ctx, query, args...)
 }

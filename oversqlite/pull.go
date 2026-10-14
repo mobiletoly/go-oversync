@@ -25,7 +25,11 @@ type snapshotApplyOptions struct {
 	UpgradeFinalizer          func(context.Context, *immediateTx) error
 }
 
-func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversync.SnapshotSession, options snapshotApplyOptions) (resultErr error) {
+func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversync.SnapshotSession, options snapshotApplyOptions) error {
+	return c.completeWork(ctx, "snapshot apply", func(ctx context.Context) error { return c.applyStagedSnapshotLockedSlice(ctx, session, options) })
+}
+
+func (c *Client) applyStagedSnapshotLockedSlice(ctx context.Context, session *oversync.SnapshotSession, options snapshotApplyOptions) (resultErr error) {
 	guard, err := c.resolveSnapshotApplyGuardLocked(ctx, options)
 	if err != nil {
 		return err

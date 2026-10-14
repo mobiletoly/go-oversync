@@ -554,7 +554,7 @@ const (
 type Config struct {
 	MaxSyncWorkspaceEntries       int64                                 // zero selects 131072
 	MaxSyncWorkspaceBytes         int64                                 // zero selects 256 MiB
-	MaxSyncWorkUnitsPerInvocation int64                                 // zero selects 1000000
+	MaxSyncWorkUnitsPerInvocation int64                                 // internal slice target; zero selects 1000000
 	GenerationID                  oversync.SchemaGenerationID           // Explicit generation resolved on attachment; no network during construction.
 	generationProof               oversync.SchemaGenerationProof        // Internal admitted identity
 	localContract                 *LocalGenerationContract              // Internal derived local conversions

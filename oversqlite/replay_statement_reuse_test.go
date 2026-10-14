@@ -612,3 +612,64 @@ func TestReplayStatementReuse_PlanWriteBounds(t *testing.T) {
 		})
 	}
 }
+
+func TestReplayStatementReuse_ReadyAtomicMutationFallbacks(t *testing.T) {
+	c, db := newA1SurvivorClient(t)
+	ctx, tx, q, cache, scope := configuredReadCache(t, c, db)
+	require.NoError(t, cache.pool.reserveAtomic(ctx, 1024))
+	before := bindingProofRecord(t, c, tx, scope.token)
+	const query = `UPDATE nodes SET name=? WHERE id=?`
+	for _, value := range []string{"first", "second"} {
+		_, err := q.ExecContext(ctx, query, value, "P")
+		require.NoError(t, err)
+	}
+	require.Len(t, cache.stmts, 1)
+	var value string
+	require.NoError(t, tx.QueryRowContext(ctx, `SELECT name FROM nodes WHERE id='P'`).Scan(&value))
+	require.Equal(t, "second", value)
+	wide := strings.Repeat("w", 12000)
+	_, err := q.ExecContext(ctx, query, wide, "P")
+	require.NoError(t, err)
+	require.Len(t, cache.stmts, 1, "wide binding must not occupy another retained slot")
+	require.NoError(t, tx.QueryRowContext(ctx, `SELECT name FROM nodes WHERE id='P'`).Scan(&value))
+	require.Equal(t, wide, value)
+	calls := 0
+	_, err = q.ExecContext(ctx, query, readAllocationValuer{calls: &calls}, "P")
+	require.NoError(t, err)
+	require.Equal(t, 1, calls, "do not invoke a driver Valuer to measure an unsupported binding")
+	require.Len(t, cache.stmts, 1)
+	require.Equal(t, before, bindingProofRecord(t, c, tx, scope.token))
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = q.ExecContext(cancelled, query, "must not apply", "P")
+	require.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, tx.QueryRowContext(ctx, `SELECT length(name) FROM nodes WHERE id='P'`).Scan(&calls))
+	require.Equal(t, 1<<20, calls)
+	require.NoError(t, cache.closeAndRelease(ctx))
+	require.Zero(t, bindingProofNativeMemory()[query])
+}
+
+func TestReplayStatementReuse_WideAuthoritativeProjection(t *testing.T) {
+	columns := []string{"id TEXT PRIMARY KEY NOT NULL"}
+	wire := map[string]any{"id": "P"}
+	for i := 1; i <= 17; i++ {
+		name := fmt.Sprintf("field_%02d", i)
+		columns = append(columns, name+" TEXT")
+		if i%3 == 0 {
+			wire[name] = nil
+		} else {
+			wire[name] = fmt.Sprintf("value_%02d", i)
+		}
+	}
+	c, db := newBundleClient(t, "main", []SyncTable{{TableName: "wide_rows", SyncKeyColumnName: "id"}}, "CREATE TABLE wide_rows("+strings.Join(columns, ",")+")")
+	ctx, _, q, cache, _ := configuredReadCache(t, c, db)
+	encoded, err := json.Marshal(wire)
+	require.NoError(t, err)
+	captured, err := c.captureAuthoritativePayload(ctx, q, "wide_rows", encoded)
+	require.NoError(t, err)
+	require.NotEmpty(t, captured)
+	expected, err := c.captureAuthoritativePayload(context.Background(), cache.tx, "wide_rows", encoded)
+	require.NoError(t, err)
+	require.Equal(t, expected, captured, "wide typed projection keeps original driver/storage encoding")
+	require.NoError(t, cache.closeAndRelease(ctx))
+}

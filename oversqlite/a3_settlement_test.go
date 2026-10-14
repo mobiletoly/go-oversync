@@ -20,7 +20,7 @@ func TestA3Settlement_BacklogBound(t *testing.T) {
 			t.Run(fmt.Sprintf("%d/%d", n, width), func(t *testing.T) {
 				var readScope *workspaceBufferScope
 				c, db := newA1SurvivorClient(t)
-				c.config.MaxSyncWorkUnitsPerInvocation = 100000000
+				c.config.MaxSyncWorkUnitsPerInvocation = 1000000
 				_, err := db.Exec(`UPDATE nodes SET name='changed parent' WHERE id='P'`)
 				require.NoError(t, err)
 				c.SetBeforePushCommitHook(func(context.Context) error { return context.Canceled })
@@ -88,15 +88,15 @@ func TestA3Settlement_BacklogBound(t *testing.T) {
 				require.Equal(t, 2*stats.primaryReads, stats.indexedVisits)
 				require.LessOrEqual(t, stats.restorationPasses, int64(3))
 				require.Greater(t, stats.duplicateChecks, int64(0))
-				require.GreaterOrEqual(t, c.syncWorkUsed, int64(1024*n))
-				require.Less(t, c.syncWorkUsed-replayStatementWork(readScope), int64(2048*n+10000))
+				require.GreaterOrEqual(t, stats.totalWork, int64(1024*n))
+				require.Less(t, stats.totalWork-replayStatementWork(readScope), int64(2048*n+10000))
 				var id, parent, detail string
 				var selectID int
 				require.NoError(t, db.QueryRow(`EXPLAIN QUERY PLAN SELECT payload FROM _sync_dirty_rows WHERE (schema_name,table_name,key_json)>(?,?,?) ORDER BY schema_name,table_name,key_json LIMIT 1`, "", "", "").Scan(&selectID, &id, &parent, &detail))
 				require.Contains(t, detail, "SEARCH")
 				require.Contains(t, detail, "INDEX")
 				require.NotContains(t, detail, "TEMP")
-				t.Logf("one public PushPending; setup excluded; frozen=%s/%d; stats=%+v work=%d totalAlloc=%d heapBefore=%d heapAfter=%d", frozenHash, frozenID, stats, c.syncWorkUsed, after.TotalAlloc-before.TotalAlloc, before.HeapAlloc, after.HeapAlloc)
+				t.Logf("one public PushPending; setup excluded; frozen=%s/%d; stats=%+v work=%d totalAlloc=%d heapBefore=%d heapAfter=%d", frozenHash, frozenID, stats, stats.totalWork, after.TotalAlloc-before.TotalAlloc, before.HeapAlloc, after.HeapAlloc)
 				t.Logf("measured public call: heapPeak=%d heapInUsePeak=%d processRSSHighWaterBefore=%d processRSSHighWaterAfter=%d (process cumulative high-water, not invocation-only RSS)", peakHeap, peakInUse, rssBefore, rssAfter)
 			})
 		}

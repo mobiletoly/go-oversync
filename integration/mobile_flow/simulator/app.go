@@ -764,86 +764,41 @@ func (app *MobileApp) pushPending(ctx context.Context) error {
 	if app.client == nil {
 		return fmt.Errorf("client not initialized")
 	}
-
-	// Perform synchronous upload with retry logic (increased delays for high-load scenarios)
-	const maxRetries = 5
-	const retryDelay = 500 * time.Millisecond
-
-	var err error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		var report oversqlite.PushReport
-		report, err = app.client.PushPending(ctx)
-		if err == nil {
-			if verboseLog {
-				app.logger.Info("Upload finished", "outcome", report.Outcome)
-			}
-			break
-		}
-
-		if attempt < maxRetries {
-			// Exponential backoff with jitter for high-load scenarios
-			backoffDelay := time.Duration(attempt) * retryDelay
-			app.logger.Warn("Upload attempt failed, retrying", "attempt", attempt, "backoff_ms", backoffDelay.Milliseconds(), "error", err.Error())
-			time.Sleep(backoffDelay)
-			continue
-		}
-
-		return fmt.Errorf("upload failed after %d attempts: %w", maxRetries, err)
+	report, err := app.client.PushPending(ctx)
+	if err != nil {
+		return err
 	}
-
-	// Refresh UI state after upload
+	if verboseLog {
+		app.logger.Info("Upload finished", "outcome", report.Outcome)
+	}
 	app.ui.SetPendingBadge(app.getPendingCount())
-
 	return nil
 }
 
-// pullToStable performs one bundle-era pull session and returns the number of
-// newly applied bundles along with the latest durable bundle checkpoint.
+// pullToStable runs one SDK operation; transport retry and local continuation
+// are owned by the SDK, and all completed bundles contribute to the result.
 func (app *MobileApp) pullToStable(ctx context.Context) (applied int, nextAfter int64, err error) {
 	if app.client == nil {
 		return 0, 0, fmt.Errorf("client not initialized")
 	}
-
-	// Perform synchronous download with retry logic (increased delays for high-load scenarios)
-	const maxRetries = 5
-	const retryDelay = 500 * time.Millisecond
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		before, err := app.lastServerSeqSeen(ctx)
-		if err != nil {
-			return 0, 0, err
-		}
-		var report oversqlite.RemoteSyncReport
-		report, err = app.client.PullToStable(ctx)
-		if err == nil {
-			nextAfter, err = app.lastServerSeqSeen(ctx)
-			if err != nil {
-				return 0, 0, err
-			}
-			if report.Outcome == oversqlite.RemoteSyncOutcomeSkippedPaused {
-				applied = 0
-			} else if nextAfter > before {
-				applied = int(nextAfter - before)
-			} else {
-				applied = 0
-			}
-			break
-		}
-		if attempt < maxRetries {
-			// Exponential backoff with jitter for high-load scenarios
-			backoffDelay := time.Duration(attempt) * retryDelay
-			app.logger.Warn("Download attempt failed, retrying", "attempt", attempt, "backoff_ms", backoffDelay.Milliseconds(), "error", err.Error())
-			time.Sleep(backoffDelay)
-			continue
-		}
-		return 0, 0, fmt.Errorf("download failed after %d attempts: %w", maxRetries, err)
+	before, err := app.lastServerSeqSeen(ctx)
+	if err != nil {
+		return 0, 0, err
 	}
-
-	// Refresh UI state after download (if any changes were applied)
+	report, err := app.client.PullToStable(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	nextAfter, err = app.lastServerSeqSeen(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if report.Outcome != oversqlite.RemoteSyncOutcomeSkippedPaused && nextAfter > before {
+		applied = int(nextAfter - before)
+	}
 	if applied > 0 {
 		app.ui.SetPendingBadge(app.getPendingCount())
 	}
-
 	return applied, nextAfter, nil
 }
 

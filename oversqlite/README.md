@@ -49,6 +49,12 @@ Sync:
 - `Rebuild(ctx) (RemoteSyncReport, error)`
 - `LastBundleSeqSeen(ctx) (int64, error)`
 
+The `MaxSyncWorkUnitsPerInvocation` name is retained for source compatibility. Its default
+1,000,000 value is an internal work-slice target. Ordinary operations continue their
+checkpointed local phase under the same caller context; customers do not catch work-yield
+errors or reset budgets. Cancellation/deadlines, genuine no-progress and hard memory/wire
+limits remain actionable. No default SDK operation timeout is added.
+
 `Sync(ctx)` drains successive bounded push bundles and then pulls. Its 64-attempt allowance
 includes prepared-outbox replay, conflict reentry, and checkpoint-recovery pushes. A late local
 write resumes the drain. `SyncIncompleteError` reports `push_attempt_limit`, `no_progress`, or
@@ -301,3 +307,18 @@ Each push is one complete atomic `POST /sync/push`. The client freezes the reque
 and source tuple across retryable failures. If a response is uncertain or lost, retry the exact complete request.
 There is no server upload session, acknowledged ordinal, staged
 prefix, or `_sync_push_progress` state.
+
+### Fresh-database qualification
+
+The work-continuation candidate is qualified on newly created server and client
+databases. It adds no database-format change today and does not implement
+old-format migrations or dual readers. Current-format close/reopen, crash recovery
+and replay remain required. Historical upgrade/retirement suites retain their
+recorded status and are outside this scoped qualification.
+
+For a clean adoption environment, create a new PostgreSQL database and point the
+server's DATABASE_URL at it, then initialize the application's current business
+schema. Close the client and database owners before creating a new SQLite database
+with the current application schema and attaching to that authority. This task
+recreates only isolated test databases; application data transfer and deployment
+are separate work.

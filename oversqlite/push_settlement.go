@@ -24,7 +24,19 @@ type pushSettlementDecision struct {
 	desiredWire    sql.NullString
 }
 
-func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dirtyRowCapture, committed *committedPushBundle) (resultErr error) {
+func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dirtyRowCapture, committed *committedPushBundle) error {
+	// Buffer copies are reconstructed on each slice. Their admission must use
+	// the pre-settlement allowance, not the previous slice's expanded peak.
+	reservationBase := workspaceCharge{}
+	if scope, _ := ctx.Value(workspaceBufferKey{}).(*workspaceBufferScope); scope != nil {
+		reservationBase = scope.base
+	}
+	return c.completeWork(ctx, "push settlement", func(ctx context.Context) error {
+		return c.applyStagedPushBundleLockedSlice(ctx, uploaded, committed, reservationBase)
+	})
+}
+
+func (c *Client) applyStagedPushBundleLockedSlice(ctx context.Context, uploaded []dirtyRowCapture, committed *committedPushBundle, reservationBase workspaceCharge) (resultErr error) {
 	if committed == nil {
 		return fmt.Errorf("committed push bundle metadata is required")
 	}
@@ -38,6 +50,9 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 	defer tx.rollbackOnReturn(&resultErr, "staged push replay transaction")
 	stmtCache := newTxStmtCache(tx)
 	defer func() { resultErr = errors.Join(resultErr, stmtCache.closeAndRelease(ctx)) }()
+	if err := c.retirePushSliceBuffersInTx(ctx, tx, reservationBase); err != nil {
+		return err
+	}
 	ctx, execution, err := c.configureStatementCache(ctx, tx, stmtCache)
 	if err != nil {
 		return err
@@ -49,7 +64,7 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 	if err := c.setBundleApplyModeInTx(ctx, execution, true); err != nil {
 		return err
 	}
-	stagedRows, effects, err := c.loadValidatedStagedPushEffectsInTx(ctx, execution, uploaded, committed)
+	stagedRows, effects, err := c.loadValidatedStagedPushEffectsInTx(ctx, execution, uploaded, committed, reservationBase)
 	if err != nil {
 		return err
 	}
@@ -107,6 +122,66 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 	return nil
 }
 
+// HTTP decoding has returned, and previous settlement slices have released
+// their statements and host copies. Keep the frozen input reservation, then
+// admit this writer's stage, decisions and statements independently. Durable
+// staged rows and apply workspace remain separately charged throughout.
+func (c *Client) retirePushSliceBuffersInTx(ctx context.Context, tx sqliteTransaction, base workspaceCharge) error {
+	scope, _ := ctx.Value(workspaceBufferKey{}).(*workspaceBufferScope)
+	if scope == nil {
+		return nil
+	}
+	// Use the existing ledger traversal/encoding model before decoding it.
+	if err := c.reserveSyncWork(ctx, scope.unit, 8); err != nil {
+		return err
+	}
+	var ledgerBytes, recordsCount int64
+	if err := scanTransactionRow(ctx, tx, `SELECT length(CAST(workspace_context AS BLOB)),json_array_length(workspace_context) FROM _sync_operation_state WHERE singleton_key=1`, nil, &ledgerBytes, &recordsCount); err != nil {
+		return err
+	}
+	ledgerWork, err := c.statementLedgerWork(scope.unit, ledgerBytes, recordsCount)
+	if err != nil {
+		return err
+	}
+	guardWork := int64(64)
+	for _, table := range c.config.localContract.Generation.Tables {
+		guardWork = saturatingWorkAdd(guardWork, saturatingWorkMultiply(int64(1+len(table.Columns)+len(table.ForeignKeys)), 16))
+	}
+	// Validation/decode plus both stores and their scalar SQL; the guard's
+	// admitted schema traversal remains charged independently of slice count.
+	if err := c.reserveSyncWork(ctx, scope.unit, saturatingWorkAdd(saturatingWorkMultiply(ledgerWork, 3), guardWork)); err != nil {
+		return err
+	}
+	records, err := c.loadWorkspaceReservations(ctx, tx)
+	if err != nil {
+		return err
+	}
+	charge, err := c.addWorkspaceCharge(scope.unit, base, workspaceCharge{1, 4096})
+	if err != nil {
+		return err
+	}
+	for i, record := range records {
+		if record.Token != scope.token {
+			continue
+		}
+		if charge.entries > record.Entries || charge.bytes > record.Bytes {
+			return fmt.Errorf("settlement buffer release cannot grow a reservation")
+		}
+		records[i].Entries, records[i].Bytes = charge.entries, charge.bytes
+		if err := storeWorkspaceReservations(ctx, tx, records); err != nil {
+			return err
+		}
+		// Revalidate on this writer; no guard or statement holder crosses slices.
+		binding, err := c.applyGuard(ctx, tx, scope.unit)
+		if err != nil {
+			return err
+		}
+		records[i].Context = binding
+		return storeWorkspaceReservations(ctx, tx, records)
+	}
+	return fmt.Errorf("live settlement buffer reservation is missing")
+}
+
 func (c *Client) restoreTriggerAffectedDirtyIntentInTx(ctx context.Context, stmtCache *txStmtCache, tx sqliteTransaction) error {
 	for pass := 0; pass < 64; pass++ {
 		changed, err := c.restoreApplySurvivors(ctx, tx, stmtCache, false)
@@ -125,7 +200,7 @@ func (c *Client) restoreTriggerAffectedDirtyIntentInTx(ctx context.Context, stmt
 	return fmt.Errorf("preserved desired state was changed by cross-row effects after bounded restoration")
 }
 
-func (c *Client) loadValidatedStagedPushEffectsInTx(ctx context.Context, tx sqliteTransaction, uploaded []dirtyRowCapture, committed *committedPushBundle) ([]stagedPushBundleRow, map[string]stagedPushBundleRow, error) {
+func (c *Client) loadValidatedStagedPushEffectsInTx(ctx context.Context, tx sqliteTransaction, uploaded []dirtyRowCapture, committed *committedPushBundle, reservationBase workspaceCharge) ([]stagedPushBundleRow, map[string]stagedPushBundleRow, error) {
 	if scope, _ := ctx.Value(workspaceBufferKey{}).(*workspaceBufferScope); scope != nil {
 		var stage workspaceCharge
 		if err := scanTransactionRow(ctx, tx, `SELECT push_stage_entries,push_stage_bytes FROM _sync_operation_state WHERE singleton_key=1`, nil, &stage.entries, &stage.bytes); err != nil {
@@ -139,7 +214,7 @@ func (c *Client) loadValidatedStagedPushEffectsInTx(ctx context.Context, tx sqli
 		if err != nil {
 			return nil, nil, err
 		}
-		charge, err := c.addWorkspaceCharge(scope.unit, scope.base, workspaceCharge{entries, bytes})
+		charge, err := c.addWorkspaceCharge(scope.unit, reservationBase, workspaceCharge{entries, bytes})
 		if err != nil {
 			return nil, nil, err
 		}

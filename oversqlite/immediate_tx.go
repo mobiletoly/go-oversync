@@ -99,8 +99,11 @@ func (tx *immediateTx) Commit(ctx context.Context) error {
 	}
 	tx.done = true
 	if tx.closeOnDone {
-		_ = tx.conn.Close()
+		if err := tx.conn.Close(); err != nil {
+			return err
+		}
 	}
+	commitWorkStep(ctx)
 	return nil
 }
 

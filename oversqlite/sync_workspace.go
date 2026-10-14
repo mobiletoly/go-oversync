@@ -240,6 +240,12 @@ func (c *Client) admitPushBufferCopies(ctx context.Context, tx sqliteTransaction
 }
 
 func (c *Client) growPushHTTPBuffers(ctx context.Context, bytes, entries int64) error {
+	return c.completeWork(ctx, "HTTP buffer admission", func(ctx context.Context) error {
+		return c.growPushHTTPBuffersSlice(ctx, bytes, entries)
+	})
+}
+
+func (c *Client) growPushHTTPBuffersSlice(ctx context.Context, bytes, entries int64) error {
 	scope, _ := ctx.Value(workspaceBufferKey{}).(*workspaceBufferScope)
 	if scope == nil {
 		return nil
@@ -406,8 +412,9 @@ const (
 	defaultSyncWorkUnits        = 1000000
 )
 
-// SyncWorkLimitError leaves durable discovery progress available to the next
-// explicit invocation. It is not a transport failure and must not be auto-retried.
+// SyncWorkLimitError is the internal bounded-slice signal. Ordinary completion
+// operations resume its durable phase inside the library. Retained for decoding
+// historical results and bounded-step diagnostics; it is not a transport failure.
 type SyncWorkLimitError struct {
 	Unit        string
 	Limit, Used int64
@@ -464,13 +471,16 @@ func (c *Client) reserveSyncWorkKind(ctx context.Context, unit string, work int6
 	if work == 0 {
 		return nil
 	}
-	if c.syncWorkUsed >= limit && (!readyAtomic || c.readyAtomicUnitDispatched) {
+	slice := workSliceFrom(ctx)
+	firstUsefulStep := slice != nil && !slice.checkpointed
+	if c.syncWorkUsed >= limit && !firstUsefulStep && (!readyAtomic || c.readyAtomicUnitDispatched) {
 		return &SyncWorkLimitError{Unit: unit, Limit: limit, Used: c.syncWorkUsed}
 	}
 	if readyAtomic {
 		c.readyAtomicUnitDispatched = true
 	}
 	c.syncWorkUsed = saturatingWorkAdd(c.syncWorkUsed, work)
+	c.a3Stats.totalWork = saturatingWorkAdd(c.a3Stats.totalWork, work)
 	return nil
 }
 
@@ -584,6 +594,44 @@ func (c *Client) workspaceScale(unit string, bytes, copies int64) (int64, error)
 // Read only singleton owner metadata; never scan payload rows for admission.
 // Overrides contain the writer's current unsaved plan state, counted once.
 func (c *Client) workspaceUsage(ctx context.Context, q queryRower, unit string, apply, push *workspaceCharge) (workspaceCharge, error) {
+	scope, _ := ctx.Value(pushPlanningWorkspaceKey{}).(*pushPlanningWorkspace)
+	if scope == nil || scope.writer != q {
+		return c.workspaceUsageUncached(ctx, q, unit, apply, push)
+	}
+	cacheCharge := pushPlanningWorkspaceCharge
+	if scope.guard != nil {
+		var err error
+		cacheCharge, err = c.sumWorkspaceCharges(unit, cacheCharge, pushPlanningGuardCharge)
+		if err != nil {
+			return workspaceCharge{}, err
+		}
+	}
+	if apply == nil {
+		if scope.base == nil {
+			base, err := c.workspaceUsageUncached(ctx, q, unit, nil, &workspaceCharge{})
+			if err != nil {
+				return workspaceCharge{}, err
+			}
+			scope.base = &base
+		}
+		if push == nil {
+			current, err := c.retainedPushWorkspaceCharge(ctx, q, unit)
+			if err != nil {
+				return workspaceCharge{}, err
+			}
+			push = &current
+		}
+		return c.sumWorkspaceCharges(unit, *scope.base, *push, cacheCharge)
+	}
+	usage, err := c.workspaceUsageUncached(ctx, q, unit, apply, push)
+	if err != nil {
+		return usage, err
+	}
+	return c.sumWorkspaceCharges(unit, usage, cacheCharge)
+}
+
+func (c *Client) workspaceUsageUncached(ctx context.Context, q queryRower, unit string, apply, push *workspaceCharge) (workspaceCharge, error) {
+	c.a3Stats.workspaceMetadataReads++
 	operation, err := c.operationWorkspaceCharge(ctx, q, unit)
 	if err != nil {
 		return workspaceCharge{}, err
@@ -685,10 +733,19 @@ func (c *Client) retainedPushWorkspaceCharge(ctx context.Context, q queryRower, 
 
 func (c *Client) checkAggregateWorkspace(ctx context.Context, q queryRower, unit string, apply, push *workspaceCharge, extra workspaceCharge) error {
 	total, err := c.workspaceUsage(ctx, q, unit, apply, push)
-	if err != nil {
-		return err
+	if err == nil {
+		err = c.checkSyncWorkspace(unit, total.entries, total.bytes, extra.entries, extra.bytes)
 	}
-	return c.checkSyncWorkspace(unit, total.entries, total.bytes, extra.entries, extra.bytes)
+	if _, capacity := err.(*SyncWorkspaceLimitError); capacity {
+		if scope, _ := ctx.Value(pushPlanningWorkspaceKey{}).(*pushPlanningWorkspace); scope != nil && scope.writer == q && scope.guard != nil {
+			scope.guard = nil
+			total, err = c.workspaceUsage(ctx, q, unit, apply, push)
+			if err == nil {
+				err = c.checkSyncWorkspace(unit, total.entries, total.bytes, extra.entries, extra.bytes)
+			}
+		}
+	}
+	return err
 }
 
 // Stage charge is encoded payload bytes plus six-byte worst-case JSON escaping

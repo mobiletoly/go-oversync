@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mobiletoly/go-oversync/oversync"
 )
@@ -78,7 +79,7 @@ type pushNode struct {
 
 func (c *Client) readPushNode(ctx context.Context, tx sqliteTransaction, p *pushPlan, ordinal int64) (*pushNode, error) {
 	var size int64
-	if err := tx.QueryRowContext(ctx, `SELECT charge FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, p.Unit, ordinal).Scan(&size); err != nil {
+	if err := scanTransactionRow(ctx, tx, `SELECT charge FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, []any{p.Unit, ordinal}, &size); err != nil {
 		return nil, err
 	}
 	if size < 0 || size > (1<<63-1)/2 {
@@ -88,18 +89,18 @@ func (c *Client) readPushNode(ctx context.Context, tx sqliteTransaction, p *push
 		return nil, err
 	}
 	n := &pushNode{}
-	err := tx.QueryRowContext(ctx, `SELECT ordinal,schema_name,table_name,key_json,status,adjacency_cursor,blocked,diagnostic_id,intent_revision,dirty_ordinal,adjacency_phase,dfs_index,lowlink,parent,stack_ordinal,edge_cursor,component,selected FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, p.Unit, ordinal).Scan(&n.ordinal, &n.schema, &n.table, &n.key, &n.status, &n.cursor, &n.blocked, &n.diagnostic, &n.revision, &n.dirtyOrdinal, &n.adjacencyPhase, &n.index, &n.lowlink, &n.parent, &n.stack, &n.edgeCursor, &n.component, &n.selected)
+	err := scanTransactionRow(ctx, tx, `SELECT ordinal,schema_name,table_name,key_json,status,adjacency_cursor,blocked,diagnostic_id,intent_revision,dirty_ordinal,adjacency_phase,dfs_index,lowlink,parent,stack_ordinal,edge_cursor,component,selected FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, []any{p.Unit, ordinal}, &n.ordinal, &n.schema, &n.table, &n.key, &n.status, &n.cursor, &n.blocked, &n.diagnostic, &n.revision, &n.dirtyOrdinal, &n.adjacencyPhase, &n.index, &n.lowlink, &n.parent, &n.stack, &n.edgeCursor, &n.component, &n.selected)
 	return n, err
 }
 func (c *Client) loadPushPlan(ctx context.Context, tx sqliteTransaction, forCleanup bool) (*pushPlan, error) {
 	p := &pushPlan{}
 	var size int64
-	err := tx.QueryRowContext(ctx, `SELECT unit,guard,phase,entries,bytes,length(CAST(state AS BLOB)) FROM _sync_push_plan WHERE singleton_key=1`).Scan(&p.Unit, &p.Guard, &p.Phase, &p.Entries, &p.Bytes, &size)
+	err := scanTransactionRow(ctx, tx, `SELECT unit,guard,phase,entries,bytes,length(CAST(state AS BLOB)) FROM _sync_push_plan WHERE singleton_key=1`, nil, &p.Unit, &p.Guard, &p.Phase, &p.Entries, &p.Bytes, &size)
 	if err != nil {
 		return nil, err
 	}
 	if forCleanup || p.Phase == "clear" {
-		err = tx.QueryRowContext(ctx, `SELECT COALESCE(json_extract(state,'$.CleanupDiagnosticID'),'') FROM _sync_push_plan WHERE singleton_key=1`).Scan(&p.CleanupDiagnosticID)
+		err = scanTransactionRow(ctx, tx, `SELECT COALESCE(json_extract(state,'$.CleanupDiagnosticID'),'') FROM _sync_push_plan WHERE singleton_key=1`, nil, &p.CleanupDiagnosticID)
 		return p, err
 	}
 	if size < 0 || size > math.MaxInt64/12 {
@@ -109,7 +110,7 @@ func (c *Client) loadPushPlan(ctx context.Context, tx sqliteTransaction, forClea
 		return nil, err
 	}
 	var state string
-	if err = tx.QueryRowContext(ctx, `SELECT state FROM _sync_push_plan WHERE singleton_key=1`).Scan(&state); err != nil {
+	if err = scanTransactionRow(ctx, tx, `SELECT state FROM _sync_push_plan WHERE singleton_key=1`, nil, &state); err != nil {
 		return nil, err
 	}
 	err = json.Unmarshal([]byte(state), p)
@@ -124,11 +125,20 @@ func savePushPlan(ctx context.Context, tx sqliteTransaction, p *pushPlan) error 
 	return err
 }
 func (c *Client) pushGuard(ctx context.Context, tx sqliteTransaction, p *pushPlan) (string, int64, string, error) {
+	scope, _ := ctx.Value(pushPlanningWorkspaceKey{}).(*pushPlanningWorkspace)
+	if scope != nil && scope.writer == tx && scope.guard != nil {
+		g := scope.guard
+		if err := c.pushWorkspace(ctx, tx, p, g.entries, g.bytes); err != nil {
+			return "", 0, "", err
+		}
+		return g.hash, g.next, g.initialization, nil
+	}
+	c.a3Stats.pushGuardReconstructions++
 	var contextBytes int64
-	err := tx.QueryRowContext(ctx, `SELECT 8192+6*(length(CAST(i.database_id AS BLOB))+length(CAST(i.service_id AS BLOB))+
+	err := scanTransactionRow(ctx, tx, `SELECT 8192+6*(length(CAST(i.database_id AS BLOB))+length(CAST(i.service_id AS BLOB))+
 		length(CAST(i.physical_shape AS BLOB))+length(CAST(i.fingerprint AS BLOB))+length(CAST(a.current_source_id AS BLOB))+
 		length(CAST(a.attached_user_id AS BLOB))+length(CAST(a.pending_initialization_id AS BLOB))+length(CAST(o.source_id AS BLOB))+
-		length(CAST(o.canonical_request_hash AS BLOB))) FROM _sync_contract_identity i CROSS JOIN _sync_attachment_state a CROSS JOIN _sync_outbox_bundle o`).Scan(&contextBytes)
+		length(CAST(o.canonical_request_hash AS BLOB))) FROM _sync_contract_identity i CROSS JOIN _sync_attachment_state a CROSS JOIN _sync_outbox_bundle o`, nil, &contextBytes)
 	if err != nil {
 		return "", 0, "", err
 	}
@@ -149,7 +159,7 @@ func (c *Client) pushGuard(ctx context.Context, tx sqliteTransaction, p *pushPla
 	}
 	var database, service, shape, fingerprint, source, account, binding, init, outboxState, outboxSource, outboxHash string
 	var epoch, generation, localVersion, dirty, baseline, checkpoint, next, outboxID int64
-	err = tx.QueryRowContext(ctx, `SELECT i.database_id,i.service_id,i.generation_id,i.local_version,i.physical_shape,i.fingerprint,a.attachment_epoch,a.current_source_id,a.binding_state,a.attached_user_id,a.pending_initialization_id,a.last_bundle_seq_seen,f.revision,f.baseline_revision,s.next_source_bundle_id,o.state,o.source_id,o.source_bundle_id,o.canonical_request_hash FROM _sync_contract_identity i CROSS JOIN _sync_attachment_state a CROSS JOIN _sync_conflict_state f JOIN _sync_source_state s ON s.source_id=a.current_source_id CROSS JOIN _sync_outbox_bundle o`).Scan(&database, &service, &generation, &localVersion, &shape, &fingerprint, &epoch, &source, &binding, &account, &init, &checkpoint, &dirty, &baseline, &next, &outboxState, &outboxSource, &outboxID, &outboxHash)
+	err = scanTransactionRow(ctx, tx, `SELECT i.database_id,i.service_id,i.generation_id,i.local_version,i.physical_shape,i.fingerprint,a.attachment_epoch,a.current_source_id,a.binding_state,a.attached_user_id,a.pending_initialization_id,a.last_bundle_seq_seen,f.revision,f.baseline_revision,s.next_source_bundle_id,o.state,o.source_id,o.source_bundle_id,o.canonical_request_hash FROM _sync_contract_identity i CROSS JOIN _sync_attachment_state a CROSS JOIN _sync_conflict_state f JOIN _sync_source_state s ON s.source_id=a.current_source_id CROSS JOIN _sync_outbox_bundle o`, nil, &database, &service, &generation, &localVersion, &shape, &fingerprint, &epoch, &source, &binding, &account, &init, &checkpoint, &dirty, &baseline, &next, &outboxState, &outboxSource, &outboxID, &outboxHash)
 	if err != nil {
 		return "", 0, "", err
 	}
@@ -170,7 +180,31 @@ func (c *Client) pushGuard(ctx context.Context, tx sqliteTransaction, p *pushPla
 			return "", 0, "", err
 		}
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), next, init, nil
+	guard := fmt.Sprintf("%x", h.Sum(nil))
+	if err = c.admitPlanningGuard(ctx, tx, p, scope, pushPlanningGuard{guard, init, next, contextEntries, contextBytes}); err != nil {
+		return "", 0, "", err
+	}
+	return guard, next, init, nil
+}
+
+// The optional copy must coexist with the still-live guard construction. A
+// capacity refusal keeps fresh reads; another failure retains its precedence.
+func (c *Client) admitPlanningGuard(ctx context.Context, tx sqliteTransaction, p *pushPlan, scope *pushPlanningWorkspace, guard pushPlanningGuard) error {
+	if scope == nil || scope.writer != tx || len(guard.initialization) > 1024 {
+		return nil
+	}
+	charge, err := c.addWorkspaceCharge(p.Unit, workspaceCharge{guard.entries, guard.bytes}, pushPlanningGuardCharge)
+	if err == nil {
+		err = c.pushWorkspace(ctx, tx, p, charge.entries, charge.bytes)
+	}
+	if err != nil {
+		if _, capacity := err.(*SyncWorkspaceLimitError); capacity {
+			return nil
+		}
+		return err
+	}
+	scope.guard = &guard
+	return nil
 }
 func newPushUnit() (string, error) {
 	var bytes [32]byte
@@ -199,7 +233,7 @@ func (c *Client) pushWorkspace(ctx context.Context, tx sqliteTransaction, p *pus
 func (c *Client) clearPushStep(ctx context.Context, tx sqliteTransaction, p *pushPlan) (bool, error) {
 	for _, table := range []string{"_sync_push_edges", "_sync_push_nodes"} {
 		var ordinal, bytes int64
-		err := tx.QueryRowContext(ctx, `SELECT ordinal,charge FROM `+table+` WHERE unit=? ORDER BY ordinal LIMIT 1`, p.Unit).Scan(&ordinal, &bytes)
+		err := scanTransactionRow(ctx, tx, `SELECT ordinal,charge FROM `+table+` WHERE unit=? ORDER BY ordinal LIMIT 1`, []any{p.Unit}, &ordinal, &bytes)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -214,14 +248,25 @@ func (c *Client) clearPushStep(ctx context.Context, tx sqliteTransaction, p *pus
 		return false, savePushPlan(ctx, tx, p)
 	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM _sync_push_plan WHERE singleton_key=1`)
+	if err == nil {
+		if scope := planningWorkspaceFor(ctx, tx); scope != nil {
+			scope.plan = nil
+			scope.planLoaded = false
+		}
+	}
 	return true, err
 }
 
-func (c *Client) seedPushStep(ctx context.Context, tx sqliteTransaction, p *pushPlan) error {
+func (c *Client) seedPushStep(ctx context.Context, tx sqliteTransaction, p *pushPlan, stepWork int64) error {
+	c.a3Stats.seedVisits++
 	query := `SELECT d.schema_name,d.table_name,d.key_json,d.dirty_ordinal,d.op,d.base_kind,COALESCE(rs.server_kind,'unknown') FROM _sync_dirty_rows d LEFT JOIN _sync_row_state rs ON rs.schema_name=d.schema_name AND rs.table_name=d.table_name AND rs.key_json=d.key_json WHERE (d.dirty_ordinal,d.schema_name,d.table_name,d.key_json)>(?,?,?,?) ORDER BY d.dirty_ordinal,d.schema_name,d.table_name,d.key_json LIMIT 1`
 	var size int64
-	err := tx.QueryRowContext(ctx, `SELECT 1024+12*(length(CAST(d.schema_name AS BLOB))+length(CAST(d.table_name AS BLOB))+length(CAST(d.key_json AS BLOB))) FROM _sync_dirty_rows d WHERE (d.dirty_ordinal,d.schema_name,d.table_name,d.key_json)>(?,?,?,?) ORDER BY d.dirty_ordinal,d.schema_name,d.table_name,d.key_json LIMIT 1`, p.SeedOrdinal, p.SeedSchema, p.SeedTable, p.SeedKey).Scan(&size)
+	err := scanTransactionRow(ctx, tx, `SELECT 1024+12*(length(CAST(d.schema_name AS BLOB))+length(CAST(d.table_name AS BLOB))+length(CAST(d.key_json AS BLOB))) FROM _sync_dirty_rows d WHERE (d.dirty_ordinal,d.schema_name,d.table_name,d.key_json)>(?,?,?,?) ORDER BY d.dirty_ordinal,d.schema_name,d.table_name,d.key_json LIMIT 1`, []any{p.SeedOrdinal, p.SeedSchema, p.SeedTable, p.SeedKey}, &size)
 	if errors.Is(err, sql.ErrNoRows) {
+		if p.NextNode == 0 {
+			p.Phase = "clear"
+			return nil
+		}
 		p.Subphase = "adjacency"
 		p.Visit = 1
 		return nil
@@ -234,7 +279,7 @@ func (c *Client) seedPushStep(ctx context.Context, tx sqliteTransaction, p *push
 	}
 	var schema, table, key, op, base, kind string
 	var ordinal int64
-	if err = tx.QueryRowContext(ctx, query, p.SeedOrdinal, p.SeedSchema, p.SeedTable, p.SeedKey).Scan(&schema, &table, &key, &ordinal, &op, &base, &kind); err != nil {
+	if err = scanTransactionRow(ctx, tx, query, []any{p.SeedOrdinal, p.SeedSchema, p.SeedTable, p.SeedKey}, &schema, &table, &key, &ordinal, &op, &base, &kind); err != nil {
 		return err
 	}
 	if op == "DELETE" && (kind == "unpublished" || kind == "absent" || kind == "deleted") {
@@ -246,12 +291,21 @@ func (c *Client) seedPushStep(ctx context.Context, tx sqliteTransaction, p *push
 		if e = c.validateHistoricalBase(ctx, tx, table, row.BaseRowVersion, historicalBase{row.BaseKind, row.BasePayload, row.BaseProvenance}); e != nil {
 			return e
 		}
+		// The extra guard refresh has the same full metadata/work coverage.
+		if e = c.chargePushWork(ctx, p.Unit, stepWork); e != nil {
+			return e
+		}
 		if _, e = tx.ExecContext(ctx, `DELETE FROM _sync_dirty_rows WHERE schema_name=? AND table_name=? AND key_json=?`, schema, table, key); e != nil {
 			return e
 		}
-		// Pruning invalidates previous traversal; cleanup is charged on subsequent steps.
-		p.Phase = "clear"
-		return nil
+		if scope, _ := ctx.Value(pushPlanningWorkspaceKey{}).(*pushPlanningWorkspace); scope != nil {
+			scope.guard = nil
+		}
+		// This key has not entered the graph, and no adjacency has been built.
+		// Rebind only after the SDK-owned delete under the same writer snapshot.
+		p.SeedOrdinal, p.SeedSchema, p.SeedTable, p.SeedKey = ordinal, schema, table, key
+		p.Guard, _, _, e = c.pushGuard(ctx, tx, p)
+		return e
 	}
 	blocked := ""
 	if kind == "unknown" {
@@ -265,7 +319,7 @@ func (c *Client) seedPushStep(ctx context.Context, tx sqliteTransaction, p *push
 	}
 	p.NextNode++
 	var revision int64
-	if err = tx.QueryRowContext(ctx, `SELECT revision FROM _sync_conflict_state WHERE singleton_key=1`).Scan(&revision); err != nil {
+	if err = scanTransactionRow(ctx, tx, `SELECT revision FROM _sync_conflict_state WHERE singleton_key=1`, nil, &revision); err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO _sync_push_nodes(unit,schema_name,table_name,key_json,ordinal,intent_revision,dirty_ordinal,status,blocked,charge) VALUES(?,?,?,?,?,?,?,'discover',?,?)`, p.Unit, schema, table, key, p.NextNode, revision, ordinal, blocked, size)
@@ -279,7 +333,7 @@ func (c *Client) seedPushStep(ctx context.Context, tx sqliteTransaction, p *push
 }
 func (c *Client) loadPushCapture(ctx context.Context, tx sqliteTransaction, p *pushPlan, schema, table, key string) (*dirtyRowCapture, error) {
 	var size int64
-	err := tx.QueryRowContext(ctx, `SELECT 2048+64*(length(CAST(COALESCE(payload,'') AS BLOB))+length(CAST(COALESCE(base_payload,'') AS BLOB))+length(CAST(base_provenance AS BLOB))+length(CAST(key_json AS BLOB))) FROM _sync_dirty_rows WHERE schema_name=? AND table_name=? AND key_json=?`, schema, table, key).Scan(&size)
+	err := scanTransactionRow(ctx, tx, `SELECT 2048+64*(length(CAST(COALESCE(payload,'') AS BLOB))+length(CAST(COALESCE(base_payload,'') AS BLOB))+length(CAST(base_provenance AS BLOB))+length(CAST(key_json AS BLOB))) FROM _sync_dirty_rows WHERE schema_name=? AND table_name=? AND key_json=?`, []any{schema, table, key}, &size)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +342,7 @@ func (c *Client) loadPushCapture(ctx context.Context, tx sqliteTransaction, p *p
 	}
 	row := &dirtyRowCapture{}
 	var kind string
-	err = tx.QueryRowContext(ctx, `SELECT d.schema_name,d.table_name,d.key_json,d.op,d.base_row_version,d.payload,d.base_kind,d.base_payload,d.base_provenance,d.dirty_ordinal,COALESCE(rs.server_kind,'unknown') FROM _sync_dirty_rows d LEFT JOIN _sync_row_state rs ON rs.schema_name=d.schema_name AND rs.table_name=d.table_name AND rs.key_json=d.key_json WHERE d.schema_name=? AND d.table_name=? AND d.key_json=?`, schema, table, key).Scan(&row.SchemaName, &row.TableName, &row.KeyJSON, &row.Op, &row.BaseRowVersion, &row.LocalPayload, &row.BaseKind, &row.BasePayload, &row.BaseProvenance, &row.DirtyOrdinal, &kind)
+	err = scanTransactionRow(ctx, tx, `SELECT d.schema_name,d.table_name,d.key_json,d.op,d.base_row_version,d.payload,d.base_kind,d.base_payload,d.base_provenance,d.dirty_ordinal,COALESCE(rs.server_kind,'unknown') FROM _sync_dirty_rows d LEFT JOIN _sync_row_state rs ON rs.schema_name=d.schema_name AND rs.table_name=d.table_name AND rs.key_json=d.key_json WHERE d.schema_name=? AND d.table_name=? AND d.key_json=?`, []any{schema, table, key}, &row.SchemaName, &row.TableName, &row.KeyJSON, &row.Op, &row.BaseRowVersion, &row.LocalPayload, &row.BaseKind, &row.BasePayload, &row.BaseProvenance, &row.DirtyOrdinal, &kind)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +365,7 @@ func blockPushNode(ctx context.Context, tx sqliteTransaction, p *pushPlan, n *pu
 }
 func (c *Client) putPushEdge(ctx context.Context, tx sqliteTransaction, p *pushPlan, dependent, prerequisite int64) error {
 	var exists int
-	err := tx.QueryRowContext(ctx, `SELECT 1 FROM _sync_push_edges WHERE unit=? AND dependent=? AND prerequisite=?`, p.Unit, dependent, prerequisite).Scan(&exists)
+	err := scanTransactionRow(ctx, tx, `SELECT 1 FROM _sync_push_edges WHERE unit=? AND dependent=? AND prerequisite=?`, []any{p.Unit, dependent, prerequisite}, &exists)
 	if err == nil {
 		return nil
 	}
@@ -343,7 +397,7 @@ func (c *Client) unknownIncomingPushCoverage(ctx context.Context, tx sqliteTrans
 				continue
 			}
 			var unknown int
-			err = tx.QueryRowContext(ctx, `SELECT 1 FROM _sync_row_state WHERE relationships_known=0 AND table_name=? LIMIT 1`, strings.ToLower(table.TableName)).Scan(&unknown)
+			err = scanTransactionRow(ctx, tx, `SELECT 1 FROM _sync_row_state WHERE relationships_known=0 AND table_name=? LIMIT 1`, []any{strings.ToLower(table.TableName)}, &unknown)
 			if err == nil {
 				return true, nil
 			}
@@ -366,7 +420,7 @@ func (c *Client) discoverPushStep(ctx context.Context, tx sqliteTransaction, p *
 		return err
 	}
 	var op string
-	if err = tx.QueryRowContext(ctx, `SELECT op FROM _sync_dirty_rows WHERE schema_name=? AND table_name=? AND key_json=?`, n.schema, n.table, n.key).Scan(&op); err != nil {
+	if err = scanTransactionRow(ctx, tx, `SELECT op FROM _sync_dirty_rows WHERE schema_name=? AND table_name=? AND key_json=?`, []any{n.schema, n.table, n.key}, &op); err != nil {
 		return err
 	}
 	if n.adjacencyPhase == 0 {
@@ -427,7 +481,7 @@ func (c *Client) discoverDesiredParent(ctx context.Context, tx sqliteTransaction
 	var size int64
 	args := []any{n.schema, n.table, n.key, n.cursor}
 	where := ` FROM _sync_relationships WHERE view='desired' AND child_schema=? AND child_table=? AND child_key=? AND fk_column>? ORDER BY fk_column LIMIT 1`
-	err := tx.QueryRowContext(ctx, `SELECT 1024+12*(length(CAST(parent_schema AS BLOB))+length(CAST(parent_table AS BLOB))+length(CAST(parent_key AS BLOB))+length(CAST(fk_column AS BLOB)))`+where, args...).Scan(&size)
+	err := scanTransactionRow(ctx, tx, `SELECT 1024+12*(length(CAST(parent_schema AS BLOB))+length(CAST(parent_table AS BLOB))+length(CAST(parent_key AS BLOB))+length(CAST(fk_column AS BLOB)))`+where, args, &size)
 	if errors.Is(err, sql.ErrNoRows) {
 		return finishPushDiscoveryNode(ctx, tx, p, n)
 	}
@@ -437,12 +491,12 @@ func (c *Client) discoverDesiredParent(ctx context.Context, tx sqliteTransaction
 	if err = c.pushWorkspace(ctx, tx, p, 3, size); err != nil {
 		return err
 	}
-	if err = tx.QueryRowContext(ctx, `SELECT fk_column,parent_schema,parent_table,parent_key`+where, args...).Scan(&column, &schema, &table, &key); err != nil {
+	if err = scanTransactionRow(ctx, tx, `SELECT fk_column,parent_schema,parent_table,parent_key`+where, args, &column, &schema, &table, &key); err != nil {
 		return err
 	}
 	var kind, parentOp string
 	var parent int64
-	err = tx.QueryRowContext(ctx, `SELECT COALESCE(rs.server_kind,'unknown'),COALESCE(d.op,''),COALESCE(pn.ordinal,0) FROM (SELECT 1) LEFT JOIN _sync_row_state rs ON rs.schema_name=? AND rs.table_name=? AND rs.key_json=? LEFT JOIN _sync_dirty_rows d ON d.schema_name=? AND d.table_name=? AND d.key_json=? LEFT JOIN _sync_push_nodes pn ON pn.unit=? AND pn.schema_name=? AND pn.table_name=? AND pn.key_json=?`, schema, table, key, schema, table, key, p.Unit, schema, table, key).Scan(&kind, &parentOp, &parent)
+	err = scanTransactionRow(ctx, tx, `SELECT COALESCE(rs.server_kind,'unknown'),COALESCE(d.op,''),COALESCE(pn.ordinal,0) FROM (SELECT 1) LEFT JOIN _sync_row_state rs ON rs.schema_name=? AND rs.table_name=? AND rs.key_json=? LEFT JOIN _sync_dirty_rows d ON d.schema_name=? AND d.table_name=? AND d.key_json=? LEFT JOIN _sync_push_nodes pn ON pn.unit=? AND pn.schema_name=? AND pn.table_name=? AND pn.key_json=?`, []any{schema, table, key, schema, table, key, p.Unit, schema, table, key}, &kind, &parentOp, &parent)
 	if err != nil {
 		return err
 	}
@@ -487,7 +541,7 @@ func (c *Client) discoverDeleteChild(ctx context.Context, tx sqliteTransaction, 
 	args := []any{view, n.schema, n.table, n.key, cursor[0], cursor[1], cursor[2], cursor[3]}
 	where := ` FROM _sync_relationships WHERE view=? AND parent_schema=? AND parent_table=? AND parent_key=? AND (child_schema,child_table,child_key,fk_column)>(?,?,?,?) ORDER BY child_schema,child_table,child_key,fk_column LIMIT 1`
 	var size int64
-	err := tx.QueryRowContext(ctx, `SELECT 1024+24*(length(CAST(child_schema AS BLOB))+length(CAST(child_table AS BLOB))+length(CAST(child_key AS BLOB))+length(CAST(fk_column AS BLOB)))`+where, args...).Scan(&size)
+	err := scanTransactionRow(ctx, tx, `SELECT 1024+24*(length(CAST(child_schema AS BLOB))+length(CAST(child_table AS BLOB))+length(CAST(child_key AS BLOB))+length(CAST(fk_column AS BLOB)))`+where, args, &size)
 	if errors.Is(err, sql.ErrNoRows) {
 		if n.adjacencyPhase == 2 {
 			return finishPushDiscoveryNode(ctx, tx, p, n)
@@ -505,7 +559,7 @@ func (c *Client) discoverDeleteChild(ctx context.Context, tx sqliteTransaction, 
 		return err
 	}
 	var schema, table, key, column string
-	if err = tx.QueryRowContext(ctx, `SELECT child_schema,child_table,child_key,fk_column`+where, args...).Scan(&schema, &table, &key, &column); err != nil {
+	if err = scanTransactionRow(ctx, tx, `SELECT child_schema,child_table,child_key,fk_column`+where, args, &schema, &table, &key, &column); err != nil {
 		return err
 	}
 	if view == "desired" {
@@ -513,12 +567,12 @@ func (c *Client) discoverDeleteChild(ctx context.Context, tx sqliteTransaction, 
 	} else {
 		var child int64
 		var op string
-		err = tx.QueryRowContext(ctx, `SELECT pn.ordinal,d.op FROM _sync_push_nodes pn JOIN _sync_dirty_rows d ON d.schema_name=pn.schema_name AND d.table_name=pn.table_name AND d.key_json=pn.key_json WHERE pn.unit=? AND pn.schema_name=? AND pn.table_name=? AND pn.key_json=?`, p.Unit, schema, table, key).Scan(&child, &op)
+		err = scanTransactionRow(ctx, tx, `SELECT pn.ordinal,d.op FROM _sync_push_nodes pn JOIN _sync_dirty_rows d ON d.schema_name=pn.schema_name AND d.table_name=pn.table_name AND d.key_json=pn.key_json WHERE pn.unit=? AND pn.schema_name=? AND pn.table_name=? AND pn.key_json=?`, []any{p.Unit, schema, table, key}, &child, &op)
 		if errors.Is(err, sql.ErrNoRows) {
 			err = blockPushNode(ctx, tx, p, n, "dependency_unavailable")
 		} else if err == nil {
 			var stillReferences int
-			e := tx.QueryRowContext(ctx, `SELECT 1 FROM _sync_relationships WHERE view='desired' AND child_schema=? AND child_table=? AND child_key=? AND fk_column=? AND parent_schema=? AND parent_table=? AND parent_key=?`, schema, table, key, column, n.schema, n.table, n.key).Scan(&stillReferences)
+			e := scanTransactionRow(ctx, tx, `SELECT 1 FROM _sync_relationships WHERE view='desired' AND child_schema=? AND child_table=? AND child_key=? AND fk_column=? AND parent_schema=? AND parent_table=? AND parent_key=?`, []any{schema, table, key, column, n.schema, n.table, n.key}, &stillReferences)
 			if e == nil {
 				err = blockPushNode(ctx, tx, p, n, "dependency_unavailable")
 			} else if errors.Is(e, sql.ErrNoRows) {
@@ -565,7 +619,7 @@ func (c *Client) sccPushStep(ctx context.Context, tx sqliteTransaction, p *pushP
 	}
 	if p.Frame == 0 {
 		var ordinal int64
-		err := tx.QueryRowContext(ctx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND status='scc' ORDER BY ordinal LIMIT 1`, p.Unit).Scan(&ordinal)
+		err := scanTransactionRow(ctx, tx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND status='scc' ORDER BY ordinal LIMIT 1`, []any{p.Unit}, &ordinal)
 		if errors.Is(err, sql.ErrNoRows) {
 			p.Phase = "pack"
 			p.Subphase = "counts"
@@ -582,7 +636,7 @@ func (c *Client) sccPushStep(ctx context.Context, tx sqliteTransaction, p *pushP
 		return err
 	}
 	var edge, next int64
-	err = tx.QueryRowContext(ctx, `SELECT ordinal,prerequisite FROM _sync_push_edges WHERE unit=? AND dependent=? AND ordinal>? ORDER BY ordinal LIMIT 1`, p.Unit, n.ordinal, n.edgeCursor).Scan(&edge, &next)
+	err = scanTransactionRow(ctx, tx, `SELECT ordinal,prerequisite FROM _sync_push_edges WHERE unit=? AND dependent=? AND ordinal>? ORDER BY ordinal LIMIT 1`, []any{p.Unit, n.ordinal, n.edgeCursor}, &edge, &next)
 	if errors.Is(err, sql.ErrNoRows) {
 		if n.index == n.lowlink {
 			p.Subphase = "pop"
@@ -608,7 +662,7 @@ func (c *Client) sccPushStep(ctx context.Context, tx sqliteTransaction, p *pushP
 		return c.enterPushDFS(ctx, tx, p, next)
 	}
 	var onStack int
-	if err = tx.QueryRowContext(ctx, `SELECT on_stack FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, p.Unit, next).Scan(&onStack); err != nil {
+	if err = scanTransactionRow(ctx, tx, `SELECT on_stack FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, []any{p.Unit, next}, &onStack); err != nil {
 		return err
 	}
 	if onStack == 1 {
@@ -618,7 +672,7 @@ func (c *Client) sccPushStep(ctx context.Context, tx sqliteTransaction, p *pushP
 }
 func (c *Client) popPushSCC(ctx context.Context, tx sqliteTransaction, p *pushPlan) error {
 	var ordinal int64
-	if err := tx.QueryRowContext(ctx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND on_stack=1 ORDER BY stack_ordinal DESC LIMIT 1`, p.Unit).Scan(&ordinal); err != nil {
+	if err := scanTransactionRow(ctx, tx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND on_stack=1 ORDER BY stack_ordinal DESC LIMIT 1`, []any{p.Unit}, &ordinal); err != nil {
 		return err
 	}
 	n, err := c.readPushNode(ctx, tx, p, ordinal)
@@ -631,9 +685,9 @@ func (c *Client) popPushSCC(ctx context.Context, tx sqliteTransaction, p *pushPl
 	}
 	var replace bool
 	var delta int64
-	err = tx.QueryRowContext(ctx, `SELECT ready_ordinal=0 OR (?,?,?,?)<(ready_ordinal,ready_schema,ready_table,ready_key),
+	err = scanTransactionRow(ctx, tx, `SELECT ready_ordinal=0 OR (?,?,?,?)<(ready_ordinal,ready_schema,ready_table,ready_key),
 		6*(? - length(CAST(ready_schema AS BLOB))-length(CAST(ready_table AS BLOB))-length(CAST(ready_key AS BLOB)))
-		FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, n.dirtyOrdinal, n.schema, n.table, n.key, int64(len(n.schema)+len(n.table)+len(n.key)), p.Unit, p.Pop).Scan(&replace, &delta)
+		FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, []any{n.dirtyOrdinal, n.schema, n.table, n.key, int64(len(n.schema) + len(n.table) + len(n.key)), p.Unit, p.Pop}, &replace, &delta)
 	if err != nil {
 		return err
 	}
@@ -674,7 +728,7 @@ func comparePushRef(as, at, ak, bs, bt, bk string) int {
 }
 func countPushDAGStep(ctx context.Context, tx sqliteTransaction, p *pushPlan) error {
 	var ordinal, dependent, prerequisite int64
-	err := tx.QueryRowContext(ctx, `SELECT e.ordinal,d.component,r.component FROM _sync_push_edges e JOIN _sync_push_nodes d ON d.unit=e.unit AND d.ordinal=e.dependent JOIN _sync_push_nodes r ON r.unit=e.unit AND r.ordinal=e.prerequisite WHERE e.unit=? AND e.ordinal>? ORDER BY e.ordinal LIMIT 1`, p.Unit, p.Cursor).Scan(&ordinal, &dependent, &prerequisite)
+	err := scanTransactionRow(ctx, tx, `SELECT e.ordinal,d.component,r.component FROM _sync_push_edges e JOIN _sync_push_nodes d ON d.unit=e.unit AND d.ordinal=e.dependent JOIN _sync_push_nodes r ON r.unit=e.unit AND r.ordinal=e.prerequisite WHERE e.unit=? AND e.ordinal>? ORDER BY e.ordinal LIMIT 1`, []any{p.Unit, p.Cursor}, &ordinal, &dependent, &prerequisite)
 	if errors.Is(err, sql.ErrNoRows) {
 		p.Subphase = "queue_init"
 		p.Cursor = 0
@@ -724,7 +778,7 @@ func addMeasuredPushTuple(bytes, count, lastTable, table, tupleBytes int64) (int
 }
 func (c *Client) choosePushComponent(ctx context.Context, tx sqliteTransaction, p *pushPlan) error {
 	var ordinal int64
-	err := tx.QueryRowContext(ctx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND status='ready' ORDER BY ready_ordinal,ready_schema,ready_table,ready_key LIMIT 1`, p.Unit).Scan(&ordinal)
+	err := scanTransactionRow(ctx, tx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND status='ready' ORDER BY ready_ordinal,ready_schema,ready_table,ready_key LIMIT 1`, []any{p.Unit}, &ordinal)
 	if errors.Is(err, sql.ErrNoRows) {
 		p.Phase = "ready"
 		return nil
@@ -757,8 +811,8 @@ func (c *Client) blockPushComponent(ctx context.Context, tx sqliteTransaction, p
 		p.BlockedComponent, p.BlockedReason = p.Current, reason
 	} else {
 		var earlier bool
-		err := tx.QueryRowContext(ctx, `SELECT (a.ready_ordinal,a.ready_schema,a.ready_table,a.ready_key)<(b.ready_ordinal,b.ready_schema,b.ready_table,b.ready_key)
-		FROM _sync_push_nodes a JOIN _sync_push_nodes b ON b.unit=a.unit WHERE a.unit=? AND a.ordinal=? AND b.ordinal=?`, p.Unit, p.Current, p.BlockedComponent).Scan(&earlier)
+		err := scanTransactionRow(ctx, tx, `SELECT (a.ready_ordinal,a.ready_schema,a.ready_table,a.ready_key)<(b.ready_ordinal,b.ready_schema,b.ready_table,b.ready_key)
+		FROM _sync_push_nodes a JOIN _sync_push_nodes b ON b.unit=a.unit WHERE a.unit=? AND a.ordinal=? AND b.ordinal=?`, []any{p.Unit, p.Current, p.BlockedComponent}, &earlier)
 		if err != nil {
 			return err
 		}
@@ -777,7 +831,7 @@ func (c *Client) blockPushComponent(ctx context.Context, tx sqliteTransaction, p
 }
 func (c *Client) nextPushComponentMember(ctx context.Context, tx sqliteTransaction, p *pushPlan) (*pushNode, error) {
 	var ordinal int64
-	err := tx.QueryRowContext(ctx, `SELECT n.ordinal FROM _sync_push_nodes n WHERE n.unit=? AND n.component=? AND (n.schema_name,n.table_name,n.key_json)>(COALESCE((SELECT schema_name FROM _sync_push_nodes WHERE unit=? AND ordinal=?),''),COALESCE((SELECT table_name FROM _sync_push_nodes WHERE unit=? AND ordinal=?),''),COALESCE((SELECT key_json FROM _sync_push_nodes WHERE unit=? AND ordinal=?),'')) ORDER BY n.schema_name,n.table_name,n.key_json LIMIT 1`, p.Unit, p.Current, p.Unit, p.Cursor, p.Unit, p.Cursor, p.Unit, p.Cursor).Scan(&ordinal)
+	err := scanTransactionRow(ctx, tx, `SELECT n.ordinal FROM _sync_push_nodes n WHERE n.unit=? AND n.component=? AND (n.schema_name,n.table_name,n.key_json)>(COALESCE((SELECT schema_name FROM _sync_push_nodes WHERE unit=? AND ordinal=?),''),COALESCE((SELECT table_name FROM _sync_push_nodes WHERE unit=? AND ordinal=?),''),COALESCE((SELECT key_json FROM _sync_push_nodes WHERE unit=? AND ordinal=?),'')) ORDER BY n.schema_name,n.table_name,n.key_json LIMIT 1`, []any{p.Unit, p.Current, p.Unit, p.Cursor, p.Unit, p.Cursor, p.Unit, p.Cursor}, &ordinal)
 	if err != nil {
 		return nil, err
 	}
@@ -913,7 +967,7 @@ func (c *Client) markPushComponentStep(ctx context.Context, tx sqliteTransaction
 func (c *Client) propagatePushComponentStep(ctx context.Context, tx sqliteTransaction, p *pushPlan) error {
 	if p.Visit == 0 {
 		var ordinal int64
-		err := tx.QueryRowContext(ctx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, p.Unit, p.Current, p.Cursor).Scan(&ordinal)
+		err := scanTransactionRow(ctx, tx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND component=? AND ordinal>? ORDER BY ordinal LIMIT 1`, []any{p.Unit, p.Current, p.Cursor}, &ordinal)
 		if errors.Is(err, sql.ErrNoRows) {
 			p.Subphase = "choose"
 			return nil
@@ -926,7 +980,7 @@ func (c *Client) propagatePushComponentStep(ctx context.Context, tx sqliteTransa
 		p.Count = 0
 	}
 	var edge, component int64
-	err := tx.QueryRowContext(ctx, `SELECT e.ordinal,n.component FROM _sync_push_edges e JOIN _sync_push_nodes n ON n.unit=e.unit AND n.ordinal=e.dependent WHERE e.unit=? AND e.prerequisite=? AND e.ordinal>? ORDER BY e.ordinal LIMIT 1`, p.Unit, p.Visit, p.Count).Scan(&edge, &component)
+	err := scanTransactionRow(ctx, tx, `SELECT e.ordinal,n.component FROM _sync_push_edges e JOIN _sync_push_nodes n ON n.unit=e.unit AND n.ordinal=e.dependent WHERE e.unit=? AND e.prerequisite=? AND e.ordinal>? ORDER BY e.ordinal LIMIT 1`, []any{p.Unit, p.Visit, p.Count}, &edge, &component)
 	if errors.Is(err, sql.ErrNoRows) {
 		p.Visit = 0
 		return nil
@@ -972,15 +1026,34 @@ func (c *Client) packPushStep(ctx context.Context, tx sqliteTransaction, p *push
 }
 
 func (c *Client) advancePushPlanInTx(ctx context.Context, tx sqliteTransaction) (*pushPlan, bool, error) {
-	defer c.releasePushTableInfoScope(tx)
-	outbox, err := loadOutboxBundle(ctx, tx)
+	stepWork, err := c.pushPreparationStepWork()
 	if err != nil {
 		return nil, false, err
 	}
-	if outbox.State != outboxStateNone {
-		return nil, true, nil
+	return c.advancePushPlanInTxWithWork(ctx, tx, stepWork)
+}
+
+func (c *Client) advancePushPlanInTxWithWork(ctx context.Context, tx sqliteTransaction, stepWork int64) (*pushPlan, bool, error) {
+	defer c.releasePushTableInfoScope(tx)
+	return c.advancePushPlanStep(ctx, tx, stepWork)
+}
+
+// Admit one exact current planning owner before advancing its durable frontier.
+func (c *Client) admitPushPlanningStep(ctx context.Context, tx sqliteTransaction, stepWork int64) (*pushPlan, bool, error) {
+	scope := planningWorkspaceFor(ctx, tx)
+	if scope == nil || !scope.outboxNone {
+		outbox, err := loadOutboxBundle(ctx, tx)
+		if err != nil {
+			return nil, false, err
+		}
+		if outbox.State != outboxStateNone {
+			return nil, true, nil
+		}
+		if scope != nil {
+			scope.outboxNone = true
+		}
 	}
-	p, err := c.loadPushPlan(ctx, tx, false)
+	p, err := c.loadPushPlanForStep(ctx, tx, scope)
 	newPlan := errors.Is(err, sql.ErrNoRows)
 	if newPlan {
 		unit, e := newPushUnit()
@@ -992,26 +1065,34 @@ func (c *Client) advancePushPlanInTx(ctx context.Context, tx sqliteTransaction) 
 			return nil, false, e
 		}
 		p = &pushPlan{CursorSecret: secret, Unit: unit, Phase: "discover", Subphase: "seed"}
+		if scope != nil {
+			scope.plan = p
+			scope.planLoaded = true
+		}
 
 	} else if err != nil {
 		return nil, false, err
-	}
-	stepWork, e := c.pushPreparationStepWork()
-	if e != nil {
-		return p, false, e
 	}
 	if err = c.chargePushWork(ctx, p.Unit, stepWork); err != nil {
 		return p, false, err
 	}
 	if newPlan {
 		var present int
-		err = tx.QueryRowContext(ctx, `SELECT 1 FROM _sync_dirty_rows LIMIT 1`).Scan(&present)
+		err = scanTransactionRow(ctx, tx, `SELECT 1 FROM _sync_dirty_rows LIMIT 1`, nil, &present)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, true, nil
 		}
 		if err != nil {
 			return p, false, err
 		}
+	}
+	return p, false, nil
+}
+
+func (c *Client) advancePushPlanStep(ctx context.Context, tx sqliteTransaction, stepWork int64) (*pushPlan, bool, error) {
+	p, ready, err := c.admitPushPlanningStep(ctx, tx, stepWork)
+	if err != nil || ready {
+		return p, ready, err
 	}
 	if p.Phase == "clear" {
 		_, e := c.clearPushStep(ctx, tx, p)
@@ -1037,7 +1118,7 @@ func (c *Client) advancePushPlanInTx(ctx context.Context, tx sqliteTransaction) 
 	switch p.Phase {
 	case "discover":
 		if p.Subphase == "seed" {
-			err = c.seedPushStep(ctx, tx, p)
+			err = c.seedPushStep(ctx, tx, p, stepWork)
 		} else {
 			err = c.discoverPushStep(ctx, tx, p)
 		}
@@ -1062,25 +1143,44 @@ func (c *Client) advancePushPlanInTx(ctx context.Context, tx sqliteTransaction) 
 	return p, p.Phase == "ready", nil
 }
 func (c *Client) preparePushPlan(ctx context.Context) (*pushPlan, error) {
+	stepWork, err := c.pushPreparationStepWork()
+	if err != nil {
+		return nil, err
+	}
+	return completeWorkPhase(ctx, c, "push preparation", func(ctx context.Context) (*pushPlan, error) { return c.preparePushPlanSliceWithWork(ctx, stepWork) })
+}
+
+func (c *Client) preparePushPlanSlice(ctx context.Context) (*pushPlan, error) {
+	stepWork, err := c.pushPreparationStepWork()
+	if err != nil {
+		return nil, err
+	}
+	return c.preparePushPlanSliceWithWork(ctx, stepWork)
+}
+
+func (c *Client) preparePushPlanSliceWithWork(ctx context.Context, stepWork int64) (*pushPlan, error) {
 	for {
 		tx, err := beginImmediateTx(ctx, c.db)
 		if err != nil {
 			return nil, err
 		}
-		p, ready, err := c.advancePushPlanInTx(ctx, tx)
+		c.a3Stats.pushPlanningTransactions++
+		group, err := c.advancePushPreparationGroup(ctx, tx, stepWork)
+		pending := error(nil)
+		if pureApplyWork(err) && group.steps > 0 {
+			pending, err = err, nil
+		}
 		if err == nil {
 			err = ctx.Err()
 		}
 		if err == nil {
 			err = tx.Commit(ctx)
 		}
-		rollbackErr := tx.Rollback()
-		if err == nil {
-			err = rollbackErr
-		}
+		err = errors.Join(pending, err, tx.Rollback())
 		if err != nil {
 			return nil, err
 		}
+		p, ready := group.plan, group.ready
 		// Finishing stale cleanup is not finishing the replacement plan.
 		if p != nil && p.Phase == "clear" {
 			continue
@@ -1092,6 +1192,58 @@ func (c *Client) preparePushPlan(ctx context.Context) (*pushPlan, error) {
 			return p, nil
 		}
 	}
+}
+
+type pushPreparationGroup struct {
+	plan  *pushPlan
+	ready bool
+	steps int
+}
+
+// Metadata is immutable within this bounded writer snapshot. Per-step guard,
+// work and workspace checks remain in the existing planning kernel.
+func (c *Client) advancePushPreparationGroup(ctx context.Context, tx sqliteTransaction, stepWork int64) (group pushPreparationGroup, err error) {
+	defer c.releasePushTableInfoScope(tx)
+	limit := 1
+	if workSliceFrom(ctx) != nil {
+		limit = 32
+		raw, ok := tx.(*immediateTx)
+		if !ok {
+			return group, fmt.Errorf("planning cache requires the current writer")
+		}
+		cache := newTxStmtCache(raw)
+		cache.planningWrites = true
+		configured, execution, setupErr := c.configureStatementCache(ctx, raw, cache)
+		defer func() { err = errors.Join(err, cache.closeAndRelease(configured)) }()
+		if setupErr != nil {
+			return group, setupErr
+		}
+		ctx, tx = configured, execution
+		defer c.releasePushTableInfoScope(tx)
+		ctx = context.WithValue(ctx, pushPlanningWorkspaceKey{}, &pushPlanningWorkspace{writer: tx})
+	}
+	for group.steps < limit {
+		if err = ctx.Err(); err != nil {
+			return group, err
+		}
+		err = c.withPushPlanningStep(ctx, tx, func() error {
+			var stepErr error
+			group.plan, group.ready, stepErr = c.advancePushPlanStep(ctx, tx, stepWork)
+			return stepErr
+		})
+		if err != nil {
+			return group, err
+		}
+		group.steps++
+		c.a3Stats.pushPlanningSteps++
+		if group.plan != nil {
+			checkpointWorkStep(ctx)
+		}
+		if group.ready {
+			return group, nil
+		}
+	}
+	return group, nil
 }
 
 // Admit all simultaneous frozen request representations before loading them.
@@ -1110,7 +1262,7 @@ func (c *Client) reserveSelectedPushCopies(ctx context.Context, tx sqliteTransac
 	var copyBytes int64
 	for ordinal := int64(1); ordinal <= p.SelectedNext; ordinal++ {
 		var size int64
-		if err := tx.QueryRowContext(ctx, `SELECT 2048+64*(length(CAST(COALESCE(d.payload,'') AS BLOB))+length(CAST(COALESCE(d.base_payload,'') AS BLOB))+length(CAST(d.base_provenance AS BLOB))+length(CAST(d.key_json AS BLOB))) FROM _sync_push_nodes n JOIN _sync_dirty_rows d ON d.schema_name=n.schema_name AND d.table_name=n.table_name AND d.key_json=n.key_json WHERE n.unit=? AND n.selected=?`, p.Unit, ordinal).Scan(&size); err != nil {
+		if err := scanTransactionRow(ctx, tx, `SELECT 2048+64*(length(CAST(COALESCE(d.payload,'') AS BLOB))+length(CAST(COALESCE(d.base_payload,'') AS BLOB))+length(CAST(d.base_provenance AS BLOB))+length(CAST(d.key_json AS BLOB))) FROM _sync_push_nodes n JOIN _sync_dirty_rows d ON d.schema_name=n.schema_name AND d.table_name=n.table_name AND d.key_json=n.key_json WHERE n.unit=? AND n.selected=?`, []any{p.Unit, ordinal}, &size); err != nil {
 			return err
 		}
 		if size < 0 || size > math.MaxInt64-copyBytes {
@@ -1141,7 +1293,7 @@ func (c *Client) selectedPushCaptures(ctx context.Context, tx sqliteTransaction,
 	captures := make([]dirtyRowCapture, 0, int(p.CandidateRows))
 	for ordinal := int64(1); ordinal <= p.SelectedNext; ordinal++ {
 		var node int64
-		if err := tx.QueryRowContext(ctx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND selected=?`, p.Unit, ordinal).Scan(&node); err != nil {
+		if err := scanTransactionRow(ctx, tx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND selected=?`, []any{p.Unit, ordinal}, &node); err != nil {
 			return nil, err
 		}
 		n, err := c.readPushNode(ctx, tx, p, node)
@@ -1222,7 +1374,7 @@ func (c *Client) pushPlanBlockedError(ctx context.Context, p *pushPlan) error {
 func (c *Client) pushPlanBlockedErrorInTx(ctx context.Context, tx sqliteTransaction, p *pushPlan) error {
 	var count, bytes int64
 	var reason, id string
-	err := tx.QueryRowContext(ctx, `SELECT component_rows,component_bytes,blocked,diagnostic_id FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, p.Unit, p.BlockedComponent).Scan(&count, &bytes, &reason, &id)
+	err := scanTransactionRow(ctx, tx, `SELECT component_rows,component_bytes,blocked,diagnostic_id FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, []any{p.Unit, p.BlockedComponent}, &count, &bytes, &reason, &id)
 	if err != nil {
 		return err
 	}
@@ -1252,7 +1404,7 @@ func (c *Client) pushDiagnosticSample(ctx context.Context, tx sqliteTransaction,
 	var cursor, size int64
 	for len(refs) < 16 {
 		var ordinal int64
-		err := tx.QueryRowContext(ctx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND component=? AND diagnostic_ordinal>? ORDER BY diagnostic_ordinal LIMIT 1`, p.Unit, component, cursor).Scan(&ordinal)
+		err := scanTransactionRow(ctx, tx, `SELECT ordinal FROM _sync_push_nodes WHERE unit=? AND component=? AND diagnostic_ordinal>? ORDER BY diagnostic_ordinal LIMIT 1`, []any{p.Unit, component, cursor}, &ordinal)
 		if errors.Is(err, sql.ErrNoRows) {
 			break
 		}
@@ -1280,7 +1432,7 @@ func (c *Client) pushDiagnosticSample(ctx context.Context, tx sqliteTransaction,
 		}
 		size += int64(len(encoded))
 		refs = append(refs, ref)
-		if err = tx.QueryRowContext(ctx, `SELECT diagnostic_ordinal FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, p.Unit, ordinal).Scan(&cursor); err != nil {
+		if err = scanTransactionRow(ctx, tx, `SELECT diagnostic_ordinal FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, []any{p.Unit, ordinal}, &cursor); err != nil {
 			return nil, false, err
 		}
 	}
@@ -1354,7 +1506,7 @@ func (c *Client) ReadPushDependencyDiagnostic(ctx context.Context, id, cursor st
 		return PushDependencyDiagnosticPage{}, stale
 	}
 	var present int
-	if err = tx.QueryRowContext(ctx, `SELECT 1 FROM _sync_push_nodes WHERE unit=? AND diagnostic_id=? LIMIT 1`, p.Unit, id).Scan(&present); errors.Is(err, sql.ErrNoRows) {
+	if err = scanTransactionRow(ctx, tx, `SELECT 1 FROM _sync_push_nodes WHERE unit=? AND diagnostic_id=? LIMIT 1`, []any{p.Unit, id}, &present); errors.Is(err, sql.ErrNoRows) {
 		return PushDependencyDiagnosticPage{}, stale
 	} else if err != nil {
 		return PushDependencyDiagnosticPage{}, err
@@ -1370,7 +1522,7 @@ func (c *Client) ReadPushDependencyDiagnostic(ctx context.Context, id, cursor st
 			return PushDependencyDiagnosticPage{}, err
 		}
 		var ordinal, size int64
-		err = tx.QueryRowContext(ctx, `SELECT ordinal,512+12*(length(CAST(schema_name AS BLOB))+length(CAST(table_name AS BLOB))+length(CAST(key_json AS BLOB))) FROM _sync_push_nodes WHERE unit=? AND diagnostic_id=? AND diagnostic_ordinal>? ORDER BY diagnostic_ordinal LIMIT 1`, p.Unit, id, after).Scan(&ordinal, &size)
+		err = scanTransactionRow(ctx, tx, `SELECT ordinal,512+12*(length(CAST(schema_name AS BLOB))+length(CAST(table_name AS BLOB))+length(CAST(key_json AS BLOB))) FROM _sync_push_nodes WHERE unit=? AND diagnostic_id=? AND diagnostic_ordinal>? ORDER BY diagnostic_ordinal LIMIT 1`, []any{p.Unit, id, after}, &ordinal, &size)
 		if errors.Is(err, sql.ErrNoRows) {
 			break
 		}
@@ -1403,13 +1555,13 @@ func (c *Client) ReadPushDependencyDiagnostic(ctx context.Context, id, cursor st
 		}
 		page.Identities = append(page.Identities, ref)
 		bytes += refBytes
-		if err = tx.QueryRowContext(ctx, `SELECT diagnostic_ordinal FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, p.Unit, ordinal).Scan(&after); err != nil {
+		if err = scanTransactionRow(ctx, tx, `SELECT diagnostic_ordinal FROM _sync_push_nodes WHERE unit=? AND ordinal=?`, []any{p.Unit, ordinal}, &after); err != nil {
 			return PushDependencyDiagnosticPage{}, err
 		}
 	}
 	if int64(len(page.Identities)) == pageSize {
 		var next int
-		err = tx.QueryRowContext(ctx, `SELECT 1 FROM _sync_push_nodes WHERE unit=? AND diagnostic_id=? AND diagnostic_ordinal>? LIMIT 1`, p.Unit, id, after).Scan(&next)
+		err = scanTransactionRow(ctx, tx, `SELECT 1 FROM _sync_push_nodes WHERE unit=? AND diagnostic_id=? AND diagnostic_ordinal>? LIMIT 1`, []any{p.Unit, id, after}, &next)
 		if err == nil {
 			page.NextCursor = diagnosticPushCursor(p, id, after)
 		} else if !errors.Is(err, sql.ErrNoRows) {
@@ -1430,71 +1582,149 @@ func (c *Client) ReleasePushDependencyDiagnostic(ctx context.Context, id string)
 	return c.clearPushPlanForLifecycle(ctx, false, id)
 }
 
-// Lifecycle and successful settlement share the same one-record cleanup owner.
+// Lifecycle and successful settlement share the same bounded cleanup owner.
 // Each committed deletion releases its own charge once; no primary owner moves.
 func (c *Client) clearPushPlanForLifecycle(ctx context.Context, onlyInvalid bool, diagnosticID ...string) error {
 	var clearingUnit string
+	return c.completeWork(ctx, "push plan cleanup", func(ctx context.Context) error {
+		return c.clearPushPlanForLifecycleSlice(ctx, &clearingUnit, onlyInvalid, diagnosticID...)
+	})
+}
+
+func (c *Client) clearPushPlanForLifecycleSlice(ctx context.Context, clearingUnit *string, onlyInvalid bool, diagnosticID ...string) error {
 	for {
-		tx, err := beginImmediateTx(ctx, c.db)
-		if err != nil {
+		done, err := c.clearPushPlanLifecycleStep(ctx, clearingUnit, onlyInvalid, diagnosticID...)
+		if err != nil || done {
 			return err
-		}
-		p, err := c.loadPushPlan(ctx, tx, true)
-		if errors.Is(err, sql.ErrNoRows) {
-			tx.Rollback()
-			return nil
-		}
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-		if len(diagnosticID) > 0 {
-			id := diagnosticID[0]
-			if p.CleanupDiagnosticID != id {
-				var found int
-				err = tx.QueryRowContext(ctx, `SELECT 1 FROM _sync_push_nodes WHERE unit=? AND diagnostic_id=? LIMIT 1`, p.Unit, id).Scan(&found)
-				if errors.Is(err, sql.ErrNoRows) {
-					tx.Rollback()
-					return nil
-				}
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
-			}
-			p.CleanupDiagnosticID = id
-		}
-		if onlyInvalid && p.Phase != "clear" {
-			tx.Rollback()
-			return nil
-		}
-		if clearingUnit == "" {
-			clearingUnit = p.Unit
-		}
-		if clearingUnit != p.Unit {
-			tx.Rollback()
-			return nil
-		}
-		if err = c.chargePushWork(ctx, p.Unit, 8); err != nil {
-			tx.Rollback()
-			return err
-		}
-		p.Phase = "clear"
-		done, err := c.clearPushStep(ctx, tx, p)
-		if err == nil {
-			err = ctx.Err()
-		}
-		if err == nil {
-			err = tx.Commit(ctx)
-		}
-		tx.Rollback()
-		if err != nil {
-			return err
-		}
-		if done {
-			return nil
 		}
 	}
+}
+
+// One cleanup transaction owns its rollback error and one exact plan identity.
+func (c *Client) clearPushPlanLifecycleStep(ctx context.Context, clearingUnit *string, onlyInvalid bool, diagnosticID ...string) (done bool, resultErr error) {
+	raw, err := beginImmediateTx(ctx, c.db)
+	if err != nil {
+		return false, err
+	}
+	defer raw.rollbackOnReturn(&resultErr, "push plan cleanup")
+	p, err := c.loadPushPlan(ctx, raw, true)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	eligible, err := c.matchPushCleanupTarget(ctx, raw, p, clearingUnit, onlyInvalid, diagnosticID...)
+	if err != nil || !eligible {
+		return true, err
+	}
+	execution := sqliteTransaction(raw)
+	limit := 1
+	cache := newTxStmtCache(raw)
+	if workSliceFrom(ctx) != nil {
+		limit = 32
+		cache.planningWrites = true
+		ctx, execution, err = c.configureStatementCache(ctx, raw, cache)
+		if err != nil {
+			return false, err
+		}
+	}
+	cleanupPending := error(nil)
+	steps := 0
+	for steps < limit {
+		err = c.withPushPlanningStep(ctx, execution, func() error {
+			if e := c.chargePushWork(ctx, p.Unit, 8); e != nil {
+				return e
+			}
+			p.Phase = "clear"
+			var e error
+			done, e = c.clearPushStep(ctx, execution, p)
+			return e
+		})
+		if err != nil {
+			break
+		}
+		steps++
+		checkpointWorkStep(ctx)
+		if done {
+			break
+		}
+	}
+	if pureApplyWork(err) && steps > 0 {
+		cleanupPending, err = err, nil
+	}
+	err = errors.Join(err, cache.closeAndRelease(ctx))
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
+		err = raw.Commit(ctx)
+	}
+	return done, errors.Join(cleanupPending, err)
+}
+
+// A computation refusal cannot publish the partially changed next frontier.
+func (c *Client) withPushPlanningStep(ctx context.Context, tx sqliteTransaction, step func() error) (resultErr error) {
+	if workSliceFrom(ctx) == nil {
+		return step()
+	}
+	if err := c.chargePushWork(ctx, applyUnit("push-step-boundary", 0, c.sourceID), 6); err != nil {
+		return err
+	}
+	if err := executePlanningBoundary(ctx, tx, "SAVEPOINT oversqlite_push_step"); err != nil {
+		return err
+	}
+	resultErr = step()
+	if resultErr == nil {
+		resultErr = ctx.Err()
+	}
+	cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if resultErr != nil {
+		resultErr = errors.Join(resultErr, executePlanningBoundary(cleanup, tx, "ROLLBACK TO oversqlite_push_step"))
+	}
+	return errors.Join(resultErr, executePlanningBoundary(cleanup, tx, "RELEASE oversqlite_push_step"))
+}
+func executePlanningBoundary(ctx context.Context, tx sqliteTransaction, query string) error {
+	if wrapper, ok := tx.(*statementTransaction); ok && wrapper.cache.active {
+		cache := wrapper.cache
+		stmt, admitted, err := cache.retainedStatement(ctx, query)
+		if err != nil {
+			return err
+		}
+		if admitted {
+			_, err = stmt.ExecContext(ctx)
+			return err
+		}
+		_, err = cache.execOneShot(ctx, query)
+		return err
+	}
+	_, err := tx.ExecContext(ctx, query)
+	return err
+}
+
+func (c *Client) matchPushCleanupTarget(ctx context.Context, tx sqliteTransaction, p *pushPlan, clearingUnit *string, onlyInvalid bool, diagnosticID ...string) (bool, error) {
+	if len(diagnosticID) > 0 {
+		id := diagnosticID[0]
+		if p.CleanupDiagnosticID != id {
+			var found int
+			err := scanTransactionRow(ctx, tx, `SELECT 1 FROM _sync_push_nodes WHERE unit=? AND diagnostic_id=? LIMIT 1`, []any{p.Unit, id}, &found)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+		}
+		p.CleanupDiagnosticID = id
+	}
+	if onlyInvalid && p.Phase != "clear" {
+		return false, nil
+	}
+	if *clearingUnit == "" {
+		*clearingUnit = p.Unit
+	}
+	return *clearingUnit == p.Unit, nil
 }
 
 // The admitted metadata is already owned by this client. Reading it through
@@ -1510,6 +1740,7 @@ func (c *Client) pushConfiguredTableInfo(table string) (*TableInfo, error) {
 	return info, nil
 }
 func (c *Client) pushPreparationStepWork() (int64, error) {
+	c.a3Stats.pushMetadataMeasurements++
 	work := int64(32)
 	for _, table := range c.config.Tables {
 		info, err := c.pushConfiguredTableInfo(table.TableName)
@@ -1528,4 +1759,26 @@ func (c *Client) releasePushTableInfoScope(tx tableInfoQueryer) {
 	for _, table := range c.config.Tables {
 		delete(provider.cache, tableInfoCacheKey{scope: scope, table: strings.ToLower(table.TableName)})
 	}
+}
+
+func planningWorkspaceFor(ctx context.Context, tx sqliteTransaction) *pushPlanningWorkspace {
+	scope, _ := ctx.Value(pushPlanningWorkspaceKey{}).(*pushPlanningWorkspace)
+	if scope != nil && scope.writer == tx {
+		return scope
+	}
+	return nil
+}
+func (c *Client) loadPushPlanForStep(ctx context.Context, tx sqliteTransaction, scope *pushPlanningWorkspace) (*pushPlan, error) {
+	if scope != nil && scope.planLoaded {
+		if scope.plan == nil {
+			return nil, sql.ErrNoRows
+		}
+		return scope.plan, nil
+	}
+	p, err := c.loadPushPlan(ctx, tx, false)
+	if scope != nil && (err == nil || errors.Is(err, sql.ErrNoRows)) {
+		scope.plan = p
+		scope.planLoaded = true
+	}
+	return p, err
 }

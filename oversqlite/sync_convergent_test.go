@@ -90,7 +90,6 @@ func TestSync_StopsBeforePushAttempt65(t *testing.T) {
 		CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL)
 	`)
 	client.config.UploadLimit = 1
-	client.config.MaxSyncWorkUnitsPerInvocation = 100_000_000 // isolate the existing 64 push-attempt allowance
 	for i := 0; i < 65; i++ {
 		_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, fmt.Sprintf("user-%03d", i), "Local", "local@example.com")
 		require.NoError(t, err)
@@ -136,7 +135,6 @@ func TestSync_Attempt64MayFinishAndPull(t *testing.T) {
 		CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL)
 	`)
 	client.config.UploadLimit = 1
-	client.config.MaxSyncWorkUnitsPerInvocation = 100_000_000 // isolate the existing 64 push-attempt allowance
 	for i := 0; i < 64; i++ {
 		_, err := db.Exec(`INSERT INTO users(id,name,email) VALUES(?,?,?)`,
 			fmt.Sprintf("user-%03d", i), "Local", "local@example.com")

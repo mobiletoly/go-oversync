@@ -34,6 +34,20 @@ runtime around those access paths rather than repeated wire-facing schema/table/
 - optional bundle-change watch streams as wake-up hints; authoritative download cost still belongs
   to `PullToStable()` / `Sync()`
 
+## Device-load simulation
+
+Parallel `mobile_flow` runs use one process per simulated user by default. The
+`--concurrency` setting bounds active child processes. Each child runs the entire
+scenario with the existing SDK settings and owns one PostgreSQL verification
+connection; the parent verifies each user's final state and collects the report.
+
+For example, start `nethttp_server`, then run
+`mobile_flow --scenario=complex-multi-batch --parallel=100 --concurrency=50` with
+verification enabled. Use `--parallel-mode=goroutine` for the retained SDK stress
+mode, where all users share one process and its SQLite allocator. These modes
+measure different deployment shapes; keep their timings and results separate.
+Caller cancellation stops further child launches and joins owned workers.
+
 ## Sizing snapshot rebuilds
 
 Snapshot limits are application configuration, not fixed framework capacity.

@@ -49,6 +49,10 @@ type stagedPushBundleRow struct {
 // incremental committed-row continuation: an interrupted response is retried
 // as the same complete source tuple.
 func (c *Client) stageAuthoritativePushRows(ctx context.Context, committed *committedPushBundle, rows []oversync.PushRequestRow) error {
+	return c.completeWork(ctx, "push response stage", func(ctx context.Context) error { return c.stageAuthoritativePushRowsSlice(ctx, committed, rows) })
+}
+
+func (c *Client) stageAuthoritativePushRowsSlice(ctx context.Context, committed *committedPushBundle, rows []oversync.PushRequestRow) error {
 	if err := validateCommittedPushBundleHardLimits(committed); err != nil {
 		return err
 	}

@@ -117,6 +117,7 @@ func (e *RetryExhaustedError) Unwrap() error {
 type retryHTTPError struct {
 	Operation  string
 	StatusCode int
+	retryAfter time.Duration
 }
 
 func (e *retryHTTPError) Error() string {
@@ -315,7 +316,12 @@ func withRetryValue[T any](ctx context.Context, policy normalizedRetryPolicy, op
 				LastFailure: classifyRetryFailure(err),
 			}
 		}
-		if err := waitRetryBackoff(ctx, jitterDuration(backoff, policy.jitterFraction)); err != nil {
+		delay := jitterDuration(backoff, policy.jitterFraction)
+		var httpErr *retryHTTPError
+		if errors.As(err, &httpErr) && httpErr.retryAfter > delay {
+			delay = httpErr.retryAfter
+		}
+		if err := waitRetryBackoff(ctx, delay); err != nil {
 			return zero, err
 		}
 		backoff = nextRetryBackoff(backoff, policy.maxBackoff)

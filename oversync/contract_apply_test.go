@@ -11,11 +11,14 @@ import (
 func TestContractCorpus_LocalApply(t *testing.T) {
 	root := requireManifestPinnedContracts(t)
 	var fixture struct {
-		FormatVersion int
-		Defaults      map[string]int64
-		Results       []struct {
-			Reason, Dimension             string
-			Resumable, AdvancesCheckpoint bool
+		FormatVersion     int
+		ExecutionContract struct {
+			DatabaseCompatibility map[string]bool
+		}
+		Defaults map[string]int64
+		Results  []struct {
+			Reason, Dimension, ExecutionScope string
+			Resumable, AdvancesCheckpoint     bool
 		}
 		RevisionCases []struct {
 			Saved, Current int64
@@ -40,14 +43,21 @@ func TestContractCorpus_LocalApply(t *testing.T) {
 	}
 	readContractFixture(t, root, "local-apply/a1.json", &fixture)
 	require.Equal(t, 1, fixture.FormatVersion)
+	require.Equal(t, map[string]bool{
+		"olderDatabaseCompatibilityRequired": false, "recreationPermitted": true,
+		"currentDatabaseReopenRequired": true, "currentDatabaseRestartReplayRequired": true,
+		"legacyUpgradeQualificationRequired": false,
+	}, fixture.ExecutionContract.DatabaseCompatibility)
 	require.Equal(t, map[string]int64{"entries": 131072, "bytes": 256 << 20, "work": 1000000}, fixture.Defaults)
 	require.Len(t, fixture.Results, 3)
 	for _, result := range fixture.Results {
 		require.False(t, result.AdvancesCheckpoint)
 		require.Equal(t, result.Reason == "sync_work_limit", result.Resumable)
 		if result.Resumable {
+			require.Equal(t, "internal-slice", result.ExecutionScope)
 			require.Equal(t, "work", result.Dimension)
 		} else {
+			require.Equal(t, "public-operation", result.ExecutionScope)
 			require.Equal(t, "sync_workspace_limit", result.Reason)
 			require.Contains(t, []string{"entries", "bytes"}, result.Dimension)
 		}

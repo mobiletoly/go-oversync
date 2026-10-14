@@ -41,6 +41,24 @@ func NewDatabaseVerifier(databaseURL string, logger *slog.Logger) (*DatabaseVeri
 	}, nil
 }
 
+// NewWorkerDatabaseVerifier bounds each isolated user's verification pool.
+func NewWorkerDatabaseVerifier(ctx context.Context, databaseURL string, logger *slog.Logger) (*DatabaseVerifier, error) {
+	configuration, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse worker verification database: %w", err)
+	}
+	configuration.MaxConns, configuration.MinConns = 1, 0
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	if err != nil {
+		return nil, fmt.Errorf("create worker verification pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping worker verification database: %w", err)
+	}
+	return &DatabaseVerifier{pool: pool, logger: logger}, nil
+}
+
 // Close closes the database connection
 func (v *DatabaseVerifier) Close() error {
 	if v.pool != nil {

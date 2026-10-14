@@ -50,7 +50,7 @@ func (c *Client) captureAuthoritativePayload(ctx context.Context, tx sqliteTrans
 	}
 	var captured string
 	query := "SELECT " + buildJsonObjectExprHexAware(info, "observed") + " FROM (SELECT " + strings.Join(columns, ",") + ") AS observed"
-	if err := tx.QueryRowContext(ctx, query, values...).Scan(&captured); err != nil {
+	if err := scanBaselineStatement(ctx, tx, query, values, &captured); err != nil {
 		return "", err
 	}
 	return captured, nil
@@ -96,7 +96,7 @@ func (c *Client) installAuthoritativeBaseline(ctx context.Context, tx sqliteTran
 		var oldVersion int64
 		var oldKind string
 		var oldPayload sql.NullString
-		err := tx.QueryRowContext(ctx, `SELECT row_version,server_kind,server_payload FROM _sync_row_state WHERE schema_name=? AND table_name=? AND key_json=?`, schema, table, key).Scan(&oldVersion, &oldKind, &oldPayload)
+		err := scanBaselineStatement(ctx, tx, `SELECT row_version,server_kind,server_payload FROM _sync_row_state WHERE schema_name=? AND table_name=? AND key_json=?`, []any{schema, table, key}, &oldVersion, &oldKind, &oldPayload)
 		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
@@ -126,7 +126,7 @@ func (c *Client) installAuthoritativeBaseline(ctx context.Context, tx sqliteTran
 func (c *Client) loadHistoricalBase(ctx context.Context, tx sqliteTransaction, schema, table, key string, version int64) (historicalBase, error) {
 	var base historicalBase
 	var retainedVersion int64
-	err := tx.QueryRowContext(ctx, `SELECT row_version,CASE server_kind WHEN 'live' THEN 'present' WHEN 'deleted' THEN 'deleted' WHEN 'unknown' THEN 'unavailable' ELSE 'absent' END,server_payload,server_provenance FROM _sync_row_state WHERE schema_name=? AND table_name=? AND key_json=?`, schema, table, key).Scan(&retainedVersion, &base.Kind, &base.Payload, &base.Provenance)
+	err := scanBaselineStatement(ctx, tx, `SELECT row_version,CASE server_kind WHEN 'live' THEN 'present' WHEN 'deleted' THEN 'deleted' WHEN 'unknown' THEN 'unavailable' ELSE 'absent' END,server_payload,server_provenance FROM _sync_row_state WHERE schema_name=? AND table_name=? AND key_json=?`, []any{schema, table, key}, &retainedVersion, &base.Kind, &base.Payload, &base.Provenance)
 	if err != nil {
 		return base, fmt.Errorf("historical base for %s.%s: %w", schema, table, err)
 	}
@@ -196,7 +196,7 @@ func (c *Client) validateHistoricalBase(ctx context.Context, q queryRower, table
 	// Read the existing identity owners on the caller's transaction/connection.
 	// Source identity is deliberately excluded: B retains its historical origin.
 	var currentJSON string
-	if err := q.QueryRowContext(ctx, "SELECT "+baselineProvenanceSQL("'never_published'", "0", "NULL")).Scan(&currentJSON); err != nil {
+	if err := scanBaselineStatement(ctx, q, "SELECT "+baselineProvenanceSQL("'never_published'", "0", "NULL"), nil, &currentJSON); err != nil {
 		return err
 	}
 	current, err := jcs.DecodeObject([]byte(currentJSON))
@@ -270,7 +270,7 @@ func validHistoricalObservation(p map[string]any, kind string, version int64) bo
 // the same full typed owner/projection validator used at freeze.
 func (c *Client) validateStoredServerProjection(ctx context.Context, tx sqliteTransaction, schema, table, key string) error {
 	var exists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM _sync_row_state WHERE schema_name=? AND table_name=? AND key_json=?)`, schema, table, key).Scan(&exists); err != nil {
+	if err := scanBaselineStatement(ctx, tx, `SELECT EXISTS(SELECT 1 FROM _sync_row_state WHERE schema_name=? AND table_name=? AND key_json=?)`, []any{schema, table, key}, &exists); err != nil {
 		return err
 	}
 	if !exists {
@@ -289,14 +289,14 @@ func (c *Client) validateBaselineProjection(ctx context.Context, tx sqliteTransa
 	payload := desired
 	var revision int64
 	if view == "desired" {
-		if err := tx.QueryRowContext(ctx, `SELECT revision FROM _sync_conflict_state WHERE singleton_key=1`).Scan(&revision); err != nil {
+		if err := scanBaselineStatement(ctx, tx, `SELECT revision FROM _sync_conflict_state WHERE singleton_key=1`, nil, &revision); err != nil {
 			return err
 		}
 	}
 	if view == "server" {
 		var kind string
 		var known int
-		err = tx.QueryRowContext(ctx, `SELECT server_kind,server_payload,relationships_known,server_revision FROM _sync_row_state WHERE schema_name=? AND table_name=? AND key_json=?`, schema, table, key).Scan(&kind, &payload, &known, &revision)
+		err = scanBaselineStatement(ctx, tx, `SELECT server_kind,server_payload,relationships_known,server_revision FROM _sync_row_state WHERE schema_name=? AND table_name=? AND key_json=?`, []any{schema, table, key}, &kind, &payload, &known, &revision)
 		if err != nil {
 			return fmt.Errorf("authoritative baseline missing: %w", err)
 		}
@@ -372,4 +372,12 @@ func (c *Client) expectedBaselineParents(table string, info *TableInfo, payload 
 		}
 	}
 	return expected, nil
+}
+
+// Wide projections retain their original one-shot route and driver semantics.
+func scanBaselineStatement(ctx context.Context, q queryRower, query string, args []any, targets ...any) error {
+	if len(args) > 16 {
+		return q.QueryRowContext(ctx, query, args...).Scan(targets...)
+	}
+	return scanTransactionRow(ctx, q, query, args, targets...)
 }

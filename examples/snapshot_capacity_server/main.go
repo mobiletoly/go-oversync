@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -23,11 +24,11 @@ import (
 )
 
 const (
-	capacityRows      = 50_000
-	childFirstOrdinal = 13
-	bundleRows        = 200
-	businessSchema    = "business"
-	capacityUser      = "snapshot-capacity-user"
+	defaultCapacityRows = 50_000
+	childFirstOrdinal   = 13
+	bundleRows          = 200
+	businessSchema      = "business"
+	capacityUser        = "snapshot-capacity-user"
 )
 
 func main() {
@@ -45,6 +46,10 @@ func run() (result error) {
 	}
 	if len(os.Args) != 1 {
 		return errors.New("usage: snapshotcapacity [--cleanup]")
+	}
+	capacityRows, err := configuredCapacityRows(os.Getenv("OVERSQLITE_CAPACITY_ROWS"))
+	if err != nil {
+		return err
 	}
 	authority, err := serverpkg.NewTestServer(&serverpkg.ServerConfig{
 		AppName:           "nethttp-server-example",
@@ -66,18 +71,18 @@ func run() (result error) {
 	if _, err := authority.SyncService.Connect(ctx, actor, proof, &oversync.ConnectRequest{}); err != nil {
 		return err
 	}
-	lastBundle, err := seedRows(ctx, authority, actor)
+	lastBundle, err := seedRows(ctx, authority, actor, capacityRows)
 	if err != nil {
 		return err
 	}
-	if err := verifyRows(ctx, authority.Pool); err != nil {
+	if err := verifyRows(ctx, authority.Pool, capacityRows); err != nil {
 		return err
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
 	}
-	control := replacementControl(authority, actor, lastBundle)
+	control := replacementControl(authority, actor, lastBundle, capacityRows)
 	controlServer := &http.Server{Handler: control}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -149,7 +154,7 @@ func createCapacityTables(ctx context.Context, pool *pgxpool.Pool, schema string
 
 func tableName(index int) string { return fmt.Sprintf("records_%02d", index) }
 
-func seedRows(ctx context.Context, authority *serverpkg.TestServer, actor oversync.Actor) (int64, error) {
+func seedRows(ctx context.Context, authority *serverpkg.TestServer, actor oversync.Actor, capacityRows int) (int64, error) {
 	var bundleID int64 = 1
 	if err := writeBundle(ctx, authority, actor, bundleID, "initial-parents", func(writeCtx context.Context, tx oversync.DatabaseWriteTx) error {
 		for index := 0; index < childFirstOrdinal; index++ {
@@ -177,7 +182,7 @@ func seedRows(ctx context.Context, authority *serverpkg.TestServer, actor oversy
 	return bundleID, nil
 }
 
-func replacementControl(authority *serverpkg.TestServer, actor oversync.Actor, initialBundle int64) http.Handler {
+func replacementControl(authority *serverpkg.TestServer, actor oversync.Actor, initialBundle int64, capacityRows int) http.Handler {
 	mux := http.NewServeMux()
 	var started atomic.Bool
 	mux.HandleFunc("POST /replace", func(w http.ResponseWriter, r *http.Request) {
@@ -187,12 +192,12 @@ func replacementControl(authority *serverpkg.TestServer, actor oversync.Actor, i
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 		defer cancel()
-		last, err := replaceRows(ctx, authority, actor, initialBundle)
+		last, err := replaceRows(ctx, authority, actor, initialBundle, capacityRows)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if err := verifyRows(ctx, authority.Pool); err != nil {
+		if err := verifyRows(ctx, authority.Pool, capacityRows); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -202,7 +207,7 @@ func replacementControl(authority *serverpkg.TestServer, actor oversync.Actor, i
 	return mux
 }
 
-func replaceRows(ctx context.Context, authority *serverpkg.TestServer, actor oversync.Actor, initialBundle int64) (int64, error) {
+func replaceRows(ctx context.Context, authority *serverpkg.TestServer, actor oversync.Actor, initialBundle int64, capacityRows int) (int64, error) {
 	bundleID := initialBundle + 1
 	if err := writeBundle(ctx, authority, actor, bundleID, "replacement-parents", func(writeCtx context.Context, tx oversync.DatabaseWriteTx) error {
 		for index := 0; index < childFirstOrdinal; index++ {
@@ -242,7 +247,7 @@ func writeBundle(ctx context.Context, authority *serverpkg.TestServer, actor ove
 		write)
 }
 
-func verifyRows(ctx context.Context, pool *pgxpool.Pool) error {
+func verifyRows(ctx context.Context, pool *pgxpool.Pool, capacityRows int) error {
 	var total int64
 	for index := 0; index < 14; index++ {
 		var count int64
@@ -251,8 +256,19 @@ func verifyRows(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 		total += count
 	}
-	if total != capacityRows {
+	if total != int64(capacityRows) {
 		return fmt.Errorf("wrong 14-table row count: %d", total)
 	}
 	return nil
+}
+
+func configuredCapacityRows(raw string) (int, error) {
+	if raw == "" {
+		return defaultCapacityRows, nil
+	}
+	rows, err := strconv.Atoi(raw)
+	if err != nil || rows < 50 || rows > defaultCapacityRows {
+		return 0, errors.New("OVERSQLITE_CAPACITY_ROWS must be an integer in 50..50000")
+	}
+	return rows, nil
 }

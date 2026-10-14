@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -115,5 +119,146 @@ func TestMobileFlow_DirectSyncDrainsSeveralAdmittedBatchesOnce(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("outbox rows after direct Sync = %d", count)
+	}
+}
+
+func TestMobileFlow_CancelledSyncReopensFrozenSecondBundle(t *testing.T) {
+	generation := oversync.SchemaGeneration{ID: 1}
+	for _, table := range serverpkg.SchemaGenerationsForBusinessSchema("business")[0].Tables {
+		if table.Table == "users" {
+			generation.Tables = append(generation.Tables, table)
+		}
+	}
+	server, err := serverpkg.NewTestServer(&serverpkg.ServerConfig{
+		JWTSecret: "direct-sync-cancellation-secret", SchemaGenerations: []oversync.SchemaGeneration{generation},
+		MaxRowsPerBundle: 2, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := server.CloseWithError(); err != nil {
+			t.Errorf("clean isolated authority: %v", err)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	userID := "cancelled-sync-" + uuid.NewString()
+	token, err := server.GenerateToken(userID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := oversqlite.DefaultConfig(1, []oversqlite.SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	config.DatabaseID, config.ServiceID = "cancelled-sync", "cancelled-sync"
+	config.LocalVersion, config.MaxSyncWorkUnitsPerInvocation = 1, 1
+	path := filepath.Join(t.TempDir(), "client.sqlite")
+	ddl := `CREATE TABLE users(id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,email TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)`
+	getToken := func(context.Context) (string, error) { return token, nil }
+	client := openWatchClient(t, path, server.URL(), getToken, config, ddl)
+	t.Cleanup(func() { _ = client.Close() })
+	if _, err := client.Attach(ctx, userID); err != nil {
+		t.Fatal(err)
+	}
+	for row := range 5 {
+		stamp := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := client.Database().ExecContext(ctx, `INSERT INTO users VALUES(?,?,?,?,?)`, uuid.NewString(),
+			fmt.Sprintf("Cancelled %d", row), fmt.Sprintf("cancelled%d@example.com", row), stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	interrupted, stop := context.WithCancel(ctx)
+	defer stop()
+	pushes := 0
+	var frozenBody []byte
+	transport := watchRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost && request.URL.Path == "/sync/push" {
+			pushes++
+			if pushes == 2 || pushes == 3 {
+				raw, err := io.ReadAll(request.Body)
+				if err != nil {
+					return nil, err
+				}
+				if err := request.Body.Close(); err != nil {
+					return nil, err
+				}
+				request.Body = io.NopCloser(bytes.NewReader(raw))
+				decoded := raw
+				if request.Header.Get("Content-Encoding") == "gzip" {
+					reader, err := gzip.NewReader(bytes.NewReader(raw))
+					if err != nil {
+						return nil, err
+					}
+					decoded, err = io.ReadAll(reader)
+					cleanup := reader.Close()
+					if err := errors.Join(err, cleanup); err != nil {
+						return nil, err
+					}
+				}
+				if pushes == 2 {
+					frozenBody = decoded
+					stop()
+					return nil, interrupted.Err()
+				}
+				if !bytes.Equal(frozenBody, decoded) {
+					return nil, fmt.Errorf("reopened second bundle changed its exact frozen body")
+				}
+			}
+		}
+		return http.DefaultTransport.RoundTrip(request)
+	})
+	client.HTTP = &http.Client{Transport: transport}
+	if _, err := client.Sync(interrupted); !errors.Is(err, context.Canceled) {
+		t.Fatalf("second push cancellation = %v", err)
+	}
+	var source, hash string
+	var bundle, rows, pending, reservations int64
+	if err := client.Database().QueryRowContext(ctx, `SELECT source_id,source_bundle_id,canonical_request_hash,row_count FROM _sync_outbox_bundle`).Scan(&source, &bundle, &hash, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 || hash == "" || len(frozenBody) == 0 {
+		t.Fatalf("retained second bundle: rows=%d hash=%q body=%d", rows, hash, len(frozenBody))
+	}
+	if err := client.Database().QueryRowContext(ctx, `SELECT count(*) FROM _sync_dirty_rows`).Scan(&pending); err != nil || pending+rows != 3 {
+		t.Fatalf("first bundle published once: dirty=%d frozen=%d err=%v", pending, rows, err)
+	}
+	if err := client.Database().QueryRowContext(ctx, `SELECT reserved_entries+reserved_bytes+length(workspace_context) FROM _sync_operation_state`).Scan(&reservations); err != nil || reservations != 0 {
+		t.Fatalf("cancelled operation released reservations: %d err=%v", reservations, err)
+	}
+	followerDB, follower := newNetHTTPWatchClient(t, server, userID, false)
+	if _, err := follower.PullToStable(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := followerDB.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("only first bundle confirmed before reopen: count=%d err=%v", count, err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	client = openWatchClient(t, path, server.URL(), getToken, config, ddl)
+	if _, err := client.Attach(ctx, userID); err != nil {
+		t.Fatalf("reattach reopened caller: %v", err)
+	}
+	var reopenedSource, reopenedHash string
+	var reopenedBundle int64
+	if err := client.Database().QueryRowContext(ctx, `SELECT source_id,source_bundle_id,canonical_request_hash FROM _sync_outbox_bundle`).Scan(&reopenedSource, &reopenedBundle, &reopenedHash); err != nil {
+		t.Fatal(err)
+	}
+	if source != reopenedSource || bundle != reopenedBundle || hash != reopenedHash {
+		t.Fatal("close/reopen changed frozen second-bundle identity")
+	}
+	client.HTTP = &http.Client{Transport: transport}
+	report, err := client.Sync(ctx)
+	if err != nil || report.Status.Pending.PendingRowCount != 0 || pushes != 4 {
+		t.Fatalf("reopened Sync: report=%+v pushes=%d err=%v", report, pushes, err)
+	}
+	if _, err := follower.PullToStable(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := followerDB.QueryRowContext(ctx, `SELECT count(*) FROM users WHERE name LIKE 'Cancelled %'`).Scan(&count); err != nil || count != 5 {
+		t.Fatalf("authority readback count=%d err=%v", count, err)
+	}
+	if err := client.Database().QueryRowContext(ctx, `SELECT reserved_entries+reserved_bytes+length(workspace_context) FROM _sync_operation_state`).Scan(&reservations); err != nil || reservations != 0 {
+		t.Fatalf("resumed operation released reservations: %d err=%v", reservations, err)
 	}
 }

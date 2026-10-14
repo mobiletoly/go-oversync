@@ -226,7 +226,13 @@ func findConflictingSnapshotRow(snapshot *pushOutboundSnapshot, conflict *oversy
 	return nil, nil
 }
 
-func (c *Client) resolvePushConflictAcceptServer(ctx context.Context, snapshot *pushOutboundSnapshot, conflictingRow *dirtyRowCapture, conflict *oversync.PushConflictDetails) (resultErr error) {
+func (c *Client) resolvePushConflictAcceptServer(ctx context.Context, snapshot *pushOutboundSnapshot, conflictingRow *dirtyRowCapture, conflict *oversync.PushConflictDetails) error {
+	return c.completeWork(ctx, "accept conflict", func(ctx context.Context) error {
+		return c.resolvePushConflictAcceptServerSlice(ctx, snapshot, conflictingRow, conflict)
+	})
+}
+
+func (c *Client) resolvePushConflictAcceptServerSlice(ctx context.Context, snapshot *pushOutboundSnapshot, conflictingRow *dirtyRowCapture, conflict *oversync.PushConflictDetails) (resultErr error) {
 	ctx = context.WithValue(ctx, applyInputSequenceKey{}, conflict.ServerRowVersion)
 	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
@@ -423,7 +429,13 @@ func (c *Client) resolvePushConflictKeepMerged(ctx context.Context, snapshot *pu
 	}
 }
 
-func (c *Client) applyConflictResolutionPlan(ctx context.Context, snapshot *pushOutboundSnapshot, conflictingRow *dirtyRowCapture, tableName string, plan conflictResolutionPlan) (resultErr error) {
+func (c *Client) applyConflictResolutionPlan(ctx context.Context, snapshot *pushOutboundSnapshot, conflictingRow *dirtyRowCapture, tableName string, plan conflictResolutionPlan) error {
+	return c.completeWork(ctx, "resolve conflict", func(ctx context.Context) error {
+		return c.applyConflictResolutionPlanSlice(ctx, snapshot, conflictingRow, tableName, plan)
+	})
+}
+
+func (c *Client) applyConflictResolutionPlanSlice(ctx context.Context, snapshot *pushOutboundSnapshot, conflictingRow *dirtyRowCapture, tableName string, plan conflictResolutionPlan) (resultErr error) {
 	if observed, ok := plan.rowStateAction.(rowStateUpsert); ok {
 		ctx = context.WithValue(ctx, applyInputSequenceKey{}, observed.rowVersion)
 	}

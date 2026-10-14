@@ -263,7 +263,11 @@ func (c *Client) expandCompactPullResponse(compact oversync.CompactPullResponse)
 	return response, nil
 }
 
-func (c *Client) applyPulledBundleLocked(ctx context.Context, bundle *oversync.Bundle) (resultErr error) {
+func (c *Client) applyPulledBundleLocked(ctx context.Context, bundle *oversync.Bundle) error {
+	return c.completeWork(ctx, "pull apply", func(ctx context.Context) error { return c.applyPulledBundleLockedSlice(ctx, bundle) })
+}
+
+func (c *Client) applyPulledBundleLockedSlice(ctx context.Context, bundle *oversync.Bundle) (resultErr error) {
 	ctx = context.WithValue(ctx, applyInputSequenceKey{}, bundle.BundleSeq)
 	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {

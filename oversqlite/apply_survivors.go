@@ -441,6 +441,9 @@ func finishApplyPreparationStep(ctx context.Context, tx sqliteTransaction, p *ap
 	if err := saveApplyPlanWithWork(ctx, tx, p, 0); err != nil {
 		return errors.Join(stepErr, err)
 	}
+	if stepErr == nil {
+		checkpointWorkStep(ctx)
+	}
 	return stepErr
 }
 
@@ -964,6 +967,10 @@ func livePayloadByteBound(info *TableInfo, alias string) string {
 // Diagnostics are operation-owned counters, not a second accounting owner or
 // public report. Tests exclude setup and read them after the public call ends.
 type a3AccountingStats struct {
+	pushGuardReconstructions, workspaceMetadataReads                              int64
+	workSlices, peakSliceWork, pushMetadataMeasurements, seedVisits               int64
+	totalWork                                                                     int64
+	pushPlanningTransactions, pushPlanningSteps                                   int64
 	primaryReads, primaryBytes, indexedVisits, duplicateChecks, restorationPasses int64
 	savedCopies, savedBytes, serializedBytes, peakPrimaryCopies, peakPrimaryBytes int64
 }

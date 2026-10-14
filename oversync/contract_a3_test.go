@@ -111,7 +111,51 @@ func a3Cases(t *testing.T, f a3Object, ids []string, execute func(*testing.T, st
 
 func TestContractCorpus_A3Workspace(t *testing.T) {
 	f := a3Read(t, "a3-workspace")
-	a3Fields(t, f, "formatVersion classification family physicalInventory cases runtimeObligations runtimeExecuted")
+	a3Fields(t, f, "formatVersion classification family physicalInventory cases runtimeObligations runtimeExecuted executionContract")
+	require.Equal(t, "internal-work-slice", a3Obj(t, f["executionContract"])["workLimitScope"])
+	require.Equal(t, false, a3Obj(t, f["executionContract"])["publicSchedulingYield"])
+	a3Compare(t, map[string]bool{
+		"olderDatabaseCompatibilityRequired": false, "recreationPermitted": true,
+		"currentDatabaseReopenRequired": true, "currentDatabaseRestartReplayRequired": true,
+		"legacyUpgradeQualificationRequired": false,
+	}, a3Obj(t, a3Obj(t, f["executionContract"])["databaseCompatibility"]))
+	atomic := a3Obj(t, a3Obj(t, f["executionContract"])["goReadyAtomicStatements"])
+	require.EqualValues(t, 16, a3Int(t, atomic, "maxArguments"))
+	require.EqualValues(t, 65536, a3Int(t, atomic, "maxEncodedArgumentBytes"))
+	for _, field := range []string{"sameReservedPool", "debitPrepaidCredits", "retainOriginalWriteCharges", "unsupportedOrOversizedOneShot", "cleanupBeforePublication"} {
+		require.Equal(t, true, atomic[field])
+	}
+	memo := a3Obj(t, a3Obj(t, f["executionContract"])["planningDescriptorReuse"])
+	for _, field := range []string{"writerScoped", "sameAdmittedMutableDescriptor", "validateOutboxOnce", "invalidateAfterOwnerDeletion", "currentPushWorkspaceCheckedPerStep"} {
+		require.Equal(t, true, memo[field])
+	}
+	require.Equal(t, false, memo["retainAcrossWriters"])
+	require.EqualValues(t, 2, a3Int(t, memo, "holderEntries"))
+	require.EqualValues(t, 256, a3Int(t, memo, "holderBytes"))
+	cleanup := a3Obj(t, a3Obj(t, f["executionContract"])["boundedCleanupWriter"])
+	require.EqualValues(t, 32, a3Int(t, cleanup, "maximumRecords"))
+	require.EqualValues(t, 8, a3Int(t, cleanup, "workPerRecord"))
+	require.EqualValues(t, 1, a3Int(t, cleanup, "rawKernelMaximumRecords"))
+	require.Equal(t, true, cleanup["fixedOuterIdentity"])
+	require.Equal(t, true, cleanup["cleanupBeforeCommit"])
+	snapshot := a3Obj(t, a3Obj(t, f["executionContract"])["planningScalarSnapshot"])
+	require.EqualValues(t, 2, a3Int(t, snapshot, "entries"))
+	require.EqualValues(t, 256, a3Int(t, snapshot, "bytes"))
+	for _, field := range []string{"writerScoped", "immutableNonPushOwnersOnly", "releaseBeforeContinuation"} {
+		require.Equal(t, true, snapshot[field])
+	}
+	guard := a3Obj(t, a3Obj(t, f["executionContract"])["planningGuardSnapshot"])
+	require.EqualValues(t, 4, a3Int(t, guard, "entries"))
+	require.EqualValues(t, 8192, a3Int(t, guard, "bytes"))
+	require.EqualValues(t, 1024, a3Int(t, guard, "maxInitializationUtf8Bytes"))
+	for _, field := range []string{"writerScoped", "invalidateAfterOwnedDelete", "optionalCapacityFallback"} {
+		require.Equal(t, true, guard[field])
+	}
+	decision := a3Obj(t, a3Obj(t, f["executionContract"])["decisionCopyReservation"])
+	require.Equal(t, "outer-operation", decision["baseScope"])
+	require.Equal(t, "complete-simultaneous-copies", decision["sliceCharge"])
+	require.Equal(t, "maximum-not-sum", decision["growthAcrossSlices"])
+	require.Equal(t, "outer-operation", decision["releaseScope"])
 	// Canonical JSON pins all physical fields, checks, indexes, charge formula and ownership.
 	inventory, err := json.Marshal(f["physicalInventory"])
 	require.NoError(t, err)

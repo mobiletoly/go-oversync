@@ -10,7 +10,9 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mobiletoly/go-oversync/integration/mobile_flow/config"
@@ -18,6 +20,14 @@ import (
 )
 
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if os.Getenv(processWorkerEnvironment) == "1" {
+		if err := runProcessWorker(ctx, os.Stdin); err != nil {
+			log.Fatalf("User worker failed: %v", err)
+		}
+		return
+	}
 	// Parse command line flags
 	var (
 		scenarioFlag    = flag.String("scenario", "", "Scenario to run (fresh-install, normal-usage, reinstall, device-replacement, offline-online, conflicts, user-switch, bundle-fk-atomicity, complex-multi-batch, multi-device-sync, multi-device-complex, files-sync, typed-rows, watch-peer-push, watch-server-originated, watch-reconnect-catch-up, watch-default-off, watch-server-unsupported-fallback, watch-idle-cleanup, watch-many-clients-converge, watch-all, all)")
@@ -29,6 +39,7 @@ func main() {
 		jwtSecretFlag   = flag.String("jwt-secret", "", "JWT secret for local token generation (defaults to env JWT_SECRET, else server default)")
 		parallelFlag    = flag.Int("parallel", 1, "Total users to simulate (1-500)")
 		concurrencyFlag = flag.Int("concurrency", 0, "Maximum concurrently active users (0 = --parallel)")
+		parallelMode    = flag.String("parallel-mode", "process", "Parallel user execution: process or goroutine (SDK stress)")
 		preserveDBFlag  = flag.Bool("preserve-db", false, "Preserve SQLite database files for manual inspection")
 	)
 	flag.Parse()
@@ -50,6 +61,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid concurrency: %v", err)
 	}
+	if *parallelMode != "process" && *parallelMode != "goroutine" {
+		log.Fatalf("Invalid parallel mode %q: use process or goroutine", *parallelMode)
+	}
 
 	jwtSecret := *jwtSecretFlag
 	if jwtSecret == "" {
@@ -69,12 +83,10 @@ func main() {
 		Logger:       logger,
 	}
 
-	ctx := context.Background()
-
 	// Check if parallel execution is requested
 	if *parallelFlag > 1 {
 		logger.Info("🚀 Starting parallel multi-user simulation", "users", *parallelFlag, "concurrency", concurrency, "scenario", *scenarioFlag)
-		err := runParallelSimulation(ctx, cfg, *scenarioFlag, *parallelFlag, concurrency)
+		err := runParallelSimulationMode(ctx, cfg, *scenarioFlag, *parallelFlag, concurrency, *parallelMode)
 		if err != nil {
 			log.Fatalf("Parallel simulation failed: %v", err)
 		}
@@ -272,6 +284,13 @@ func runBoundedUserWorkers(numUsers, concurrency int, run func(int)) {
 
 // runParallelSimulation runs scenarios for multiple users with bounded active-user concurrency.
 func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenarioName string, numUsers, requestedConcurrency int) error {
+	return runParallelSimulationMode(ctx, baseCfg, scenarioName, numUsers, requestedConcurrency, "process")
+}
+
+func runParallelSimulationMode(ctx context.Context, baseCfg *config.Config, scenarioName string, numUsers, requestedConcurrency int, mode string) (resultErr error) {
+	if mode != "process" && mode != "goroutine" {
+		return fmt.Errorf("invalid parallel mode %q: use process or goroutine", mode)
+	}
 	concurrency, err := normalizeSimulationConcurrency(numUsers, requestedConcurrency)
 	if err != nil {
 		return fmt.Errorf("invalid simulation concurrency: %w", err)
@@ -281,6 +300,7 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 	baseCfg.Logger.Info("🚀 Starting parallel multi-user simulation",
 		"users", numUsers,
 		"concurrency", concurrency,
+		"parallel_mode", mode,
 		"scenario", scenarioName,
 		"run_id", runID,
 		"server", baseCfg.ServerURL)
@@ -297,113 +317,41 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 	}
 
 	// Channel to collect results
-	type userResult struct {
-		userID       string
-		duration     time.Duration
-		err          error
-		sqliteDBPath string
+	var processes *processUserRunner
+	if mode == "process" {
+		processes, err = newProcessUserRunner()
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if resultErr == nil {
+				resultErr = processes.cleanup()
+			} else {
+				baseCfg.Logger.Info("Retained worker results", "directory", processes.directory)
+			}
+		}()
 	}
 
-	results := make(chan userResult, numUsers)
+	results := make(chan simulationUserResult, numUsers)
 	go func() {
 		runBoundedUserWorkers(numUsers, concurrency, func(userIndex int) {
 			userID := fmt.Sprintf("parallel-%s-user-%03d", runID, userIndex)
 			userStartTime := time.Now()
 
-			// Create user-specific configuration with shared verifier
-			userCfg := &config.Config{
-				ServerURL:    baseCfg.ServerURL,
-				DatabaseURL:  baseCfg.DatabaseURL,
-				JWTSecret:    baseCfg.JWTSecret,
-				EnableVerify: false,              // Disable individual verifiers - we'll use the shared one
-				OutputFile:   "",                 // No individual output files for parallel users
-				PreserveDB:   baseCfg.PreserveDB, // Preserve database files if requested
-				Logger:       baseCfg.Logger,
-			}
-
-			// Create user-specific simulator with parallel user config
 			deviceID := fmt.Sprintf("parallel-%s-device-%03d", runID, userIndex)
-			sim, err := simulator.NewSimulatorWithUserConfigAndVerifier(userCfg, userID, deviceID, sharedVerifier)
-			if err != nil {
-				results <- userResult{userID: userID, duration: 0, err: fmt.Errorf("failed to create simulator: %w", err)}
-				return
-			}
-
-			// Run the scenario
 			baseCfg.Logger.Info("⏱️ Starting scenario for user", "user_id", userID, "scenario", scenarioName, "start_time", userStartTime.Format(time.RFC3339))
-			err, sqliteDBPath := func() (resultErr error, databasePath string) {
-				defer func() {
-					if closeErr := sim.Close(); resultErr == nil && closeErr != nil {
-						resultErr = fmt.Errorf("failed to close simulator: %w", closeErr)
-					}
-				}()
-				resultErr = runScenarioForUser(ctx, sim, scenarioName, userID)
-				if app := sim.GetCurrentApp(); app != nil {
-					databasePath = app.GetDatabasePath()
-				}
-				return resultErr, databasePath
-			}()
-			duration := time.Since(userStartTime)
-
-			if err != nil {
-				baseCfg.Logger.Error("⏱️ Scenario failed for user", "user_id", userID, "duration", duration, "error", err)
+			var result simulationUserResult
+			if processes != nil {
+				result = processes.run(ctx, baseCfg, scenarioName, userID, deviceID, userIndex)
+			} else {
+				result = runSimulationUser(ctx, baseCfg, scenarioName, userID, deviceID, sharedVerifier)
 			}
-
-			results <- userResult{userID: userID, duration: duration, err: err, sqliteDBPath: sqliteDBPath}
+			results <- result
 		})
 		close(results)
 	}()
 
-	// Collect and report results
-	var successCount, failureCount int
-	var totalDuration time.Duration
-	var errors []string
-	var userReports []simulator.UserVerificationReport
-
-	// Create report generator
-	reportGenerator := simulator.NewReportGenerator(sharedVerifier)
-
-	for result := range results {
-		totalDuration += result.duration
-		if result.err != nil {
-			failureCount++
-			errors = append(errors, fmt.Sprintf("%s: %v", result.userID, result.err))
-			baseCfg.Logger.Error("❌ User simulation failed", "user", result.userID, "error", result.err)
-		} else {
-			successCount++
-			baseCfg.Logger.Info("✅ User simulation completed", "user", result.userID, "duration", result.duration)
-		}
-
-		// Generate comprehensive report for this user (only if verification is enabled)
-		if baseCfg.EnableVerify && sharedVerifier != nil {
-			expectedCounts := map[string]int{
-				"business.users": 50,  // Expected users per user
-				"business.posts": 100, // Expected posts per user
-			}
-
-			userReport, err := reportGenerator.GenerateUserReport(ctx, result.userID, scenarioName, result.sqliteDBPath, expectedCounts, result.duration)
-			if err != nil {
-				baseCfg.Logger.Warn("Failed to generate user report", "user_id", result.userID, "error", err)
-				// Create minimal report with error
-				userReport = &simulator.UserVerificationReport{
-					UserID:             result.userID,
-					ScenarioName:       scenarioName,
-					SQLiteDatabasePath: result.sqliteDBPath,
-					VerificationPassed: false,
-					Errors:             []string{fmt.Sprintf("Report generation failed: %v", err)},
-					Duration:           result.duration.String(),
-				}
-			}
-
-			// Fold scenario execution result into the verification summary to keep the report consistent
-			// with the parallel runner's success/failure counts.
-			if result.err != nil {
-				userReport.VerificationPassed = false
-				userReport.Errors = append(userReport.Errors, fmt.Sprintf("Scenario failed: %v", result.err))
-			}
-			userReports = append(userReports, *userReport)
-		}
-	}
+	successCount, failureCount, totalDuration, errors, userReports := collectParallelResults(ctx, baseCfg, scenarioName, sharedVerifier, results)
 
 	// Final report
 	totalTime := time.Since(startTime)
@@ -418,52 +366,7 @@ func runParallelSimulation(ctx context.Context, baseCfg *config.Config, scenario
 		"avg_user_time", avgDuration,
 		"scenario", scenarioName)
 
-	// Generate comprehensive test report
-	var verificationFailures int
-	if baseCfg.EnableVerify && len(userReports) > 0 {
-		testName := fmt.Sprintf("parallel_%dusers", numUsers)
-		completeReport := reportGenerator.GenerateCompleteReport(testName, scenarioName, userReports, totalTime)
-
-		// Save report to file
-		if err := reportGenerator.SaveReportToFile(completeReport, ""); err != nil {
-			baseCfg.Logger.Warn("Failed to save test report", "error", err)
-		}
-
-		// Print summary
-		fmt.Printf("\n📊 COMPREHENSIVE TEST REPORT\n")
-		fmt.Printf("═══════════════════════════════════════════════════════════════\n")
-		fmt.Printf("🧪 Test: %s\n", completeReport.TestName)
-		fmt.Printf("📋 Scenario: %s\n", completeReport.ScenarioName)
-		fmt.Printf("👥 Users: %d total, %d successful, %d failed\n",
-			completeReport.TotalUsers, completeReport.SuccessfulUsers, completeReport.FailedUsers)
-		fmt.Printf("⏱️  Duration: %s total, %s average per user\n",
-			completeReport.TotalDuration, completeReport.AverageUserTime)
-
-		fmt.Printf("\n📊 POSTGRESQL TOTALS:\n")
-		for table, count := range completeReport.Summary.PostgreSQLTotals {
-			fmt.Printf("  %s: %d records\n", table, count)
-		}
-
-		fmt.Printf("\n📊 SQLITE TOTALS:\n")
-		for table, count := range completeReport.Summary.SQLiteTotals {
-			fmt.Printf("  %s: %d records\n", table, count)
-		}
-
-		fmt.Printf("\n💾 SQLITE DATABASE PATHS:\n")
-		for i, path := range completeReport.Summary.DatabasePaths {
-			if i < 10 { // Show first 10 paths
-				fmt.Printf("  %s\n", path)
-			} else if i == 10 {
-				fmt.Printf("  ... and %d more databases\n", len(completeReport.Summary.DatabasePaths)-10)
-				break
-			}
-		}
-
-		fmt.Printf("\n📈 Total Records Verified: %d\n", completeReport.Summary.TotalRecords)
-		fmt.Printf("═══════════════════════════════════════════════════════════════\n")
-
-		verificationFailures = completeReport.FailedUsers
-	}
+	verificationFailures := finishParallelVerification(baseCfg, scenarioName, numUsers, userReports, totalTime, sharedVerifier)
 
 	if failureCount > 0 {
 		baseCfg.Logger.Error("❌ Some simulations failed", "failures", errors)
