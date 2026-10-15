@@ -8,12 +8,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -25,6 +31,21 @@ import (
 )
 
 const defaultPerfDatabaseURL = "postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable"
+
+const perfProcessWorkerEnvironment = "OVERSYNC_PERF_PROCESS_WORKER"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(perfProcessWorkerEnvironment) == "1" && os.Getenv(processWorkerEnvironment) == "1" {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		if err := runProcessWorker(ctx, os.Stdin); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 type stageMetricsCollector struct {
 	mu      sync.Mutex
@@ -39,6 +60,79 @@ type stageMetricSummary struct {
 	Max          time.Duration
 	TotalCount   int64
 	ErrorSamples int64
+}
+
+type perfStatusCounter struct {
+	handler     http.Handler
+	unavailable atomic.Int64
+}
+
+type perfStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *perfStatusWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *perfStatusWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *perfStatusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (c *perfStatusCounter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	status := &perfStatusWriter{ResponseWriter: w}
+	c.handler.ServeHTTP(status, r)
+	if status.status == http.StatusServiceUnavailable {
+		c.unavailable.Add(1)
+	}
+}
+
+type perfResourcePeaks struct {
+	poolAcquired int32
+	poolTotal    int32
+	heapAlloc    uint64
+}
+
+func samplePerfResources(server *serverpkg.TestServer, stop <-chan struct{}) <-chan perfResourcePeaks {
+	finished := make(chan perfResourcePeaks, 1)
+	go func() {
+		var peaks perfResourcePeaks
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		sample := func() {
+			pool := server.Pool.Stat()
+			if acquired := pool.AcquiredConns(); acquired > peaks.poolAcquired {
+				peaks.poolAcquired = acquired
+			}
+			if total := pool.TotalConns(); total > peaks.poolTotal {
+				peaks.poolTotal = total
+			}
+			var memory runtime.MemStats
+			runtime.ReadMemStats(&memory)
+			if memory.HeapAlloc > peaks.heapAlloc {
+				peaks.heapAlloc = memory.HeapAlloc
+			}
+		}
+		for {
+			sample()
+			select {
+			case <-stop:
+				finished <- peaks
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return finished
 }
 
 func newStageMetricsCollector() *stageMetricsCollector {
@@ -129,23 +223,35 @@ func TestPerfComplexMultiBatchParallel(t *testing.T) {
 		t.Fatalf("start test server: %v", err)
 	}
 	defer testServer.Close()
+	statusCounter := &perfStatusCounter{handler: testServer.Handler}
+	measuredServer := httptest.NewServer(statusCounter)
+	defer measuredServer.Close()
 
 	baseCfg := &config.Config{
-		ServerURL:    testServer.URL(),
+		ServerURL:    measuredServer.URL,
 		DatabaseURL:  perfDatabaseURL,
 		JWTSecret:    "perf-test-secret",
 		EnableVerify: verify,
 		PreserveDB:   verify,
 		Logger:       logger,
 	}
+	t.Setenv(perfProcessWorkerEnvironment, "1")
 
+	stopSampling := make(chan struct{})
+	resourcePeaks := samplePerfResources(testServer, stopSampling)
 	start := time.Now()
-	if err := runParallelSimulation(ctx, baseCfg, "complex-multi-batch", parallelUsers, concurrency); err != nil {
-		t.Fatalf("run parallel simulation: %v", err)
-	}
+	runErr := runParallelSimulation(ctx, baseCfg, "complex-multi-batch", parallelUsers, concurrency)
 	duration := time.Since(start)
+	close(stopSampling)
+	peaks := <-resourcePeaks
+	var usage syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil {
+		t.Logf("read process peak RSS: %v", err)
+	}
 
-	t.Logf("scenario=complex-multi-batch parallel=%d concurrency=%d verify=%t duration=%s", parallelUsers, concurrency, verify, duration)
+	t.Logf("scenario=complex-multi-batch parallel=%d concurrency=%d verify=%t projection_slots=%d duration=%s http_503=%d pool_acquired_peak=%d pool_total_peak=%d heap_alloc_sampled_peak_bytes=%d process_peak_rss_raw=%d process_peak_rss_goos=%s",
+		parallelUsers, concurrency, verify, envInt("OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS", 4), duration,
+		statusCounter.unavailable.Load(), peaks.poolAcquired, peaks.poolTotal, peaks.heapAlloc, usage.Maxrss, runtime.GOOS)
 
 	for idx, summary := range stageMetrics.snapshot() {
 		if idx >= 12 {
@@ -167,6 +273,9 @@ func TestPerfComplexMultiBatchParallel(t *testing.T) {
 			summary.TotalCount,
 			summary.ErrorSamples,
 		)
+	}
+	if runErr != nil {
+		t.Fatalf("run parallel simulation: %v", runErr)
 	}
 }
 

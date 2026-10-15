@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -390,8 +391,10 @@ func (s *ComplexMultiBatchScenario) testDownloadWithPhoneSourceID(ctx context.Co
 		logger.Info("📊 Expected result: 0 records (data already synced from this device)")
 	}
 
-	// Perform download sync - should get 0 records since we uploaded from this phone
-	applied, nextAfter, err := s.app.pullToStable(ctx)
+	// Perform download sync - should get 0 records since we uploaded from this phone.
+	// A retryable 503 may outlast the SDK's per-call transport budget. Exercise
+	// application recovery by reopening the same database before trying again.
+	applied, nextAfter, err := s.pullPhoneAfter503Restart(ctx, logger)
 	if err != nil {
 		logger.Warn("❌ Download with phone device identity failed", "error", err.Error())
 		return fmt.Errorf("download sync with phone device identity failed: %w", err)
@@ -402,6 +405,63 @@ func (s *ComplexMultiBatchScenario) testDownloadWithPhoneSourceID(ctx context.Co
 		logger.Info("✅ Download sync with phone device identity completed", "device_id", s.phoneDeviceID)
 		logger.Info("📊 Result: No new records downloaded (expected behavior)")
 	}
+	return nil
+}
+
+func (s *ComplexMultiBatchScenario) pullPhoneAfter503Restart(ctx context.Context, logger *slog.Logger) (int, int64, error) {
+	const maxRestarts = 3
+	for restarts := 0; ; restarts++ {
+		applied, nextAfter, err := s.app.pullToStable(ctx)
+		var exhausted *oversqlite.RetryExhaustedError
+		if err == nil || !errors.As(err, &exhausted) || exhausted.Operation != "pull_request" || exhausted.LastFailure.Kind != "http_status" || exhausted.LastFailure.HTTPStatus != 503 {
+			return applied, nextAfter, err
+		}
+		if restarts == maxRestarts {
+			return applied, nextAfter, fmt.Errorf("phone pull still received HTTP 503 after %d application restarts: %w", restarts, err)
+		}
+		if err := s.reopenPhoneAfter503(ctx, logger, restarts+1); err != nil {
+			return 0, 0, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, 0, ctx.Err()
+		case <-time.After(time.Duration(restarts+1) * time.Second):
+		}
+	}
+}
+
+func (s *ComplexMultiBatchScenario) reopenPhoneAfter503(ctx context.Context, logger *slog.Logger, restart int) error {
+	path := s.app.GetDatabasePath()
+	var sourceID string
+	if readErr := s.app.db.QueryRowContext(ctx, `SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1`).Scan(&sourceID); readErr != nil {
+		return fmt.Errorf("read phone source identity before 503 recovery: %w", readErr)
+	}
+	checkpoint, readErr := s.app.lastServerSeqSeen(ctx)
+	if readErr != nil {
+		return fmt.Errorf("read phone checkpoint before 503 recovery: %w", readErr)
+	}
+	logger.Info("Phone pull exhausted on HTTP 503; reopening the same SQLite database", "path", path, "restart", restart)
+	restarted, restartErr := s.restartApp(ctx, s.app, "phone")
+	if restartErr != nil {
+		return fmt.Errorf("reopen phone after pull 503: %w", restartErr)
+	}
+	s.app = restarted
+	s.simulator.currentApp = restarted
+	if restarted.GetDatabasePath() != path {
+		return fmt.Errorf("phone database path changed during pull 503 recovery")
+	}
+	var reopenedSourceID string
+	if readErr := restarted.db.QueryRowContext(ctx, `SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1`).Scan(&reopenedSourceID); readErr != nil {
+		return fmt.Errorf("read reopened phone source identity: %w", readErr)
+	}
+	reopenedCheckpoint, readErr := restarted.lastServerSeqSeen(ctx)
+	if readErr != nil {
+		return fmt.Errorf("read reopened phone checkpoint: %w", readErr)
+	}
+	if sourceID == "" || reopenedSourceID != sourceID || reopenedCheckpoint != checkpoint {
+		return fmt.Errorf("phone source or checkpoint changed during pull 503 recovery")
+	}
+	restarted.currentClient().ResumeDownloads()
 	return nil
 }
 

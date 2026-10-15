@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"github.com/mobiletoly/go-oversync/integration/mobile_flow/config"
 	"github.com/mobiletoly/go-oversync/integration/mobile_flow/simulator"
-	"time"
 )
 
 func collectParallelResults(ctx context.Context, baseCfg *config.Config, scenarioName string, sharedVerifier *simulator.DatabaseVerifier, results <-chan simulationUserResult) (int, int, time.Duration, []string, []simulator.UserVerificationReport) {
@@ -30,9 +31,16 @@ func collectParallelResults(ctx context.Context, baseCfg *config.Config, scenari
 
 		// Generate comprehensive report for this user (only if verification is enabled)
 		if baseCfg.EnableVerify && sharedVerifier != nil {
-			expectedCounts := map[string]int{
-				"business.users": 50,  // Expected users per user
-				"business.posts": 100, // Expected posts per user
+			// For other scenarios, these keys select tables to include in the report.
+			// The complex scenario also has a fixed final state that we can verify.
+			expectedCounts := map[string]int{"business.users": 0, "business.posts": 0}
+			if scenarioName == "complex-multi-batch" {
+				expectedCounts = map[string]int{
+					"business.users":        23,
+					"business.posts":        447,
+					"business.files":        50,
+					"business.file_reviews": 50,
+				}
 			}
 
 			userReport, err := reportGenerator.GenerateUserReport(ctx, result.userID, scenarioName, result.sqliteDBPath, expectedCounts, result.duration)
@@ -55,11 +63,34 @@ func collectParallelResults(ctx context.Context, baseCfg *config.Config, scenari
 				userReport.VerificationPassed = false
 				userReport.Errors = append(userReport.Errors, fmt.Sprintf("Scenario failed: %v", result.err))
 			}
+			if scenarioName == "complex-multi-batch" {
+				verifyComplexMultiBatchCounts(userReport, expectedCounts)
+			}
 			userReports = append(userReports, *userReport)
 		}
 	}
 
 	return successCount, failureCount, totalDuration, errors, userReports
+}
+
+func verifyComplexMultiBatchCounts(report *simulator.UserVerificationReport, expected map[string]int) {
+	for table, want := range expected {
+		postgresCount, postgresPresent := report.PostgreSQLResults.BusinessTableCounts[table]
+		if !postgresPresent || postgresCount != want {
+			report.VerificationPassed = false
+			report.Errors = append(report.Errors, fmt.Sprintf("PostgreSQL %s: expected %d, got %d (present=%t)", table, want, postgresCount, postgresPresent))
+		}
+		sqliteTable := table[len("business."):]
+		sqliteCount, sqlitePresent := report.SQLiteResults.TableCounts[sqliteTable]
+		if !sqlitePresent || sqliteCount != want {
+			report.VerificationPassed = false
+			report.Errors = append(report.Errors, fmt.Sprintf("SQLite %s: expected %d, got %d (present=%t)", sqliteTable, want, sqliteCount, sqlitePresent))
+		}
+	}
+	if report.SQLiteResults.PendingChanges != 0 {
+		report.VerificationPassed = false
+		report.Errors = append(report.Errors, fmt.Sprintf("SQLite has %d pending changes", report.SQLiteResults.PendingChanges))
+	}
 }
 
 func finishParallelVerification(baseCfg *config.Config, scenarioName string, numUsers int, userReports []simulator.UserVerificationReport, totalTime time.Duration, sharedVerifier *simulator.DatabaseVerifier) int {
@@ -114,6 +145,6 @@ func printParallelVerificationReport(completeReport *simulator.TestReport) {
 		}
 	}
 
-	fmt.Printf("\n📈 Total Records Verified: %d\n", completeReport.Summary.TotalRecords)
+	fmt.Printf("\n📈 PostgreSQL business records counted (including incomplete users): %d\n", completeReport.Summary.TotalRecords)
 	fmt.Printf("═══════════════════════════════════════════════════════════════\n")
 }
