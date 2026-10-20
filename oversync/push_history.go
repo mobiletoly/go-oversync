@@ -38,6 +38,11 @@ type PushFailedError struct{}
 func (*PushFailedError) Error() string { return "push failed" }
 
 func sanitizePushError(err error) error {
+	var denied *ScopeAccessDeniedError
+	var unavailable *ScopeAdmissionUnavailableError
+	if errors.As(err, &denied) || errors.As(err, &unavailable) {
+		return err
+	}
 	var applicationErr *ApplicationWriteRejectedError
 	if errors.As(err, &applicationErr) || err == nil {
 		return err

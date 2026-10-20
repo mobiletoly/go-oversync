@@ -41,6 +41,9 @@ func (s *SyncService) Connect(ctx context.Context, actor Actor, proof SchemaGene
 
 	var resp *ConnectResponse
 	err = pgx.BeginTxFunc(ctx, conn, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, Kind: ScopeTransactionConnect, SourceID: actor.SourceID}); err != nil {
+			return err
+		}
 		if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
 			return err
 		}

@@ -2128,7 +2128,10 @@ func schemaGenerationAnonymousTuple(tuple *types.Tuple) *types.Tuple {
 // catalog report fields, and the private background-worker switch.
 // Discovery adds GetGeneration, HandleGeneration and its two-field response;
 // the unreleased v1 vocabulary drops int16, int32 and float32 constants.
-const schemaGenerationAllowedPackageSurfaceHash = "285999048d6866ff72fc544e30214c1ef3aec6182f775d664a60f6c19cdac38c"
+// Scope lifecycle adds the SQL-only transaction admission capability, closed origin
+// kinds, safe admission errors and the existing-only ScopeManager write option.
+// Generation declaration types and fingerprints remain unchanged.
+const schemaGenerationAllowedPackageSurfaceHash = "a8ed6636c04ef884eae95b4517bcc5ac31bc9d7938344cc4cda249dae0612a37"
 
 func schemaGenerationPackageSurfaceHash(surface []string) string {
 	digest := sha256.Sum256([]byte(strings.Join(surface, "\n")))

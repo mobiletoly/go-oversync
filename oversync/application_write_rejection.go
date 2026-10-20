@@ -36,6 +36,11 @@ func (s *SyncService) classifyApplicationWriteError(err error) error {
 	if s == nil || s.config == nil || s.config.Readiness == nil {
 		return err
 	}
+	var denied *ScopeAccessDeniedError
+	var unavailable *ScopeAdmissionUnavailableError
+	if errors.As(err, &denied) || errors.As(err, &unavailable) {
+		return err
+	}
 	var rollback *WriteRollbackUnconfirmedError
 	var commit *CommitOutcomeUnknownError
 	if errors.As(err, &rollback) || errors.As(err, &commit) {

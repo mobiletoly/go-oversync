@@ -417,3 +417,40 @@ HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable sta
 ## License
 
 Apache 2.0. See `LICENSE` if present in your distribution or the source headers in this repository.
+
+### Transaction admission for application-owned scope lifecycle
+
+`ServiceConfig.ScopeTransactionAdmission` optionally supplies an application policy implementing
+`AdmitScopeTransaction(context.Context, DatabaseWriteTx, ScopeTransactionOperation) error`.
+Oversync calls it inside each actual scoped mutation transaction, before scope creation or receipt
+replay, and calls it again on every transaction retry. A nil capability preserves SDK behavior.
+The supplied SQL-only transaction has the same context, SQL and nested SDK operation restrictions
+as retryable write callbacks. The application owns its policy tables and lock namespace.
+
+`ScopeTransactionOperation` carries exact `ScopeID` and `SourceID` values and an SDK-derived `Kind`:
+
+| Entry point | Kind | Source |
+| --- | --- | --- |
+| `Connect` | `ScopeTransactionConnect` | authenticated client source |
+| `PushOneShot` and `WithinSyncBundle` | `ScopeTransactionClientPush` | validated non-reserved source |
+| `ScopeManager.ExecWrite` | `ScopeTransactionServerWrite` | trusted in-process writer |
+| Populated-table baseline adoption | `ScopeTransactionServerWrite` | SDK `oversync-adoption:` namespace |
+| Snapshot creation and source replacement | `ScopeTransactionSnapshotCreate` | authenticated old/current source |
+| Explicit snapshot retirement | `ScopeTransactionSnapshotRetire` | authenticated client source |
+
+Client sources cannot impersonate configured reserved server writers. Authorize privileged writers
+using both the kind and exact source ID. A policy can acquire a shared transaction advisory lock,
+then read application lifecycle state in a **separate statement** under Read Committed; a retiring
+application takes the matching exclusive lock and durably records retirement. The lock stays held
+until commit or rollback. Scope reads, watches and erasure-only metadata maintenance do not invoke
+this capability or hold its lifecycle lock.
+
+Return `&oversync.ScopeAccessDeniedError{}` to reject with safe HTTP 403 `scope_access_denied`.
+Other policy errors fail closed as `ScopeAdmissionUnavailableError`, with safe HTTP 503
+`scope_admission_unavailable`; the cause is available to trusted Go callers through `Unwrap`.
+The SDK implements no account-deletion policy and creates no lifecycle table.
+
+`ScopeWriteOptions.RequireExistingScope` makes trusted server writes reject absent or uninitialized
+scopes with `ScopeUninitializedError`, after transaction admission and without creating metadata.
+It supports repeated application erasure without accidentally initializing an empty scope. Include
+this option in the application's frozen `OperationHash`, just as application-selected byte limits.

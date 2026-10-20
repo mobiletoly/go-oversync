@@ -507,6 +507,9 @@ func (h *HTTPSyncHandlers) writeJSONBytes(w http.ResponseWriter, r *http.Request
 }
 
 func (h *HTTPSyncHandlers) writeServiceUnavailable(w http.ResponseWriter, r *http.Request, err error) bool {
+	if h.writeScopeAdmissionFailure(w, r, err) {
+		return true
+	}
 	if !errors.Is(err, errServiceShuttingDown) && !errors.Is(err, errServiceNotReady) {
 		return false
 	}
@@ -515,6 +518,9 @@ func (h *HTTPSyncHandlers) writeServiceUnavailable(w http.ResponseWriter, r *htt
 }
 
 func (h *HTTPSyncHandlers) writePushTransactionFailure(w http.ResponseWriter, r *http.Request, err error) bool {
+	if h.writeScopeAdmissionFailure(w, r, err) {
+		return true
+	}
 	var applicationErr *ApplicationWriteRejectedError
 	if errors.As(err, &applicationErr) {
 		h.writeError(w, http.StatusUnprocessableEntity, applicationErr.Category, "Application rejected the write; resolve the pending intent before retrying", r)
@@ -595,6 +601,9 @@ func (h *HTTPSyncHandlers) HandlePush(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HTTPSyncHandlers) writeCompactPushError(w http.ResponseWriter, r *http.Request, sourceID string, err error) {
+	if h.writeScopeAdmissionFailure(w, r, err) {
+		return
+	}
 	var replayMismatchErr *PushReplayMismatchError
 	if errors.As(err, &replayMismatchErr) {
 		h.writeError(w, http.StatusConflict, "push_replay_mismatch", replayMismatchErr.Error(), r)
@@ -660,6 +669,9 @@ func (h *HTTPSyncHandlers) HandleConnect(w http.ResponseWriter, r *http.Request)
 
 	response, err := h.service.Connect(r.Context(), actor, proof, &req)
 	if err != nil {
+		if h.writeScopeAdmissionFailure(w, r, err) {
+			return
+		}
 		if h.writeGenerationOrSourceLifecycleError(w, r, actor.SourceID, err) {
 			return
 		}
@@ -986,6 +998,9 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 
 	response, err := h.service.CreateSnapshotSessionWithRequest(r.Context(), actor, proof, req)
 	if err != nil {
+		if h.writeScopeAdmissionFailure(w, r, err) {
+			return
+		}
 		if h.writeGenerationOrSourceLifecycleError(w, r, actor.SourceID, err) {
 			return
 		}
@@ -1185,6 +1200,9 @@ func (h *HTTPSyncHandlers) HandleDeleteSnapshotSession(w http.ResponseWriter, r 
 
 	snapshotID := r.PathValue("snapshot_id")
 	if err := h.service.DeleteSnapshotSession(r.Context(), actor, proof, snapshotID); err != nil {
+		if h.writeScopeAdmissionFailure(w, r, err) {
+			return
+		}
 		if h.writeGenerationOrSourceLifecycleError(w, r, actor.SourceID, err) {
 			return
 		}
@@ -1291,4 +1309,22 @@ func (h *HTTPSyncHandlers) writePushConflict(w http.ResponseWriter, r *http.Requ
 		"status_code", http.StatusConflict,
 		"error_code", "push_conflict",
 		"message", conflictErr.Error())
+}
+
+// writeScopeAdmissionFailure preserves safe, identical admission envelopes for
+// connect, push and snapshot mutations, including wrapped transaction errors.
+// Mutation dispatchers call it before inspecting domain error causes because
+// unavailable admissions retain their cause for trusted diagnostics and retry.
+func (h *HTTPSyncHandlers) writeScopeAdmissionFailure(w http.ResponseWriter, r *http.Request, err error) bool {
+	var denied *ScopeAccessDeniedError
+	if errors.As(err, &denied) {
+		h.writeError(w, http.StatusForbidden, "scope_access_denied", "Scope access denied", r)
+		return true
+	}
+	var unavailable *ScopeAdmissionUnavailableError
+	if errors.As(err, &unavailable) {
+		h.writeError(w, http.StatusServiceUnavailable, "scope_admission_unavailable", "Scope admission unavailable; retry later", r)
+		return true
+	}
+	return false
 }

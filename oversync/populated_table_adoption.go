@@ -1387,6 +1387,21 @@ func (s *SyncService) validateRetainedAdoptionBundles(
 	return retainedRows, nil
 }
 
+// allocateAdoptionSourceID freezes the exact trusted origin before lifecycle
+// admission, without creating any scoped metadata.
+func allocateAdoptionSourceID(ctx context.Context, tx pgx.Tx, userID string) (string, error) {
+	for {
+		sourceID := adoptionSourcePrefix + uuid.NewString()
+		var collision bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sync.source_state source JOIN sync.user_state scope USING (user_pk) WHERE scope.user_id=$1 AND source.source_id=$2)`, userID, sourceID).Scan(&collision); err != nil {
+			return "", fmt.Errorf("check adoption source collision for scope %s: %w", userID, err)
+		}
+		if !collision {
+			return sourceID, nil
+		}
+	}
+}
+
 func (s *SyncService) persistAdoptionBaseline(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -1396,6 +1411,13 @@ func (s *SyncService) persistAdoptionBaseline(
 ) (adoptionScopeState, error) {
 	if len(rows) == 0 {
 		return adoptionScopeState{}, nil
+	}
+	sourceID, err := allocateAdoptionSourceID(ctx, tx, userID)
+	if err != nil {
+		return adoptionScopeState{}, err
+	}
+	if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: userID, Kind: ScopeTransactionServerWrite, SourceID: sourceID}); err != nil {
+		return adoptionScopeState{}, err
 	}
 	if err := ensureScopeStateExistsWithExec(ctx, tx, userID); err != nil {
 		return adoptionScopeState{}, err
@@ -1467,17 +1489,7 @@ func (s *SyncService) persistAdoptionBaseline(
 	if err != nil {
 		return adoptionScopeState{}, &PopulatedTableAdoptionError{Reason: "baseline_unrepresentable", UserID: userID, BusinessRowCount: int64(len(rows)), Detail: err.Error()}
 	}
-	var sourceID string
-	for {
-		sourceID = adoptionSourcePrefix + uuid.NewString()
-		var collision bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sync.source_state WHERE user_pk = $1 AND source_id = $2)`, scope.UserPK, sourceID).Scan(&collision); err != nil {
-			return adoptionScopeState{}, fmt.Errorf("check adoption source collision for scope %s: %w", userID, err)
-		}
-		if !collision {
-			break
-		}
-	}
+
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO sync.bundle_log (
 			user_pk, bundle_seq, source_id, source_bundle_id, row_count,

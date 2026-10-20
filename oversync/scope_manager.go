@@ -39,6 +39,9 @@ type ScopeWriteOptions struct {
 	// Include application-selected limits in OperationHash when freezing a request.
 	MaxBytesPerBundle int
 	WriterID          string
+	// RequireExistingScope rejects absent or uninitialized scopes instead of
+	// creating sync metadata. Include this choice in OperationHash.
+	RequireExistingScope bool
 	RetryableWriteOptions
 	RequiredEffectTables  []RegisteredEffectTable
 	ForbiddenEffectTables []RegisteredEffectTable
@@ -216,16 +219,38 @@ func requireNormalizedEffects(bundle *Bundle, required canonicalEffectSet) error
 	return &RetryableCallbackViolationError{Message: "retryable database-write callback produced no required normalized registered-table effect"}
 }
 
+// prepareScopeWriteInTx admits lifecycle policy, enforces existing-only writes,
+// marks trusted reservations, then creates or resolves the scope's metadata.
+// All locks and SQL effects remain in the attempt's transaction.
+func (s *SyncService) prepareScopeWriteInTx(ctx context.Context, tx pgx.Tx, scopeID string, opts ScopeWriteOptions) (int64, error) {
+	if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: scopeID, Kind: ScopeTransactionServerWrite, SourceID: opts.WriterID}); err != nil {
+		return 0, err
+	}
+	if opts.RequireExistingScope {
+		state, err := loadScopeStateForUpdate(ctx, tx, scopeID)
+		if err != nil {
+			return 0, err
+		}
+		if state.State != scopeStateInitialized {
+			return 0, &ScopeUninitializedError{UserID: scopeID}
+		}
+	}
+	if err := markReservedServerSourceUsed(ctx, tx, opts.WriterID, s.isReservedServerSourceID(opts.WriterID)); err != nil {
+		return 0, err
+	}
+	if !opts.RequireExistingScope {
+		if err := ensureScopeStateExistsWithExec(ctx, tx, scopeID); err != nil {
+			return 0, err
+		}
+	}
+	return lookupUserPK(ctx, tx, scopeID)
+}
+
 // executeScopeWriteInTx owns the receipt, callback and canonical effects within
-// one transaction. ExecWrite owns admission, connection and bounded retry instead.
+// one transaction, admitting lifecycle policy before initialization or receipt replay.
+// ExecWrite owns readiness admission, connection and bounded retry.
 func (m *ScopeManager) executeScopeWriteInTx(ctx context.Context, tx pgx.Tx, scopeID string, opts ScopeWriteOptions, fn RetryableDatabaseWrite, requiredEffects, forbiddenEffects canonicalEffectSet) (*ScopeWriteResult, error) {
-	if err := markReservedServerSourceUsed(ctx, tx, opts.WriterID, m.service.isReservedServerSourceID(opts.WriterID)); err != nil {
-		return nil, err
-	}
-	if err := ensureScopeStateExistsWithExec(ctx, tx, scopeID); err != nil {
-		return nil, err
-	}
-	userPK, err := lookupUserPK(ctx, tx, scopeID)
+	userPK, err := m.service.prepareScopeWriteInTx(ctx, tx, scopeID, opts)
 	if err != nil {
 		return nil, err
 	}

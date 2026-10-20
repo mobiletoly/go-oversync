@@ -148,6 +148,9 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 
 	var resp *SnapshotSession
 	err = withOriginTransaction(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, Kind: ScopeTransactionSnapshotCreate, SourceID: actor.SourceID}); err != nil {
+			return err
+		}
 		if err := requireScopeInitializedQuerier(ctx, tx, actor.UserID); err != nil {
 			return err
 		}
@@ -958,6 +961,9 @@ func (s *SyncService) DeleteSnapshotSession(ctx context.Context, actor Actor, pr
 	}
 
 	err = withOriginTransaction(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, Kind: ScopeTransactionSnapshotRetire, SourceID: actor.SourceID}); err != nil {
+			return err
+		}
 		if _, _, err := validateSnapshotSessionAccessForUpdate(ctx, tx, actor, proof, snapshotID); err != nil {
 			return err
 		}

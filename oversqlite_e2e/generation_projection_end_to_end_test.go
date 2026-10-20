@@ -661,7 +661,14 @@ func TestEndToEnd_ProductionCommittedPageEncoderAndReaderCarryLargeEffect(t *tes
 	schema := "e2e_projection_large_committed_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	server := newExampleServer(t, schema)
 	userID := "e2e-large-committed-user-" + uuid.NewString()
-	client, db := newSQLiteClient(t, server, userID, "large-committed-client", defaultOversqliteConfig(schema, syncTables("users")), usersDDL)
+	config := defaultOversqliteConfig(schema, syncTables("users"))
+	// This deliberately expanded row produces about 13 MiB of escaped wire
+	// data. The reader conservatively charges 64 copies of encoded/decoded
+	// buffers alongside the frozen request. Supply a 4 GiB fixture allowance
+	// for that bounded envelope so the codec and settlement assertions execute.
+	// Workspace admission limits retain their dedicated owning coverage.
+	config.MaxSyncWorkspaceBytes = 4 << 30
+	client, db := newSQLiteClient(t, server, userID, "large-committed-client", config, usersDDL)
 	rowID := uuid.NewString()
 	largeName := strings.Repeat("<>&", 700<<10) + "\u2028\u2029\"\\" + string([]byte{1})
 	_, err := db.Exec(`INSERT INTO users(id,name,email) VALUES(?,?,?)`, rowID, largeName, "large-committed@example.com")

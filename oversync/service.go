@@ -221,6 +221,9 @@ type snapshotTestHooks struct {
 
 // ServiceConfig holds configuration for the sync service
 type ServiceConfig struct {
+	// ScopeTransactionAdmission optionally fences each scoped mutation inside its
+	// SQL transaction. Nil preserves ordinary SDK behavior.
+	ScopeTransactionAdmission      ScopeTransactionAdmission
 	Readiness                      *ReadinessConfig   // Required application-owned deployment evidence
 	SchemaGenerations              []SchemaGeneration // Required immutable client generation contracts
 	AppName                        string             // Application name for connection tracking

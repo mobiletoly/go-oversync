@@ -338,6 +338,9 @@ func (s *SyncService) withinSyncBundleAttempt(
 	emptyEffects canonicalEffectSet,
 	fn RetryableDatabaseWrite,
 ) error {
+	if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, Kind: ScopeTransactionClientPush, SourceID: source.SourceID}); err != nil {
+		return err
+	}
 	if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
 		return err
 	}

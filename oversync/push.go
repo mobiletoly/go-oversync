@@ -199,6 +199,9 @@ func (s *SyncService) PushOneShot(ctx context.Context, actor Actor, proof Schema
 	err = runRetryableOwnedTransaction(ctx, conn, func(tx pgx.Tx) error {
 		releaseHistoryProjection(&releaseProjection)
 		resp = nil
+		if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, Kind: ScopeTransactionClientPush, SourceID: actor.SourceID}); err != nil {
+			return err
+		}
 		if err := s.configureUploadTx(ctx, tx); err != nil {
 			return err
 		}

@@ -53,6 +53,7 @@ paths:
         '200': { $ref: '#/components/responses/ConnectOK' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ScopeAccessDenied' }
         '409': { $ref: '#/components/responses/Error' }
         '410': { $ref: '#/components/responses/Error' }
         '415': { $ref: '#/components/responses/UnsupportedEncoding' }
@@ -66,7 +67,7 @@ paths:
       description: |
         Validation precedence is authentication; immutable source/generation headers;
         media type/encoding; encoded and decoded limits; strict envelope; compact
-        rows and canonical request hash; then committed-history replay. The response
+        rows and canonical request hash; transaction scope admission; then committed-history replay. The response
         is the entire authoritative effect and HTTP 200 means committed.
       security: [{ BearerAuth: [] }]
       parameters: [ { $ref: '#/components/parameters/SourceIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationFingerprintHeader' }, { $ref: '#/components/parameters/RequestContentEncoding' } ]
@@ -75,6 +76,7 @@ paths:
         '200': { $ref: '#/components/responses/PushOK' }
         '400': { $ref: '#/components/responses/PushBadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ScopeAccessDenied' }
         '409': { $ref: '#/components/responses/Error' }
         '410': { $ref: '#/components/responses/Error' }
         '413': { $ref: '#/components/responses/BodyTooLarge' }
@@ -128,6 +130,7 @@ paths:
         '200': { $ref: '#/components/responses/SnapshotSessionOK' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ScopeAccessDenied' }
         '409': { $ref: '#/components/responses/Error' }
         '410': { $ref: '#/components/responses/Error' }
         '413': { $ref: '#/components/responses/BodyTooLarge' }
@@ -206,7 +209,8 @@ components:
     PushBadRequest: { description: Strict envelope failures return invalid_request; accepted-envelope compact tuple, logical row, or canonical-hash failures return push_invalid, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
     UnsupportedEncoding: { description: Unsupported media type or content encoding, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
     BodyTooLarge: { description: Encoded or decoded body exceeds its bound, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-    ServiceUnavailable: { description: Service unavailable or commit outcome unknown, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+    ScopeAccessDenied: { description: Application transaction admission denied the scope (scope_access_denied), headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+    ServiceUnavailable: { description: Service unavailable (including scope_admission_unavailable) or commit outcome unknown, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
     ConnectOK: { description: Lifecycle resolved, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ConnectResponse' } } } }
     PushOK:
       description: Complete committed or replayed authoritative effect.
