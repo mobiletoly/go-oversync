@@ -23,7 +23,8 @@ func TestA3Settlement_BacklogBound(t *testing.T) {
 				c.config.MaxSyncWorkUnitsPerInvocation = 1000000
 				_, err := db.Exec(`UPDATE nodes SET name='changed parent' WHERE id='P'`)
 				require.NoError(t, err)
-				c.SetBeforePushCommitHook(func(context.Context) error { return context.Canceled })
+				c.HTTP = &http.Client{Transport: a1SettlementServer(t)}
+				c.SetBeforePushReplayHook(func(context.Context) error { return context.Canceled })
 				_, err = c.PushPending(context.Background())
 				require.ErrorIs(t, err, context.Canceled)
 				// Setup ends after the exact one-row outbox is frozen. The measured public
@@ -45,7 +46,7 @@ func TestA3Settlement_BacklogBound(t *testing.T) {
 				var frozenID int64
 				require.NoError(t, db.QueryRow(`SELECT canonical_request_hash,source_bundle_id FROM _sync_outbox_bundle`).Scan(&frozenHash, &frozenID))
 				require.EqualValues(t, 2, frozenID)
-				c.HTTP = &http.Client{Transport: a1SettlementServer(t)}
+				c.SetBeforePushReplayHook(nil)
 				var before, after runtime.MemStats
 				runtime.GC()
 				runtime.ReadMemStats(&before)
@@ -145,14 +146,15 @@ func TestA3Settlement_TriggerRestoration(t *testing.T) {
 	c, db := newA1SurvivorClient(t)
 	_, err := db.Exec(`UPDATE nodes SET name='changed parent' WHERE id='P'`)
 	require.NoError(t, err)
-	c.SetBeforePushCommitHook(func(context.Context) error { return context.Canceled })
+	c.HTTP = &http.Client{Transport: a1SettlementServer(t)}
+	c.SetBeforePushReplayHook(func(context.Context) error { return context.Canceled })
 	_, err = c.PushPending(context.Background())
 	require.ErrorIs(t, err, context.Canceled)
 	// U now has newer L, while an apply-mode business write produces a supported
 	// live deviation from L. It must become an exception, never a replacement B.
 	_, err = db.Exec(`INSERT INTO nodes VALUES('U','new L',NULL); UPDATE _sync_apply_state SET apply_mode=1; UPDATE nodes SET name='live exception' WHERE id='U'; UPDATE _sync_apply_state SET apply_mode=0; CREATE TRIGGER alter_u AFTER DELETE ON nodes WHEN OLD.id='P' BEGIN UPDATE nodes SET name='trigger damage' WHERE id='U'; END`)
 	require.NoError(t, err)
-	c.HTTP = &http.Client{Transport: a1SettlementServer(t)}
+	c.SetBeforePushReplayHook(nil)
 	_, err = c.PushPending(context.Background())
 	require.NoError(t, err)
 	var name, desired string

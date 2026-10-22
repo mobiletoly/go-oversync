@@ -1,457 +1,1433 @@
+---
 openapi: 3.1.0
 info:
-  title: go-oversync Two-Way Sync API
+  title: Oversqlite v1 durable recovery — durable recovery contract
   version: 1.0.0
-  description: |
-    Breaking-change Oversqlite v1 data plane. Discovery is the sole admitted wire
-    contract. Compact row groups are expanded to logical rows before validation,
-    hashing, conflict checks, and application. Bounded JSON bodies may use a
-    single gzip content encoding only when it is smaller than identity at 2,048
-    decoded bytes or above; all protocol limits describe decoded JSON bytes.
+  description: Active sole-v1 wire contract for narrowed durable recovery. Runtime outcome and snapshot
+    implementation is phased separately. Sole v1 with exact terminal upload outcomes, resolve-or-cancel,
+    acknowledgment, and floor/hash-bound clean recovery snapshots. Snapshots cannot settle an outstanding
+    upload. Existing row codecs and request/bundle hashes remain. No compatibility, per-column merge,
+    decision/report API or prepaid storage quotas. Examples use independently computed shared golden vectors.
 servers:
-  - url: http://localhost:8080
+- url: http://localhost:8080
 paths:
   /syncx/health:
     get:
       summary: Readiness health check
       responses:
-        '200': { $ref: '#/components/responses/StatusOK' }
-        '503': { $ref: '#/components/responses/StatusUnavailable' }
+        '200':
+          $ref: '#/components/responses/StatusOK'
+        '503':
+          $ref: '#/components/responses/StatusUnavailable'
   /syncx/status:
     get:
       summary: Service status snapshot
       responses:
-        '200': { $ref: '#/components/responses/StatusOK' }
+        '200':
+          $ref: '#/components/responses/StatusOK'
   /sync/generations/{generation_id}:
     get:
       summary: Discover the sole admitted Oversqlite wire contract
-      security: [{ BearerAuth: [] }]
+      security:
+      - BearerAuth: []
       parameters:
-        - $ref: '#/components/parameters/SourceIDHeader'
-        - $ref: '#/components/parameters/GenerationIDPath'
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/GenerationIDPath'
       responses:
         '200':
-          description: Exact v1 discovery contract; no features or implementation tuning fields.
+          description: Exact sole-v1 discovery; no fallback or negotiation.
           headers:
-            Content-Encoding: { $ref: '#/components/headers/OptionalGzip' }
+            Content-Encoding:
+              $ref: '#/components/headers/OptionalGzip'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/DiscoveryResponse' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '409': { $ref: '#/components/responses/Error' }
-        '426': { $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
-        '500': { $ref: '#/components/responses/Error' }
+              schema:
+                $ref: '#/components/schemas/DiscoveryResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Error'
+        '426':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/Error'
   /sync/connect:
     post:
       summary: Resolve source lifecycle admission after discovery
-      security: [{ BearerAuth: [] }]
-      parameters: [ { $ref: '#/components/parameters/SourceIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationFingerprintHeader' }, { $ref: '#/components/parameters/RequestContentEncoding' } ]
-      requestBody: { $ref: '#/components/requestBodies/ConnectRequest' }
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/RequestContentEncoding'
+      requestBody:
+        $ref: '#/components/requestBodies/ConnectRequest'
       responses:
-        '200': { $ref: '#/components/responses/ConnectOK' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/ScopeAccessDenied' }
-        '409': { $ref: '#/components/responses/Error' }
-        '410': { $ref: '#/components/responses/Error' }
-        '415': { $ref: '#/components/responses/UnsupportedEncoding' }
-        '413': { $ref: '#/components/responses/BodyTooLarge' }
-        '426': { $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
-        '500': { $ref: '#/components/responses/Error' }
+        '200':
+          $ref: '#/components/responses/ConnectOK'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ScopeAccessDenied'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedEncoding'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '426':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/Error'
+      description: Attach a client source to the authorized scope. No outcome storage is prepaid on connect;
+        retain existing source-count admission. A pending outcome cannot be destroyed by rebinding or
+        replacement. Client-upload and trusted server-writer sources are disjoint within each scope;
+        cross-owner admission returns409 source_generation_conflict before effects. Ownership fences
+        survive acknowledgment, binding cleanup, history pruning and restart.
   /sync/push:
     post:
-      summary: Atomically commit or exactly replay one bounded complete source bundle
-      description: |
-        Validation precedence is authentication; immutable source/generation headers;
-        media type/encoding; encoded and decoded limits; strict envelope; compact
-        rows and canonical request hash; transaction scope admission; then committed-history replay. The response
-        is the entire authoritative effect and HTTP 200 means committed.
-      security: [{ BearerAuth: [] }]
-      parameters: [ { $ref: '#/components/parameters/SourceIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationFingerprintHeader' }, { $ref: '#/components/parameters/RequestContentEncoding' } ]
-      requestBody: { $ref: '#/components/requestBodies/PushRequest' }
+      summary: Commit or exactly replay one source operation and its retained terminal outcome
+      description: Require exact v1/source/generation headers and strict complete request. Serialize with
+        resolve/ack. Terminal committed/rejected/cancelled is HTTP200. Persist exact projected outcome
+        and terminal source state atomically with committed business/history, or after rollback for typed
+        rejection. No next source sequence before acknowledgment. Invalid/admission/infrastructure errors
+        are nonterminal; old frozen requests require resolve-or-cancel before replacement.
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/RequestContentEncoding'
+      requestBody:
+        $ref: '#/components/requestBodies/PushRequest'
       responses:
-        '200': { $ref: '#/components/responses/PushOK' }
-        '400': { $ref: '#/components/responses/PushBadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/ScopeAccessDenied' }
-        '409': { $ref: '#/components/responses/Error' }
-        '410': { $ref: '#/components/responses/Error' }
-        '413': { $ref: '#/components/responses/BodyTooLarge' }
-        '415': { $ref: '#/components/responses/UnsupportedEncoding' }
-        '422': { $ref: '#/components/responses/Error' }
-        '426': { $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
-        '500': { $ref: '#/components/responses/Error' }
+        '200':
+          $ref: '#/components/responses/PushOK'
+        '400':
+          $ref: '#/components/responses/PushBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ScopeAccessDenied'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedEncoding'
+        '422':
+          $ref: '#/components/responses/Error'
+        '426':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/Error'
   /sync/pull:
     get:
       summary: Read compact authoritative bundles to a stable ceiling
-      security: [{ BearerAuth: [] }]
-      parameters: [ { $ref: '#/components/parameters/SourceIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationFingerprintHeader' }, { $ref: '#/components/parameters/AfterBundleSeq' }, { $ref: '#/components/parameters/MaxBundles' }, { $ref: '#/components/parameters/TargetBundleSeq' } ]
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/AfterBundleSeq'
+      - $ref: '#/components/parameters/MaxBundles'
+      - $ref: '#/components/parameters/TargetBundleSeq'
       responses:
-        '200': { $ref: '#/components/responses/PullOK' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '409': { $ref: '#/components/responses/Error' }
-        '410': { $ref: '#/components/responses/Error' }
-        '413': { $ref: '#/components/responses/BodyTooLarge' }
-        '426': { $ref: '#/components/responses/Error' }
-        '500': { $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '200':
+          $ref: '#/components/responses/PullOK'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '426':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /sync/watch:
     get:
       summary: Receive optional coalescible bundle-sequence wake-up hints
       description: SSE is identity encoded and event delivery is not authoritative.
-      security: [{ BearerAuth: [] }]
-      parameters: [ { $ref: '#/components/parameters/SourceIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationFingerprintHeader' }, { $ref: '#/components/parameters/AfterBundleSeq' } ]
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/AfterBundleSeq'
       responses:
         '200':
-          description: 'Identity-encoded event stream; every bundle event is exactly event: bundle followed by data: {"bundle_seq":N} and a blank line.'
+          description: 'Identity-encoded event stream; every bundle event is exactly event: bundle followed
+            by data: {"bundle_seq":N} and a blank line.'
           content:
             text/event-stream:
-              schema: { type: string }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
-        '410': { $ref: '#/components/responses/Error' }
-        '426': { $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
-        '500': { $ref: '#/components/responses/Error' }
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '426':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/Error'
   /sync/snapshot-sessions:
     post:
       summary: Create a bounded snapshot session
-      security: [{ BearerAuth: [] }]
-      parameters: [ { $ref: '#/components/parameters/SourceIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationFingerprintHeader' }, { $ref: '#/components/parameters/RequestContentEncoding' } ]
-      requestBody: { $ref: '#/components/requestBodies/SnapshotSessionCreateRequest' }
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/RequestContentEncoding'
+      requestBody:
+        $ref: '#/components/requestBodies/SnapshotSessionCreateRequest'
       responses:
-        '200': { $ref: '#/components/responses/SnapshotSessionOK' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/ScopeAccessDenied' }
-        '409': { $ref: '#/components/responses/Error' }
-        '410': { $ref: '#/components/responses/Error' }
-        '413': { $ref: '#/components/responses/BodyTooLarge' }
-        '415': { $ref: '#/components/responses/UnsupportedEncoding' }
-        '426': { $ref: '#/components/responses/Error' }
-        '429': { $ref: '#/components/responses/Error' }
-        '500': { $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '200':
+          $ref: '#/components/responses/SnapshotSessionOK'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ScopeAccessDenied'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedEncoding'
+        '426':
+          $ref: '#/components/responses/Error'
+        '429':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+      description: Recovery requires no unacknowledged source outcome, otherwise push_outcome_pending.
+        The closed recovery object contains only minimum_bundle_seq. Source replacement and recovery are
+        exclusive. Materialize T>=floor, echo the binding and streaming hash. The client requires clean
+        local state; snapshots never settle an upload. No idempotent-create guarantee; TTL bounds orphan
+        sessions.
   /sync/snapshot-sessions/{snapshot_id}:
     get:
       summary: Retrieve one bounded compact snapshot chunk
-      security: [{ BearerAuth: [] }]
-      parameters: [ { $ref: '#/components/parameters/SourceIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationFingerprintHeader' }, { $ref: '#/components/parameters/SnapshotIDPath' }, { $ref: '#/components/parameters/AfterRowOrdinal' }, { $ref: '#/components/parameters/MaxRows' }, { $ref: '#/components/parameters/MaxBytes' } ]
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/SnapshotIDPath'
+      - $ref: '#/components/parameters/AfterRowOrdinal'
+      - $ref: '#/components/parameters/MaxRows'
+      - $ref: '#/components/parameters/MaxBytes'
       responses:
-        '200': { $ref: '#/components/responses/SnapshotChunkOK' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Error' }
-        '404': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
-        '410': { $ref: '#/components/responses/Error' }
-        '426': { $ref: '#/components/responses/Error' }
-        '429': { $ref: '#/components/responses/Error' }
-        '500': { $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '200':
+          $ref: '#/components/responses/SnapshotChunkOK'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '426':
+          $ref: '#/components/responses/Error'
+        '429':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     delete:
       summary: Release a snapshot session
-      security: [{ BearerAuth: [] }]
-      parameters: [ { $ref: '#/components/parameters/SourceIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationIDHeader' }, { $ref: '#/components/parameters/SchemaGenerationFingerprintHeader' }, { $ref: '#/components/parameters/SnapshotIDPath' } ]
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/SnapshotIDPath'
       responses:
-        '204': { description: Snapshot session released }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Error' }
-        '404': { $ref: '#/components/responses/Error' }
-        '409': { $ref: '#/components/responses/Error' }
-        '410': { $ref: '#/components/responses/Error' }
-        '426': { $ref: '#/components/responses/Error' }
-        '500': { $ref: '#/components/responses/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '204':
+          description: Snapshot session released
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '426':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /sync/push-outcomes/resolve:
+    post:
+      operationId: resolvePushOutcome
+      summary: Resolve exact upload or durably cancel it
+      description: Serialized with push; returns retained exact outcome, or consumes the next sequence
+        with cancelled. It never returns racy absence. Delayed push cannot commit after cancellation.
+        Request encoded/decoded body limit4096 bytes.
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/RequestContentEncoding'
+      requestBody:
+        $ref: '#/components/requestBodies/PushOutcomeResolveRequest'
+      responses:
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ScopeAccessDenied'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '413':
+          $ref: '#/components/responses/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedEncoding'
+        '426':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '200':
+          $ref: '#/components/responses/PushOK'
+  /sync/push-outcomes/ack:
+    post:
+      operationId: acknowledgePushOutcome
+      summary: Acknowledge durable local disposition
+      description: Only after atomic local disposition. Removes retained outcome payload while preserving
+        durable sequence and latest-ack fences. Next operation requires this acknowledgment. Exact latest
+        duplicate is idempotent; older sequence is HTTP 410. Encoded/decoded request body limit is 4096
+        bytes.
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/RequestContentEncoding'
+      requestBody:
+        $ref: '#/components/requestBodies/PushOutcomeAckRequest'
+      responses:
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ScopeAccessDenied'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '413':
+          $ref: '#/components/responses/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedEncoding'
+        '426':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '204':
+          description: Acknowledgment durable, including exact latest duplicate.
 components:
   securitySchemes:
-    BearerAuth: { type: http, scheme: bearer }
+    BearerAuth:
+      type: http
+      scheme: bearer
   parameters:
-    SourceIDHeader: { name: Oversync-Source-ID, in: header, required: true, schema: { type: string, minLength: 1 } }
-    SchemaGenerationIDHeader: { name: Oversync-Schema-Generation-ID, in: header, required: true, schema: { type: string, minLength: 1 } }
-    SchemaGenerationFingerprintHeader: { name: Oversync-Schema-Generation-Fingerprint, in: header, required: true, schema: { type: string, pattern: '^[0-9a-f]{64}$' } }
-    RequestContentEncoding: { name: Content-Encoding, in: header, required: false, schema: { type: string, enum: [identity, gzip] }, description: A single gzip member only; other or multiple encodings return unsupported_content_encoding. }
-    GenerationIDPath: { name: generation_id, in: path, required: true, schema: { type: string, minLength: 1 } }
-    SnapshotIDPath: { name: snapshot_id, in: path, required: true, schema: { type: string, minLength: 1 } }
-    AfterBundleSeq: { name: after_bundle_seq, in: query, required: false, schema: { type: integer, format: int64, minimum: 0 } }
-    MaxBundles: { name: max_bundles, in: query, required: false, schema: { type: integer, minimum: 1 } }
-    TargetBundleSeq: { name: target_bundle_seq, in: query, required: false, schema: { type: integer, format: int64, minimum: 0 } }
-    AfterRowOrdinal: { name: after_row_ordinal, in: query, required: false, schema: { type: integer, format: int64, minimum: 0 } }
-    MaxRows: { name: max_rows, in: query, required: false, schema: { type: integer, minimum: 1 } }
-    MaxBytes: { name: max_bytes, in: query, required: false, schema: { type: integer, format: int64, minimum: 1 } }
+    SourceIDHeader:
+      name: Oversync-Source-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: ^[!-~]{1,256}$
+    SchemaGenerationIDHeader:
+      name: Oversync-Schema-Generation-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    SchemaGenerationFingerprintHeader:
+      name: Oversync-Schema-Generation-Fingerprint
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: ^[0-9a-f]{64}$
+    RequestContentEncoding:
+      name: Content-Encoding
+      in: header
+      required: false
+      schema:
+        type: string
+        enum:
+        - identity
+        - gzip
+      description: A single gzip member only; other or multiple encodings return unsupported_content_encoding.
+    GenerationIDPath:
+      name: generation_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    SnapshotIDPath:
+      name: snapshot_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    AfterBundleSeq:
+      name: after_bundle_seq
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        maximum: 9223372036854775807
+        minimum: 0
+    MaxBundles:
+      name: max_bundles
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+    TargetBundleSeq:
+      name: target_bundle_seq
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        maximum: 9223372036854775807
+        minimum: 0
+    AfterRowOrdinal:
+      name: after_row_ordinal
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        maximum: 9223372036854775807
+        minimum: 0
+    MaxRows:
+      name: max_rows
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+    MaxBytes:
+      name: max_bytes
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        maximum: 9223372036854775807
+        minimum: 1
+    ProtocolVersionHeader:
+      name: Oversync-Protocol-Version
+      in: header
+      required: true
+      schema:
+        type: string
+        const: v1
+      description: Missing, duplicate or non-v1 is HTTP426 before mutation. Exact literal; no negotiation.
   headers:
-    OptionalGzip: { schema: { type: string, enum: [gzip] }, description: Present only for a beneficial single-member gzip representation. }
+    OptionalGzip:
+      schema:
+        type: string
+        enum:
+        - gzip
+      description: Present only for a beneficial single-member gzip representation.
   requestBodies:
     ConnectRequest:
       required: true
-      content: { application/json: { schema: { $ref: '#/components/schemas/ConnectRequest' } } }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ConnectRequest'
     PushRequest:
       required: true
-      content: { application/json: { schema: { $ref: '#/components/schemas/PushRequest' } } }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PushRequest'
     SnapshotSessionCreateRequest:
       required: false
-      content: { application/json: { schema: { $ref: '#/components/schemas/SnapshotSessionCreateRequest' } } }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SnapshotSessionCreateRequest'
+    PushOutcomeResolveRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PushOutcomeResolveRequest'
+    PushOutcomeAckRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PushOutcomeAckRequest'
   responses:
-    StatusOK: { description: Service status, content: { application/json: { schema: { $ref: '#/components/schemas/StatusResponse' } } } }
-    StatusUnavailable: { description: Service unavailable, content: { application/json: { schema: { $ref: '#/components/schemas/StatusResponse' } } } }
-    Unauthorized: { description: Authentication required }
-    Error: { description: Typed bounded error response, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { anyOf: [ { $ref: '#/components/schemas/ErrorResponse' }, { $ref: '#/components/schemas/SourceRetiredResponse' }, { $ref: '#/components/schemas/PushConflictResponse' } ] } } } }
-    InvalidRequest: { description: Strict JSON/envelope or query error, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-    PushInvalid: { description: Push logical row/group/tuple/hash error after envelope acceptance, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-    PushBadRequest: { description: Strict envelope failures return invalid_request; accepted-envelope compact tuple, logical row, or canonical-hash failures return push_invalid, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-    UnsupportedEncoding: { description: Unsupported media type or content encoding, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-    BodyTooLarge: { description: Encoded or decoded body exceeds its bound, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-    ScopeAccessDenied: { description: Application transaction admission denied the scope (scope_access_denied), headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-    ServiceUnavailable: { description: Service unavailable (including scope_admission_unavailable) or commit outcome unknown, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-    ConnectOK: { description: Lifecycle resolved, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/ConnectResponse' } } } }
+    StatusOK:
+      description: Service status
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StatusResponse'
+    StatusUnavailable:
+      description: Service unavailable
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StatusResponse'
+    Unauthorized:
+      description: Authentication required
+    Error:
+      description: Typed bounded error response
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            anyOf:
+            - $ref: '#/components/schemas/ErrorResponse'
+            - $ref: '#/components/schemas/SourceRetiredResponse'
+    InvalidRequest:
+      description: Strict JSON/envelope or query error
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PushInvalid:
+      description: Push logical row/group/tuple/hash error after envelope acceptance
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PushBadRequest:
+      description: Strict envelope failures return invalid_request; accepted-envelope compact tuple, logical
+        row, or canonical-hash failures return push_invalid.
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnsupportedEncoding:
+      description: Unsupported media type or content encoding
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BodyTooLarge:
+      description: Encoded or decoded body exceeds its bound
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ScopeAccessDenied:
+      description: Application transaction admission denied the scope (scope_access_denied)
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: Service unavailable (including scope_admission_unavailable) or commit outcome unknown
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ConnectOK:
+      description: Lifecycle resolved
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ConnectResponse'
     PushOK:
-      description: Complete committed or replayed authoritative effect.
-      headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }
-      content: { application/json: { schema: { $ref: '#/components/schemas/PushResponse' } } }
+      description: 'Durably committed terminal outcome: committed, rejected or cancelled. HTTP200 alone
+        does not prove business commit.'
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PushResponse'
     PullOK:
-      description: Stable compact bundle page; an unrepresentable retained bundle is a terminal 500, never an empty has_more page.
-      headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }
-      content: { application/json: { schema: { $ref: '#/components/schemas/PullResponse' } } }
-    SnapshotSessionOK: { description: Snapshot session, headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }, content: { application/json: { schema: { $ref: '#/components/schemas/SnapshotSessionResponse' } } } }
+      description: Stable compact bundle page; an unrepresentable retained bundle is a terminal 500, never
+        an empty has_more page.
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PullResponse'
+    SnapshotSessionOK:
+      description: Snapshot session
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SnapshotSessionResponse'
     SnapshotChunkOK:
-      description: Compact insert-only snapshot rows. required_decoded_body_bytes is returned only by snapshot_chunk_too_small.
-      headers: { Content-Encoding: { $ref: '#/components/headers/OptionalGzip' } }
-      content: { application/json: { schema: { $ref: '#/components/schemas/SnapshotChunkResponse' } } }
+      description: Compact insert-only snapshot rows. required_decoded_body_bytes is returned only by
+        snapshot_chunk_too_small.
+      headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SnapshotChunkResponse'
   schemas:
-    StatusResponse: { type: object, additionalProperties: true }
+    StatusResponse:
+      type: object
+      additionalProperties: true
     ErrorResponse:
       type: object
-      required: [error, message]
+      required:
+      - error
+      - message
       properties:
         error:
-          oneOf:
-            - type: string
-              enum: [authentication_failed, invalid_request, invalid_generation_discovery_request, missing_schema_generation, invalid_schema_generation_id, unknown_schema_generation, missing_schema_generation_fingerprint, malformed_schema_generation_fingerprint, schema_generation_fingerprint_mismatch, unsupported_schema_generation, retired_schema_generation, source_generation_unbound, source_generation_conflict, schema_generation_downgrade_forbidden, corrupt_source_generation_state, source_binding_limit_exceeded, session_generation_mismatch, corrupt_session_generation_state, corrupt_committed_push_state, generation_history_unavailable, generation_projection_integrity_error, bundle_limit_exceeded, bundle_projection_too_large, history_projection_capacity_exceeded, push_effect_coverage_incomplete, schema_generation_resolution_failed, generation_discovery_failed, source_retired, source_retired_invalid, invalid_gzip, unsupported_media_type, unsupported_content_encoding, encoded_body_too_large, decoded_body_too_large, push_invalid, push_conflict, push_replay_mismatch, source_sequence_out_of_order, source_sequence_changed, scope_uninitialized, scope_initializing, initialization_stale, history_pruned, initialization_expired, commit_outcome_unknown, service_not_ready, push_failed, connect_invalid, connect_failed, checkpoint_ahead, committed_bundle_unrepresentable, pull_failed, bundle_change_watch_forbidden, bundle_change_watch_disabled, bundle_change_watch_failed, snapshot_session_invalid, snapshot_build_capacity, snapshot_session_limit_exceeded, source_replacement_invalid, snapshot_session_create_failed, snapshot_chunk_invalid, snapshot_chunk_capacity, snapshot_chunk_too_small, snapshot_session_not_found, snapshot_session_expired, snapshot_session_forbidden, snapshot_chunk_failed, snapshot_session_delete_failed, projection_response_encoding_failed, response_encoding_failed, method_not_allowed, status_failed, health_failed]
-            - type: string
-              pattern: '^[a-z][a-z0-9_]{0,63}$'
-              description: Deployment-declared application rejection category, valid only on HTTP 422.
-        message: { type: string }
-        required_decoded_body_bytes: { type: integer, format: int64, minimum: 1 }
-        actual: { type: integer, format: int64, minimum: 0 }
-        limit: { type: integer, format: int64, minimum: 1 }
-        dimension: { type: string, enum: [row_count, logical_byte_count, row_decoded_body_bytes] }
-        retryable: { type: boolean }
-        remediation: { type: string }
-        schema_generation_id: { type: string }
-        source_id: { type: string, minLength: 1 }
-        replaced_by_source_id: { type: string, minLength: 1, description: Omitted when no replacement exists; null and empty are invalid. }
-        conflict: { $ref: '#/components/schemas/PushConflictDetails' }
+          anyOf:
+          - type: string
+            enum:
+            - authentication_failed
+            - invalid_request
+            - invalid_generation_discovery_request
+            - missing_schema_generation
+            - invalid_schema_generation_id
+            - unknown_schema_generation
+            - missing_schema_generation_fingerprint
+            - malformed_schema_generation_fingerprint
+            - schema_generation_fingerprint_mismatch
+            - unsupported_schema_generation
+            - retired_schema_generation
+            - source_generation_unbound
+            - source_generation_conflict
+            - schema_generation_downgrade_forbidden
+            - corrupt_source_generation_state
+            - source_binding_limit_exceeded
+            - session_generation_mismatch
+            - corrupt_session_generation_state
+            - corrupt_committed_push_state
+            - generation_history_unavailable
+            - generation_projection_integrity_error
+            - bundle_limit_exceeded
+            - bundle_projection_too_large
+            - history_projection_capacity_exceeded
+            - push_effect_coverage_incomplete
+            - schema_generation_resolution_failed
+            - generation_discovery_failed
+            - source_retired
+            - source_retired_invalid
+            - invalid_gzip
+            - unsupported_media_type
+            - unsupported_content_encoding
+            - encoded_body_too_large
+            - decoded_body_too_large
+            - push_invalid
+            - source_sequence_out_of_order
+            - source_sequence_changed
+            - scope_uninitialized
+            - scope_initializing
+            - initialization_stale
+            - history_pruned
+            - initialization_expired
+            - commit_outcome_unknown
+            - service_not_ready
+            - push_failed
+            - connect_invalid
+            - connect_failed
+            - checkpoint_ahead
+            - committed_bundle_unrepresentable
+            - pull_failed
+            - bundle_change_watch_forbidden
+            - bundle_change_watch_disabled
+            - bundle_change_watch_failed
+            - snapshot_session_invalid
+            - snapshot_build_capacity
+            - snapshot_session_limit_exceeded
+            - source_replacement_invalid
+            - snapshot_session_create_failed
+            - snapshot_chunk_invalid
+            - snapshot_chunk_capacity
+            - snapshot_chunk_too_small
+            - snapshot_session_not_found
+            - snapshot_session_expired
+            - snapshot_session_forbidden
+            - snapshot_chunk_failed
+            - snapshot_session_delete_failed
+            - projection_response_encoding_failed
+            - response_encoding_failed
+            - method_not_allowed
+            - status_failed
+            - health_failed
+            - protocol_version_mismatch
+            - push_outcome_mismatch
+            - push_outcome_pending
+            - push_outcome_acknowledged
+            - push_outcome_too_large
+            - recovery_floor_ahead
+          - type: string
+            pattern: ^[a-z][a-z0-9_]{0,63}$
+            description: Nonterminal infrastructure/admission category. Validated application rejection
+              is HTTP 200 inside PushOutcomeRejection.
+        message:
+          type: string
+        required_decoded_body_bytes:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        actual:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        limit:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        dimension:
+          type: string
+          enum:
+          - row_count
+          - logical_byte_count
+          - row_decoded_body_bytes
+        retryable:
+          type: boolean
+        remediation:
+          type: string
+        schema_generation_id:
+          type: string
+        source_id:
+          type: string
+          pattern: ^[!-~]{1,256}$
+          minLength: 1
+        replaced_by_source_id:
+          type: string
+          pattern: ^[!-~]{1,256}$
+          minLength: 1
+          description: Omitted when no replacement exists; null and empty are invalid.
+        conflict:
+          $ref: '#/components/schemas/PushConflictDetails'
       additionalProperties: true
+      description: 'New status mapping: protocol_version_mismatch 426; outcome mismatch/pending and recovery_floor_ahead
+        409; push_outcome_acknowledged 410; push_outcome_too_large 413. Infrastructure/storage failures
+        remain nonterminal. No nonterminal error proves an earlier attempt did not commit.'
     PushConflictDetails:
       type: object
       additionalProperties: false
-      required: [schema, table, key, op, base_row_version, server_row_version, server_row_deleted, server_row]
+      required:
+      - schema
+      - table
+      - key
+      - op
+      - base_row_version
+      - server_row_version
+      - server_row_deleted
+      - server_row
       properties:
-        schema: { type: string }
-        table: { type: string }
-        key: { type: object }
-        op: { type: string, enum: [i, u, d] }
-        base_row_version: { type: integer, format: int64, minimum: 0 }
-        server_row_version: { type: integer, format: int64, minimum: 0 }
-        server_row_deleted: { type: boolean }
-        server_row: { description: Canonical full row after-image, or null when deleted or absent. }
-    PushConflictResponse:
-      type: object
-      additionalProperties: false
-      required: [error, message]
-      properties:
-        error: { type: string, enum: [push_conflict] }
-        message: { type: string }
-        conflict: { $ref: '#/components/schemas/PushConflictDetails' }
+        schema:
+          type: string
+        table:
+          type: string
+        key:
+          type: object
+        op:
+          type: string
+          enum:
+          - i
+          - u
+          - d
+        base_row_version:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        server_row_version:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        server_row_deleted:
+          type: boolean
+        server_row:
+          type:
+          - object
+          - 'null'
+          description: Canonical full row after-image or null when deleted or absent.
     SourceRetiredResponse:
       type: object
       additionalProperties: false
-      required: [error, message, source_id]
+      required:
+      - error
+      - message
+      - source_id
       properties:
-        error: { type: string, enum: [source_retired] }
-        message: { type: string }
-        source_id: { type: string, minLength: 1, description: Exact source identity from the failed request. }
-        replaced_by_source_id: { type: string, minLength: 1, description: Omitted when no replacement exists; null and empty are invalid. }
+        error:
+          type: string
+          enum:
+          - source_retired
+        message:
+          type: string
+        source_id:
+          type: string
+          pattern: ^[!-~]{1,256}$
+          minLength: 1
+          description: Exact source identity from the failed request.
+        replaced_by_source_id:
+          type: string
+          pattern: ^[!-~]{1,256}$
+          minLength: 1
+          description: Omitted when no replacement exists; null and empty are invalid.
     DiscoveryResponse:
       type: object
       additionalProperties: false
-      required: [protocol_version, schema_generation, limits, watch_enabled]
+      required:
+      - protocol_version
+      - schema_generation
+      - limits
+      - watch_enabled
       properties:
-        protocol_version: { type: string, enum: [v1] }
-        schema_generation: { $ref: '#/components/schemas/SchemaGeneration' }
-        limits: { $ref: '#/components/schemas/WireLimits' }
-        watch_enabled: { type: boolean }
+        protocol_version:
+          type: string
+          const: v1
+        schema_generation:
+          $ref: '#/components/schemas/SchemaGeneration'
+        limits:
+          $ref: '#/components/schemas/WireLimits'
+        watch_enabled:
+          type: boolean
     WireLimits:
       type: object
       additionalProperties: false
-      required: [max_push_rows, max_push_decoded_bytes, max_pull_bundles, max_pull_decoded_bytes, max_snapshot_rows_per_chunk, max_snapshot_decoded_bytes_per_chunk, max_snapshot_rows, max_snapshot_logical_bytes, max_row_decoded_bytes]
+      required:
+      - max_push_rows
+      - max_push_decoded_bytes
+      - max_pull_bundles
+      - max_pull_decoded_bytes
+      - max_snapshot_rows_per_chunk
+      - max_snapshot_decoded_bytes_per_chunk
+      - max_snapshot_rows
+      - max_snapshot_logical_bytes
+      - max_row_decoded_bytes
+      - max_push_outcome_decoded_bytes
       properties:
-        max_push_rows: { type: integer, minimum: 1 }
-        max_push_decoded_bytes: { type: integer, format: int64, minimum: 1 }
-        max_pull_bundles: { type: integer, minimum: 1 }
-        max_pull_decoded_bytes: { type: integer, format: int64, minimum: 1 }
-        max_snapshot_rows_per_chunk: { type: integer, minimum: 1 }
-        max_snapshot_decoded_bytes_per_chunk: { type: integer, format: int64, minimum: 1 }
-        max_snapshot_rows: { type: integer, minimum: 1 }
-        max_snapshot_logical_bytes: { type: integer, format: int64, minimum: 1 }
-        max_row_decoded_bytes: { type: integer, format: int64, minimum: 1 }
+        max_push_rows:
+          type: integer
+          minimum: 1
+        max_push_decoded_bytes:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+          description: Complete decoded push request bound. Terminal push/resolve responses use max_push_outcome_decoded_bytes.
+        max_pull_bundles:
+          type: integer
+          minimum: 1
+        max_pull_decoded_bytes:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        max_snapshot_rows_per_chunk:
+          type: integer
+          minimum: 1
+        max_snapshot_decoded_bytes_per_chunk:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        max_snapshot_rows:
+          type: integer
+          minimum: 1
+        max_snapshot_logical_bytes:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        max_row_decoded_bytes:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        max_push_outcome_decoded_bytes:
+          type: integer
+          format: int64
+          minimum: 8194
+          maximum: 67117056
+          description: Complete decoded terminal envelope bound, including rejection details. Default
+            MaxBytesPerBundle + 8192; configured minimum uses the same formula. Persisted at fresh v1-store
+            initialization; every service instance must match this immutable value.
     SchemaGeneration:
       type: object
-      required: [id, fingerprint, tables]
+      required:
+      - id
+      - fingerprint
+      - tables
       properties:
-        id: { type: string, minLength: 1 }
-        fingerprint: { type: string, pattern: '^[0-9a-f]{64}$' }
-        tables: { type: array, items: { $ref: '#/components/schemas/GenerationTable' } }
+        id:
+          type: string
+          minLength: 1
+        fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        tables:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenerationTable'
     GenerationTable:
       type: object
-      required: [schema, table, sync_key_columns, columns, foreign_keys]
+      required:
+      - schema
+      - table
+      - sync_key_columns
+      - columns
+      - foreign_keys
       properties:
-        schema: { type: string }
-        table: { type: string }
-        sync_key_columns: { type: array, minItems: 1, items: { type: string } }
-        columns: { type: array, items: { $ref: '#/components/schemas/GenerationColumn' } }
-        foreign_keys: { type: array, items: { type: object } }
+        schema:
+          type: string
+        table:
+          type: string
+        sync_key_columns:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenerationColumn'
+        foreign_keys:
+          type: array
+          items:
+            type: object
     GenerationColumn:
       type: object
-      required: [name, wire_type, nullable]
+      required:
+      - name
+      - wire_type
+      - nullable
       properties:
-        name: { type: string }
-        wire_type: { type: string }
-        nullable: { type: boolean }
+        name:
+          type: string
+        wire_type:
+          type: string
+        nullable:
+          type: boolean
     CanonicalInitializationToken:
       type: string
       format: uuid
       minLength: 36
       maxLength: 36
-      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-      description: Canonical lowercase dashed UUID initialization token; clients and servers must not trim, normalize, or case-fold it.
+      pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+      description: Canonical lowercase dashed UUID initialization token; clients and servers must not
+        trim, normalize, or case-fold it.
     ConnectRequest:
       type: object
       additionalProperties: false
-      required: [has_local_pending_rows]
-      properties: { has_local_pending_rows: { type: boolean } }
+      required:
+      - has_local_pending_rows
+      properties:
+        has_local_pending_rows:
+          type: boolean
     ConnectResponse:
       type: object
       additionalProperties: false
-      required: [resolution]
+      required:
+      - resolution
       properties:
-        resolution: { type: string, enum: [remote_authoritative, initialize_local, initialize_empty, retry_later] }
-        initialization_id: { $ref: '#/components/schemas/CanonicalInitializationToken' }
-        lease_expires_at: { type: string, format: date-time }
-        retry_after_seconds: { type: integer, minimum: 1 }
+        resolution:
+          type: string
+          enum:
+          - remote_authoritative
+          - initialize_local
+          - initialize_empty
+          - retry_later
+        initialization_id:
+          $ref: '#/components/schemas/CanonicalInitializationToken'
+        lease_expires_at:
+          type: string
+          format: date-time
+        retry_after_seconds:
+          type: integer
+          minimum: 1
     PushRequest:
       type: object
       additionalProperties: false
-      required: [source_bundle_id, canonical_request_hash, rows]
+      required:
+      - source_bundle_id
+      - canonical_request_hash
+      - rows
       properties:
-        source_bundle_id: { type: integer, format: int64, minimum: 1 }
-        canonical_request_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
-        initialization_id: { $ref: '#/components/schemas/CanonicalInitializationToken' }
-        rows: { $ref: '#/components/schemas/NonEmptyCompactRowGroups' }
+        source_bundle_id:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        canonical_request_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        initialization_id:
+          $ref: '#/components/schemas/CanonicalInitializationToken'
+        rows:
+          $ref: '#/components/schemas/NonEmptyCompactRowGroups'
     PushResponse:
       type: object
       additionalProperties: false
-      required: [bundle_seq, bundle_hash, rows]
       properties:
-        bundle_seq: { type: integer, format: int64, minimum: 1 }
-        bundle_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
-        rows: { $ref: '#/components/schemas/NonEmptyCompactRowGroups' }
+        source_id:
+          type: string
+          pattern: ^[!-~]{1,256}$
+          minLength: 1
+        schema_generation_id:
+          type: string
+          minLength: 1
+        schema_generation_fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        source_bundle_id:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        canonical_request_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        initialization_id:
+          $ref: '#/components/schemas/NullableInitializationToken'
+        status:
+          type: string
+          enum:
+          - committed
+          - rejected
+          - cancelled
+        outcome_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        committed:
+          $ref: '#/components/schemas/CommittedPushEffect'
+        rejection:
+          $ref: '#/components/schemas/PushOutcomeRejection'
+      required:
+      - source_id
+      - schema_generation_id
+      - schema_generation_fingerprint
+      - source_bundle_id
+      - canonical_request_hash
+      - initialization_id
+      - status
+      - outcome_hash
+      oneOf:
+      - properties:
+          status:
+            const: committed
+        required:
+        - committed
+        not:
+          required:
+          - rejection
+      - properties:
+          status:
+            const: rejected
+        required:
+        - rejection
+        not:
+          required:
+          - committed
+      - properties:
+          status:
+            const: cancelled
+        not:
+          anyOf:
+          - required:
+            - committed
+          - required:
+            - rejection
+      description: Exact terminal outcome. All three statuses consume source_bundle_id and require durable-local-disposition
+        acknowledgment. outcome_hash follows r0001 section3.1 including exact hash-only integral strings;
+        complete authoritative effect validation is mandatory.
+      examples:
+      - source_id: 550e8400-e29b-41d4-a716-446655440000
+        schema_generation_id: '1'
+        schema_generation_fingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        source_bundle_id: 7
+        canonical_request_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        initialization_id: null
+        status: committed
+        outcome_hash: f35087afc08b0eeb52afb17bd48969593950c046d24e1ec65fed23b8ce19f5a9
+        committed:
+          bundle_seq: 42
+          bundle_hash: 6410304a66664967ab888f51441f0b8c6491bb7e4fd29a3e72a4a09f9b661c44
+          row_count: 3
+          rows:
+          - - 0
+            - 0
+            - - - u
+                - - first
+                - 42
+                - id: first
+                  label: λ
+                  enabled: true
+                  integer: '9223372036854775807'
+                  decimal: '123.45'
+                  ratio: '1.25'
+                  blob: AAEC
+                  uuid: 550e8400-e29b-41d4-a716-446655440003
+                  json: '{"nested":["exact",null,true]}'
+              - - i
+                - - second
+                - 42
+                - id: second
+                  label: null
+                  enabled: true
+                  integer: '9223372036854775807'
+                  decimal: '123.45'
+                  ratio: '1.25'
+                  blob: AAEC
+                  uuid: 550e8400-e29b-41d4-a716-446655440003
+                  json: '{"nested":["exact",null,true]}'
+              - - d
+                - - gone
+                - 42
+      - source_id: 550e8400-e29b-41d4-a716-446655440000
+        schema_generation_id: '1'
+        schema_generation_fingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        source_bundle_id: 7
+        canonical_request_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        initialization_id: null
+        status: rejected
+        outcome_hash: 1b89ecc8c617d13d6f7580b77dfbdf0971f27b5e5cdca80525400cad2f15bf5e
+        rejection:
+          code: push_conflict
+          conflict:
+            schema: business
+            table: records
+            key:
+              id: first
+            op: u
+            base_row_version: 6
+            server_row_version: 7
+            server_row_deleted: false
+            server_row:
+              id: first
+              label: λ
+              enabled: true
+              integer: '9223372036854775807'
+              decimal: '123.45'
+              ratio: '1.25'
+              blob: AAEC
+              uuid: 550e8400-e29b-41d4-a716-446655440003
+              json: '{"nested":["exact",null,true]}'
+      - source_id: 550e8400-e29b-41d4-a716-446655440000
+        schema_generation_id: '1'
+        schema_generation_fingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        source_bundle_id: 7
+        canonical_request_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        initialization_id: null
+        status: rejected
+        outcome_hash: 0f4573d9d0bd68420f293adc94c673b384ba6e2d9e9f49e789bb55d221695d17
+        rejection:
+          code: push_conflict
+          conflict:
+            schema: business
+            table: records
+            key:
+              id: first
+            op: u
+            base_row_version: 6
+            server_row_version: 7
+            server_row_deleted: true
+            server_row: null
+      - source_id: 550e8400-e29b-41d4-a716-446655440000
+        schema_generation_id: '1'
+        schema_generation_fingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        source_bundle_id: 7
+        canonical_request_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        initialization_id: null
+        status: rejected
+        outcome_hash: 1db46c7ba41b48adeec16a36e49b9ad2589bfa120390b37b89334de88d964df2
+        rejection:
+          code: business_rule_rejected
+      - source_id: 550e8400-e29b-41d4-a716-446655440000
+        schema_generation_id: '1'
+        schema_generation_fingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        source_bundle_id: 7
+        canonical_request_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        initialization_id: null
+        status: cancelled
+        outcome_hash: 5a376ce2a63930bf5f5233ec8200ebed6239ee289838555b575e10c7510b50af
     PullResponse:
       type: object
       additionalProperties: false
-      required: [stable_bundle_seq, bundles, has_more]
+      required:
+      - stable_bundle_seq
+      - bundles
+      - has_more
       properties:
-        stable_bundle_seq: { type: integer, format: int64, minimum: 0 }
-        bundles: { type: array, items: { $ref: '#/components/schemas/CompactBundle' } }
-        has_more: { type: boolean }
+        stable_bundle_seq:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        bundles:
+          type: array
+          items:
+            $ref: '#/components/schemas/CompactBundle'
+        has_more:
+          type: boolean
     CompactBundle:
       type: object
       additionalProperties: false
-      required: [bundle_seq, source_id, source_bundle_id, bundle_hash, rows]
+      required:
+      - bundle_seq
+      - source_id
+      - source_bundle_id
+      - bundle_hash
+      - rows
       properties:
-        bundle_seq: { type: integer, format: int64, minimum: 1 }
-        source_id: { type: string }
-        source_bundle_id: { type: integer, format: int64, minimum: 1 }
-        bundle_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
-        rows: { $ref: '#/components/schemas/CompactRowGroups' }
+        bundle_seq:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        source_id:
+          type: string
+          pattern: ^[!-~]{1,256}$
+        source_bundle_id:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        bundle_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        rows:
+          $ref: '#/components/schemas/CompactRowGroups'
     CompactRowGroups:
       type: array
-      items: { $ref: '#/components/schemas/CompactRowGroup' }
-      description: Ordered contiguous groups; each group begins at the enclosing requested or implied ordinal.
+      items:
+        $ref: '#/components/schemas/CompactRowGroup'
+      description: Ordered contiguous groups; each group begins at the enclosing requested or implied
+        ordinal.
     NonEmptyCompactRowGroups:
       type: array
       minItems: 1
-      items: { $ref: '#/components/schemas/CompactRowGroup' }
-      description: A non-empty compact row-group sequence used by push requests and authoritative push responses.
+      items:
+        $ref: '#/components/schemas/CompactRowGroup'
+      description: A non-empty compact row-group sequence used by push requests and authoritative push
+        responses.
     CompactRowGroup:
       type: array
       minItems: 3
       maxItems: 3
-      x-oversqlite-array-shape: [table_index, first_row_ordinal, rows]
+      x-oversqlite-array-shape:
+      - table_index
+      - first_row_ordinal
+      - rows
       prefixItems:
-        - { type: integer, minimum: 0 }
-        - { type: integer, format: int64, minimum: 0 }
-        - type: array
-          minItems: 1
-          items: { $ref: '#/components/schemas/CompactRowTuple' }
+      - type: integer
+        minimum: 0
+      - type: integer
+        format: int64
+        maximum: 9223372036854775807
+        minimum: 0
+      - type: array
+        minItems: 1
+        items:
+          $ref: '#/components/schemas/CompactRowTuple'
       items: false
-      description: '[table_index, first_row_ordinal, rows] where table_index is the discovery table-array position.'
+      description: '[table_index, first_row_ordinal, rows] where table_index is the discovery table-array
+        position.'
     CompactRowTuple:
       oneOf:
+      - type: array
+        minItems: 3
+        maxItems: 3
+        x-oversqlite-array-shape:
+        - op
+        - key_values
+        - version
+        prefixItems:
+        - type: string
+          enum:
+          - d
         - type: array
-          minItems: 3
-          maxItems: 3
-          x-oversqlite-array-shape: [op, key_values, version]
-          prefixItems:
-            - { type: string, enum: [d] }
-            - { type: array }
-            - { type: integer, format: int64, minimum: 0 }
-          items: false
-          description: Delete tuple, exactly ["d", key_values, version].
+        - type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        items: false
+        description: Delete tuple, exactly ["d", key_values, version].
+      - type: array
+        minItems: 4
+        maxItems: 4
+        x-oversqlite-array-shape:
+        - op
+        - key_values
+        - version
+        - payload
+        prefixItems:
+        - type: string
+          enum:
+          - i
+          - u
         - type: array
-          minItems: 4
-          maxItems: 4
-          x-oversqlite-array-shape: [op, key_values, version, payload]
-          prefixItems:
-            - { type: string, enum: [i, u] }
-            - { type: array }
-            - { type: integer, format: int64, minimum: 0 }
-            - { type: object }
-          items: false
-          description: Insert/update tuple, exactly ["i"|"u", key_values, version, payload-object].
-      description: Key values follow discovered sync_key_columns; payload objects preserve omitted versus null.
+        - type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        - type: object
+        items: false
+        description: Insert/update tuple, exactly ["i"|"u", key_values, version, payload-object].
+      description: Key values follow discovered sync_key_columns; payload objects preserve omitted versus
+        null.
     SnapshotCompactRowGroups:
       type: array
-      items: { $ref: '#/components/schemas/SnapshotCompactRowGroup' }
-      description: Every tuple is exactly the four-element insert code full-after-image form; update, delete, missing, and partial payloads are invalid.
+      items:
+        $ref: '#/components/schemas/SnapshotCompactRowGroup'
+      description: Every tuple is exactly the four-element insert code full-after-image form; update,
+        delete, missing, and partial payloads are invalid.
     SnapshotCompactRowGroup:
       type: array
       minItems: 3
       maxItems: 3
       prefixItems:
-        - { type: integer, minimum: 0 }
-        - { type: integer, format: int64, minimum: 0 }
-        - type: array
-          minItems: 1
-          items: { $ref: '#/components/schemas/SnapshotCompactRowTuple' }
+      - type: integer
+        minimum: 0
+      - type: integer
+        format: int64
+        maximum: 9223372036854775807
+        minimum: 0
+      - type: array
+        minItems: 1
+        items:
+          $ref: '#/components/schemas/SnapshotCompactRowTuple'
       items: false
     SnapshotCompactRowTuple:
       type: array
       minItems: 4
       maxItems: 4
       prefixItems:
-        - { type: string, enum: [i] }
-        - { type: array }
-        - { type: integer, format: int64, minimum: 1 }
-        - { type: object }
+      - type: string
+        enum:
+        - i
+      - type: array
+      - type: integer
+        format: int64
+        maximum: 9223372036854775807
+        minimum: 1
+      - type: object
       items: false
     SnapshotSessionCreateRequest:
       type: object
@@ -460,26 +1436,222 @@ components:
         source_replacement:
           type: object
           additionalProperties: false
-          required: [previous_source_id, new_source_id, reason]
+          required:
+          - previous_source_id
+          - new_source_id
+          - reason
           properties:
-            previous_source_id: { type: string }
-            new_source_id: { type: string }
-            reason: { type: string }
+            previous_source_id:
+              type: string
+              pattern: ^[!-~]{1,256}$
+            new_source_id:
+              type: string
+              pattern: ^[!-~]{1,256}$
+            reason:
+              type: string
+        recovery:
+          $ref: '#/components/schemas/SnapshotRecovery'
+      not:
+        required:
+        - recovery
+        - source_replacement
     SnapshotSessionResponse:
       type: object
-      required: [snapshot_id, snapshot_bundle_seq, row_count, logical_byte_count, expires_at]
+      required:
+      - snapshot_id
+      - snapshot_bundle_seq
+      - row_count
+      - logical_byte_count
+      - expires_at
+      - snapshot_hash
       properties:
-        snapshot_id: { type: string }
-        snapshot_bundle_seq: { type: integer, format: int64, minimum: 0 }
-        row_count: { type: integer, format: int64, minimum: 0 }
-        logical_byte_count: { type: integer, format: int64, minimum: 0, description: 'Checked sum of JCS ["i", table_index, key_values, row_version, payload] values only.' }
-        expires_at: { type: string, format: date-time }
+        snapshot_id:
+          type: string
+        snapshot_bundle_seq:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        row_count:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        logical_byte_count:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+          description: Checked sum of JCS ["i", table_index, key_values, row_version, payload] values
+            only.
+        expires_at:
+          type: string
+          format: date-time
+        snapshot_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        recovery:
+          $ref: '#/components/schemas/SnapshotRecovery'
+      additionalProperties: false
+      description: Immutable source/generation-bound view. snapshot_hash follows r0001 section 5 framed
+        streaming hash with section 3.1 exact integral strings. recovery is echoed exactly iff requested;
+        T is at least its floor. Never settles or acknowledges an upload.
+      examples:
+      - snapshot_id: snapshot-fixture
+        snapshot_bundle_seq: 0
+        row_count: 0
+        logical_byte_count: 0
+        expires_at: '2026-10-23T13:00:00Z'
+        snapshot_hash: 9b2ad9cd022f64ec2a3797f4bec44afa150fc71c2fa32e957087912ff6d0b565
+      - snapshot_id: snapshot-fixture
+        snapshot_bundle_seq: 42
+        row_count: 0
+        logical_byte_count: 0
+        expires_at: '2026-10-23T13:00:00Z'
+        snapshot_hash: d293c0d8c2d8bd27d98d74ec351e0610add37cb8850111c4a1e4d0ca3d481942
+        recovery:
+          minimum_bundle_seq: 42
+      - snapshot_id: snapshot-fixture
+        snapshot_bundle_seq: 42
+        row_count: 2
+        logical_byte_count: 468
+        expires_at: '2026-10-23T13:00:00Z'
+        snapshot_hash: 4d4c0a27e84ed987f8d8a10b88f918878d74a73af8f39cf12d58bd90a8ca9d88
+        recovery:
+          minimum_bundle_seq: 0
     SnapshotChunkResponse:
       type: object
       additionalProperties: false
-      required: [rows, next_row_ordinal, logical_byte_count, has_more]
+      required:
+      - rows
+      - next_row_ordinal
+      - logical_byte_count
+      - has_more
       properties:
-        rows: { $ref: '#/components/schemas/SnapshotCompactRowGroups' }
-        next_row_ordinal: { type: integer, format: int64, minimum: 0 }
-        logical_byte_count: { type: integer, format: int64, minimum: 0 }
-        has_more: { type: boolean }
+        rows:
+          $ref: '#/components/schemas/SnapshotCompactRowGroups'
+        next_row_ordinal:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        logical_byte_count:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+        has_more:
+          type: boolean
+    NullableInitializationToken:
+      oneOf:
+      - $ref: '#/components/schemas/CanonicalInitializationToken'
+      - type: 'null'
+    CommittedPushEffect:
+      type: object
+      additionalProperties: false
+      required:
+      - bundle_seq
+      - bundle_hash
+      - row_count
+      - rows
+      properties:
+        bundle_seq:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        bundle_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        rows:
+          $ref: '#/components/schemas/NonEmptyCompactRowGroups'
+        row_count:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+    PushOutcomeRejection:
+      type: object
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,63}$
+        conflict:
+          $ref: '#/components/schemas/PushConflictDetails'
+      required:
+      - code
+      oneOf:
+      - properties:
+          code:
+            const: push_conflict
+        required:
+        - conflict
+      - properties:
+          code:
+            not:
+              const: push_conflict
+        not:
+          required:
+          - conflict
+    PushOutcomeResolveRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        source_bundle_id:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        canonical_request_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        initialization_id:
+          $ref: '#/components/schemas/NullableInitializationToken'
+      required:
+      - source_bundle_id
+      - canonical_request_hash
+      - initialization_id
+      examples:
+      - source_bundle_id: 7
+        canonical_request_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        initialization_id: null
+    PushOutcomeAckRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        source_bundle_id:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+        canonical_request_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        outcome_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+      required:
+      - source_bundle_id
+      - canonical_request_hash
+      - outcome_hash
+      examples:
+      - source_bundle_id: 7
+        canonical_request_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        outcome_hash: 5a376ce2a63930bf5f5233ec8200ebed6239ee289838555b575e10c7510b50af
+    SnapshotRecovery:
+      type: object
+      additionalProperties: false
+      properties:
+        minimum_bundle_seq:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 0
+      required:
+      - minimum_bundle_seq
+      description: 'Closed clean-recovery request: minimum_bundle_seq only. Server rejects any unacknowledged
+        source outcome. Client must also have no dirty intent, frozen upload, unsettled outcome or ack_pending.'
+x-implementation-status: contract-active-runtime-phases-pending
+x-governing-spec: ../specs/r0001-oversqlite-durable-recovery.md
+x-base-openapi-sha256: cb820edb6d3610d16a9eac26fb9d49c8f914f1022f1c20af18fd105a540c819e

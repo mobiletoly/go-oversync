@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"math"
@@ -182,7 +183,7 @@ func TestSnapshotChunkRequest_SendsRowsAndBytesAndRequiresDeclaredCount(t *testi
 			return rawJSONResponse(http.StatusOK, `{"rows":[],"next_row_ordinal":0,"has_more":false}`), nil
 		})}
 		_, _, err := client.fetchSnapshotChunk(context.Background(), "snapshot-1", 4, 0, 17, 2048)
-		require.ErrorContains(t, err, "missing required logical_byte_count")
+		require.ErrorContains(t, err, "snapshot evidence: missing required chunk fields")
 	})
 }
 
@@ -212,7 +213,7 @@ func TestSnapshotSourceRetiredWithoutReplacementRemainsTypedAndRedacted(t *testi
 	require.NotContains(t, err.Error(), "hostile-private-message")
 }
 
-func TestSnapshotSessionMissingByteCount_AttemptsRetirement(t *testing.T) {
+func TestSnapshotSessionMissingByteCount_RejectsBeforeTrustingRetirementIdentity(t *testing.T) {
 	client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
 	var retired atomic.Int64
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -220,11 +221,11 @@ func TestSnapshotSessionMissingByteCount_AttemptsRetirement(t *testing.T) {
 			retired.Add(1)
 			return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody}, nil
 		}
-		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-invalid","snapshot_bundle_seq":4,"row_count":0,"expires_at":"2030-01-01T00:00:00Z"}`), nil
+		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-invalid","snapshot_bundle_seq":4,"row_count":0,"snapshot_hash":"`+sealedTestSnapshot(t, client, "snapshot-invalid", 4, nil, nil).SnapshotHash+`","expires_at":"2030-01-01T00:00:00Z"}`), nil
 	})}
 	_, err := client.createSnapshotSession(context.Background(), nil)
-	require.ErrorContains(t, err, "missing required logical_byte_count")
-	require.Equal(t, int64(1), retired.Load())
+	require.ErrorContains(t, err, "snapshot evidence: invalid session JSON")
+	require.Zero(t, retired.Load(), "closed-object decoding has not admitted the peer session identity; remote TTL owns it")
 }
 
 func TestSnapshotResponsePresence_OrdinaryAndRotatedDownloadsRequireExplicitEmptyFraming(t *testing.T) {
@@ -264,7 +265,16 @@ func TestSnapshotResponsePresence_OrdinaryAndRotatedDownloadsRequireExplicitEmpt
 		t.Run(tc.name, func(t *testing.T) {
 			client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
 			client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
-				return rawJSONResponse(http.StatusOK, tc.body), nil
+				body := tc.body
+				if tc.operation == "session" {
+					var fields map[string]any
+					require.NoError(t, json.Unmarshal([]byte(body), &fields))
+					fields["snapshot_hash"] = sealedTestSnapshotForSource(t, client, tc.sourceID, fields["snapshot_id"].(string), 8, nil, nil).SnapshotHash
+					raw, marshalErr := json.Marshal(fields)
+					require.NoError(t, marshalErr)
+					body = string(raw)
+				}
+				return rawJSONResponse(http.StatusOK, body), nil
 			})}
 			var err error
 			if tc.operation == "session" {
@@ -272,7 +282,13 @@ func TestSnapshotResponsePresence_OrdinaryAndRotatedDownloadsRequireExplicitEmpt
 			} else {
 				_, _, err = client.fetchSnapshotChunkAsSource(context.Background(), tc.snapshotID, 8, 0, 1, 1024, tc.sourceID)
 			}
-			require.ErrorContains(t, err, tc.want)
+			var integrity *snapshotEvidenceError
+			require.ErrorAs(t, err, &integrity)
+			if tc.operation == "session" {
+				require.ErrorContains(t, err, "invalid session JSON")
+			} else {
+				require.ErrorContains(t, err, "missing required chunk fields")
+			}
 		})
 	}
 }
@@ -365,7 +381,7 @@ func TestSnapshotSessionBuildCapacity_RetriesOnlyLockedStructuredCode(t *testing
 		if attempts.Add(1) < 3 {
 			return errorJSONResponse(http.StatusTooManyRequests, oversync.ErrorResponse{Error: "snapshot_build_capacity"}), nil
 		}
-		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":0,"row_count":0,"logical_byte_count":0,"expires_at":"2030-01-01T00:00:00Z"}`), nil
+		return snapshotFixtureResponse(t, client, r, "snapshot-1", 0, nil), nil
 	})}
 	_, err := client.createSnapshotSession(context.Background(), nil)
 	require.NoError(t, err)
@@ -505,7 +521,7 @@ func TestSnapshotChunkSemanticFailure_ClosesBodyAndRecordsDecodedHighWater(t *te
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: body}, nil
 	})}
 	_, _, err := client.fetchSnapshotChunk(context.Background(), "snapshot-1", 4, 0, 1, 1024)
-	require.ErrorContains(t, err, "next_row_ordinal")
+	require.ErrorContains(t, err, "invalid snapshot chunk limits or ordinals")
 	require.Equal(t, int64(1), body.closed.Load())
 	require.Greater(t, client.SnapshotTransferDiagnostics().MaxChunkDecodedBodyBytes, int64(0))
 }

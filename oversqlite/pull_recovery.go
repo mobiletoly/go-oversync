@@ -117,7 +117,7 @@ func (c *Client) resumeCheckpointRecoveryLocked(ctx context.Context) (RemoteSync
 			}
 		}
 	}
-	return c.rebuildKeepSourceLocked(ctx)
+	return c.runAutomaticRecovery(ctx)
 }
 
 func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context) (RemoteSyncReport, error) {
@@ -166,7 +166,6 @@ func (c *Client) rebuildSourceRecoveryWithFinalizerLocked(
 		RotateSource:              true,
 		NewSourceID:               newSourceID,
 		ReplacementReason:         strings.TrimSpace(operation.Reason),
-		PreserveOutbox:            true,
 		ClearSourceRecovery:       true,
 		RequireFreshRotatedSource: true,
 	}
@@ -210,6 +209,9 @@ func (c *Client) ensureRebuildPreconditionsLocked(ctx context.Context) error {
 }
 
 func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, options snapshotApplyOptions) (RemoteSyncReport, error) {
+	if err := requireNoUnresolvedUpload(ctx, c.db); err != nil {
+		return RemoteSyncReport{}, err
+	}
 	limits, err := c.negotiateSnapshotLimits(ctx)
 	if err != nil {
 		return RemoteSyncReport{}, err
@@ -221,21 +223,13 @@ func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, optio
 	} else if err := c.setRebuildRequired(ctx, true); err != nil {
 		return RemoteSyncReport{}, err
 	}
-	guard, err := c.pinSnapshotApplyGuard(ctx, options)
+	guard, err := completeWorkPhase(ctx, c, "snapshot guard", func(ctx context.Context) (*snapshotApplyGuard, error) { return c.pinSnapshotApplyGuard(ctx, options) })
 	if err != nil {
 		return RemoteSyncReport{}, err
 	}
 	options.PinnedGuard = guard
-	if err := c.clearSnapshotStage(ctx); err != nil {
-		return RemoteSyncReport{}, err
-	}
-
-	sessionReq, err := snapshotSessionCreateRequestFromOptions(c.sourceID, options)
-	if err != nil {
-		return RemoteSyncReport{}, err
-	}
 	startedAt := time.Now()
-	session, err := c.createSnapshotSession(ctx, sessionReq)
+	session, transfer, err := c.stageOperationSnapshot(ctx, options, limits)
 	if err != nil {
 		return RemoteSyncReport{}, err
 	}
@@ -243,10 +237,7 @@ func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, optio
 	if options.RotateSource {
 		effectiveSourceID = options.NewSourceID
 	}
-	defer c.deleteSnapshotSessionBestEffortAsSource(session.SnapshotID, effectiveSourceID)
-
-	transfer, err := c.downloadSnapshotSessionAsSource(ctx, session, limits, effectiveSourceID)
-	if err != nil {
+	if err := c.updateAutomaticPhase(ctx, "prepare_transition"); err != nil {
 		return RemoteSyncReport{}, err
 	}
 	if c.beforeSnapshotApplyHook != nil {
@@ -258,6 +249,7 @@ func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, optio
 	if err := c.applyStagedSnapshotLocked(ctx, session, options); err != nil {
 		return RemoteSyncReport{}, err
 	}
+	c.retireSnapshotSession(ctx, session.SnapshotID, effectiveSourceID)
 	if c.snapshotObserver != nil {
 		c.snapshotObserver(snapshotRestoreObservation{
 			StagedRows: transfer.rows, DeclaredWireBytes: transfer.bytes,

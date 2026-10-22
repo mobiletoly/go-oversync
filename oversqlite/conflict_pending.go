@@ -168,15 +168,18 @@ func (c *Client) preserveConflict(ctx context.Context, snapshot *pushOutboundSna
 	if err != nil {
 		return nil, err
 	}
-	if outbox.State != outboxStatePrepared || outbox.SourceBundleID != snapshot.SourceBundleID {
-		return nil, &StaleConflictResolutionError{}
-	}
 	previous, err := readPendingConflict(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
 	if previous != nil {
+		if err := c.guardConflictDecision(ctx, tx, previous); err != nil {
+			return nil, err
+		}
 		return previous, nil
+	}
+	if outbox.State != outboxStatePrepared || outbox.SourceBundleID != snapshot.SourceBundleID {
+		return nil, &StaleConflictResolutionError{}
 	}
 	p := PendingConflict{ID: uuid.NewString(), SourceID: outbox.SourceID, SourceBundleID: outbox.SourceBundleID, RequestHash: outbox.CanonicalRequestHash, Generation: c.schemaGenerationProof, Conflict: conflict, Response: response.Response}
 	if err := tx.QueryRowContext(ctx, `SELECT revision,baseline_revision FROM _sync_conflict_state WHERE singleton_key=1`).Scan(&p.Revision, &p.BaselineRevision); err != nil {
@@ -187,6 +190,9 @@ func (c *Client) preserveConflict(ctx context.Context, snapshot *pushOutboundSna
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE _sync_conflict_state SET pending=? WHERE singleton_key=1`, string(data)); err != nil {
+		return nil, err
+	}
+	if err := retainRejectedUploadInTx(ctx, tx); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -294,13 +300,17 @@ func optionalJSONEqual(left, right json.RawMessage) (bool, error) {
 	return jcs.Equal(left, right)
 }
 
-// RetryConflict clears only the definitive conflict observation, retaining the
-// exact frozen request for another ordinary, bounded upload attempt.
+// RetryConflict releases the selected rejected operation's policy ownership and
+// requeues preserved intent for a successor upload after its disposition/ack.
 func (c *Client) RetryConflict(ctx context.Context, selected PendingConflict) error {
 	if err := c.tryBeginSyncOperation(); err != nil {
 		return err
 	}
 	defer c.writeMu.Unlock()
+	snapshot, err := c.loadPushOutboundSnapshot(ctx)
+	if err != nil {
+		return err
+	}
 	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
 		return err
@@ -309,7 +319,13 @@ func (c *Client) RetryConflict(ctx context.Context, selected PendingConflict) er
 	if err := c.guardConflictDecision(ctx, tx, &selected); err != nil {
 		return err
 	}
+	if err := c.requeueSnapshotRowsInTx(ctx, tx, snapshot, nil); err != nil {
+		return err
+	}
 	if err := recordConflictDecision(ctx, tx, &selected, DeferConflict{}); err != nil {
+		return err
+	}
+	if err := c.deletePushOutboundSnapshotInTx(ctx, tx, selected.SourceBundleID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -327,7 +343,7 @@ func (c *Client) guardConflictDecision(ctx context.Context, tx sqliteTransaction
 	if err != nil {
 		return err
 	}
-	if current == nil || current.ID != p.ID || current.Revision != p.Revision || current.BaselineRevision != p.BaselineRevision || outbox.State != outboxStatePrepared || outbox.SourceID != p.SourceID || outbox.SourceBundleID != p.SourceBundleID || outbox.CanonicalRequestHash != p.RequestHash || p.Generation != c.schemaGenerationProof {
+	if current == nil || current.ID != p.ID || current.Revision != p.Revision || current.BaselineRevision != p.BaselineRevision || outbox.State != outboxStateRejected || outbox.SourceID != p.SourceID || outbox.SourceBundleID != p.SourceBundleID || outbox.CanonicalRequestHash != p.RequestHash || p.Generation != c.schemaGenerationProof {
 		return &StaleConflictResolutionError{}
 	}
 	return nil

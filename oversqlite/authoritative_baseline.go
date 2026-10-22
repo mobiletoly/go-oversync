@@ -111,7 +111,9 @@ func (c *Client) installAuthoritativeBaseline(ctx context.Context, tx sqliteTran
 			if oldKind != kind || !same {
 				return fmt.Errorf("inconsistent authoritative payload at equal version")
 			}
-			return nil
+			if observation.Origin != "snapshot" {
+				return nil
+			}
 		}
 	}
 	query := `INSERT INTO _sync_row_state(schema_name,table_name,key_json,row_version,server_kind,server_payload,server_provenance,relationships_known)

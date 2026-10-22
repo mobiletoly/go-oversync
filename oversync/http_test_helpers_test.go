@@ -33,6 +33,7 @@ func doJSONHandlerRequest(
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	setTestSchemaGenerationHeaders(req, service)
 	req = req.WithContext(ContextWithActor(req.Context(), actor))
 	for key, value := range pathValues {

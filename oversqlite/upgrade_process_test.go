@@ -178,10 +178,7 @@ func TestUpgradeProcessHelper(t *testing.T) {
 				case request.Method == http.MethodGet && request.URL.Path == "/sync/pull":
 					return jsonResponse(oversync.PullResponse{StableBundleSeq: 0}), nil
 				case request.Method == http.MethodPost && request.URL.Path == "/sync/snapshot-sessions":
-					return jsonResponse(oversync.SnapshotSession{
-						SnapshotID: "boundary-snapshot", SnapshotBundleSeq: 7,
-						RowCount: 0, ByteCount: 0, ExpiresAt: "2030-01-01T00:00:00Z",
-					}), nil
+					return snapshotFixtureResponseForGeneration(t, upgradeCapabilities(t, plan.testTarget).SchemaGeneration, request, "boundary-snapshot", 7, nil), nil
 				case request.Method == http.MethodGet && request.URL.Path == "/sync/snapshot-sessions/process-snapshot":
 					return jsonResponse(oversync.SnapshotChunkResponse{
 						SnapshotID: "process-snapshot", SnapshotBundleSeq: 7,
@@ -292,6 +289,7 @@ func prepareU8ProcessTestDatabase(t *testing.T, path string) UpgradePlan {
 	require.NoError(t, fresh.Close())
 	admitTestCoordinatorTarget(t, fresh)
 	retainTestDiscoveredGenerationDescriptor(t, db, plan.testInstalled)
+	retainTestDiscoveredGenerationDescriptor(t, db, plan.testTarget)
 	guardTx, err := beginImmediateTx(context.Background(), db)
 	require.NoError(t, err)
 	require.NoError(t, installLocalOnlyUpgradeGuards(context.Background(), guardTx, plan.LocalOnlyTables))
@@ -330,6 +328,19 @@ func prepareU8ProcessTestDatabase(t *testing.T, path string) UpgradePlan {
 		SnapshotBundleSeq: 7, SnapshotRowCount: 1, SnapshotByteCount: byteCount,
 		SnapshotRowsStaged: 1, SnapshotBytesStaged: byteCount,
 	}))
+	// This fresh-format fixture represents a confirmed U6 receipt and the full
+	// sealed snapshot, rather than reconstructing metadata from row totals.
+	fresh.config.BaseURL = "http://process.invalid"
+	target, err := fresh.newPhysicalClient(plan.testTarget, fresh.config.TargetClientConfig)
+	require.NoError(t, err)
+	target.sourceID, target.UserID = "source-new", plan.UserID
+	record, err := loadUpgradeJournal(context.Background(), db)
+	require.NoError(t, err)
+	seal := sealedTestSnapshotForGeneration(t, upgradeCapabilities(t, plan.testTarget).SchemaGeneration, "source-new", "process-snapshot", 7, []oversync.SnapshotRow{row}, nil)
+	sealTx, err := beginImmediateTx(context.Background(), db)
+	require.NoError(t, err)
+	require.NoError(t, target.retainUpgradeSnapshot(context.Background(), sealTx, record, seal))
+	require.NoError(t, sealTx.Commit(context.Background()))
 	require.NoError(t, db.Close())
 	return plan
 }
@@ -840,15 +851,12 @@ func TestOpening_I09SnapshotCleanupStartsFreshTargetSession(t *testing.T) {
 			case request.Method == http.MethodGet && request.URL.Path == "/sync/snapshot-sessions/process-snapshot":
 				return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "snapshot_session_not_found"}), nil
 			case request.Method == http.MethodPost && request.URL.Path == "/sync/snapshot-sessions":
-				if request.Body != nil {
-					var body map[string]any
-					require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
-					require.NotContains(t, body, "source_replacement", "U7 recovery must not rotate the already replaced source")
-				}
-				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID: "replacement-target-snapshot", SnapshotBundleSeq: 7,
-					RowCount: 0, ByteCount: 0, ExpiresAt: "2030-01-01T00:00:00Z",
-				}), nil
+				var body oversync.SnapshotSessionCreateRequest
+				require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+				require.Nil(t, body.SourceReplacement, "U7 recovery must not rotate the already replaced source")
+				require.Equal(t, &oversync.SnapshotRecovery{MinimumBundleSeq: 0}, body.Recovery)
+				require.Equal(t, "source-new", request.Header.Get(oversync.SourceIDHeader))
+				return jsonResponse(sealedTestSnapshotForGeneration(t, upgradeCapabilities(t, plan.testTarget).SchemaGeneration, "source-new", "replacement-target-snapshot", 7, nil, body.Recovery)), nil
 			case request.Method == http.MethodDelete && request.URL.Path == "/sync/snapshot-sessions/replacement-target-snapshot":
 				return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: http.NoBody}, nil
 			default:
@@ -865,6 +873,47 @@ func TestOpening_I09SnapshotCleanupStartsFreshTargetSession(t *testing.T) {
 	require.Equal(t, plan.testTarget.Proof, result.Status.TargetProof)
 	require.NoError(t, coordinator.Close())
 	require.NoError(t, db.Close())
+}
+
+func TestOpening_I09ContextChangePreventsRefresh(t *testing.T) {
+	for _, schema := range []string{"main", "temp"} {
+		t.Run(schema, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "context.sqlite")
+			plan := prepareU7ProcessTestDatabase(t, path)
+			db, err := sql.Open("sqlite3", path)
+			require.NoError(t, err)
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			pages, creates := 0, 0
+			opening, err := newTestOpening(db, &openingRuntimeConfig{
+				Plan: plan, BaseURL: "http://process.invalid", Token: tokenProviderForTests,
+				HTTP: &http.Client{Transport: rawRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+					switch {
+					case request.Method == http.MethodGet && request.URL.Path == "/sync/generations/1":
+						return jsonResponse(upgradeCapabilities(t, plan.testTarget)), nil
+					case request.Method == http.MethodGet && request.URL.Path == "/sync/snapshot-sessions/process-snapshot":
+						pages++
+						_, err := db.Exec(`CREATE TABLE ` + schema + `.changed_context(id INTEGER)`)
+						require.NoError(t, err)
+						return errorJSONResponse(http.StatusGone, oversync.ErrorResponse{Error: "snapshot_session_expired"}), nil
+					case request.Method == http.MethodPost && request.URL.Path == "/sync/snapshot-sessions":
+						creates++
+					}
+					return nil, fmt.Errorf("unexpected request %s %s", request.Method, request.URL.Path)
+				})},
+			})
+			require.NoError(t, err)
+			defer opening.Close()
+			record, err := loadUpgradeJournal(context.Background(), db)
+			require.NoError(t, err)
+			before := recoveryVector(t, db, "people", "local_notes", "_sync_row_state", "_sync_source_state", "_sync_attachment_state", "_sync_upgrade_journal", "_sync_operation_state")
+			err = opening.resumeTargetSnapshot(context.Background(), record)
+			require.ErrorContains(t, err, "upgrade snapshot authority or local context changed")
+			require.Equal(t, 1, pages)
+			require.Zero(t, creates)
+			require.Equal(t, before, recoveryVector(t, db, "people", "local_notes", "_sync_row_state", "_sync_source_state", "_sync_attachment_state", "_sync_upgrade_journal", "_sync_operation_state"))
+		})
+	}
 }
 
 func TestOpening_I10EveryLocalBoundaryProcessDeath(t *testing.T) {
@@ -1020,7 +1069,7 @@ func TestOpening_I08StableReplacementTupleAfterProcessReplyLoss(t *testing.T) {
 				var replay oversync.SnapshotSessionCreateRequest
 				require.NoError(t, json.NewDecoder(request.Body).Decode(&replay))
 				require.Equal(t, lostRequest, replay)
-				return jsonResponse(oversync.SnapshotSession{SnapshotID: "replacement-replay", SnapshotBundleSeq: 7, RowCount: 0, ByteCount: 0, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+				return jsonResponse(sealedTestSnapshotForGeneration(t, upgradeCapabilities(t, plan.testTarget).SchemaGeneration, replay.SourceReplacement.NewSourceID, "replacement-replay", 7, nil, replay.Recovery)), nil
 			case request.Method == http.MethodDelete && request.URL.Path == "/sync/snapshot-sessions/replacement-replay":
 				return jsonResponse(map[string]string{"status": "deleted"}), nil
 			default:
@@ -1069,6 +1118,14 @@ func TestOpening_I12MalformedReplacementResponseIsIntegrityFailure(t *testing.T)
 }
 
 func TestOpening_I03PermanentRejectionRequiresBoundResolution(t *testing.T) {
+	testOpeningTerminalRejectionRetry(t, false)
+}
+
+func TestRecoveryJournal_OpeningRejectionRetryKeepsIntent(t *testing.T) {
+	testOpeningTerminalRejectionRetry(t, true)
+}
+
+func testOpeningTerminalRejectionRetry(t *testing.T, stopAfterDrain bool) {
 	path := filepath.Join(t.TempDir(), "same-file.sqlite")
 	plan := preparePushProcessTestDatabase(t, path)
 	db, err := sql.Open("sqlite3", path)
@@ -1076,6 +1133,12 @@ func TestOpening_I03PermanentRejectionRequiresBoundResolution(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	base := newMockPushServer(t)
 	reject := true
+	base.pushHook = func(p *mockDirectPush) *http.Response {
+		if reject {
+			return errorJSONResponse(422, oversync.ErrorResponse{Error: "payload_invalid", Message: "application resolution required"})
+		}
+		return base.defaultPushResponse(p)
+	}
 	httpClient := &http.Client{Transport: rawRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		generation := request.Header.Get(oversync.SchemaGenerationIDHeader)
 		switch {
@@ -1084,12 +1147,10 @@ func TestOpening_I03PermanentRejectionRequiresBoundResolution(t *testing.T) {
 				return jsonResponse(upgradeCapabilities(t, plan.testInstalled)), nil
 			}
 			return jsonResponse(upgradeCapabilities(t, plan.testTarget)), nil
-		case request.Method == http.MethodPost && request.URL.Path == "/sync/push" && reject:
-			return errorJSONResponse(http.StatusUnprocessableEntity, oversync.ErrorResponse{Error: "payload_invalid", Message: "application resolution required"}), nil
 		case request.Method == http.MethodGet && request.URL.Path == "/sync/pull":
 			return jsonResponse(oversync.PullResponse{StableBundleSeq: base.nextBundleSeq - 1}), nil
 		case request.Method == http.MethodPost && request.URL.Path == "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: "after-resolution", SnapshotBundleSeq: max(int64(1), base.nextBundleSeq-1), RowCount: 0, ByteCount: 0, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return snapshotFixtureResponseForGeneration(t, upgradeCapabilities(t, plan.testTarget).SchemaGeneration, request, "after-resolution", max(int64(1), base.nextBundleSeq-1), nil), nil
 		case request.Method == http.MethodDelete && request.URL.Path == "/sync/snapshot-sessions/after-resolution":
 			return jsonResponse(map[string]string{"status": "deleted"}), nil
 		default:
@@ -1113,13 +1174,44 @@ func TestOpening_I03PermanentRejectionRequiresBoundResolution(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, result.Status.Revision, status.Revision)
 
+	require.Len(t, base.ackRequests, 1)
+	require.Equal(t, outboxStateRejected, requireOutboxBundle(t, db).State)
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_upload_journal`))
+	require.NoError(t, coordinator.Close())
+	coordinator, err = newTestOpening(db, &openingRuntimeConfig{Plan: plan, BaseURL: "http://resolution.invalid", Token: tokenProviderForTests, HTTP: httpClient})
+	require.NoError(t, err)
+	retryCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if stopAfterDrain {
+		coordinator.config.testBoundary = func(boundary string) {
+			if boundary == "after_U2_commit" {
+				cancel()
+			}
+		}
+	}
 	reject = false
-	result, err = coordinator.ResolvePendingIntent(context.Background(), PendingIntentResolution{
+	result, err = coordinator.ResolvePendingIntent(retryCtx, PendingIntentResolution{
 		Action: PendingIntentRetry, PlanID: status.PlanID, Revision: status.Revision,
 		RequestHash: status.PendingRequestHash,
 	})
-	require.NoError(t, err)
-	require.Equal(t, UpgradeOutcomeReady, result.Status.Outcome)
+	if stopAfterDrain {
+		require.ErrorIs(t, err, context.Canceled)
+		record, readErr := loadUpgradeJournal(context.Background(), db)
+		require.NoError(t, readErr)
+		require.True(t, record.DrainComplete)
+		require.Len(t, base.pushRequests, 2)
+		require.EqualValues(t, 1, base.pushRequests[0].SourceBundleID)
+		require.EqualValues(t, 2, base.pushRequests[1].SourceBundleID)
+		require.Len(t, base.ackRequests, 2)
+		require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_upload_journal`))
+		require.Equal(t, outboxStateNone, requireOutboxBundle(t, db).State)
+		pending, readErr := readPendingPushRejection(context.Background(), db)
+		require.NoError(t, readErr)
+		require.Nil(t, pending)
+	} else {
+		require.NoError(t, err)
+		require.Equal(t, UpgradeOutcomeReady, result.Status.Outcome)
+	}
 	require.NoError(t, coordinator.Close())
 	require.NoError(t, db.Close())
 }
@@ -1143,7 +1235,7 @@ func TestOpening_I04HistoryPrunedRecoveryCompletesUnderFrozenCoordinator(t *test
 				return jsonResponse(upgradeCapabilities(t, plan.testInstalled)), nil
 			}
 			return jsonResponse(upgradeCapabilities(t, plan.testTarget)), nil
-		case request.Method == http.MethodPost && request.URL.Path == "/sync/push" && createPruned:
+		case request.Method == http.MethodGet && request.URL.Path == "/sync/pull" && generation == fmt.Sprint(plan.testInstalled.Proof.ID) && createPruned:
 			createPruned = false
 			return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{
 				Error: "history_pruned", Message: "old source tuple is below the retained floor",
@@ -1151,16 +1243,21 @@ func TestOpening_I04HistoryPrunedRecoveryCompletesUnderFrozenCoordinator(t *test
 		case request.Method == http.MethodPost && request.URL.Path == "/sync/snapshot-sessions" && generation == fmt.Sprint(plan.testInstalled.Proof.ID):
 			var create oversync.SnapshotSessionCreateRequest
 			require.NoError(t, json.NewDecoder(request.Body).Decode(&create))
-			require.NotNil(t, create.SourceReplacement)
-			require.Equal(t, "source-old", create.SourceReplacement.PreviousSourceID)
-			require.Equal(t, "history_pruned", create.SourceReplacement.Reason)
-			recoveredOldSource = create.SourceReplacement.NewSourceID
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID: "old-recovery", SnapshotBundleSeq: 0, RowCount: 0, ByteCount: 0, ExpiresAt: "2030-01-01T00:00:00Z",
-			}), nil
+			require.Nil(t, create.SourceReplacement, "ordinary pull pruning keeps the settled upload source")
+			recoveredOldSource = request.Header.Get(oversync.SourceIDHeader)
+			require.Equal(t, "source-old", recoveredOldSource)
+			for _, table := range []string{"_sync_dirty_rows", "_sync_outbox_rows", "_sync_upload_journal"} {
+				require.Zero(t, countA3(t, db, "SELECT count(*) FROM "+table), "original upload must settle and acknowledge before S")
+			}
+			require.Len(t, base.ackRequests, 1)
+			oldRows := []oversync.SnapshotRow{}
+			for _, row := range base.committedBySeq[1].Rows {
+				oldRows = append(oldRows, oversync.SnapshotRow{Schema: row.Schema, Table: row.Table, Key: row.Key, RowVersion: row.RowVersion, Payload: row.Payload})
+			}
+			return jsonResponse(sealedTestSnapshotForGeneration(t, upgradeCapabilities(t, plan.testInstalled).SchemaGeneration, recoveredOldSource, "old-recovery", 1, oldRows, create.Recovery)), nil
 		case request.Method == http.MethodGet && request.URL.Path == "/sync/snapshot-sessions/old-recovery":
 			return jsonResponse(oversync.SnapshotChunkResponse{
-				SnapshotID: "old-recovery", SnapshotBundleSeq: 0, NextRowOrdinal: 0, HasMore: false, ByteCount: 0,
+				SnapshotID: "old-recovery", SnapshotBundleSeq: 1, Rows: []oversync.SnapshotRow{{Schema: base.committedBySeq[1].Rows[0].Schema, Table: base.committedBySeq[1].Rows[0].Table, Key: base.committedBySeq[1].Rows[0].Key, RowVersion: 1, Payload: base.committedBySeq[1].Rows[0].Payload}}, NextRowOrdinal: 1, HasMore: false,
 			}), nil
 		case request.Method == http.MethodDelete && request.URL.Path == "/sync/snapshot-sessions/old-recovery":
 			return jsonResponse(map[string]string{"status": "deleted"}), nil
@@ -1172,9 +1269,7 @@ func TestOpening_I04HistoryPrunedRecoveryCompletesUnderFrozenCoordinator(t *test
 			require.NotNil(t, create.SourceReplacement)
 			require.Equal(t, recoveredOldSource, create.SourceReplacement.PreviousSourceID)
 			require.Equal(t, "schema_generation_upgrade", create.SourceReplacement.Reason)
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID: "target-rebuild", SnapshotBundleSeq: 1, RowCount: 0, ByteCount: 0, ExpiresAt: "2030-01-01T00:00:00Z",
-			}), nil
+			return jsonResponse(sealedTestSnapshotForGeneration(t, upgradeCapabilities(t, plan.testTarget).SchemaGeneration, create.SourceReplacement.NewSourceID, "target-rebuild", 1, nil, create.Recovery)), nil
 		case request.Method == http.MethodGet && request.URL.Path == "/sync/snapshot-sessions/target-rebuild":
 			return jsonResponse(oversync.SnapshotChunkResponse{
 				SnapshotID: "target-rebuild", SnapshotBundleSeq: 1, NextRowOrdinal: 0, HasMore: false, ByteCount: 0,
@@ -1195,7 +1290,7 @@ func TestOpening_I04HistoryPrunedRecoveryCompletesUnderFrozenCoordinator(t *test
 	require.NotEmpty(t, recoveredOldSource)
 	require.Equal(t, recoveredOldSource, result.Status.OldSourceID)
 	require.NotEqual(t, recoveredOldSource, result.Status.NewSourceID)
-	require.Len(t, base.pushRequests, 1, "the preserved request must replay after same-generation recovery")
+	require.Len(t, base.pushRequests, 1, "original upload commits once before clean same-generation recovery")
 	require.Equal(t, operationKindNone, requireOperationKind(t, db))
 }
 
@@ -1235,6 +1330,239 @@ func TestOpening_I03ResolutionDecisionSurvivesProcessDeath(t *testing.T) {
 				require.IsType(t, AcceptServer{}, resolver.Resolve(ConflictContext{}))
 			}
 			require.NoError(t, db.Close())
+		})
+	}
+}
+
+func TestRecoveryJournal_PreU0FinishesOriginalBeforeTargetAdmission(t *testing.T) {
+	for _, phase := range []string{"frozen", "ack_pending"} {
+		t.Run(phase, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "original.sqlite")
+			plan := preparePushProcessTestDatabase(t, path)
+			db, err := sql.Open("sqlite3", path)
+			require.NoError(t, err)
+			db.SetMaxOpenConns(1)
+			defer db.Close()
+			authority := newMockPushServer(t)
+			discovery := 0
+			transport := &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if strings.HasPrefix(r.URL.Path, "/sync/generations/") {
+					discovery++
+					return errorJSONResponse(426, oversync.ErrorResponse{Error: "unsupported_protocol_version", Message: "target unavailable"}), nil
+				}
+				return authority.RoundTrip(r)
+			})}
+			opening, err := newTestOpening(db, &openingRuntimeConfig{Plan: plan, BaseURL: "http://preupgrade.invalid", Token: tokenProviderForTests, HTTP: transport})
+			require.NoError(t, err)
+			opening.config.HTTP = transport // override the general fixture target-discovery shortcut
+			client, err := opening.newPhysicalClient(plan.testInstalled, nil)
+			require.NoError(t, err)
+			attachment, err := loadAttachmentState(context.Background(), db)
+			require.NoError(t, err)
+			client.sourceID = attachment.CurrentSourceID
+			client.UserID = plan.UserID
+			client.sessionConnected = true
+			client.config.RetryPolicy = &RetryPolicy{MaxAttempts: 1}
+			if phase == "frozen" {
+				client.SetBeforePushCommitHook(func(context.Context) error { return context.Canceled })
+			} else {
+				client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Path == "/sync/push-outcomes/ack" {
+						return nil, context.Canceled
+					}
+					return authority.RoundTrip(r)
+				})}
+			}
+			_, err = client.PushPending(context.Background())
+			require.Error(t, err)
+			before := recoveryVector(t, db, "people", "local_notes")
+			journal, err := loadUploadJournal(context.Background(), db)
+			require.NoError(t, err)
+			require.Equal(t, phase, journal.Phase)
+			_, err = opening.Advance(context.Background())
+			require.Error(t, err)
+			t.Logf("pre-U0 error: %T %v", err, err)
+			require.Equal(t, 1, discovery, "mutable target admission follows original obligation")
+			require.Equal(t, before, recoveryVector(t, db, "people", "local_notes"))
+			require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_upload_journal`))
+			require.Len(t, authority.ackRequests, 1)
+			require.Len(t, authority.resolveRequests, map[string]int{"frozen": 1, "ack_pending": 0}[phase])
+			require.Len(t, authority.pushRequests, map[string]int{"frozen": 0, "ack_pending": 1}[phase])
+			var version int
+			require.NoError(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+			require.Equal(t, 1, version)
+			if phase == "frozen" {
+				require.Positive(t, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`))
+			}
+			require.NoError(t, opening.Close())
+		})
+	}
+}
+
+func TestRecoveryJournal_PreU0RealPolicyUsesExistingOpeningResolution(t *testing.T) {
+	for _, kind := range []string{"application", "row_conflict"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "policy.sqlite")
+			plan := preparePushProcessTestDatabase(t, path)
+			db, err := sql.Open("sqlite3", path)
+			require.NoError(t, err)
+			db.SetMaxOpenConns(1)
+			defer db.Close()
+			authority := newMockPushServer(t)
+			authority.pushHook = func(p *mockDirectPush) *http.Response {
+				if kind == "application" {
+					return errorJSONResponse(422, oversync.ErrorResponse{Error: "application_rejected", Message: "real rejection"})
+				}
+				return errorJSONResponse(409, oversync.PushConflictResponse{Error: "push_conflict", Message: "real conflict", Conflict: &oversync.PushConflictDetails{Schema: p.Rows[0].Schema, Table: p.Rows[0].Table, Key: p.Rows[0].Key, Op: p.Rows[0].Op, BaseRowVersion: 0, ServerRowVersion: 1, ServerRow: json.RawMessage(`{"id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","name":"remote"}`)}})
+			}
+			transport := &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/sync/generations/1" {
+					if r.Header.Get(oversync.SchemaGenerationIDHeader) == fmt.Sprint(plan.testInstalled.Proof.ID) {
+						return jsonResponse(upgradeCapabilities(t, plan.testInstalled)), nil
+					}
+					return jsonResponse(upgradeCapabilities(t, plan.testTarget)), nil
+				}
+				if r.URL.Path == "/sync/pull" {
+					return jsonResponse(oversync.PullResponse{StableBundleSeq: authority.nextBundleSeq - 1}), nil
+				}
+				return authority.RoundTrip(r)
+			})}
+			opening, err := newTestOpening(db, &openingRuntimeConfig{Plan: plan, BaseURL: "http://prepolicy.invalid", Token: tokenProviderForTests, HTTP: transport})
+			require.NoError(t, err)
+			client, err := opening.newPhysicalClient(plan.testInstalled, opening.config.OldClientConfig)
+			require.NoError(t, err)
+			a, err := loadAttachmentState(context.Background(), db)
+			require.NoError(t, err)
+			client.sourceID = a.CurrentSourceID
+			client.UserID = plan.UserID
+			client.sessionConnected = true
+			client.config.RetryPolicy = &RetryPolicy{MaxAttempts: 1}
+			client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				response, err := authority.RoundTrip(r)
+				if err == nil && r.URL.Path == "/sync/push" {
+					response.Body.Close()
+					return nil, context.Canceled
+				}
+				return response, err
+			})}
+			_, err = client.PushPending(context.Background())
+			require.Error(t, err)
+			result, err := opening.Advance(context.Background())
+			require.Error(t, err)
+			require.Equal(t, UpgradeOutcomeNeedsResolution, result.Status.Outcome)
+			require.Equal(t, UpgradePhaseResolvingOldIntent, result.Status.Phase)
+			require.Len(t, authority.pushRequests, 1)
+			require.Len(t, authority.resolveRequests, 1)
+			require.Len(t, authority.ackRequests, 1)
+			require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_upload_journal`))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			opening.config.testBoundary = func(cut string) {
+				if cut == "after_U2_commit" {
+					cancel()
+				}
+			}
+			authority.pushHook = nil
+			action := PendingIntentRetry
+			_, err = opening.ResolvePendingIntent(ctx, PendingIntentResolution{Action: action, PlanID: result.Status.PlanID, Revision: result.Status.Revision, RequestHash: result.Status.PendingRequestHash})
+			require.ErrorIs(t, err, context.Canceled)
+			record, err := loadUpgradeJournal(context.Background(), db)
+			require.NoError(t, err)
+			require.True(t, record.DrainComplete)
+			require.Len(t, authority.pushRequests, 2)
+			require.Len(t, authority.ackRequests, 2)
+			require.NoError(t, opening.Close())
+		})
+	}
+}
+
+func TestOpening_I09ReplacementRetryAdmission(t *testing.T) {
+	for _, change := range []string{"main", "temp"} {
+		t.Run(change, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "replacement-retry.sqlite")
+			plan := prepareU6ProcessTestDatabase(t, path)
+			db, err := sql.Open("sqlite3", path)
+			require.NoError(t, err)
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			creates := 0
+			opening, err := newTestOpening(db, &openingRuntimeConfig{Plan: plan, BaseURL: "http://process.invalid", Token: tokenProviderForTests,
+				HTTP: &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+					if r.Method == http.MethodGet && r.URL.Path == "/sync/generations/1" {
+						return jsonResponse(upgradeCapabilities(t, plan.testTarget)), nil
+					}
+					if r.Method == http.MethodPost && r.URL.Path == "/sync/snapshot-sessions" {
+						creates++
+						ddl := `CREATE TABLE ` + change + `.changed_replacement(id INTEGER)`
+						_, err := db.Exec(ddl)
+						require.NoError(t, err)
+						return errorJSONResponse(http.StatusServiceUnavailable, oversync.ErrorResponse{Error: "synthetic_transient"}), nil
+					}
+					return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				})}})
+			require.NoError(t, err)
+			defer opening.Close()
+			rec, err := loadUpgradeJournal(context.Background(), db)
+			require.NoError(t, err)
+			require.Error(t, opening.confirmReplacement(context.Background(), rec))
+			require.Equal(t, 1, creates)
+			after, err := loadUpgradeJournal(context.Background(), db)
+			require.NoError(t, err)
+			require.Equal(t, rec, after)
+			require.Equal(t, int64(0), countA3(t, db, `SELECT last_bundle_seq_seen FROM _sync_attachment_state`))
+		})
+	}
+}
+
+func TestOpening_I09ReplacementDescriptorAdmission(t *testing.T) {
+	for _, field := range []string{"table", "single_key", "ordered_keys"} {
+		t.Run(field, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "descriptor.sqlite")
+			plan := prepareU6ProcessTestDatabase(t, path)
+			db, err := sql.Open("sqlite3", path)
+			require.NoError(t, err)
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			opening, err := newTestOpening(db, &openingRuntimeConfig{Plan: plan, BaseURL: "http://process.invalid"})
+			require.NoError(t, err)
+			defer opening.Close()
+			client, err := opening.newPhysicalClient(plan.testTarget, opening.config.TargetClientConfig)
+			require.NoError(t, err)
+			client.sourceID, client.UserID = "source-old", plan.UserID
+			rec, err := loadUpgradeJournal(context.Background(), db)
+			require.NoError(t, err)
+			client.config.MaxSyncWorkspaceBytes = 512 << 10
+			before := recoveryVector(t, db, "people", "local_notes", "_sync_operation_state", "_sync_attachment_state", "_sync_upgrade_journal")
+			attempt := func() (string, error, int) {
+				tx, err := beginImmediateTx(context.Background(), db)
+				require.NoError(t, err)
+				probe := &upgradeProofReadProbe{sqliteTransaction: tx}
+				guard, admissionErr := client.readSnapshotReplacementContext(context.Background(), probe, rec)
+				require.NoError(t, tx.Rollback())
+				return guard, admissionErr, probe.journalReads
+			}
+			guard, err, reads := attempt()
+			require.NoError(t, err)
+			require.Len(t, guard, 64)
+			require.Equal(t, 1, reads)
+			// Exercise descriptor admission independently of schema validation. No SQL or
+			// unsupported application table is installed by this serializer-boundary test.
+			huge := strings.Repeat("target", 128<<10)
+			switch field {
+			case "table":
+				client.config.Tables[0].TableName = huge
+			case "single_key":
+				client.config.Tables[0].SyncKeyColumnName = huge
+			case "ordered_keys":
+				client.config.Tables[0].SyncKeyColumns = []string{huge}
+			}
+			guard, err, reads = attempt()
+			var capacity *SyncWorkspaceLimitError
+			require.ErrorAs(t, err, &capacity)
+			require.Empty(t, guard)
+			require.Zero(t, reads, "refuse before allocating the journal and target JSON")
+			require.Greater(t, capacity.Reserved, client.config.MaxSyncWorkspaceBytes)
+			require.Equal(t, before, recoveryVector(t, db, "people", "local_notes", "_sync_operation_state", "_sync_attachment_state", "_sync_upgrade_journal"))
 		})
 	}
 }

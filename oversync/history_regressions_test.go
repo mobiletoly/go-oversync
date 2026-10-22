@@ -129,6 +129,8 @@ func TestDirectPush_DeferredConstraintEffectsFinishBeforeCaptureAndCoverage(t *t
 	require.NoError(t, err)
 	require.JSONEq(t, fmt.Sprintf(`{"email":"bob@example.com","id":%q,"name":"BOB"}`, normalizedID), string(pull.Bundles[0].Rows[0].Payload))
 
+	acknowledgeRetainedOutcomeForTest(t, ctx, service, actor, proof)
+
 	droppedID := uuid.NewString()
 	_, _, err = pushRowsWithGeneration(t, ctx, service, actor, proof, 2, []PushRequestRow{{
 		Schema: schema, Table: "users", Key: SyncKey{"id": droppedID}, Op: OpInsert,
@@ -484,6 +486,7 @@ func TestGenerationProjectionIntegrityCorruption_UsesProductionHTTPErrorFamily(t
 	assertIntegrityResponse := func(t *testing.T, method, target string, handle func(http.ResponseWriter, *http.Request)) {
 		t.Helper()
 		request := httptest.NewRequest(method, target, nil)
+		request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 		request.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(proof.ID))
 		request.Header.Set(SchemaGenerationFingerprintHeader, proof.Fingerprint)
 		request = request.WithContext(ContextWithActor(request.Context(), reader))
@@ -565,6 +568,7 @@ func TestGenerationProjectionIntegrityCorruption_UsesProductionHTTPErrorFamily(t
 	require.NoError(t, err)
 	commitRequest := httptest.NewRequest(http.MethodPost, "/sync/push", bytes.NewReader(pushBody))
 	commitRequest.Header.Set("Content-Type", "application/json")
+	commitRequest.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	commitRequest.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(proof.ID))
 	commitRequest.Header.Set(SchemaGenerationFingerprintHeader, proof.Fingerprint)
 	commitRequest = commitRequest.WithContext(ContextWithActor(commitRequest.Context(), conflictActor))
@@ -644,6 +648,7 @@ func TestHistoryProjectionResourceBound_TwoPopulationScalesKeepFixedHighWater(t 
 		maxWrite := 0
 		for after < int64(population) {
 			request := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/sync/pull?after_bundle_seq=%d&max_bundles=8&target_bundle_seq=%d", after, population), nil)
+			request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 			request.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(proof.ID))
 			request.Header.Set(SchemaGenerationFingerprintHeader, proof.Fingerprint)
 			request = request.WithContext(ContextWithActor(request.Context(), actor))
@@ -701,6 +706,7 @@ func TestHistoryProjectionHTTPLease_RemainsTrackedThroughResponseLifetime(t *tes
 	}
 	requestFor := func(ctx context.Context, actor Actor, proof SchemaGenerationProof) *http.Request {
 		request := httptest.NewRequest(http.MethodGet, "/sync/pull?after_bundle_seq=0", nil).WithContext(ctx)
+		request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 		request.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(proof.ID))
 		request.Header.Set(SchemaGenerationFingerprintHeader, proof.Fingerprint)
 		return request.WithContext(ContextWithActor(request.Context(), actor))
@@ -809,6 +815,7 @@ func TestPushHTTPLease_RemainsTrackedThroughResponseLifetime(t *testing.T) {
 	requestFor := func(ctx context.Context, f fixture) *http.Request {
 		request := httptest.NewRequest(http.MethodPost, "/sync/push", bytes.NewReader(f.body)).WithContext(ctx)
 		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 		request.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(f.proof.ID))
 		request.Header.Set(SchemaGenerationFingerprintHeader, f.proof.Fingerprint)
 		return request.WithContext(ContextWithActor(request.Context(), f.actor))
@@ -892,7 +899,7 @@ func TestPushConflict_OversizedVisibleRowIsSuppressedBeforeGoMaterialization(t *
 	}
 	service := newBootstrappedIntegrationService(t, ctx, pool, largeConfig, integrationTestLogger(slog.LevelWarn))
 	userID := "conflict-user"
-	mustInitializeEmptyScope(t, ctx, service, userID, "server")
+	mustInitializeEmptyScope(t, ctx, service, userID, "initializing-reader")
 	rowID := uuid.New()
 	largeName := strings.Repeat("v", 12<<10)
 	err := service.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
@@ -905,6 +912,7 @@ func TestPushConflict_OversizedVisibleRowIsSuppressedBeforeGoMaterialization(t *
 	smallConfig := *largeConfig
 	smallConfig.MaxBytesPerBundle = 4096
 	smallConfig.MaxBytesPerPullResponse = 4096
+	smallConfig.MaxPushOutcomeDecodedBytes = 73728 // preserve immutable store ceiling across a projection-limit restart
 	restarted := newBootstrappedIntegrationService(t, ctx, pool, &smallConfig, integrationTestLogger(slog.LevelWarn))
 	var observation conflictRowScanObservation
 	restarted.uploadConnHooks = &userUploadConnTestHooks{afterConflictRowScan: func(actual conflictRowScanObservation) {
@@ -914,9 +922,9 @@ func TestPushConflict_OversizedVisibleRowIsSuppressedBeforeGoMaterialization(t *
 		Schema: schemaName, Table: "users", Key: SyncKey{"id": rowID.String()}, Op: OpUpdate, BaseRowVersion: 0,
 		Payload: json.RawMessage(fmt.Sprintf(`{"email":"small@example.com","id":"%s","name":"small"}`, rowID)),
 	}})
-	var limitErr *GenerationProjectionError
+	var limitErr *PushOutcomeError
 	require.ErrorAs(t, err, &limitErr)
-	require.Equal(t, BundleLimitExceeded, limitErr.Code)
+	require.Equal(t, "push_outcome_too_large", limitErr.Code)
 	require.Greater(t, observation.ReportedPayloadByteCount, int64(smallConfig.MaxBytesPerBundle))
 	require.False(t, observation.PayloadMaterialized, "oversized authoritative data must be suppressed before the driver scans it")
 	require.Zero(t, observation.MaterializedPayloadBytes)

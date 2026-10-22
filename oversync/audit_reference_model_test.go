@@ -210,6 +210,7 @@ func TestAuditReferenceModel_SeededMultiScopeSequence(t *testing.T) {
 
 		assertAuditReferenceModel(t, ctx, pool, svc, schemaName, model)
 		requireAuditMetadataIntegrity(t, ctx, pool)
+		acknowledgeRetainedOutcomeForTest(t, ctx, svc, scope.actor, testSchemaGenerationProofForService(svc))
 	}
 }
 

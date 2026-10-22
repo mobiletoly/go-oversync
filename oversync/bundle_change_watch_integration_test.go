@@ -82,6 +82,7 @@ func (f *bundleChangeWatchFixture) pushOne(t *testing.T, actor Actor, sourceBund
 	bundle, err := pushRowsOneShot(t, f.ctx, f.svc, actor, sourceBundleID, []PushRequestRow{f.userInsert(name)})
 	require.NoError(t, err)
 	require.NotNil(t, bundle)
+	acknowledgeRetainedOutcomeForTest(t, f.ctx, f.svc, actor, testSchemaGenerationProofForService(f.svc))
 	return bundle
 }
 
@@ -261,7 +262,7 @@ func TestSubscribeBundleChanges_DoesNotWakeOnRolledBackBundle(t *testing.T) {
 	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 
-	err = f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err = f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		tableIdent := pgx.Identifier{f.schemaName, "users"}.Sanitize()
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (_sync_scope_id, id, name, email) VALUES ($1, $2, $3, $4)`, tableIdent), actor.UserID, uuid.New(), "rollback", "rollback@example.com")
 		require.NoError(t, execErr)
@@ -343,7 +344,7 @@ func TestBundleChangeNotify_NoCapturedChangesEmitsNoPostgresNotify(t *testing.T)
 	mustInitializeEmptyScope(t, f.ctx, f.svc, actor.UserID, actor.SourceID)
 	rawListener := acquireRawBundleChangeListener(t, f.ctx, f.pool, f.svc.effectiveBundleChangeWatchConfig())
 
-	err := f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err := f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		return nil
 	})
 	var noChanges *ScopeWriteNoCapturedChangesError

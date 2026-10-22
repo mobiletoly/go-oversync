@@ -802,3 +802,29 @@ func TestContractDiscovery_PublicReadyReopenPreservesDistinctSchemas(t *testing.
 	}
 	require.NoError(t, result.Ready.Close())
 }
+
+func TestRecoveryProtocol_DiscoveryRequiresOutcomeCeiling(t *testing.T) {
+	caps := discoveryPeopleCapabilities(t)
+	caps.ProtocolVersion = requiredProtocolVersion
+	caps.Limits = testWireLimits()
+	raw, err := json.Marshal(caps)
+	require.NoError(t, err)
+	_, err = decodeDiscoveredContract(raw, 1)
+	require.NoError(t, err)
+	for _, mutation := range []func(map[string]any){
+		func(root map[string]any) { delete(root["limits"].(map[string]any), "max_push_outcome_decoded_bytes") },
+		func(root map[string]any) { root["limits"].(map[string]any)["max_push_outcome_decoded_bytes"] = 0 },
+		func(root map[string]any) {
+			root["limits"].(map[string]any)["max_push_outcome_decoded_bytes"] = 67117057
+		},
+		func(root map[string]any) { root["protocol_version"] = "v2" },
+	} {
+		var root map[string]any
+		require.NoError(t, json.Unmarshal(raw, &root))
+		mutation(root)
+		candidate, err := json.Marshal(root)
+		require.NoError(t, err)
+		_, err = decodeDiscoveredContract(candidate, 1)
+		require.Error(t, err)
+	}
+}

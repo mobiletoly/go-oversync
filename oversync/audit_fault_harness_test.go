@@ -576,6 +576,7 @@ func TestAuditHarness_HelperProcessStartsServesRealHandlersAndStops(t *testing.T
 
 	request, err := http.NewRequest(http.MethodGet, process.URL()+"/sync/generations/1", nil)
 	require.NoError(t, err)
+	request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	request.Header.Set(auditHelperUserIDHeader, "audit-user")
 	request.Header.Set(SourceIDHeader, "audit-source")
 	response, err = client.Do(request)

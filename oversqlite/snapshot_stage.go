@@ -5,10 +5,8 @@ package oversqlite
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
-	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
@@ -120,89 +118,6 @@ func (c *Client) ensureFreshRotatedSourceInTx(ctx context.Context, tx sqliteTran
 	}
 	if state.NextSourceBundleID != 1 || state.ReplacedBySourceID != "" {
 		return fmt.Errorf("rotated rebuild requires a fresh source id; reserved source is already in use")
-	}
-	return nil
-}
-
-func (c *Client) retargetPreparedOutboxInTx(ctx context.Context, tx sqliteTransaction, sourceID string, sourceBundleID int64) error {
-	if sourceBundleID <= 0 {
-		return fmt.Errorf("sourceBundleID must be positive when preserving prepared outbox")
-	}
-	outbox, err := loadOutboxBundle(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if outbox.State != outboxStatePrepared {
-		return fmt.Errorf("cannot preserve outbox during source recovery when outbox state is %q", outbox.State)
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE _sync_outbox_rows SET source_bundle_id = ? WHERE source_bundle_id = ?`, sourceBundleID, outbox.SourceBundleID); err != nil {
-		return fmt.Errorf("failed to retarget preserved outbox rows: %w", err)
-	}
-	outbox.SourceID = sourceID
-	outbox.SourceBundleID = sourceBundleID
-	if err := persistOutboxBundle(ctx, tx, outbox); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *Client) reapplyPreparedOutboxIntentLocallyInTx(ctx context.Context, stmtCache *txStmtCache, tx sqliteTransaction) error {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT table_name, key_json, op, local_payload
-		FROM _sync_outbox_rows
-		ORDER BY row_ordinal
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to query preserved outbox rows for local replay: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			tableName    string
-			keyJSON      string
-			op           string
-			localPayload sql.NullString
-		)
-		if err := rows.Scan(&tableName, &keyJSON, &op, &localPayload); err != nil {
-			return fmt.Errorf("failed to scan preserved outbox row for local replay: %w", err)
-		}
-
-		switch op {
-		case oversync.OpDelete:
-			localPK, _, err := c.decodeDirtyKeyForPush(tx, tableName, keyJSON)
-			if err != nil {
-				return err
-			}
-			pkColumn, err := c.primaryKeyColumnForTable(tableName)
-			if err != nil {
-				return err
-			}
-			pkValue, err := c.convertPKForQueryInTx(tx, tableName, localPK)
-			if err != nil {
-				return fmt.Errorf("failed to convert preserved outbox delete key for %s: %w", tableName, err)
-			}
-			query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", quoteIdent(tableName), quoteIdent(pkColumn))
-			if _, err := stmtCache.ExecContext(ctx, query, pkValue); err != nil {
-				return fmt.Errorf("failed to replay preserved outbox delete for %s: %w", tableName, err)
-			}
-		case oversync.OpInsert, oversync.OpUpdate:
-			if !localPayload.Valid {
-				return fmt.Errorf("preserved outbox row for %s is missing local_payload", tableName)
-			}
-			payload, err := jcs.DecodeObject([]byte(localPayload.String))
-			if err != nil {
-				return fmt.Errorf("failed to decode preserved outbox payload for %s: %w", tableName, err)
-			}
-			if err := c.upsertLocalRowInTxUsing(ctx, stmtCache, tx, tableName, payload); err != nil {
-				return fmt.Errorf("failed to replay preserved outbox upsert for %s: %w", tableName, err)
-			}
-		default:
-			return fmt.Errorf("unsupported preserved outbox op %q", op)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed to iterate preserved outbox rows for local replay: %w", err)
 	}
 	return nil
 }

@@ -4,8 +4,10 @@
 package oversqlite_e2e
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -468,12 +470,13 @@ func TestEndToEnd_PrunedPreparedDirectPushFailsClosedBeforeSnapshotRebuild(t *te
 	require.Equal(t, "prepared", outboxState)
 	require.Positive(t, sourceBundleID)
 	receiptSeq := sourceBundleID
+	frozenBeforeClose := durableRecoveryVectorE2E(t, db)
+	requireFrozenRebuildRefusalE2E(t, client, db)
 	require.NoError(t, client.Close())
 	require.NoError(t, db.Close())
 
-	// A later authoritative write is intentionally newer than the receipt.
-	// The snapshot fallback must apply this current state without pretending it
-	// verified the now-pruned result hash.
+	// Retained C is independent of pruned history. Resolve and acknowledge its
+	// original effect first; only a subsequent clean snapshot may install Dana.
 	serverActor := oversync.Actor{UserID: userID, SourceID: "server-writer"}
 	err = server.SyncService.WithinSyncBundle(ctx, serverActor, oversync.BundleSource{SourceID: serverActor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s.users SET name='Dana' WHERE id=$1`, pgx.Identifier{schema}.Sanitize()), rowID)
@@ -496,15 +499,30 @@ func TestEndToEnd_PrunedPreparedDirectPushFailsClosedBeforeSnapshotRebuild(t *te
 
 	restarted, restartedDB := openClient(false)
 	defer func() { require.NoError(t, restarted.Close()); require.NoError(t, restartedDB.Close()) }()
+	require.Equal(t, frozenBeforeClose, durableRecoveryVectorE2E(t, restartedDB))
 	attached, err = restarted.Attach(ctx, userID)
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.AttachStatusConnected, attached.Status)
-	_, err = restarted.PushPending(ctx)
-	require.ErrorContains(t, err, "source recovery is required")
+	requireFrozenRebuildRefusalE2E(t, restarted, restartedDB)
+	settled, err := restarted.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeCommitted, settled.Outcome)
+	var localName string
+	var checkpoint, journals int64
+	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id=?`, rowID).Scan(&localName))
+	require.Equal(t, "BOB", localName, "original C is verified and installed even after history is pruned")
+	require.NoError(t, restartedDB.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_attachment_state`).Scan(&checkpoint))
+	require.Equal(t, receiptSeq, checkpoint, "newer Dana is not attributed to the original operation")
+	require.NoError(t, restartedDB.QueryRow(`SELECT count(*) FROM _sync_upload_journal`).Scan(&journals))
+	require.Zero(t, journals)
+	require.NoError(t, restartedDB.QueryRow(`SELECT state FROM _sync_outbox_bundle WHERE singleton_key=1`).Scan(&outboxState))
+	require.Equal(t, "none", outboxState)
 	_, err = restarted.Rebuild(ctx)
 	require.NoError(t, err)
-	require.NoError(t, restartedDB.QueryRow(`SELECT state FROM _sync_outbox_bundle WHERE singleton_key=1`).Scan(&outboxState))
-	require.Equal(t, "prepared", outboxState)
+	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id=?`, rowID).Scan(&localName))
+	require.Equal(t, "DANA", localName)
+	require.NoError(t, restartedDB.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_attachment_state`).Scan(&checkpoint))
+	require.Equal(t, currentBundleSeq, checkpoint)
 }
 
 func TestEndToEnd_LostCoverageRejectionReplyRestartsAndRejectsWithoutSideEffects(t *testing.T) {
@@ -572,21 +590,60 @@ func TestEndToEnd_LostCoverageRejectionReplyRestartsAndRejectsWithoutSideEffects
 	var outboxState string
 	require.NoError(t, db.QueryRow(`SELECT state FROM _sync_outbox_bundle WHERE singleton_key=1`).Scan(&outboxState))
 	require.Equal(t, "prepared", outboxState)
+	frozenBeforeClose := durableRecoveryVectorE2E(t, db)
+	requireFrozenRebuildRefusalE2E(t, client, db)
+	var retained int
+	require.NoError(t, server.Pool.QueryRow(ctx, `SELECT count(*) FROM sync.push_outcomes WHERE user_pk=(SELECT user_pk FROM sync.user_state WHERE user_id=$1)`, userID).Scan(&retained))
+	require.Zero(t, retained, "effect-coverage admission failure is not a retained terminal rejection")
 	require.NoError(t, client.Close())
 	require.NoError(t, db.Close())
 
 	restarted, restartedDB := openClient(false)
 	defer func() { require.NoError(t, restarted.Close()); require.NoError(t, restartedDB.Close()) }()
+	require.Equal(t, frozenBeforeClose, durableRecoveryVectorE2E(t, restartedDB))
 	attached, err = restarted.Attach(ctx, userID)
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.AttachStatusConnected, attached.Status)
+	cancelled, err := restarted.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeNoChange, cancelled.Outcome, "resolve cancels the original uncommitted tuple and restores its intent")
+	var dirty, journals int
+	require.NoError(t, restartedDB.QueryRow(`SELECT count(*) FROM _sync_dirty_rows`).Scan(&dirty))
+	require.Equal(t, 1, dirty)
+	require.NoError(t, restartedDB.QueryRow(`SELECT count(*) FROM _sync_upload_journal`).Scan(&journals))
+	require.Zero(t, journals)
+	var rejectionCode string
+	var rejectionStatus int
+	observedHTTP := *restarted.HTTP
+	baseTransport := observedHTTP.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	observedHTTP.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		response, err := baseTransport.RoundTrip(request)
+		if err == nil && request.URL.Path == "/sync/push" {
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				return nil, readErr
+			}
+			response.Body = io.NopCloser(bytes.NewReader(body))
+			var decoded oversync.ErrorResponse
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				return nil, err
+			}
+			rejectionCode, rejectionStatus = decoded.Error, response.StatusCode
+		}
+		return response, err
+	})
+	restarted.HTTP = &observedHTTP
 	_, err = restarted.PushPending(ctx)
-	var resolutionErr *oversqlite.PushRejectionNeedsResolutionError
-	require.ErrorAs(t, err, &resolutionErr)
-	require.Equal(t, http.StatusUnprocessableEntity, resolutionErr.Pending.Status)
-	require.Equal(t, "push_effect_coverage_incomplete", resolutionErr.Pending.Category)
-	var rejectionErr *oversqlite.PushApplicationRejectionError
-	require.ErrorAs(t, err, &rejectionErr)
+	require.ErrorContains(t, err, "status 422")
+	require.Equal(t, http.StatusUnprocessableEntity, rejectionStatus)
+	require.Equal(t, "push_effect_coverage_incomplete", rejectionCode)
+	// This admission failure still cannot masquerade as terminal C. Its new
+	// frozen tuple remains intact and snapshot remains forbidden.
+	requireFrozenRebuildRefusalE2E(t, restarted, restartedDB)
 
 	var localName string
 	require.NoError(t, restartedDB.QueryRow(`SELECT name FROM users WHERE id=?`, rowID).Scan(&localName))

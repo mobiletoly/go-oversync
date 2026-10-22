@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 
 	"github.com/mobiletoly/go-oversync/oversync"
@@ -149,23 +148,6 @@ func (e *PushConflictRetryExhaustedError) Error() string {
 		e.RetryCount,
 		e.RemainingDirtyCount,
 	)
-}
-
-func decodePushConflictError(status int, body []byte) *PushConflictError {
-	if status != http.StatusConflict {
-		return nil
-	}
-
-	response, err := completeConflictResponse(body)
-	if err != nil {
-		return nil
-	}
-	response.Message = ""
-	return &PushConflictError{
-		Status:   status,
-		RawBody:  "",
-		Response: *response,
-	}
 }
 
 func syncKeysEqual(left, right oversync.SyncKey) (bool, error) {

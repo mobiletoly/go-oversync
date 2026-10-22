@@ -99,6 +99,8 @@ func TestAuditIntegrityOracle_AfterDirectCommittedWork(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// The next source tuple starts only after the first terminal outcome is settled.
+	acknowledgeRetainedOutcomeForTest(t, ctx, fixture.svc, fixture.writer, testSchemaGenerationProofForService(fixture.svc))
 	_, err = pushRowsOneShot(t, ctx, fixture.svc, fixture.writer, 2, []PushRequestRow{
 		fixture.userRow(auditUUID(2), "Second"),
 	})

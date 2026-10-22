@@ -47,6 +47,7 @@ func runAuditProtocolActorRequest(
 	}))
 
 	request := httptest.NewRequest(http.MethodGet, "/sync/pull", nil)
+	request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	if includeSource {
 		request.Header.Set(SourceIDHeader, sourceID)
 	}
@@ -154,8 +155,8 @@ func TestAuditProtocolGreen_HTTPRejectsMalformedAndSnapshotUnknownJSON(t *testin
 }
 
 func TestAuditProtocolGreen_PushAcceptsJSONMediaTypeWithCharset(t *testing.T) {
-	fixture, _ := newAuditPushHTTPFixture(t)
-	body := auditCompactPushBody(t, fixture, "")
+	fixture, initializationID := newAuditPushHTTPFixture(t)
+	body := auditCompactPushBody(t, fixture, initializationID)
 
 	recorder := runAuditPushRequest(t, fixture, body, "application/json; charset=utf-8")
 	require.Equal(t, http.StatusOK, recorder.Code)
@@ -252,6 +253,15 @@ func TestAuditProtocolContract_MalformedUUIDPathIDsReturnBadRequest(t *testing.T
 			path:   "/sync/snapshot-sessions/not-a-uuid",
 			key:    "snapshot_id",
 		},
+		{
+			name: "snapshot retirement",
+			handle: func(handlers *HTTPSyncHandlers, w http.ResponseWriter, request *http.Request) {
+				handlers.HandleDeleteSnapshotSession(w, request)
+			},
+			method: http.MethodDelete,
+			path:   "/sync/snapshot-sessions/not-a-uuid",
+			key:    "snapshot_id",
+		},
 	}
 
 	for _, test := range tests {
@@ -261,6 +271,7 @@ func TestAuditProtocolContract_MalformedUUIDPathIDsReturnBadRequest(t *testing.T
 			handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
 			request := httptest.NewRequest(test.method, test.path, nil)
 			request.SetPathValue(test.key, "not-a-uuid")
+			setTestSchemaGenerationHeaders(request, fixture.svc)
 			request = request.WithContext(ContextWithActor(request.Context(), fixture.writer))
 			recorder := httptest.NewRecorder()
 

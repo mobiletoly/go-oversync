@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -122,7 +123,7 @@ func TestMobileFlow_DirectSyncDrainsSeveralAdmittedBatchesOnce(t *testing.T) {
 	}
 }
 
-func TestMobileFlow_CancelledSyncReopensFrozenSecondBundle(t *testing.T) {
+func TestMobileFlow_DirectSyncRecoveryPreservesIntent(t *testing.T) {
 	generation := oversync.SchemaGeneration{ID: 1}
 	for _, table := range serverpkg.SchemaGenerationsForBusinessSchema("business")[0].Tables {
 		if table.Table == "users" {
@@ -169,11 +170,54 @@ func TestMobileFlow_CancelledSyncReopensFrozenSecondBundle(t *testing.T) {
 	interrupted, stop := context.WithCancel(ctx)
 	defer stop()
 	pushes := 0
+	resolves, snapshots := 0, 0
+	var cancelledAck bool
 	var frozenBody []byte
-	transport := watchRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+	var frozenSource string
+	var frozenRows map[string]string
+	successorRows := make(map[string]string)
+	transport := watchRoundTripFunc(func(request *http.Request) (response *http.Response, resultErr error) {
+		defer func() {
+			if resultErr != nil {
+				t.Logf("transport boundary %s: %v", request.URL.Path, resultErr)
+			}
+		}()
+		if request.URL.Path == "/sync/snapshot-sessions" {
+			snapshots++
+		}
+		if request.URL.Path == "/sync/push-outcomes/resolve" {
+			resolves++
+			if request.Header.Get(oversync.SourceIDHeader) != frozenSource {
+				return nil, fmt.Errorf("resolve changed original source")
+			}
+			raw, err := io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+			if err := request.Body.Close(); err != nil {
+				return nil, err
+			}
+			request.Body = io.NopCloser(bytes.NewReader(raw))
+			var frozen, resolve map[string]json.RawMessage
+			if err := json.Unmarshal(frozenBody, &frozen); err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(raw, &resolve); err != nil {
+				return nil, err
+			}
+			for _, key := range []string{"source_bundle_id", "canonical_request_hash"} {
+				if !bytes.Equal(frozen[key], resolve[key]) {
+					return nil, fmt.Errorf("resolve changed original %s", key)
+				}
+			}
+			t.Logf("reached resolve original source=%s tuple=%s", request.Header.Get("Oversync-Source-ID"), raw)
+		}
+		if request.URL.Path == "/sync/push-outcomes/ack" && resolves > 0 && pushes == 2 {
+			cancelledAck = true
+		}
 		if request.Method == http.MethodPost && request.URL.Path == "/sync/push" {
 			pushes++
-			if pushes == 2 || pushes == 3 {
+			if pushes >= 2 {
 				raw, err := io.ReadAll(request.Body)
 				if err != nil {
 					return nil, err
@@ -196,11 +240,44 @@ func TestMobileFlow_CancelledSyncReopensFrozenSecondBundle(t *testing.T) {
 				}
 				if pushes == 2 {
 					frozenBody = decoded
+					frozenSource = request.Header.Get(oversync.SourceIDHeader)
+					frozenRows, err = directSyncCompactIntentRows(decoded)
+					if err != nil {
+						return nil, err
+					}
 					stop()
 					return nil, interrupted.Err()
 				}
-				if !bytes.Equal(frozenBody, decoded) {
-					return nil, fmt.Errorf("reopened second bundle changed its exact frozen body")
+				var frozen, successor map[string]json.RawMessage
+				if err := json.Unmarshal(frozenBody, &frozen); err != nil {
+					return nil, err
+				}
+				if err := json.Unmarshal(decoded, &successor); err != nil {
+					return nil, err
+				}
+				// Cancellation consumes F's sequence and restores its intent to
+				// ordinary dirty scheduling. The remaining independent row may
+				// share the next batch; compare every original row across all
+				// successors, without imposing the old frozen batch boundary.
+				var originalSequence, successorSequence int64
+				if err := json.Unmarshal(frozen["source_bundle_id"], &originalSequence); err != nil {
+					return nil, err
+				}
+				if err := json.Unmarshal(successor["source_bundle_id"], &successorSequence); err != nil {
+					return nil, err
+				}
+				if !cancelledAck || successorSequence <= originalSequence || request.Header.Get(oversync.SourceIDHeader) != frozenSource {
+					return nil, fmt.Errorf("successor must follow original cancellation acknowledgment on the original source with a new sequence")
+				}
+				preserved, err := directSyncCompactIntentRows(decoded)
+				if err != nil {
+					return nil, err
+				}
+				for key, row := range preserved {
+					if _, duplicate := successorRows[key]; duplicate {
+						return nil, fmt.Errorf("successor repeated row %s", key)
+					}
+					successorRows[key] = row
 				}
 			}
 		}
@@ -213,6 +290,18 @@ func TestMobileFlow_CancelledSyncReopensFrozenSecondBundle(t *testing.T) {
 	var source, hash string
 	var bundle, rows, pending, reservations int64
 	if err := client.Database().QueryRowContext(ctx, `SELECT source_id,source_bundle_id,canonical_request_hash,row_count FROM _sync_outbox_bundle`).Scan(&source, &bundle, &hash, &rows); err != nil {
+		t.Fatal(err)
+	}
+	var journalRequest []byte
+	var frozenCaptures string
+	const capturesSQL = `SELECT json_group_array(json_array(source_bundle_id,row_ordinal,schema_name,table_name,key_json,wire_key_json,op,base_row_version,base_kind,base_payload,base_provenance,local_payload,wire_payload)) FROM (SELECT * FROM _sync_outbox_rows ORDER BY row_ordinal)`
+	if err := client.Database().QueryRowContext(ctx, `SELECT request_body FROM _sync_upload_journal`).Scan(&journalRequest); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(frozenBody, journalRequest) || source != frozenSource {
+		t.Fatal("retained journal differs from the actual original request/source")
+	}
+	if err := client.Database().QueryRowContext(ctx, capturesSQL).Scan(&frozenCaptures); err != nil {
 		t.Fatal(err)
 	}
 	if rows != 2 || hash == "" || len(frozenBody) == 0 {
@@ -247,10 +336,32 @@ func TestMobileFlow_CancelledSyncReopensFrozenSecondBundle(t *testing.T) {
 	if source != reopenedSource || bundle != reopenedBundle || hash != reopenedHash {
 		t.Fatal("close/reopen changed frozen second-bundle identity")
 	}
+	var reopenedRequest []byte
+	var reopenedCaptures string
+	if err := client.Database().QueryRowContext(ctx, `SELECT request_body FROM _sync_upload_journal`).Scan(&reopenedRequest); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Database().QueryRowContext(ctx, capturesSQL).Scan(&reopenedCaptures); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(journalRequest, reopenedRequest) || frozenCaptures != reopenedCaptures {
+		t.Fatal("physical reopen changed original bytes, bases or captures")
+	}
 	client.HTTP = &http.Client{Transport: transport}
 	report, err := client.Sync(ctx)
 	if err != nil || report.Status.Pending.PendingRowCount != 0 || pushes != 4 {
 		t.Fatalf("reopened Sync: report=%+v pushes=%d err=%v", report, pushes, err)
+	}
+	if len(successorRows) != 3 {
+		t.Fatalf("successors retained %d rows; want original three pending rows", len(successorRows))
+	}
+	for key, row := range frozenRows {
+		if successorRows[key] != row {
+			t.Fatalf("successor changed original key/op/base/payload: %s", key)
+		}
+	}
+	if resolves != 1 || snapshots != 0 || !cancelledAck {
+		t.Fatalf("recovery lifecycle resolve=%d snapshot=%d cancellation acknowledged=%v", resolves, snapshots, cancelledAck)
 	}
 	if _, err := follower.PullToStable(ctx); err != nil {
 		t.Fatal(err)
@@ -261,4 +372,32 @@ func TestMobileFlow_CancelledSyncReopensFrozenSecondBundle(t *testing.T) {
 	if err := client.Database().QueryRowContext(ctx, `SELECT reserved_entries+reserved_bytes+length(workspace_context) FROM _sync_operation_state`).Scan(&reservations); err != nil || reservations != 0 {
 		t.Fatalf("resumed operation released reservations: %d err=%v", reservations, err)
 	}
+}
+
+// Ignore transport group ordinals when comparing the same immutable row intent
+// across newly scheduled successor bundles. Keep table, key, op, base and values.
+func directSyncCompactIntentRows(body []byte) (map[string]string, error) {
+	var request oversync.CompactPushRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return nil, err
+	}
+	result := make(map[string]string)
+	for _, group := range request.Rows {
+		for _, row := range group.Rows {
+			key, err := json.Marshal(row.KeyValues)
+			if err != nil {
+				return nil, err
+			}
+			encoded, err := json.Marshal(row)
+			if err != nil {
+				return nil, err
+			}
+			identity := fmt.Sprintf("%d:%s", group.TableIndex, key)
+			if _, exists := result[identity]; exists {
+				return nil, fmt.Errorf("duplicate compact intent key %s", identity)
+			}
+			result[identity] = string(encoded)
+		}
+	}
+	return result, nil
 }

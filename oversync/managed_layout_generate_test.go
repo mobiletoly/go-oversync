@@ -23,11 +23,12 @@ func TestGenerateManagedLayoutManifest(t *testing.T) {
 	ctx := context.Background()
 	pool := newIntegrationTestPool(t, ctx)
 	service := &SyncService{logger: slog.Default(), config: &ServiceConfig{}}
+	require.NoError(t, normalizeHistoryProjectionConfig(service.config))
 	require.NoError(t, pgx.BeginTxFunc(ctx, pool, syncMutationTxOptions(), func(tx pgx.Tx) error { return service.createFreshSyncLayoutInTx(ctx, tx) }))
 	facts, err := loadManagedLayoutFacts(ctx, pool)
 	require.NoError(t, err)
 	retryKeys := map[managedLayoutFactKey]struct{}{}
-	for _, fact := range retryableWriteManagedLayoutFacts {
+	for _, fact := range append(append([]managedLayoutFact(nil), retryableWriteManagedLayoutFacts...), pushOutcomeManagedLayoutFacts...) {
 		retryKeys[managedLayoutFactKey{fact.Kind, fact.Identity, fact.Attribute}] = struct{}{}
 	}
 	static := facts[:0]

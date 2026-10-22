@@ -45,6 +45,7 @@ type adoptionQueryCounts struct {
 	historyStatements    int
 	persistence          int
 	catalogDefinition    int
+	outcomeAdmission     int
 	explicitDataLocks    int
 	dml                  int
 	ddl                  int
@@ -223,10 +224,16 @@ func (t *adoptionQueryTracer) counts() adoptionQueryCounts {
 			strings.Contains(normalized, "join pg_") || strings.Contains(normalized, "information_schema") ||
 			strings.Contains(normalized, "to_regclass(") || strings.Contains(normalized, "from sync.meta") ||
 			strings.Contains(normalized, "from sync.table_catalog") ||
-			strings.Contains(normalized, "from sync.server_source_reservations") {
+			strings.Contains(normalized, "from sync.server_source_reservations") ||
+			normalized == "select max_outcome_bytes from sync.push_protocol_store where singleton and format='durable_outcomes'" {
 			counts.catalogDefinition++
 			classified = true
 		}
+		if normalized == "select distinct generation_id,generation_fingerprint from sync.push_outcomes" {
+			counts.outcomeAdmission++
+			classified = true
+		}
+
 		if !classified {
 			counts.unknown = append(counts.unknown, normalized)
 		}
@@ -425,12 +432,17 @@ func TestBootstrap_ExistingLayoutAttachesWithoutDataQueriesLocksOrMutation(t *te
 			require.Contains(t, statementFamilies, "select pg_try_advisory_xact_lock_shared($1::int,$2::int)", "readiness adds one fixed authority-lock query")
 			require.Contains(t, statementFamilies, "select pg_catalog.current_setting('session_replication_role')='origin'", "one fixed actual-session attestation")
 			// The catalog revision peek selects read-only attachment versus locked append.
-			require.Equal(t, 39, restartCounts.total, "existing-layout attachment SQL count must be scale-independent, including readiness admission and catalog revision selection")
+			// Current durable-outcome admission adds one store definition read and
+			// one operational outcome-header read. This fixture varies business
+			// population with an empty outcome backlog; it makes no outcome-backlog
+			// scaling or general constant-work claim.
+			require.Equal(t, 41, restartCounts.total, "statement count is constant across this business population with an empty outcome backlog")
 			if expectedAttachStatementFamilies == nil {
 				expectedAttachStatementFamilies = append([]string(nil), statementFamilies...)
 			} else {
 				require.Equal(t, expectedAttachStatementFamilies, statementFamilies, "existing-layout attachment SQL families and ordering must be scale-independent")
 			}
+			require.Equal(t, 1, restartCounts.outcomeAdmission, "current outcome-admission read is operational data, independently classified")
 			require.Zero(t, restartCounts.business, "existing-layout attachment must not query business rows")
 			require.Zero(t, restartCounts.scopeEnvelope, "existing-layout attachment must not query operational scope state")
 			require.Zero(t, restartCounts.currentRow, "existing-layout attachment must not query current row state")

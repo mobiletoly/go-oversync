@@ -234,8 +234,9 @@ type ServiceConfig struct {
 	// client boundaries and available to trusted ScopeManager writes.
 	ReservedServerSourceIDs []string
 
-	MaxRowsPerBundle                int // Zero selects 10,000; hard maximum 100,000.
-	MaxBytesPerBundle               int // Zero selects 16 MiB; hard maximum 64 MiB.
+	MaxRowsPerBundle                int   // Zero selects 10,000; hard maximum 100,000.
+	MaxBytesPerBundle               int   // Zero selects 16 MiB; hard maximum 64 MiB.
+	MaxPushOutcomeDecodedBytes      int64 // Zero selects MaxBytesPerBundle+8KiB; immutable per fresh store.
 	MaxBytesPerPullResponse         int64
 	MaxConcurrentHistoryProjections int
 	InitializationLeaseTTL          time.Duration
@@ -287,6 +288,12 @@ func normalizeHistoryProjectionConfig(cfg *ServiceConfig) error {
 	}
 	if cfg.MaxBytesPerBundle == 0 {
 		cfg.MaxBytesPerBundle = defaultMaxBytesPerBundle
+	}
+	if cfg.MaxPushOutcomeDecodedBytes == 0 {
+		cfg.MaxPushOutcomeDecodedBytes = int64(cfg.MaxBytesPerBundle) + 8192
+	}
+	if cfg.MaxPushOutcomeDecodedBytes < int64(cfg.MaxBytesPerBundle)+8192 || cfg.MaxPushOutcomeDecodedBytes > int64(maxMaxBytesPerBundle)+8192 {
+		return fmt.Errorf("MaxPushOutcomeDecodedBytes must be between MaxBytesPerBundle+8192 and %d", int64(maxMaxBytesPerBundle)+8192)
 	}
 	if cfg.MaxBytesPerPullResponse == 0 {
 		cfg.MaxBytesPerPullResponse = defaultMaxBytesPerPullResponse
@@ -654,6 +661,9 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 				return err
 			}
 			if !freshLayout {
+				if err := s.validatePushOutcomeStore(ctx, tx); err != nil {
+					return err
+				}
 				if err := validateStaticManagedLayout(ctx, tx); err != nil {
 					s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
 					return err

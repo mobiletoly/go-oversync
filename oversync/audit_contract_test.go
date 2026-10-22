@@ -57,6 +57,7 @@ func TestAuditActorMiddleware_PreservesExactVisibleASCIISourceToken(t *testing.T
 	}))
 
 	request := httptest.NewRequest(http.MethodGet, "/sync/pull", nil)
+	request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	request.Header.Set(SourceIDHeader, sourceID)
 	handler.ServeHTTP(httptest.NewRecorder(), request)
 

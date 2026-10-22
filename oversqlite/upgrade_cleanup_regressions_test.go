@@ -268,3 +268,48 @@ func TestUpgradeRegression_NewOpeningDeepClonesReadyConfiguration(t *testing.T) 
 	require.Equal(t, 3*time.Second, client.config.PushCapacityRetryPolicy.MaxWait)
 	require.NoError(t, client.Close())
 }
+
+// A generation migrator may drop an omitted old table. Its capture inventory
+// must change atomically with DDL so strict retained admission can resume.
+func TestUpgradeRegression_DroppedTableCaptureInventoryCommitsAndRollsBack(t *testing.T) {
+	for _, commit := range []bool{false, true} {
+		t.Run(fmt.Sprint("commit=", commit), func(t *testing.T) {
+			ctx := context.Background()
+			db := openUpgradeTestDB(t)
+			_, err := db.Exec(`CREATE TABLE legacy_notes(id TEXT NOT NULL PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE people(id TEXT NOT NULL PRIMARY KEY,name TEXT NOT NULL); CREATE TABLE table_local_notes(id TEXT NOT NULL PRIMARY KEY,note TEXT NOT NULL); INSERT INTO table_local_notes VALUES('sentinel','preserve')`)
+			require.NoError(t, err)
+			old := tableVectorLocal(tableEvolutionVector(t), 0)
+			target := tableVectorLocal(tableEvolutionVector(t), 1)
+			config := admittedFixtureConfig("main", old.Tables, old.Proof)
+			config.localContract = &old
+			config.LocalOnlyTables = []string{"table_local_notes"}
+			client, err := newAdmittedFixtureClient(db, "http://inventory.invalid", tokenProviderForTests, config)
+			require.NoError(t, err)
+			require.NoError(t, client.Close())
+			tx, err := beginImmediateTx(ctx, db)
+			require.NoError(t, err)
+			defer tx.Rollback()
+			require.NoError(t, suspendInstalledCaptureTriggersInTx(ctx, tx, old))
+			_, err = tx.ExecContext(ctx, `DROP TABLE legacy_notes; CREATE TABLE projects(id TEXT NOT NULL PRIMARY KEY,title TEXT NOT NULL); ALTER TABLE people ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED; CREATE TABLE attachments(id TEXT NOT NULL PRIMARY KEY,person_id TEXT REFERENCES people(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,body TEXT NOT NULL)`)
+			require.NoError(t, err)
+			require.NoError(t, refreshTargetTriggersInTx(ctx, tx, target))
+			require.NoError(t, validateRetainedCaptureTriggers(ctx, tx))
+			if commit {
+				require.NoError(t, tx.Commit(ctx))
+			} else {
+				require.NoError(t, tx.Rollback())
+			}
+			require.NoError(t, validateCompleteRetainedRuntime(ctx, db))
+			var inventory string
+			require.NoError(t, db.QueryRow(`SELECT group_concat(schema_name||'.'||table_name,',') FROM (SELECT schema_name,table_name FROM _sync_managed_tables ORDER BY schema_name,table_name)`).Scan(&inventory))
+			expected := "main.legacy_notes,main.people"
+			if commit {
+				expected = "main.attachments,main.people,main.projects"
+			}
+			require.Equal(t, expected, inventory)
+			var sentinel string
+			require.NoError(t, db.QueryRow(`SELECT note FROM table_local_notes WHERE id='sentinel'`).Scan(&sentinel))
+			require.Equal(t, "preserve", sentinel)
+		})
+	}
+}

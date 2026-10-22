@@ -352,9 +352,14 @@ func TestPullAndRebuild_RejectWhilePushOutboundReplayIsPending(t *testing.T) {
 			})}
 
 			err = tc.op(client, ctx)
-			var replayErr *PendingPushReplayError
-			require.ErrorAs(t, err, &replayErr)
-			require.Equal(t, 1, replayErr.OutboundCount)
+			if tc.name == "pull rejects pending outbound replay" {
+				var replayErr *PendingPushReplayError
+				require.ErrorAs(t, err, &replayErr)
+				require.Equal(t, 1, replayErr.OutboundCount)
+			} else {
+				var pending *UploadJournalIntegrityError
+				require.ErrorAs(t, err, &pending)
+			}
 			require.Equal(t, 0, requests)
 		})
 	}

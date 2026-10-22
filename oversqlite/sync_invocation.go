@@ -16,9 +16,11 @@ const maxInteractivePushAttempts = 64
 type SyncIncompleteReason string
 
 const (
-	SyncIncompletePushAttemptLimit SyncIncompleteReason = "push_attempt_limit"
-	SyncIncompleteNoProgress       SyncIncompleteReason = "no_progress"
-	SyncIncompleteUploadsPaused    SyncIncompleteReason = "uploads_paused"
+	SyncIncompleteRecoveryReplanLimit   SyncIncompleteReason = "recovery_replan_limit"
+	SyncIncompletePushAttemptLimit      SyncIncompleteReason = "push_attempt_limit"
+	SyncIncompleteNoProgress            SyncIncompleteReason = "no_progress"
+	SyncIncompleteUploadsPaused         SyncIncompleteReason = "uploads_paused"
+	SyncIncompleteRecoveryExchangeLimit SyncIncompleteReason = "recovery_exchange_limit"
 )
 
 // SyncIncompleteError leaves all confirmed work and outstanding local intent durable.
@@ -43,8 +45,12 @@ type confirmedPushKey struct {
 }
 
 type syncInvocation struct {
-	pushAttempts int
-	confirmed    map[confirmedPushKey]struct{}
+	pushAttempts         int
+	recoveryReplans      int
+	recoveryStarted      bool
+	snapshotReplacements int
+	recoveryExchanges    int
+	confirmed            map[confirmedPushKey]struct{}
 }
 
 func invocationFromContext(ctx context.Context) *syncInvocation {

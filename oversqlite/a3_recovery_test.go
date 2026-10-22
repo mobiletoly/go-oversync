@@ -58,15 +58,15 @@ func TestA3Recovery_PreparedOutbox(t *testing.T) {
 	s := stageUserSnapshotRowsForGate(t, c, "a3-prepared", 2, a3SnapshotRows(t, [][3]string{{"Q", "new clean Q", ""}, {"P", "server parent", ""}, {"C", "child", "P"}, {"D", "grandchild", "C"}}))
 	_, err = db.Exec(`CREATE TRIGGER damage_q AFTER UPDATE ON nodes WHEN NEW.id='P' BEGIN UPDATE nodes SET name='trigger damage' WHERE id='Q'; END`)
 	require.NoError(t, err)
-	require.NoError(t, c.applyStagedSnapshotLocked(context.Background(), s, snapshotApplyOptions{PreserveOutbox: true,
-		RotateSource: true, NewSourceID: "a3-replacement", ReplacementReason: string(SourceRecoveryHistoryPruned), ClearSourceRecovery: true, RequireFreshRotatedSource: true}))
+	before := qualificationState(t, db, "nodes")
+	err = c.applyStagedSnapshotLocked(context.Background(), s, snapshotApplyOptions{RotateSource: true, NewSourceID: "a3-replacement", ReplacementReason: string(SourceRecoveryHistoryPruned), ClearSourceRecovery: true, RequireFreshRotatedSource: true})
+	var pending *UploadJournalIntegrityError
+	require.ErrorAs(t, err, &pending)
+	require.Equal(t, before, qualificationState(t, db, "nodes"))
 	require.Equal(t, "local parent", baselineText(t, db, `SELECT name FROM nodes WHERE id='P'`))
-	require.Equal(t, "new clean Q", baselineText(t, db, `SELECT name FROM nodes WHERE id='Q'`))
-	require.Equal(t, "server parent", baselineText(t, db, `SELECT json_extract(server_payload,'$.name.value') FROM _sync_row_state WHERE key_json='{"id":"P"}'`))
 	require.Equal(t, frozen, baselineText(t, db, `SELECT canonical_request_hash FROM _sync_outbox_bundle`))
-	require.Equal(t, "a3-replacement", baselineText(t, db, `SELECT source_id FROM _sync_outbox_bundle`))
-	require.EqualValues(t, 1, countA3(t, db, `SELECT source_bundle_id FROM _sync_outbox_bundle`))
+	require.Equal(t, c.sourceID, baselineText(t, db, `SELECT source_id FROM _sync_outbox_bundle`))
 	require.Equal(t, base, baselineText(t, db, `SELECT json_array(base_kind,base_payload,base_provenance,wire_payload,local_payload) FROM _sync_outbox_rows`))
-	requireLastBundleSeqSeen(t, c, context.Background(), 2)
+	requireLastBundleSeqSeen(t, c, context.Background(), 1)
 	require.Zero(t, countA3(t, db, `SELECT count(*) FROM pragma_foreign_key_check`))
 }

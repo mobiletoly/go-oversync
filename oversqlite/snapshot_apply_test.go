@@ -62,7 +62,7 @@ func TestRebuildKeepSource_CheckpointUnchangedOnFailedFinalApply(t *testing.T) {
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
 			id TEXT PRIMARY KEY NOT NULL,
-			name TEXT NOT NULL,
+			name TEXT NOT NULL CHECK(name<>'Broken'),
 			email TEXT NOT NULL
 		)
 	`)
@@ -70,30 +70,20 @@ func TestRebuildKeepSource_CheckpointUnchangedOnFailedFinalApply(t *testing.T) {
 	_, err := db.Exec(`DELETE FROM _sync_dirty_rows`)
 	require.NoError(t, err)
 
+	snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 4, Payload: mustBundlePayload(t, "user-1", "Broken", "broken@example.com")}}
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-bad-final",
-				SnapshotBundleSeq: 4,
-				RowCount:          1,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-bad-final", 4, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-bad-final":
 			switch r.Method {
 			case http.MethodGet:
 				return jsonResponse(oversync.SnapshotChunkResponse{
 					SnapshotID:        "snapshot-bad-final",
 					SnapshotBundleSeq: 4,
-					Rows: []oversync.SnapshotRow{{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-1"),
-						RowVersion: 4,
-						Payload:    []byte(`{"id":"user-1","name":"Broken"}`),
-					}},
-					NextRowOrdinal: 1,
-					HasMore:        false,
+					Rows:              snapshotRows,
+					NextRowOrdinal:    1,
+					HasMore:           false,
 				}), nil
 			case http.MethodDelete:
 				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
@@ -121,47 +111,40 @@ func TestRebuildRotateSource_ReusesDurableReplacementSourceAcrossRetry(t *testin
 		)
 	`)
 
-	_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, "user-1", "Ada", "ada@example.com")
-	require.NoError(t, err)
+	seedSyncedUserRow(t, client, db, "user-1", "Ada", 1)
+	require.NoError(t, client.markSourceRecoveryRequiredLocked(ctx, SourceRecoveryHistoryPruned, "", "reserved-rotated-device"))
 	client.sourceIDGenerator = func() string { return "reserved-rotated-device" }
 
 	var requestedReplacementSourceIDs []string
-	createPruned := true
+	allowExpiredReplacement := false
+	firstRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("remote"), RowVersion: 9, Payload: mustBundlePayload(t, "remote", "Remote", "remote@example.com")}}
 	sessionCreates := 0
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
-		case "/sync/push":
-			if createPruned {
-				createPruned = false
-				return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{
-					Error:   "history_pruned",
-					Message: "source tuple is below retained history floor",
-				}), nil
-			}
-			return nil, io.EOF
 		case "/sync/snapshot-sessions":
 			var req oversync.SnapshotSessionCreateRequest
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
-			require.NotNil(t, req.SourceReplacement)
-			requestedReplacementSourceIDs = append(requestedReplacementSourceIDs, req.SourceReplacement.NewSourceID)
+			source := r.Header.Get(oversync.SourceIDHeader)
+			if sessionCreates == 0 {
+				require.NotNil(t, req.SourceReplacement)
+				require.Equal(t, "bundle-device", req.SourceReplacement.PreviousSourceID)
+				source = req.SourceReplacement.NewSourceID
+			} else {
+				require.Nil(t, req.SourceReplacement, "durable confirmed replacement receipt uses the existing new source on a replacement session")
+				require.Equal(t, "reserved-rotated-device", source)
+			}
+			requestedReplacementSourceIDs = append(requestedReplacementSourceIDs, source)
 			sessionCreates++
 			if sessionCreates == 1 {
-				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID:        "retry-rotate-a",
-					SnapshotBundleSeq: 9,
-					RowCount:          1,
-					ExpiresAt:         "2030-01-01T00:00:00Z",
-				}), nil
+				return jsonResponse(sealedTestSnapshotForGeneration(t, client.discovery.SchemaGeneration, source, "retry-rotate-a", 9, firstRows, req.Recovery)), nil
 			}
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "retry-rotate-b",
-				SnapshotBundleSeq: 9,
-				RowCount:          0,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return jsonResponse(sealedTestSnapshotForGeneration(t, client.discovery.SchemaGeneration, source, "retry-rotate-b", 9, nil, req.Recovery)), nil
 		case "/sync/snapshot-sessions/retry-rotate-a":
 			switch r.Method {
 			case http.MethodGet:
+				if !allowExpiredReplacement {
+					return nil, io.EOF
+				}
 				return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{
 					Error:   "snapshot_session_not_found",
 					Message: "snapshot session retry-rotate-a was not found",
@@ -186,18 +169,13 @@ func TestRebuildRotateSource_ReusesDurableReplacementSourceAcrossRetry(t *testin
 		return nil, io.EOF
 	})}
 
-	_, err = client.PushPending(ctx)
-	var recoveryErr *SourceRecoveryRequiredError
-	require.ErrorAs(t, err, &recoveryErr)
-	require.Equal(t, SourceRecoveryHistoryPruned, recoveryErr.Code)
-	require.Equal(t, "reserved-rotated-device", requireOperationReplacementSourceID(t, db))
-
-	_, err = client.Rebuild(ctx)
+	_, err := client.Rebuild(ctx)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "snapshot_session_not_found")
+	require.Contains(t, err.Error(), "failed to send snapshot chunk request")
 	require.Equal(t, "bundle-device", client.sourceID)
 	require.Equal(t, "reserved-rotated-device", requireOperationReplacementSourceID(t, db))
 
+	allowExpiredReplacement = true
 	report, err := client.Rebuild(ctx)
 	require.NoError(t, err)
 	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
@@ -212,7 +190,7 @@ func TestRebuildRotateSource_SourceIDDoesNotRotateOnFailedFinalApply(t *testing.
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
 			id TEXT PRIMARY KEY NOT NULL,
-			name TEXT NOT NULL,
+			name TEXT NOT NULL CHECK(name<>'Broken'),
 			email TEXT NOT NULL
 		)
 	`)
@@ -222,30 +200,20 @@ func TestRebuildRotateSource_SourceIDDoesNotRotateOnFailedFinalApply(t *testing.
 	require.NoError(t, err)
 	setCurrentSourceBundleState(t, db, 5, 4)
 
+	snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 9, Payload: mustBundlePayload(t, "user-1", "Broken", "broken@example.com")}}
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-bad-recover",
-				SnapshotBundleSeq: 9,
-				RowCount:          1,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-bad-recover", 9, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-bad-recover":
 			switch r.Method {
 			case http.MethodGet:
 				return jsonResponse(oversync.SnapshotChunkResponse{
 					SnapshotID:        "snapshot-bad-recover",
 					SnapshotBundleSeq: 9,
-					Rows: []oversync.SnapshotRow{{
-						Schema:     "main",
-						Table:      "users",
-						Key:        mustBundleKey("user-1"),
-						RowVersion: 9,
-						Payload:    []byte(`{"id":"user-1","name":"Broken"}`),
-					}},
-					NextRowOrdinal: 1,
-					HasMore:        false,
+					Rows:              snapshotRows,
+					NextRowOrdinal:    1,
+					HasMore:           false,
 				}), nil
 			case http.MethodDelete:
 				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil

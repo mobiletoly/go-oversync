@@ -72,6 +72,7 @@ func (c *Client) applyStagedPushBundleLockedSlice(ctx context.Context, uploaded 
 	if err != nil {
 		return err
 	}
+	ctx = withUniqueApplyContext(ctx)
 	unit := applyUnit("push", committed.BundleSeq, committed.BundleHash)
 	if err := c.prepareApplySurvivors(ctx, execution, unit, len(stagedRows), func(index int) (applySurvivor, error) {
 		row := stagedRows[index]
@@ -86,6 +87,10 @@ func (c *Client) applyStagedPushBundleLockedSlice(ctx context.Context, uploaded 
 		}
 		return commitApplyProgress(ctx, tx, err)
 	}
+	if err := c.installUniqueFinalState(ctx, execution, stmtCache); err != nil {
+		return err
+	}
+
 	if err := c.applyPushSettlementEffectsInTx(ctx, stmtCache, execution, stagedRows, decisions, committed.BundleSeq); err != nil {
 		return err
 	}
@@ -405,10 +410,14 @@ func (c *Client) finalizeStagedPushBundleInTx(ctx context.Context, tx sqliteTran
 	if committed.BundleSeq == attachment.LastBundleSeqSeen+1 {
 		attachment.LastBundleSeqSeen = committed.BundleSeq
 	}
+	attachment.PendingInitializationID = ""
 	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
 		return err
 	}
 	if err := updateSourceNextBundleID(ctx, tx, committed.SourceID, committed.SourceBundleID+1); err != nil {
+		return err
+	}
+	if err := markUploadDispositionInTx(ctx, tx); err != nil {
 		return err
 	}
 	if _, err := deleteSettlementPages(ctx, tx, "_sync_outbox_rows", "source_bundle_id", committed.SourceBundleID); err != nil {

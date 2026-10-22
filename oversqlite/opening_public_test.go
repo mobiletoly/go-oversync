@@ -240,6 +240,7 @@ func TestOpening_CommittedReadyPublicationDoesNotRevalidate(t *testing.T) {
 			return errors.New("completed local migration must not run")
 		}}
 		config := publicOpeningConfigForPlan(path, plan)
+		config.BaseURL = "http://process.invalid"
 		config.HTTP = &http.Client{Transport: rawRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 			switch {
 			case request.Method == http.MethodGet && request.URL.Path == "/sync/generations/1":

@@ -324,6 +324,8 @@ func TestAuditProfileMetrics_RepresentativeOperations(t *testing.T) {
 			_, err := auditBenchmarkPush(fixture.ctx, fixture.svc, fixture.writer, sourceBundleID, rows)
 			return err
 		})
+		// Keep this sample push-only; settle its terminal result before the next tuple.
+		acknowledgeRetainedOutcomeForTest(t, fixture.ctx, fixture.svc, fixture.writer, testSchemaGenerationProofForService(fixture.svc))
 		if i >= auditProfileWarmupSamples {
 			pushSamples = append(pushSamples, sample)
 		}
@@ -339,6 +341,7 @@ func TestAuditProfileMetrics_RepresentativeOperations(t *testing.T) {
 			auditBenchmarkRows(fixture.schemaName, sourceBundleID, 10),
 		)
 		require.NoError(t, err)
+		acknowledgeRetainedOutcomeForTest(t, fixture.ctx, fixture.svc, fixture.writer, testSchemaGenerationProofForService(fixture.svc))
 	}
 
 	pullSamples := make([]auditProfileSample, 0, auditProfileMeasuredSamples)
@@ -414,6 +417,7 @@ func TestAuditProfileMetrics_QueryPlans(t *testing.T) {
 			auditBenchmarkRows(fixture.schemaName, sourceBundleID, 10),
 		)
 		require.NoError(t, err)
+		acknowledgeRetainedOutcomeForTest(t, fixture.ctx, fixture.svc, fixture.writer, testSchemaGenerationProofForService(fixture.svc))
 	}
 	userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.writer.UserID)
 	require.NoError(t, err)

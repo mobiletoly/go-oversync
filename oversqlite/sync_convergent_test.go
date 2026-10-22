@@ -28,7 +28,7 @@ func TestSync_DrainsBoundedBacklogInOnePublicCall(t *testing.T) {
 	server := newMockPushServer(t)
 	pulls := 0
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/sync/push" {
+		if r.URL.Path == "/sync/push" || strings.HasPrefix(r.URL.Path, "/sync/push-outcomes/") {
 			return server.RoundTrip(r)
 		}
 		require.Equal(t, "/sync/pull", r.URL.Path)
@@ -59,7 +59,7 @@ func TestSync_FinalWorkSnapshotDrainsWriteAtReadBoundary(t *testing.T) {
 	`)
 	server := newMockPushServer(t)
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/sync/push" {
+		if r.URL.Path == "/sync/push" || strings.HasPrefix(r.URL.Path, "/sync/push-outcomes/") {
 			return server.RoundTrip(r)
 		}
 		require.Equal(t, "/sync/pull", r.URL.Path)
@@ -98,8 +98,8 @@ func TestSync_StopsBeforePushAttempt65(t *testing.T) {
 	pulls := 0
 	ambiguousFirstReply := true
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/sync/push" {
-			if ambiguousFirstReply {
+		if r.URL.Path == "/sync/push" || strings.HasPrefix(r.URL.Path, "/sync/push-outcomes/") {
+			if ambiguousFirstReply && r.URL.Path == "/sync/push" {
 				ambiguousFirstReply = false
 				response, err := server.RoundTrip(r)
 				require.NoError(t, err)
@@ -143,7 +143,7 @@ func TestSync_Attempt64MayFinishAndPull(t *testing.T) {
 	server := newMockPushServer(t)
 	pulls := 0
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/sync/push" {
+		if r.URL.Path == "/sync/push" || strings.HasPrefix(r.URL.Path, "/sync/push-outcomes/") {
 			return server.RoundTrip(r)
 		}
 		pulls++
@@ -171,17 +171,22 @@ func TestSync_RecoveryDrainsBatchesAndLateSnapshotGateWrite(t *testing.T) {
 			fmt.Sprintf("recovery-%d", i), "Local", "local@example.com")
 		require.NoError(t, err)
 	}
-	_, err := db.Exec(`UPDATE _sync_attachment_state SET rebuild_required = 1 WHERE singleton_key = 1`)
-	require.NoError(t, err)
 	originalSourceID := client.sourceID
 	server := newMockPushServer(t)
 	snapshots := 0
+	pulls := 0
 	var sessionRows []oversync.SnapshotRow
 	var sessionSeq int64
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch {
-		case r.URL.Path == "/sync/push":
+		case r.URL.Path == "/sync/push" || strings.HasPrefix(r.URL.Path, "/sync/push-outcomes/"):
 			return server.RoundTrip(r)
+		case r.URL.Path == "/sync/pull":
+			pulls++
+			if snapshots < 2 {
+				return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{Error: "history_pruned", Message: "pruned"}), nil
+			}
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: sessionSeq}), nil
 		case r.URL.Path == "/sync/snapshot-sessions" && r.Method == http.MethodPost:
 			snapshots++
 			sessionRows = nil
@@ -194,11 +199,7 @@ func TestSync_RecoveryDrainsBatchesAndLateSnapshotGateWrite(t *testing.T) {
 				}
 			}
 			sessionSeq = server.nextBundleSeq - 1
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID: fmt.Sprintf("snapshot-%d", snapshots), SnapshotBundleSeq: sessionSeq,
-				RowCount: int64(len(sessionRows)), ByteCount: testSnapshotRowsByteCount(sessionRows),
-				ExpiresAt: "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, fmt.Sprintf("snapshot-%d", snapshots), sessionSeq, sessionRows), nil
 		case strings.HasPrefix(r.URL.Path, "/sync/snapshot-sessions/") && r.Method == http.MethodGet:
 			if snapshots == 1 {
 				_, err := db.Exec(`INSERT INTO users (id, name, email) VALUES ('recovery-late', 'Late', 'late@example.com')`)
@@ -214,17 +215,28 @@ func TestSync_RecoveryDrainsBatchesAndLateSnapshotGateWrite(t *testing.T) {
 		return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 	})}
 
+	_, err := client.Sync(ctx)
+	require.Error(t, err, "late write must block clean snapshot installation")
+	require.Equal(t, 1, snapshots)
+	require.Len(t, server.pushRequests, 3)
+	dirty, err := client.pendingChangeCount(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, dirty)
+	name, _, exists := loadUserForKey(t, db, "recovery-late")
+	require.True(t, exists)
+	require.Equal(t, "Late", name)
 	report, err := client.Sync(ctx)
 	require.NoError(t, err)
 	require.Equal(t, PushOutcomeCommitted, report.PushOutcome)
 	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.RemoteOutcome)
 	require.Len(t, server.committedBySource, 4)
 	require.Equal(t, 2, snapshots)
+	require.Equal(t, 2, pulls)
 	require.Equal(t, originalSourceID, client.sourceID)
-	dirty, err := client.pendingChangeCount(ctx)
+	dirty, err = client.pendingChangeCount(ctx)
 	require.NoError(t, err)
 	require.Zero(t, dirty)
-	name, _, exists := loadUserForKey(t, db, "recovery-late")
+	name, _, exists = loadUserForKey(t, db, "recovery-late")
 	require.True(t, exists)
 	require.Equal(t, "Late", name)
 }
@@ -259,10 +271,13 @@ func TestSync_DrainsWritesAfterPullDiscoversRecovery(t *testing.T) {
 			var sessionSeq int64
 			client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				switch {
-				case r.URL.Path == "/sync/push":
+				case r.URL.Path == "/sync/push" || strings.HasPrefix(r.URL.Path, "/sync/push-outcomes/"):
 					return server.RoundTrip(r)
 				case r.URL.Path == "/sync/pull":
 					pulls++
+					if snapshots > 0 {
+						return jsonResponse(oversync.PullResponse{StableBundleSeq: sessionSeq}), nil
+					}
 					if !lateWriteRan {
 						lateWriteRan = true
 						_, err := db.Exec(`INSERT INTO users(id,name,email) VALUES
@@ -284,11 +299,10 @@ func TestSync_DrainsWritesAfterPullDiscoversRecovery(t *testing.T) {
 						}
 					}
 					sessionSeq = server.nextBundleSeq - 1
-					return jsonResponse(oversync.SnapshotSession{
-						SnapshotID: fmt.Sprintf("snapshot-%d", snapshots), SnapshotBundleSeq: sessionSeq,
-						RowCount: int64(len(sessionRows)), ByteCount: testSnapshotRowsByteCount(sessionRows),
-						ExpiresAt: "2030-01-01T00:00:00Z",
-					}), nil
+					if reason == "checkpoint_ahead" {
+						sessionSeq = 99
+					}
+					return snapshotFixtureResponse(t, client, r, fmt.Sprintf("snapshot-%d", snapshots), sessionSeq, sessionRows), nil
 				case strings.HasPrefix(r.URL.Path, "/sync/snapshot-sessions/") && r.Method == http.MethodGet:
 					return jsonResponse(oversync.SnapshotChunkResponse{
 						SnapshotID: fmt.Sprintf("snapshot-%d", snapshots), SnapshotBundleSeq: sessionSeq,
@@ -300,13 +314,25 @@ func TestSync_DrainsWritesAfterPullDiscoversRecovery(t *testing.T) {
 				return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			})}
 
+			_, err = client.Sync(ctx)
+			require.Error(t, err, "writes discovered during pull must block snapshot")
+			require.Zero(t, snapshots)
+			require.Equal(t, pushesBefore, len(server.pushRequests))
+			pending, err := client.pendingChangeCount(ctx)
+			require.NoError(t, err)
+			require.Equal(t, 2, pending)
+			for id, expected := range map[string]string{"late-a": "Local A", "late-b": "Local B"} {
+				name, _, ok := loadUserForKey(t, db, id)
+				require.True(t, ok)
+				require.Equal(t, expected, name)
+			}
 			report, err := client.Sync(ctx)
 			require.NoError(t, err)
 			require.True(t, lateWriteRan)
 			require.Equal(t, PushOutcomeCommitted, report.PushOutcome)
 			require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.RemoteOutcome)
 			require.Equal(t, 2, len(server.pushRequests)-pushesBefore)
-			require.Equal(t, 1, pulls)
+			require.Equal(t, 3, pulls)
 			require.Equal(t, 1, snapshots)
 			require.Equal(t, originalSourceID, client.sourceID)
 			dirty, err := client.pendingChangeCount(ctx)
@@ -321,7 +347,7 @@ func TestSync_DrainsWritesAfterPullDiscoversRecovery(t *testing.T) {
 			require.Equal(t, int64(4), nextSourceBundleID)
 			checkpoint, err := client.LastBundleSeqSeen(ctx)
 			require.NoError(t, err)
-			require.Equal(t, int64(3), checkpoint)
+			require.Equal(t, sessionSeq, checkpoint)
 			rebuildRequired, err := client.rebuildRequired(ctx)
 			require.NoError(t, err)
 			require.False(t, rebuildRequired)
@@ -357,7 +383,7 @@ func TestSync_ConflictReentryAtAttempt65IsRefused(t *testing.T) {
 	}
 	pulls := 0
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/sync/push" {
+		if r.URL.Path == "/sync/push" || strings.HasPrefix(r.URL.Path, "/sync/push-outcomes/") {
 			return server.RoundTrip(r)
 		}
 		pulls++

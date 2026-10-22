@@ -93,6 +93,7 @@ func TestHTTPSyncHandlers_HandleGenerationRequiresAuthentication(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/sync/generations/1", nil)
 	rec := httptest.NewRecorder()
 
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleGeneration(rec, req)
 
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
@@ -231,6 +232,7 @@ func TestHTTPSyncHandlers_HandleHealthUsesStatusCodeForUnhealthyService(t *testi
 
 	req := httptest.NewRequest(http.MethodGet, "/syncx/health", nil)
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleHealth(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
@@ -263,6 +265,7 @@ func TestHTTPSyncHandlers_HandleHealthReportsWithdrawnReadiness(t *testing.T) {
 	h := NewHTTPSyncHandlers(svc, slog.Default())
 	req := httptest.NewRequest(http.MethodGet, "/syncx/health", nil)
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleHealth(rec, req)
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
@@ -284,6 +287,7 @@ func TestHTTPSyncHandlers_HandleStatusReturnsLifecycleSnapshot(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/syncx/status", nil)
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleStatus(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -312,6 +316,7 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionRequiresAuthenticatedActor(
 
 	req := httptest.NewRequest(http.MethodPost, "/sync/snapshot-sessions", nil)
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleCreateSnapshotSession(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
@@ -328,6 +333,7 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionRejectsMalformedBody(t *tes
 	setTestSchemaGenerationHeaders(req, fixture.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "snapshot-invalid-body-user", SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleCreateSnapshotSession(rec, req)
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -377,6 +383,7 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T)
 	setTestSchemaGenerationHeaders(initialReq, svc)
 	initialReq = initialReq.WithContext(ContextWithActor(initialReq.Context(), oldWriter))
 	initialRec := httptest.NewRecorder()
+	initialReq.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleCreateSnapshotSession(initialRec, initialReq)
 	require.Equal(t, http.StatusOK, initialRec.Code)
 
@@ -391,6 +398,7 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T)
 	setTestSchemaGenerationHeaders(retiredReq, svc)
 	retiredReq = retiredReq.WithContext(ContextWithActor(retiredReq.Context(), oldWriter))
 	retiredRec := httptest.NewRecorder()
+	retiredReq.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleCreateSnapshotSession(retiredRec, retiredReq)
 	require.Equal(t, http.StatusConflict, retiredRec.Code)
 	retiredResp := decodeErrorResponse(t, retiredRec)
@@ -407,6 +415,7 @@ func TestHTTPSyncHandlers_HandleCreateSnapshotSessionErrorMappings(t *testing.T)
 	setTestSchemaGenerationHeaders(replacementReq, svc)
 	replacementReq = replacementReq.WithContext(ContextWithActor(replacementReq.Context(), otherWriter))
 	replacementRec := httptest.NewRecorder()
+	replacementReq.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleCreateSnapshotSession(replacementRec, replacementReq)
 	require.Equal(t, http.StatusConflict, replacementRec.Code)
 	replacementResp := decodeErrorResponse(t, replacementRec)

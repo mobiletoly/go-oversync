@@ -107,11 +107,23 @@ func TestAuditPostgresRestart_DirectPushReplayAfterInterruptedResponse(t *testin
 	request := &OneShotPushRequest{SourceBundleID: 1, CanonicalRequestHash: hash, InitializationID: init, Rows: []PushRequestRow{row}}
 	response, err := svc.PushOneShot(ctx, actor, testSchemaGenerationProofForService(svc), request)
 	require.NoError(t, err)
+	require.Equal(t, "committed", response.Outcome.Status)
+	require.NotNil(t, response.Outcome.Committed)
+	proof := testSchemaGenerationProofForService(svc)
+	contract, ok := svc.schemaGenerationRegistry.Generation(proof.ID)
+	require.True(t, ok)
+	generation := generationDescriptor(contract)
+	binding := PushOperationBinding{
+		SourceID: actor.SourceID, GenerationID: canonicalSchemaGenerationID(proof.ID), GenerationFingerprint: proof.Fingerprint,
+		SourceBundleID: request.SourceBundleID, CanonicalRequestHash: request.CanonicalRequestHash, InitializationID: &init,
+	}
+	require.NoError(t, ValidatePushOutcomeBinding(*response.Outcome, binding, generation))
 	postgres.crashAndRestart(t)
 	requireAuditRestartPoolReady(t, pool)
 	replay, err := svc.PushOneShot(ctx, actor, testSchemaGenerationProofForService(svc), request)
 	require.NoError(t, err)
-	require.Equal(t, response.Bundle.BundleSeq, replay.Bundle.BundleSeq)
-	require.Equal(t, response.Bundle.BundleHash, replay.Bundle.BundleHash)
+	require.NoError(t, ValidatePushOutcomeBinding(*replay.Outcome, binding, generation))
+	require.Equal(t, response.Outcome, replay.Outcome)
+	require.Equal(t, response.encoded, replay.encoded, "restart must preserve the exact unacknowledged terminal envelope")
 	requireAuditMetadataIntegrity(t, ctx, pool)
 }

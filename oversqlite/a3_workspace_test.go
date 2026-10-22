@@ -133,14 +133,15 @@ func TestA3Workspace_AtomicResume(t *testing.T) {
 	c, db := newA1SurvivorClient(t)
 	_, err := db.Exec(`UPDATE nodes SET name='changed parent' WHERE id='P'`)
 	require.NoError(t, err)
-	c.SetBeforePushCommitHook(func(context.Context) error { return context.Canceled })
+	c.HTTP = &http.Client{Transport: a1SettlementServer(t)}
+	c.SetBeforePushReplayHook(func(context.Context) error { return context.Canceled })
 	_, err = c.PushPending(context.Background())
 	require.ErrorIs(t, err, context.Canceled)
 	before, err := loadOutboxBundle(context.Background(), db)
 	require.NoError(t, err)
 	protected := a3ProtectedPrimaryVector(t, db)
 	c.config.MaxSyncWorkUnitsPerInvocation = 100
-	c.HTTP = &http.Client{Transport: a1SettlementServer(t)}
+	c.SetBeforePushReplayHook(nil)
 	frozen, err := c.loadPushOutboundSnapshot(context.Background())
 	require.NoError(t, err)
 	committed, err := c.obtainCommittedPushBundleLocked(context.Background(), frozen)

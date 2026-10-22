@@ -24,6 +24,9 @@ func (c *Client) PushPending(ctx context.Context) (report PushReport, resultErr 
 	if err := c.ensureConnectedSessionLocked(ctx, "PushPending()"); err != nil {
 		return PushReport{}, err
 	}
+	if err := c.acknowledgeUploadJournal(ctx); err != nil {
+		return PushReport{}, err
+	}
 	if err := c.ensurePushPreconditionsLocked(ctx, false); err != nil {
 		return PushReport{}, err
 	}
@@ -63,6 +66,18 @@ func (c *Client) pushPendingLockedWithRecovery(ctx context.Context, conflictRetr
 }
 
 func (c *Client) ensurePushPreconditionsLocked(ctx context.Context, allowCheckpointRecovery bool) error {
+	reconnect, err := c.initializationReconnectRequired(ctx)
+	if err != nil {
+		return err
+	}
+	if reconnect {
+		return &AttachRequiredError{Operation: "PushPending(): initialization lease requires reconnect"}
+	}
+	if frozen, err := c.frozenUploadMayResume(ctx); err != nil {
+		return err
+	} else if frozen {
+		return nil
+	}
 	sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx)
 	if err != nil {
 		return err
@@ -84,8 +99,16 @@ func (c *Client) ensurePushPreconditionsLocked(ctx context.Context, allowCheckpo
 }
 
 func (c *Client) pushPendingAfterPreflightLocked(ctx context.Context, conflictRetryCount int, allowCheckpointRecovery bool) (report PushReport, resultErr error) {
+	if err := c.acknowledgeUploadJournal(ctx); err != nil {
+		return report, err
+	}
+	if reconnect, err := c.initializationReconnectRequired(ctx); err != nil {
+		return report, err
+	} else if reconnect {
+		return report, &AttachRequiredError{Operation: "PushPending(): initialization lease requires reconnect"}
+	}
 	var pendingWork bool
-	if err := c.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM _sync_dirty_rows) OR EXISTS(SELECT 1 FROM _sync_outbox_rows)`).Scan(&pendingWork); err != nil {
+	if err := c.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM _sync_dirty_rows) OR EXISTS(SELECT 1 FROM _sync_outbox_rows) OR EXISTS(SELECT 1 FROM _sync_upload_journal)`).Scan(&pendingWork); err != nil {
 		return report, err
 	}
 	if pendingWork {
@@ -140,7 +163,11 @@ func (c *Client) pushPendingAfterPreflightLocked(ctx context.Context, conflictRe
 	if err := c.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed); err != nil {
 		return PushReport{}, err
 	}
+	c.pendingInitializationID = ""
 	if err := c.clearPushPlanForLifecycle(ctx, true); err != nil {
+		return PushReport{}, err
+	}
+	if err := c.acknowledgeUploadJournal(ctx); err != nil {
 		return PushReport{}, err
 	}
 	return c.pushReportWithOutcomeLocked(ctx, PushOutcomeCommitted)
@@ -165,9 +192,22 @@ func (c *Client) obtainCommittedPushBundleLocked(ctx context.Context, snapshot *
 }
 
 func (c *Client) handlePushCommitErrorLocked(ctx context.Context, snapshot *pushOutboundSnapshot, commitErr error, conflictRetryCount int, allowCheckpointRecovery bool) (PushReport, error) {
+	var cancelled *cancelledUploadOutcome
+	if errors.As(commitErr, &cancelled) {
+		if err := c.disposeCancelledUpload(ctx, snapshot); err != nil {
+			return PushReport{}, err
+		}
+		if err := c.acknowledgeUploadJournal(ctx); err != nil {
+			return PushReport{}, err
+		}
+		return c.pushReportWithOutcomeLocked(ctx, PushOutcomeNoChange)
+	}
 	if rejected := pushApplicationRejection(commitErr); rejected != nil {
 		pending, err := c.preservePushRejection(ctx, snapshot, rejected)
 		if err != nil {
+			return PushReport{}, err
+		}
+		if err := c.acknowledgeUploadJournal(ctx); err != nil {
 			return PushReport{}, err
 		}
 		return PushReport{}, &PushRejectionNeedsResolutionError{Pending: *pending}
@@ -177,6 +217,9 @@ func (c *Client) handlePushCommitErrorLocked(ctx context.Context, snapshot *push
 		return PushReport{}, commitErr
 	}
 	if err := c.resolvePushConflict(ctx, snapshot, conflictErr); err != nil {
+		return PushReport{}, err
+	}
+	if err := c.acknowledgeUploadJournal(ctx); err != nil {
 		return PushReport{}, err
 	}
 	remainingDirtyCount, err := c.pendingChangeCount(ctx)

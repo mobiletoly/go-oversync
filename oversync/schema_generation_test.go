@@ -2131,7 +2131,10 @@ func schemaGenerationAnonymousTuple(tuple *types.Tuple) *types.Tuple {
 // Scope lifecycle adds the SQL-only transaction admission capability, closed origin
 // kinds, safe admission errors and the existing-only ScopeManager write option.
 // Generation declaration types and fingerprints remain unchanged.
-const schemaGenerationAllowedPackageSurfaceHash = "a8ed6636c04ef884eae95b4517bcc5ac31bc9d7938344cc4cda249dae0612a37"
+// C01-C04 add v1 protocol admission, durable push outcomes/resolve/ack and
+// sealed snapshots/recovery/source replacement. Declarations remain declarative.
+// Prior pre-durable-recovery surface: a8ed6636c04ef884eae95b4517bcc5ac31bc9d7938344cc4cda249dae0612a37.
+const schemaGenerationAllowedPackageSurfaceHash = "601db16632ecdb5da11bda0e83bd07d74e890d819e455eb46c8713ed39f1b6fd"
 
 func schemaGenerationPackageSurfaceHash(surface []string) string {
 	digest := sha256.Sum256([]byte(strings.Join(surface, "\n")))

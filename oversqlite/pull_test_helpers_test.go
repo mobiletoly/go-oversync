@@ -33,6 +33,10 @@ func mustBundlePayload(t *testing.T, id, name, email string) []byte {
 
 func setPullResponses(t *testing.T, client *Client, responses ...any) {
 	t.Helper()
+	// This ordinary replay fixture supplies only pull units, with no sealed
+	// snapshot authority. Preserve its original blocker/retry assertions in
+	// disabled mode. Public automatic recovery has its own complete authority.
+	client.config.RecoveryMode = RecoveryDisabled
 	requests := 0
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if requests >= len(responses) {

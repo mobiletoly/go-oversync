@@ -5,6 +5,8 @@ package oversqlite
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -43,7 +45,9 @@ func TestPushPending_RejectsInvalidCommitResponse(t *testing.T) {
 
 	_, err = client.PushPending(ctx)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "missing required bundle_hash")
+	// Any forbidden legacy member may be found first when validating the object.
+	require.Regexp(t, `unknown member "(bundle_seq|row_count|planned_row_count|byte_count)"`, err.Error())
+	require.Empty(t, server.ackRequests)
 
 	var dirtyCount, outboundCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows WHERE table_name = 'users'`).Scan(&dirtyCount))
@@ -91,7 +95,9 @@ func TestPushPending_ReplaysDirectRequestAfterCrashBeforeDurableApply(t *testing
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, result.Status)
 	mustPushPending(t, restarted, ctx)
-	require.Len(t, server.pushRequests, 2, "restart replays the idempotent direct request before applying its authoritative response")
+	require.Len(t, server.pushRequests, 1, "durable C settles locally after restart")
+	require.Empty(t, server.resolveRequests)
+	require.Len(t, server.ackRequests, 1)
 
 	var dirtyCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_dirty_rows`).Scan(&dirtyCount))
@@ -135,7 +141,7 @@ func TestPushPending_AuthoritativeReplayDoesNotGenerateDirtyRowsAndCapturesLater
 		RowVersion: 1,
 		Payload:    mustJSONPayload(t, map[string]any{"id": userID, "name": "Ada Server", "email": "ada.server@example.com"}),
 	}}
-	committed := committedPushForTest(t, client, db, 1, committedRows)
+	committed := boundCommittedPushForReplayTest(t, client, db, snapshot, 1, committedRows)
 	stageCommittedPushBundleRows(t, db, committed.BundleSeq, committedRows)
 
 	require.NoError(t, client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed))
@@ -163,7 +169,8 @@ func TestPushPending_AuthoritativeReplayRollbackDoesNotLeakApplyMode(t *testing.
 		CREATE TABLE users (
 			id TEXT PRIMARY KEY NOT NULL,
 			name TEXT NOT NULL,
-			email TEXT NOT NULL
+			email TEXT NOT NULL,
+            CHECK(name != 'Broken')
 		)
 	`)
 
@@ -181,14 +188,15 @@ func TestPushPending_AuthoritativeReplayRollbackDoesNotLeakApplyMode(t *testing.
 		Key:        mustBundleKey(userID),
 		Op:         oversync.OpInsert,
 		RowVersion: 1,
-		Payload:    []byte(`{"id":"` + userID + `","name":"Broken"}`),
+		Payload:    []byte(`{"id":"` + userID + `","name":"Broken","email":"valid@example.invalid"}`),
 	}}
-	committed := committedPushForTest(t, client, db, 1, committedRows)
+	committed := boundCommittedPushForReplayTest(t, client, db, snapshot, 1, committedRows)
 	stageCommittedPushBundleRows(t, db, committed.BundleSeq, committedRows)
 
 	err = client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "payload for users")
+	require.Contains(t, err.Error(), "CHECK constraint failed")
+	require.Positive(t, countA3(t, db, `SELECT length(outcome_body) FROM _sync_upload_journal WHERE phase='frozen'`))
 	require.Equal(t, 0, readApplyMode(t, db, client.UserID))
 
 	var dirtyCount, outboundCount, stagedCount int
@@ -240,7 +248,7 @@ func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T
 				Payload:    mustJSONPayload(t, map[string]any{"id": "parent", "name": "Parent", "parent_id": nil}),
 			},
 		}
-		committed := committedPushForTest(t, client, db, 1, committedRows)
+		committed := boundCommittedPushForReplayTest(t, client, db, snapshot, 1, committedRows)
 		stageCommittedPushBundleRows(t, db, committed.BundleSeq, committedRows)
 
 		require.NoError(t, client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed))
@@ -302,7 +310,7 @@ func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T
 				Payload:    mustJSONPayload(t, map[string]any{"id": "member-1", "name": "Ada", "team_id": "team-1"}),
 			},
 		}
-		committed := committedPushForTest(t, client, db, 1, committedRows)
+		committed := boundCommittedPushForReplayTest(t, client, db, snapshot, 1, committedRows)
 		stageCommittedPushBundleRows(t, db, committed.BundleSeq, committedRows)
 
 		require.NoError(t, client.applyStagedPushBundleLocked(ctx, snapshot.Rows, committed))
@@ -313,4 +321,27 @@ func TestPushPending_AuthoritativeReplayRunsWithDeferredForeignKeys(t *testing.T
 		require.Equal(t, "member-1", captainID)
 		require.Equal(t, "team-1", teamID)
 	})
+}
+
+// Low-level apply witnesses carry the same complete validated C as the public
+// path. Staging rows alone is deliberately insufficient for disposition.
+func boundCommittedPushForReplayTest(t *testing.T, c *Client, db *sql.DB, snapshot *pushOutboundSnapshot, seq int64, rows []oversync.BundleRow) *committedPushBundle {
+	t.Helper()
+	ctx := context.Background()
+	committed := committedPushForTest(t, c, db, seq, rows)
+	journal, err := loadUploadJournal(ctx, db)
+	require.NoError(t, err)
+	require.NotNil(t, journal)
+	groups, err := oversync.CompactGroupsForBundleRows(c.discovery.SchemaGeneration, rows)
+	require.NoError(t, err)
+	op := journal.Binding.Operation
+	outcome := oversync.PushOutcome{SourceID: op.SourceID, GenerationID: op.GenerationID, GenerationFingerprint: op.GenerationFingerprint, SourceBundleID: op.SourceBundleID, CanonicalRequestHash: op.CanonicalRequestHash, InitializationID: op.InitializationID, Status: "committed", Committed: &oversync.CommittedPushEffect{BundleSeq: seq, BundleHash: committed.BundleHash, RowCount: int64(len(rows)), Rows: groups}}
+	outcome.OutcomeHash, err = oversync.HashPushOutcome(outcome, c.discovery.SchemaGeneration)
+	require.NoError(t, err)
+	raw, err := json.Marshal(outcome)
+	require.NoError(t, err)
+	validated, _, _, err := c.decodeJournalOutcome(ctx, raw, journal, snapshot.Rows)
+	require.NoError(t, err)
+	require.NoError(t, c.persistUploadOutcome(ctx, journal, raw, validated))
+	return committed
 }

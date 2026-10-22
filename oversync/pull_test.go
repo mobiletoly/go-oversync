@@ -29,6 +29,7 @@ func mustPushUserBundle(t *testing.T, ctx context.Context, svc *SyncService, act
 	}})
 	require.NoError(t, err)
 	require.NotNil(t, bundle)
+	acknowledgeRetainedOutcomeForTest(t, ctx, svc, actor, testSchemaGenerationProofForService(svc))
 	return bundle
 }
 

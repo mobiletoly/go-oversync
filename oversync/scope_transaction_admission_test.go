@@ -255,7 +255,7 @@ func TestScopeTransactionAdmission_HTTPEnvelopes(t *testing.T) {
 		{"application_rejection", &ApplicationWriteRejectedError{Category: "private_dependency_category"}, http.StatusServiceUnavailable, "scope_admission_unavailable", "Scope admission unavailable; retry later"},
 		{"projection", &GenerationProjectionError{Code: BundleProjectionTooLarge, Message: private}, http.StatusServiceUnavailable, "scope_admission_unavailable", "Scope admission unavailable; retry later"},
 		{"push_limit", &GenerationProjectionError{Code: BundleLimitExceeded, Operation: "push", Message: private}, http.StatusServiceUnavailable, "scope_admission_unavailable", "Scope admission unavailable; retry later"},
-		{"replay", fmt.Errorf("%s: %w", private, &PushReplayMismatchError{}), http.StatusServiceUnavailable, "scope_admission_unavailable", "Scope admission unavailable; retry later"},
+		{"replay", fmt.Errorf("%s: %w", private, outcomeError("push_outcome_mismatch")), http.StatusServiceUnavailable, "scope_admission_unavailable", "Scope admission unavailable; retry later"},
 	} {
 		t.Run(policy.name, func(t *testing.T) {
 			f.service.config.ScopeTransactionAdmission = scopeAdmissionFunc(func(context.Context, DatabaseWriteTx, ScopeTransactionOperation) error { return policy.err })
@@ -279,6 +279,7 @@ func TestScopeTransactionAdmission_HTTPEnvelopes(t *testing.T) {
 				t.Run(endpoint.name, func(t *testing.T) {
 					request := httptest.NewRequest(endpoint.method, endpoint.path, bytes.NewReader(endpoint.body))
 					request.Header.Set("Content-Type", "application/json")
+					request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 					request.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(f.proof.ID))
 					request.Header.Set(SchemaGenerationFingerprintHeader, f.proof.Fingerprint)
 					request.SetPathValue("snapshot_id", "id")
@@ -295,6 +296,7 @@ func TestScopeTransactionAdmission_HTTPEnvelopes(t *testing.T) {
 	f.service.config.ScopeTransactionAdmission = nil
 	request := httptest.NewRequest(http.MethodPost, "/sync/connect", strings.NewReader(`{"has_local_pending_rows":false}`))
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	request.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(f.proof.ID))
 	request.Header.Set(SchemaGenerationFingerprintHeader, f.proof.Fingerprint)
 	request = request.WithContext(ContextWithActor(request.Context(), actor))
@@ -313,9 +315,9 @@ func TestScopeTransactionAdmission_OrdinaryDomainErrorsRetainBehavior(t *testing
 		code   string
 	}{
 		{"source_generation", &SourceGenerationError{Code: SourceGenerationConflict, Message: "public conflict"}, http.StatusConflict, string(SourceGenerationConflict)},
-		{"application_rejection", &ApplicationWriteRejectedError{Category: "public_rejection"}, http.StatusUnprocessableEntity, "public_rejection"},
+		{"unretained_application_error", &ApplicationWriteRejectedError{Category: "public_rejection"}, http.StatusInternalServerError, "push_failed"},
 		{"projection", &GenerationProjectionError{Code: BundleProjectionTooLarge, Message: "public projection"}, http.StatusUnprocessableEntity, string(BundleProjectionTooLarge)},
-		{"replay", &PushReplayMismatchError{}, http.StatusConflict, "push_replay_mismatch"},
+		{"replay", outcomeError("push_outcome_mismatch"), http.StatusConflict, "push_outcome_mismatch"},
 	} {
 		t.Run(ordinary.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()

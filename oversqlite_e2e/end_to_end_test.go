@@ -343,7 +343,7 @@ func TestEndToEnd_DirectPushConflictPreservesWholeBundleSemantics(t *testing.T) 
 	require.Equal(t, 0, stagedCount)
 
 	nextSourceBundleID := requireNextSourceBundleID(t, dbB)
-	require.Equal(t, int64(3), nextSourceBundleID)
+	require.Equal(t, int64(4), nextSourceBundleID, "one terminal rejection and two commits consumed three source sequences")
 
 	var serverName string
 	require.NoError(t, server.Pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id = $1`, pgx.Identifier{schema}.Sanitize()), conflictUserID).Scan(&serverName))
@@ -504,6 +504,15 @@ func TestEndToEnd_RebuildRetryClearsStaleStageAndStartsNewSession(t *testing.T) 
 	require.NoError(t, dbB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count))
 	require.Equal(t, 0, count)
 
+	// Expire this owned sealed session so this scenario actually exercises
+	// stale-stage replacement. A still-valid seal must otherwise resume.
+	var stagedSession string
+	require.NoError(t, dbB.QueryRow(`SELECT staged_snapshot_id FROM _sync_operation_state`).Scan(&stagedSession))
+	require.NotEmpty(t, stagedSession)
+	result, err := server.Pool.Exec(ctx, `UPDATE sync.snapshot_sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE snapshot_id=$1`, stagedSession)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, result.RowsAffected())
+	require.Greater(t, snapshotStageCount(t, dbB), 0)
 	clientB.HTTP = &http.Client{Timeout: 120 * time.Second}
 	clientB.ResetSnapshotTransferDiagnostics()
 	mustRebuildE2E(t, clientB, ctx)

@@ -163,6 +163,7 @@ func TestSnapshotChunk_ThousandRowsFourMiB(t *testing.T) {
 		}
 		_, err := pushRowsOneShot(t, fixture.ctx, fixture.svc, fixture.writer, int64(batch+1), rows)
 		require.NoError(t, err)
+		acknowledgeRetainedOutcomeForTest(t, fixture.ctx, fixture.svc, fixture.writer, testSchemaGenerationProofForService(fixture.svc))
 	}
 	proof := testSchemaGenerationProofForService(fixture.svc)
 	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, proof)
@@ -234,6 +235,7 @@ func TestSnapshotChunk_ExactByteBoundaries(t *testing.T) {
 			Schema: fixture.schemaName, Table: "users", Key: SyncKey{"id": id}, Op: OpInsert, Payload: payload,
 		}})
 		require.NoError(t, err)
+		acknowledgeRetainedOutcomeForTest(t, fixture.ctx, fixture.svc, fixture.writer, testSchemaGenerationProofForService(fixture.svc))
 	}
 	proof := testSchemaGenerationProofForService(fixture.svc)
 	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, proof)

@@ -608,10 +608,23 @@ func TestConnect_ReconnectAfterInitializationStaleClearsStalePendingInitializati
 	testReconnectAfterInitializationLeaseFailure(t, http.StatusConflict, "initialization_stale")
 }
 
-func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, errorCode string) {
+func TestConnect_ReconnectAfterInitializationStalePreservesIntentWhenScopeInitialized(t *testing.T) {
+	testReconnectAfterInitializationLeaseFailure(t, http.StatusConflict, "initialization_stale", "remote_authoritative")
+}
+
+func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, errorCode string, secondResolutions ...string) {
 	t.Helper()
 
+	secondResolution := "initialize_local"
+	secondToken := "33333333-3333-4333-8333-333333333333"
+	expectedOutcome := AttachOutcomeSeededLocal
+	if len(secondResolutions) > 0 {
+		secondResolution = secondResolutions[0]
+		secondToken = ""
+		expectedOutcome = AttachOutcomeResumedAttached
+	}
 	var connectRequests int32
+	recovery := newMockPushServer(t)
 	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/generations/1":
@@ -625,9 +638,12 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 					LeaseExpiresAt:   "2030-01-01T00:00:00Z",
 				}), nil
 			case 2:
+				if secondResolution == "remote_authoritative" {
+					return jsonResponse(&oversync.ConnectResponse{Resolution: secondResolution}), nil
+				}
 				return jsonResponse(&oversync.ConnectResponse{
-					Resolution:       "initialize_local",
-					InitializationID: "33333333-3333-4333-8333-333333333333",
+					Resolution:       secondResolution,
+					InitializationID: secondToken,
 					LeaseExpiresAt:   "2030-01-01T00:00:00Z",
 				}), nil
 			default:
@@ -636,7 +652,12 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 					Message: "unexpected connect attempt",
 				}), nil
 			}
+		case "/sync/push-outcomes/resolve", "/sync/push-outcomes/ack":
+			return recovery.RoundTrip(r)
 		case "/sync/push":
+			if atomic.LoadInt32(&connectRequests) > 1 {
+				return recovery.RoundTrip(r)
+			}
 			return errorJSONResponse(statusCode, oversync.ErrorResponse{
 				Error:   errorCode,
 				Message: "seed lease is no longer valid",
@@ -661,31 +682,37 @@ func testReconnectAfterInitializationLeaseFailure(t *testing.T, statusCode int, 
 
 	_, err = client.PushPending(context.Background())
 	require.Error(t, err)
-	require.Contains(t, err.Error(), errorCode)
-	require.Empty(t, client.UserID)
-	require.Empty(t, client.pendingInitializationID)
-
-	var (
-		bindingState string
-		bindingScope string
-	)
-	require.NoError(t, db.QueryRow(`
-		SELECT binding_state, attached_user_id, pending_initialization_id
-		FROM _sync_attachment_state
-		WHERE singleton_key = 1
-	`).Scan(&bindingState, &bindingScope, &pendingInitializationID))
-	require.Equal(t, lifecycleBindingAnonymous, bindingState)
-	require.Empty(t, bindingScope)
-	require.Empty(t, pendingInitializationID)
-
+	// Admission errors are not terminal proof and cannot erase an uncertain F.
+	require.Equal(t, "lifecycle-user", client.UserID)
+	require.Equal(t, pendingInitializationID, client.pendingInitializationID)
+	frozen, certificate, phase := frozenJournalBodies(t, db)
+	require.NotEmpty(t, frozen)
+	require.Empty(t, certificate)
+	require.Equal(t, "frozen", phase)
+	require.Equal(t, int32(1), atomic.LoadInt32(&connectRequests))
+	// Resolve the original lease first, dispose + ack cancellation, then renew it.
+	_, err = client.PushPending(context.Background())
+	require.NoError(t, err)
+	require.Len(t, recovery.resolveRequests, 1)
+	require.Equal(t, pendingInitializationID, *recovery.resolveRequests[0].InitializationID)
+	require.Len(t, recovery.ackRequests, 1)
+	require.Equal(t, int32(1), atomic.LoadInt32(&connectRequests))
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_upload_journal`))
 	reconnectResult, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
-	require.Equal(t, AttachOutcomeSeededLocal, reconnectResult.Outcome)
+	require.Equal(t, expectedOutcome, reconnectResult.Outcome)
 	require.Equal(t, int32(2), atomic.LoadInt32(&connectRequests))
-	require.Equal(t, "lifecycle-user", client.UserID)
-	require.Equal(t, "33333333-3333-4333-8333-333333333333", client.pendingInitializationID)
-	pendingInitializationID = requirePendingInitializationID(t, db)
-	require.Equal(t, "33333333-3333-4333-8333-333333333333", pendingInitializationID)
+	require.Equal(t, secondToken, client.pendingInitializationID)
+	require.Equal(t, client.pendingInitializationID, requirePendingInitializationID(t, db))
+	require.EqualValues(t, 1, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`))
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_upload_journal`))
+	_, err = client.PushPending(context.Background())
+	require.NoError(t, err)
+	require.Len(t, recovery.pushRequests, 1)
+	require.EqualValues(t, 2, recovery.pushRequests[0].SourceBundleID)
+	require.Equal(t, secondToken, recovery.pushRequests[0].InitializationID)
+	require.Empty(t, client.pendingInitializationID)
+	require.EqualValues(t, 1, countA3(t, db, `SELECT count(*) FROM users WHERE id='seed-1' AND name='Seed'`))
 }
 
 func TestConnect_ResumesSameAttachedUserAfterProtocolGate(t *testing.T) {
@@ -727,26 +754,21 @@ func TestOpen_AllowsPendingRemoteReplaceRecoveryState(t *testing.T) {
 	mustOpen(t, client, context.Background())
 }
 
-func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemovedFromConfig(t *testing.T) {
+func TestConnect_RemoteAuthoritativePreservesUnregisteredLocalRows(t *testing.T) {
 	snapshotRows := []oversync.SnapshotRow{{
 		Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote-1"}, RowVersion: 7,
 		Payload: json.RawMessage(`{"id":"remote-1","name":"Remote","email":"remote@example.com"}`),
 	}}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
-	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
+	var client *Client
+	var db *sql.DB
+	client, db = newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/generations/1":
 			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case "/sync/connect":
 			return jsonResponse(&oversync.ConnectResponse{Resolution: "remote_authoritative"}), nil
 		case "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-remote-replace",
-				SnapshotBundleSeq: 7,
-				RowCount:          1,
-				ByteCount:         snapshotBytes,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-remote-replace", 7, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-remote-replace":
 			switch r.Method {
 			case http.MethodGet:
@@ -776,13 +798,8 @@ func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemove
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO legacy_docs (id, body) VALUES (?, ?)`, "legacy-1", "stale body")
 	require.NoError(t, err)
-	_, err = db.Exec(`
-		INSERT INTO _sync_managed_tables (schema_name, table_name)
-		VALUES ('main', 'legacy_docs')
-		ON CONFLICT(schema_name, table_name) DO NOTHING
-	`)
-	require.NoError(t, err)
-	seedLegacyDocBaseline(t, client, db)
+	// This fresh-format fixture keeps application-owned, unregistered rows.
+	// Dynamic historical registration/removal is no longer a snapshot path.
 
 	result, err := client.Attach(context.Background(), "lifecycle-user")
 	require.NoError(t, err)
@@ -790,7 +807,7 @@ func TestConnect_RemoteAuthoritativeReplaceClearsHistoricallyManagedTablesRemove
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
-	require.Equal(t, 0, count)
+	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_row_state WHERE table_name = 'legacy_docs'`).Scan(&count))
 	require.Equal(t, 0, count)
 
@@ -812,13 +829,14 @@ func TestConnect_PendingRemoteReplaceMismatchedScopeFailsClosed(t *testing.T) {
 
 func TestConnect_PendingRemoteReplaceStartsFreshValidatedSessionAfterProtocolGate(t *testing.T) {
 	snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote-2"}, RowVersion: 5, Payload: mustJSONPayload(t, map[string]any{"id": "remote-2", "name": "Remote 2", "email": "remote2@example.com"})}}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
-	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
+	var client *Client
+	var db *sql.DB
+	client, db = newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/generations/1":
 			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case "/sync/snapshot-sessions":
-			return jsonResponse(&oversync.SnapshotSession{SnapshotID: "snapshot-2", SnapshotBundleSeq: 12, RowCount: 1, ByteCount: snapshotBytes, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-2", 12, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-2":
 			if r.Method == http.MethodDelete {
 				return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody}, nil
@@ -868,21 +886,16 @@ func TestConnect_RemoteAuthoritativeStagesAndReplacesAnonymousLocalRows(t *testi
 		Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote-1"}, RowVersion: 7,
 		Payload: mustJSONPayload(t, map[string]any{"id": "remote-1", "name": "Remote", "email": "remote@example.com"}),
 	}}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
-	client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
+	var client *Client
+	var db *sql.DB
+	client, db = newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/generations/1":
 			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case "/sync/connect":
 			return jsonResponse(&oversync.ConnectResponse{Resolution: "remote_authoritative"}), nil
 		case "/sync/snapshot-sessions":
-			return jsonResponse(&oversync.SnapshotSession{
-				SnapshotID:        "snapshot-remote",
-				SnapshotBundleSeq: 9,
-				RowCount:          1,
-				ByteCount:         snapshotBytes,
-				ExpiresAt:         time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-remote", 9, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-remote":
 			return jsonResponse(&oversync.SnapshotChunkResponse{
 				SnapshotID:        "snapshot-remote",

@@ -138,6 +138,10 @@ the sequence, source tuple, row count, bundle hash, and canonical request hash. 
 no `Bundle.Rows`; fetch retained payloads through ordinary pull/history APIs. Receipt replay returns
 the same summary even after `sync.bundle_rows` and `sync.bundle_log` pruning.
 
+## Source ownership
+
+Use source IDs distinct from client Connect/upload sources within each scope for both trusted APIs. A client source remains client-owned after acknowledgment, binding cleanup, retirement, history pruning and restart. Both trusted APIs reject a client-owned source before receipt replay or callback execution; client Connect rejects a trusted-writer source with `source_generation_conflict` on `source_id`. Source strings in different scopes are independent. Distinct trusted writers retain ordinary receipt replay and committed sequence allocation. This owner-approved durable-recovery rule supersedes earlier shared-source examples; it does not change server-write receipt or reserved-ID guarantees.
+
 ## Reserved server writer IDs
 
 Trusted server publishers may reserve exact visible-ASCII source IDs (1-256 bytes). Configure the
@@ -164,3 +168,57 @@ state or Scope receipt references it. A used reservation is never client-eligibl
 reservation trigger acquires those locks, rejects additions that conflict with any client source
 history, and rejects removal of referenced or used rows; operators must still stop all participating
 processes and deploy one exact frozen set.
+
+
+## Final-state capture and local application
+
+Capture records which registered identities were touched. After deferred database
+work completes, Oversync rereads their final rows in the same transaction and
+compares them with prior authoritative row state. History contains the final
+insert/update/delete for each identity in first-touch order. An absent-to-absent
+insert/delete is omitted, while raw forbidden-table evidence remains effective.
+Business data, history, row state, source advancement, notification and receipt
+completion commit together. Final encoded images must pass the normal limits.
+
+Established reserved writers hold compatible reservation locks until commit.
+Different scopes can use one writer concurrently. First use may wait for another
+first-use transaction; a rolled-back first use does not mark the reservation
+used. A committed use leaves a permanent used tombstone and excludes offline
+reservation removal.
+
+Clients stage their complete intended images before applying a bundle. SQLite
+orders unique-value transfers by their actual uniqueness dependencies. Safe
+cycles temporarily vacate only their component and dependent closure inside the
+atomic apply transaction. Wire order, hashes and identities do not change.
+
+A client-side `FinalStateApplyBlockedError` (Go) or
+`FinalStateApplyBlockedException` (Kotlin) leaves business data, pending intent
+and the checkpoint intact. Its bounded `reason`, operation, table, index,
+trigger and key fields identify the correction:
+
+- `conflicting_desired_state`: resolve the competing records through supported
+  application edits or conflict resolution. If the authoritative server itself
+  contains duplicate values forbidden by the client schema, correct the records
+  on the server or align the application's schema contract.
+- `unsafe_trigger_or_dependency`: revise the named application trigger or
+  dependency through the application's schema-upgrade path so temporary deletion
+  has no unknown effects.
+- `unsupported_uniqueness`: revise the named partial/expression unique index or
+  obtain SDK support for its semantics through a supported application upgrade.
+
+Retry ordinary sync after a local correction. Schema/intent guard changes
+invalidate only derived preparation. A later server write cannot rewrite an
+invalid retained bundle: after correcting authoritative state, use the supported
+`Rebuild`/`rebuild` snapshot API to install current state while retaining pending
+intent. Rebuild retains its dirty/outbox/conflict admission checks: resolve the
+pending operation through supported APIs or fix its blocking schema first; never
+clear a frozen operation to force recovery. Do not alter `_sync_*` tables, skip a checkpoint, or
+remove the database to bypass a blocker. A valid supported final state that
+blocks is an SDK defect; retain the diagnostics for a focused regression.
+
+This repair targets fresh server and client databases. No migration or repair of
+history produced by earlier capture behavior is included. Provision a separate
+empty application database with the current application schema, bootstrap the
+current server, and create new SDK databases using the current generation
+contract. Recreating existing databases, deployment and publication require their
+own authorization; this change does not perform them.

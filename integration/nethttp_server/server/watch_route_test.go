@@ -45,6 +45,7 @@ func TestWatchRoute_ServerDiscoversWatchWhenEnabled(t *testing.T) {
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set(oversync.SourceIDHeader, "device-a")
+	req.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -161,6 +162,7 @@ func openWatchRouteForTest(t *testing.T, ts *TestServer, userID string, afterBun
 func setSchemaGenerationProofHeadersForTest(t *testing.T, req *http.Request, ts *TestServer) {
 	t.Helper()
 	proof := schemaGenerationProofForTestServer(t, ts)
+	req.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 	req.Header.Set(oversync.SchemaGenerationIDHeader, strconv.FormatInt(int64(proof.ID), 10))
 	req.Header.Set(oversync.SchemaGenerationFingerprintHeader, proof.Fingerprint)
 }

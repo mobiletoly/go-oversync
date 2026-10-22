@@ -44,19 +44,12 @@ func TestRebuildKeepSource_RebuildsFromSnapshotWithDeferredFKs(t *testing.T) {
 		{Schema: "main", Table: "posts", Key: mustBundleKey("post-1"), RowVersion: 7, Payload: []byte(`{"id":"post-1","title":"Hello","author_id":"user-1"}`)},
 		{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 6, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")},
 	}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
 			require.Equal(t, http.MethodPost, r.Method)
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-hydrate",
-				SnapshotBundleSeq: 7,
-				RowCount:          2,
-				ByteCount:         snapshotBytes,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-hydrate", 7, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-hydrate":
 			switch r.Method {
 			case http.MethodGet:
@@ -108,12 +101,7 @@ func TestRebuildKeepSource_RejectsMalformedSnapshotResponse(t *testing.T) {
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
 			require.Equal(t, http.MethodPost, r.Method)
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-malformed",
-				SnapshotBundleSeq: 7,
-				RowCount:          1,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-malformed", 7, nil), nil
 		case "/sync/snapshot-sessions/snapshot-malformed":
 			switch r.Method {
 			case http.MethodGet:
@@ -131,7 +119,7 @@ func TestRebuildKeepSource_RejectsMalformedSnapshotResponse(t *testing.T) {
 
 	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to decode snapshot chunk response")
+	require.Contains(t, err.Error(), "snapshot evidence: invalid chunk JSON")
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
@@ -178,7 +166,7 @@ func TestRebuildKeepSource_RejectsSnapshotResponseMissingBundleSeq(t *testing.T)
 
 	_, err = client.Rebuild(ctx)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "snapshot_bundle_seq")
+	require.Contains(t, err.Error(), "snapshot evidence: invalid session JSON")
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
@@ -207,7 +195,6 @@ func TestRebuildKeepSource_MultiChunkDownloadStagesRowsBeforeFinalApply(t *testi
 		{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 7, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")},
 		{Schema: "main", Table: "users", Key: mustBundleKey("user-2"), RowVersion: 8, Payload: mustBundlePayload(t, "user-2", "Grace", "grace@example.com")},
 	}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 
 	requests := 0
 	client.config.SnapshotChunkRows = 1
@@ -215,13 +202,7 @@ func TestRebuildKeepSource_MultiChunkDownloadStagesRowsBeforeFinalApply(t *testi
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
 			require.Equal(t, http.MethodPost, r.Method)
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-multi",
-				SnapshotBundleSeq: 8,
-				RowCount:          2,
-				ByteCount:         snapshotBytes,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-multi", 8, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-multi":
 			switch r.Method {
 			case http.MethodGet:
@@ -292,13 +273,7 @@ func TestRebuildKeepSource_OneChunkStillStagesBeforeFinalApply(t *testing.T) {
 		NextRowOrdinal: 1,
 		HasMore:        false,
 	}
-	session := &oversync.SnapshotSession{
-		SnapshotID:        "snapshot-stage-one",
-		SnapshotBundleSeq: 5,
-		RowCount:          1,
-		ByteCount:         testSnapshotRowsByteCount(chunk.Rows),
-		ExpiresAt:         "2030-01-01T00:00:00Z",
-	}
+	session := sealedTestSnapshot(t, client, "snapshot-stage-one", 5, chunk.Rows, nil)
 
 	require.NoError(t, client.stageSnapshotChunk(ctx, chunk, 0))
 	require.Equal(t, 1, snapshotStageCount(t, db))
@@ -313,7 +288,7 @@ func TestRebuildKeepSource_OneChunkStillStagesBeforeFinalApply(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
-func TestRebuildKeepSource_ClearsStaleSnapshotStageBeforeNewAttempt(t *testing.T) {
+func TestRebuildKeepSource_ChargesOldSnapshotStageUntilReplacementAdmission(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -332,19 +307,12 @@ func TestRebuildKeepSource_ClearsStaleSnapshotStageBeforeNewAttempt(t *testing.T
 	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
 	require.NoError(t, err)
 	snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 6, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")}}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
-			require.Equal(t, 0, snapshotStageCount(t, db))
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-fresh",
-				SnapshotBundleSeq: 6,
-				RowCount:          1,
-				ByteCount:         snapshotBytes,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			require.Equal(t, 1, snapshotStageCount(t, db), "unowned historical stage is preserved and remains charged")
+			return snapshotFixtureResponse(t, client, r, "snapshot-fresh", 6, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-fresh":
 			switch r.Method {
 			case http.MethodGet:
@@ -363,10 +331,10 @@ func TestRebuildKeepSource_ClearsStaleSnapshotStageBeforeNewAttempt(t *testing.T
 	})}
 
 	mustRebuild(t, client, ctx)
-	require.Equal(t, 0, snapshotStageCount(t, db))
+	require.Equal(t, 0, snapshotStageCount(t, db), "admitted replacement clears the obsolete snapshot stage")
 }
 
-func TestRebuildKeepSource_PartialDownloadRestartClearsStageAndStartsFromZero(t *testing.T) {
+func TestRebuildKeepSource_PartialDownloadRestartResumesSealedPrefix(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -383,19 +351,12 @@ func TestRebuildKeepSource_PartialDownloadRestartClearsStageAndStartsFromZero(t 
 		{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 6, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")},
 		{Schema: "main", Table: "users", Key: mustBundleKey("never-fetched"), RowVersion: 7, Payload: mustBundlePayload(t, "never-fetched", "Never", "never@example.com")},
 	}
-	secondRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 7, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")}}
 
 	firstAttemptRequests := 0
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-restart-a",
-				SnapshotBundleSeq: 7,
-				RowCount:          2,
-				ByteCount:         testSnapshotRowsByteCount(firstRows),
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-restart-a", 7, firstRows), nil
 		case "/sync/snapshot-sessions/snapshot-restart-a":
 			switch r.Method {
 			case http.MethodGet:
@@ -421,27 +382,22 @@ func TestRebuildKeepSource_PartialDownloadRestartClearsStageAndStartsFromZero(t 
 	require.Error(t, err)
 	require.Equal(t, 1, snapshotStageCount(t, db))
 
-	secondAttemptStarted := false
+	resumedPrefix := false
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
-			secondAttemptStarted = true
-			require.Equal(t, 0, snapshotStageCount(t, db))
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-restart-b",
-				SnapshotBundleSeq: 7,
-				RowCount:          1,
-				ByteCount:         testSnapshotRowsByteCount(secondRows),
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
-		case "/sync/snapshot-sessions/snapshot-restart-b":
+			t.Fatal("sealed incomplete S must resume without creating a replacement")
+		case "/sync/snapshot-sessions/snapshot-restart-a":
 			switch r.Method {
 			case http.MethodGet:
+				resumedPrefix = true
+				require.Equal(t, "1", r.URL.Query().Get("after_row_ordinal"))
+				require.Equal(t, 1, snapshotStageCount(t, db))
 				return jsonResponse(oversync.SnapshotChunkResponse{
-					SnapshotID:        "snapshot-restart-b",
+					SnapshotID:        "snapshot-restart-a",
 					SnapshotBundleSeq: 7,
-					Rows:              secondRows,
-					NextRowOrdinal:    1,
+					Rows:              firstRows[1:],
+					NextRowOrdinal:    2,
 					HasMore:           false,
 				}), nil
 			case http.MethodDelete:
@@ -452,7 +408,9 @@ func TestRebuildKeepSource_PartialDownloadRestartClearsStageAndStartsFromZero(t 
 	})}
 
 	mustRebuild(t, client, ctx)
-	require.True(t, secondAttemptStarted)
+	require.True(t, resumedPrefix)
+	requireUserCount(t, db, "user-1", 1)
+	requireUserCount(t, db, "never-fetched", 1)
 	require.Equal(t, 0, snapshotStageCount(t, db))
 }
 
@@ -496,6 +454,7 @@ func runSnapshotSessionRetryRestoresData(t *testing.T, tc snapshotSessionRetryCa
 		{Schema: "main", Table: "users", Key: mustBundleKey("never-fetched"), RowVersion: tc.bundleSeq, Payload: mustBundlePayload(t, "never-fetched", "Never", "never@example.com")},
 	}
 	secondRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: tc.secondRowVersion, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")}}
+	beforeReplacement := recoveryVector(t, db, "users", "_sync_row_state", "_sync_source_state", "_sync_dirty_rows", "_sync_outbox_bundle", "_sync_outbox_rows", "_sync_upload_journal")
 	sessionCreates := 0
 	secondAttemptStarted := false
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -504,23 +463,12 @@ func runSnapshotSessionRetryRestoresData(t *testing.T, tc snapshotSessionRetryCa
 			require.Equal(t, http.MethodPost, r.Method)
 			sessionCreates++
 			if sessionCreates == 1 {
-				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID:        firstSnapshotID,
-					SnapshotBundleSeq: tc.bundleSeq,
-					RowCount:          2,
-					ByteCount:         testSnapshotRowsByteCount(firstRows),
-					ExpiresAt:         "2030-01-01T00:00:00Z",
-				}), nil
+				return snapshotFixtureResponse(t, client, r, firstSnapshotID, tc.bundleSeq, firstRows), nil
 			}
 			secondAttemptStarted = true
-			require.Equal(t, 0, snapshotStageCount(t, db))
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        secondSnapshotID,
-				SnapshotBundleSeq: tc.bundleSeq,
-				RowCount:          1,
-				ByteCount:         testSnapshotRowsByteCount(secondRows),
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			require.Equal(t, 1, snapshotStageCount(t, db), "obsolete prefix remains charged until replacement admission")
+			require.Equal(t, beforeReplacement, recoveryVector(t, db, "users", "_sync_row_state", "_sync_source_state", "_sync_dirty_rows", "_sync_outbox_bundle", "_sync_outbox_rows", "_sync_upload_journal"))
+			return snapshotFixtureResponse(t, client, r, secondSnapshotID, tc.bundleSeq, secondRows), nil
 		case "/sync/snapshot-sessions/" + firstSnapshotID:
 			switch r.Method {
 			case http.MethodGet:
@@ -560,31 +508,9 @@ func runSnapshotSessionRetryRestoresData(t *testing.T, tc snapshotSessionRetryCa
 	})}
 
 	_, err = client.Rebuild(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), tc.failureCode)
-	require.Equal(t, 1, snapshotStageCount(t, db))
-	if !tc.keepSource {
-		require.Equal(t, originalSourceID, client.sourceID)
-	}
-
+	require.NoError(t, err)
+	require.Equal(t, 2, sessionCreates, "one expired incomplete session replacement in the parent invocation")
 	var count int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
-	require.Equal(t, 1, count)
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'user-1'`).Scan(&count))
-	require.Equal(t, 0, count)
-
-	if tc.keepSource {
-		lastBundleSeq, err := client.LastBundleSeqSeen(ctx)
-		require.NoError(t, err)
-		require.Equal(t, int64(0), lastBundleSeq)
-	} else {
-		sourceID, nextSourceBundleID, lastBundleSeq := readBundleClientState(t, db, client.UserID)
-		require.Equal(t, originalSourceID, sourceID)
-		require.Equal(t, int64(5), nextSourceBundleID)
-		require.Equal(t, int64(4), lastBundleSeq)
-	}
-
-	mustRebuild(t, client, ctx)
 	require.True(t, secondAttemptStarted)
 	require.Equal(t, 0, snapshotStageCount(t, db))
 	if !tc.keepSource {
@@ -661,9 +587,11 @@ func setChunkedSnapshotSession(t *testing.T, client *Client, snapshotID string, 
 	t.Helper()
 	sessionPath := "/sync/snapshot-sessions/" + snapshotID
 	var rowCount int64
+	var allSnapshotRows []oversync.SnapshotRow
 	var byteCount int64
 	var firstRowOrdinal int64
 	for _, rows := range chunks {
+		allSnapshotRows = append(allSnapshotRows, rows...)
 		rowCount += int64(len(rows))
 		_, logicalBytes, err := oversync.CompactGroupsForSnapshotRowsAt(client.discovery.SchemaGeneration, rows, firstRowOrdinal)
 		require.NoError(t, err)
@@ -674,13 +602,7 @@ func setChunkedSnapshotSession(t *testing.T, client *Client, snapshotID string, 
 		switch r.URL.Path {
 		case "/sync/snapshot-sessions":
 			require.Equal(t, http.MethodPost, r.Method)
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        snapshotID,
-				SnapshotBundleSeq: bundleSeq,
-				RowCount:          rowCount,
-				ByteCount:         byteCount,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, snapshotID, bundleSeq, allSnapshotRows), nil
 		case sessionPath:
 			switch r.Method {
 			case http.MethodGet:

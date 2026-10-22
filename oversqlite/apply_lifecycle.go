@@ -131,48 +131,41 @@ func (c *Client) finishConflictApply(ctx context.Context, tx sqliteTransaction) 
 	return finishApplySurvivors(ctx, tx)
 }
 
-// Preparation and final verification use the existing owner; snapshot exclusion
-// intentionally does not walk incoming edges from the old business generation.
-func (c *Client) prepareSnapshotApply(ctx context.Context, tx sqliteTransaction, session *oversync.SnapshotSession, preserve bool) error {
-	var outboxRows int64
-	if preserve {
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM _sync_outbox_rows`).Scan(&outboxRows); err != nil {
-			return err
-		}
+// Snapshot roots describe the complete final managed state. Existing rows absent
+// from S are explicit deletions; surviving identities participate in the same
+// dependency and uniqueness plan as ordinary final-state application.
+func (c *Client) prepareSnapshotApply(ctx context.Context, tx sqliteTransaction, session *oversync.SnapshotSession) error {
+	if err := requireNoUnresolvedUpload(ctx, tx); err != nil {
+		return err
 	}
-	roots, err := checkedAddInt64(session.RowCount, outboxRows)
+	absentQuery, err := c.snapshotAbsentRowsQuery(tx, session.SnapshotID)
+	if err != nil {
+		return err
+	}
+	var absent int64
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM ("+absentQuery+")").Scan(&absent); err != nil {
+		return err
+	}
+	roots, err := checkedAddInt64(session.RowCount, absent)
 	if err != nil || roots > int64(int(^uint(0)>>1)) {
 		return fmt.Errorf("snapshot apply root count overflow")
 	}
-	unit := applyUnit("snapshot", session.SnapshotBundleSeq, fmt.Sprintf("%s/%d/%d/%t", session.SnapshotID, session.RowCount, session.ByteCount, preserve))
+	unit := applyUnit("snapshot", session.SnapshotBundleSeq, fmt.Sprintf("%s/%d/%d", session.SnapshotID, session.RowCount, session.ByteCount))
 	return c.prepareApplySurvivors(ctx, tx, unit, int(roots), func(index int) (applySurvivor, error) {
-		// Frozen L takes precedence in the desired business view, never in A.
-		if int64(index) < outboxRows {
-			return c.snapshotOutboxSurvivor(ctx, tx, int64(index))
+		if int64(index) < session.RowCount {
+			return c.snapshotStageSurvivor(ctx, tx, session.SnapshotID, int64(index)+1)
 		}
-		return c.snapshotStageSurvivor(ctx, tx, session.SnapshotID, int64(index)-outboxRows+1)
+		var row applySurvivor
+		row.role = "intended"
+		cursorTable, cursorKey := "", ""
+		if int64(index) > session.RowCount {
+			if err := tx.QueryRowContext(ctx, `SELECT table_name,local_pk FROM _sync_apply_rows WHERE ordinal=?`, index).Scan(&cursorTable, &cursorKey); err != nil {
+				return row, err
+			}
+		}
+		err := tx.QueryRowContext(ctx, "SELECT table_name,local_pk FROM ("+absentQuery+") WHERE (table_name,local_pk)>(?,?) ORDER BY table_name,local_pk LIMIT 1", cursorTable, cursorKey).Scan(&row.table, &row.pk)
+		return row, err
 	}, "snapshot")
-}
-
-func (c *Client) snapshotOutboxSurvivor(ctx context.Context, tx sqliteTransaction, ordinal int64) (applySurvivor, error) {
-	var table, key string
-	var payload sql.NullString
-	var size int64
-	if err := tx.QueryRowContext(ctx, `SELECT 64+6*(length(CAST(table_name AS BLOB))+length(CAST(key_json AS BLOB)))+length(CAST(COALESCE(local_payload,'') AS BLOB)) FROM _sync_outbox_rows WHERE row_ordinal=?`, ordinal).Scan(&size); err != nil {
-		return applySurvivor{}, err
-	}
-	p, err := loadApplyPlan(ctx, tx)
-	if err != nil {
-		return applySurvivor{}, err
-	}
-	if err := c.checkApplyWorkspace(p, 8, 8*size); err != nil {
-		return applySurvivor{}, err
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT table_name,key_json,local_payload FROM _sync_outbox_rows WHERE row_ordinal=?`, ordinal).Scan(&table, &key, &payload); err != nil {
-		return applySurvivor{}, err
-	}
-	pk, _, err := c.decodeDirtyKeyForPush(tx, table, key)
-	return applySurvivor{table: table, pk: pk, payload: payload, role: "intended"}, err
 }
 
 func (c *Client) snapshotStageSurvivor(ctx context.Context, tx sqliteTransaction, id string, ordinal int64) (applySurvivor, error) {
@@ -407,7 +400,7 @@ func (c *Client) applyPending(ctx context.Context, tx sqliteTransaction, p *appl
 	return result
 }
 
-func (c *Client) verifySnapshotFinalState(ctx context.Context, tx sqliteTransaction, session *oversync.SnapshotSession, preserve bool) error {
+func (c *Client) verifySnapshotFinalState(ctx context.Context, tx sqliteTransaction, session *oversync.SnapshotSession) error {
 	cache := newTxStmtCache(tx)
 	defer cache.Close()
 	if _, err := c.restoreApplySurvivors(ctx, tx, cache, true); err != nil {
@@ -418,17 +411,8 @@ func (c *Client) verifySnapshotFinalState(ctx context.Context, tx sqliteTransact
 			return err
 		}
 	}
-	if preserve {
-		var invalid int64
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM _sync_outbox_rows o JOIN _sync_row_state a ON (a.schema_name,a.table_name,a.key_json)=(o.schema_name,o.table_name,o.key_json) WHERE NOT EXISTS(SELECT 1 FROM _sync_snapshot_stage s WHERE s.snapshot_id=? AND (s.schema_name,s.table_name,s.key_json)=(o.schema_name,o.table_name,o.key_json)) AND (a.server_kind<>'absent' OR a.row_version<>0 OR a.server_payload IS NOT NULL OR a.relationships_known<>1 OR json_extract(a.server_provenance,'$.origin') IS NOT 'snapshot' OR json_extract(a.server_provenance,'$.authoritative_version') IS NOT 0 OR json_extract(a.server_provenance,'$.bundle_sequence') IS NOT ?)`, session.SnapshotID, session.SnapshotBundleSeq).Scan(&invalid); err != nil {
-			return err
-		}
-		if invalid != 0 {
-			return fmt.Errorf("excluded prepared intent has fabricated snapshot A")
-		}
-	}
 	for _, table := range c.config.Tables {
-		if err := c.verifySnapshotTableScope(ctx, tx, session, preserve, table.TableName); err != nil {
+		if err := c.verifySnapshotTableScope(ctx, tx, session, table.TableName); err != nil {
 			return err
 		}
 	}
@@ -493,35 +477,30 @@ func (c *Client) verifySnapshotAuthoritativeRow(ctx context.Context, tx sqliteTr
 	}
 	return nil
 }
-func (c *Client) verifySnapshotTableScope(ctx context.Context, tx sqliteTransaction, session *oversync.SnapshotSession, preserve bool, table string) error {
-	var desired, live, authoritative, staged, excluded int64
+func (c *Client) verifySnapshotTableScope(ctx context.Context, tx sqliteTransaction, session *oversync.SnapshotSession, table string) error {
+	var desired, live, authoritative, staged int64
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM _sync_apply_rows WHERE table_name=? AND payload IS NOT NULL`, table).Scan(&desired); err != nil {
 		return err
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM `+quoteIdent(table)).Scan(&live); err != nil {
 		return err
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM _sync_row_state WHERE table_name=?`, table).Scan(&authoritative); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM _sync_row_state WHERE table_name=? AND server_kind='live'`, table).Scan(&authoritative); err != nil {
 		return err
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM _sync_snapshot_stage WHERE snapshot_id=? AND table_name=?`, session.SnapshotID, table).Scan(&staged); err != nil {
 		return err
 	}
-	if preserve {
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM _sync_outbox_rows o WHERE table_name=? AND NOT EXISTS(SELECT 1 FROM _sync_snapshot_stage s WHERE s.snapshot_id=? AND s.schema_name=o.schema_name AND s.table_name=o.table_name AND s.key_json=o.key_json)`, table, session.SnapshotID).Scan(&excluded); err != nil {
-			return err
-		}
-	}
-	if live != desired || authoritative != staged+excluded {
+	if live != desired || authoritative != staged {
 		return fmt.Errorf("snapshot final scope count does not match intended installation")
 	}
 	return nil
 }
-func (c *Client) completeSnapshotDesiredState(ctx context.Context, tx sqliteTransaction, cache *txStmtCache, session *oversync.SnapshotSession, preserve bool) error {
+func (c *Client) completeSnapshotDesiredState(ctx context.Context, tx sqliteTransaction, cache *txStmtCache, session *oversync.SnapshotSession) error {
 	if err := c.restoreTriggerAffectedDirtyIntentInTx(ctx, cache, tx); err != nil {
 		return err
 	}
-	if err := c.verifySnapshotFinalState(ctx, tx, session, preserve); err != nil {
+	if err := c.verifySnapshotFinalState(ctx, tx, session); err != nil {
 		return err
 	}
 	return finishApplySurvivors(ctx, tx)

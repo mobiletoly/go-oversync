@@ -609,6 +609,8 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 			row_count BIGINT NOT NULL DEFAULT 0,
 			byte_count BIGINT NOT NULL DEFAULT 0,
 			expires_at TIMESTAMPTZ NOT NULL,
+			snapshot_hash TEXT COLLATE "C" NOT NULL DEFAULT repeat('0',64) CHECK(snapshot_hash ~ '^[0-9a-f]{64}$'),
+			recovery_minimum_bundle_seq BIGINT CHECK(recovery_minimum_bundle_seq >= 0 AND recovery_minimum_bundle_seq <= snapshot_bundle_seq),
 			CONSTRAINT snapshot_sessions_generation_id_chk CHECK (schema_generation_id BETWEEN 1 AND 2147483647),
 			CONSTRAINT snapshot_sessions_generation_fingerprint_chk CHECK (schema_generation_fingerprint ~ '^[0-9a-f]{64}$'),
 			CONSTRAINT snapshot_sessions_source_generation_fk
@@ -1138,6 +1140,9 @@ func (s *SyncService) createFreshSyncLayoutInTx(ctx context.Context, tx pgx.Tx) 
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("scope write managed trigger creation failed: %w", err)
 		}
+	}
+	if err := s.createPushOutcomeStore(ctx, tx); err != nil {
+		return err
 	}
 	s.logger.Info("Sync schema initialized successfully", "migrations", len(migrations))
 

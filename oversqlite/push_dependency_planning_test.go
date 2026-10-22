@@ -842,9 +842,10 @@ func TestPushDependencyPlanning_RekeyEquivalentFactsAndPartialFailure(t *testing
 	require.ErrorAs(t, err, &rejected)
 	failed := qualificationState(t, db, "users")
 	require.Equal(t, prefix["users"], failed["users"])
-	for _, owner := range []string{"_sync_row_state", "_sync_relationships", "_sync_source_state", "_sync_attachment_state"} {
+	for _, owner := range []string{"_sync_row_state", "_sync_relationships", "_sync_attachment_state"} {
 		require.Equal(t, prefix[owner], failed[owner], owner)
 	}
+	require.EqualValues(t, 4, countA3(t, db, `SELECT next_source_bundle_id FROM _sync_source_state`))
 	require.Len(t, failed["_sync_outbox_rows"], 1)
 	require.Equal(t, qualificationPayload(t, qualificationRow(t, before, "_sync_dirty_rows", "Q"), "base_provenance"), qualificationPayload(t, qualificationRow(t, failed, "_sync_outbox_rows", "Q"), "base_provenance"))
 	require.Equal(t, "absent", qualificationText(qualificationRow(t, failed, "_sync_outbox_rows", "Q"), "base_kind"))

@@ -86,11 +86,14 @@ func TestReadiness_BootstrapFailClosedAndHTTPGuard(t *testing.T) {
 	require.NoError(t, service.Close(ctx))
 }
 
-func TestReadiness_ApplicationRejectionHTTP(t *testing.T) {
+// Application rejection is terminal only after the business savepoint rolls back
+// and its exact evidence is retained. An unretained error cannot claim HTTP422.
+func TestReadiness_ApplicationRejectionCannotEscapeAsTransportProof(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	handler := &HTTPSyncHandlers{logger: slog.New(slog.DiscardHandler)}
-	require.True(t, handler.writePushTransactionFailure(recorder, nil, &ApplicationWriteRejectedError{Category: "transition_input_invalid"}))
-	require.Equal(t, http.StatusUnprocessableEntity, recorder.Code)
-	require.Contains(t, recorder.Body.String(), "transition_input_invalid")
-	require.Contains(t, recorder.Body.String(), "pending intent")
+	rejection := &ApplicationWriteRejectedError{Category: "transition_input_invalid"}
+	require.False(t, handler.writePushTransactionFailure(recorder, nil, rejection))
+	handler.writeCompactPushError(recorder, nil, "source", rejection)
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+	require.NotContains(t, recorder.Body.String(), rejection.Category)
 }

@@ -95,6 +95,7 @@ func TestGenerationDiscoveryHTTP(t *testing.T) {
 			mux.Handle("GET /sync/generations/{generation_id}", generationHandler)
 			mux.Handle("GET /sync/generations/", generationHandler)
 			req := httptest.NewRequest(http.MethodGet, "/sync/generations/"+tc.id, nil)
+			req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 			req.Header.Set(SourceIDHeader, tc.source)
 			if tc.proof != "" {
 				req.Header.Set(tc.proof, "")
@@ -124,6 +125,7 @@ func TestGenerationDiscoveryHTTPLeaseSpansResponseWrite(t *testing.T) {
 	middleware := ActorMiddleware(ActorMiddlewareConfig{UserIDFromContext: func(context.Context) (string, error) { return "user", nil }})
 	handler := middleware(http.HandlerFunc(h.HandleGeneration))
 	req := httptest.NewRequest(http.MethodGet, "/sync/generations/1", nil)
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	req.SetPathValue("generation_id", "1")
 	req.Header.Set(SourceIDHeader, "source")
 	writer := newBlockingDiscoveryWriter()
@@ -183,6 +185,7 @@ func TestGenerationDiscoveryHTTPPrefixMountedMux(t *testing.T) {
 	outer.Handle("/host/", http.StripPrefix("/host", inner))
 
 	req := httptest.NewRequest(http.MethodGet, "/host/sync/generations/1", nil)
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	req.Header.Set(SourceIDHeader, "source")
 	rec := httptest.NewRecorder()
 	outer.ServeHTTP(rec, req)

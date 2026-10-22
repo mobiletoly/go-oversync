@@ -516,6 +516,7 @@ func TestSnapshotPublicContract_LockedCapabilityAndEndpointDocumentation(t *test
 				Schema struct {
 					Ref       string `yaml:"$ref"`
 					Type      string `yaml:"type"`
+					Pattern   string `yaml:"pattern"`
 					MinLength int    `yaml:"minLength"`
 				} `yaml:"schema"`
 			} `yaml:"parameters"`
@@ -531,7 +532,7 @@ func TestSnapshotPublicContract_LockedCapabilityAndEndpointDocumentation(t *test
 	require.NoError(t, yaml.Unmarshal(swaggerBytes, &spec))
 	sourceID := spec.Components.Parameters["SourceIDHeader"].Schema
 	require.Equal(t, "string", sourceID.Type)
-	require.Equal(t, 1, sourceID.MinLength)
+	require.Equal(t, "^[!-~]{1,256}$", sourceID.Pattern)
 	require.NotContains(t, spec.Paths, "/sync/push-sessions/{push_id}/chunks")
 	require.NotContains(t, spec.Paths, "/sync/push-sessions/{push_id}/commit")
 	require.NotContains(t, spec.Paths, "/sync/push-sessions/{push_id}")

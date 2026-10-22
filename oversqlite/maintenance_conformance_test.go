@@ -122,7 +122,7 @@ func TestMaintenanceConformance_TemporaryRejection(t *testing.T) {
 			server := newMockPushServer(t)
 			var attempts int
 			c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				hit := boundary == "push" && r.Method == http.MethodPost && r.URL.Path == "/sync/push"
+				hit := boundary == "push" && r.Method == http.MethodPost && (r.URL.Path == "/sync/push" || r.URL.Path == "/sync/push-outcomes/resolve")
 				if hit {
 					attempts++
 					return errorJSONResponse(response.Status, response.Body), nil

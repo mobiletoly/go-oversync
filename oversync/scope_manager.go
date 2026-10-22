@@ -147,7 +147,7 @@ func markReservedServerSourceUsed(ctx context.Context, tx pgx.Tx, writerID strin
 		SELECT ever_used
 		FROM sync.server_source_reservations
 		WHERE source_id = $1
-		FOR UPDATE
+		FOR KEY SHARE
 	`, writerID).Scan(&everUsed)
 	if err == pgx.ErrNoRows {
 		if required {
@@ -252,6 +252,9 @@ func (s *SyncService) prepareScopeWriteInTx(ctx context.Context, tx pgx.Tx, scop
 func (m *ScopeManager) executeScopeWriteInTx(ctx context.Context, tx pgx.Tx, scopeID string, opts ScopeWriteOptions, fn RetryableDatabaseWrite, requiredEffects, forbiddenEffects canonicalEffectSet) (*ScopeWriteResult, error) {
 	userPK, err := m.service.prepareScopeWriteInTx(ctx, tx, scopeID, opts)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireServerWriteSource(ctx, tx, userPK, opts.WriterID); err != nil {
 		return nil, err
 	}
 	decision, err := acquireScopeWriteReceipt(ctx, tx, scopeWriteReceiptSpec{

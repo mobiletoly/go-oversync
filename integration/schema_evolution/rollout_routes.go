@@ -56,6 +56,7 @@ func registerMemberSyncRoutes(mux *http.ServeMux, s *oversync.SyncService, input
 		{"GET /sync/generations/{generation_id}", handlers.HandleGeneration},
 		{"GET /sync/generations/", handlers.HandleGeneration},
 		{"POST /sync/connect", handlers.HandleConnect}, {"POST /sync/push", handlers.HandlePush}, {"GET /sync/pull", handlers.HandlePull},
+		{"POST /sync/push-outcomes/resolve", handlers.HandlePushOutcomeResolve}, {"POST /sync/push-outcomes/ack", handlers.HandlePushOutcomeAck},
 		{"GET /sync/watch", handlers.HandleWatch}, {"POST /sync/snapshot-sessions", handlers.HandleCreateSnapshotSession},
 		{"GET /sync/snapshot-sessions/{snapshot_id}", handlers.HandleGetSnapshotChunk}, {"DELETE /sync/snapshot-sessions/{snapshot_id}", handlers.HandleDeleteSnapshotSession},
 	}

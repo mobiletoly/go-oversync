@@ -117,6 +117,12 @@ func (f *directPushFixture) push(t *testing.T, ctx context.Context, actor Actor,
 	})
 }
 
+func (f *directPushFixture) acknowledge(t *testing.T, ctx context.Context, actor Actor, result *OneShotPushResponse) {
+	t.Helper()
+	o := result.Outcome
+	require.NoError(t, f.svc.AcknowledgePushOutcome(ctx, actor, testSchemaGenerationProofForService(f.svc), PushOutcomeAckRequest{SourceBundleID: o.SourceBundleID, CanonicalRequestHash: o.CanonicalRequestHash, OutcomeHash: o.OutcomeHash}))
+}
+
 func (f *directPushFixture) businessUserCount(t *testing.T, ctx context.Context) int {
 	t.Helper()
 	var count int
@@ -136,7 +142,12 @@ func (f *directPushFixture) durablePushState(t *testing.T, ctx context.Context, 
 			'bundle_count', (SELECT count(*) FROM sync.bundle_log AS bl WHERE bl.user_pk = us.user_pk),
 			'bundle_row_count', (SELECT count(*) FROM sync.bundle_rows AS br WHERE br.user_pk = us.user_pk),
 			'row_state_count', (SELECT count(*) FROM sync.row_state AS rs WHERE rs.user_pk = us.user_pk),
-			'business_row_count', (SELECT count(*) FROM %s.users AS bu WHERE bu._sync_scope_id = us.user_id)
+'outcome', (SELECT to_jsonb(o) FROM sync.push_outcomes o WHERE o.user_pk=us.user_pk AND o.source_id=$2),
+'progress', (SELECT to_jsonb(p) FROM sync.push_source_progress p WHERE p.user_pk=us.user_pk AND p.source_id=$2),
+			'receipt_count', (SELECT count(*) FROM sync.scope_write_receipts rr WHERE rr.user_pk=us.user_pk),
+'binding', (SELECT to_jsonb(b) FROM sync.source_generation_bindings b WHERE b.user_pk=us.user_pk AND b.source_id=$2),
+'capture_count', (SELECT count(*) FROM sync.bundle_capture_stage c WHERE c.user_pk=us.user_pk),
+'business_row_count', (SELECT count(*) FROM %s.users AS bu WHERE bu._sync_scope_id = us.user_id)
 		)::text
 		FROM sync.user_state AS us
 		JOIN sync.scope_state AS sc ON sc.user_pk = us.user_pk
@@ -160,6 +171,7 @@ func TestDirectPush_CompleteRequestPreservesOrderAndBusinessState(t *testing.T) 
 	require.Equal(t, first.String(), committed.Bundle.Rows[1].Key["id"])
 	require.Equal(t, 2, f.businessUserCount(t, ctx))
 
+	f.acknowledge(t, ctx, f.writer, committed)
 	updated, err := f.push(t, ctx, f.writer, 2, []PushRequestRow{f.updateUserRow(first, "First Updated", committed.Bundle.Rows[1].RowVersion), f.deleteUserRow(second, committed.Bundle.Rows[0].RowVersion)})
 	require.NoError(t, err)
 	require.Len(t, updated.Bundle.Rows, 2)
@@ -177,12 +189,11 @@ func TestDirectPush_ExactReplayReturnsSameBundleAndMismatchDoesNotMutate(t *test
 	require.NoError(t, err)
 	replay, err := f.push(t, ctx, f.writer, 1, []PushRequestRow{row})
 	require.NoError(t, err)
-	require.Equal(t, first.Bundle.BundleSeq, replay.Bundle.BundleSeq)
-	require.Equal(t, first.Bundle.BundleHash, replay.Bundle.BundleHash)
+	require.Equal(t, first.encoded, replay.encoded)
 
 	mismatched := f.userRow(uuid.New(), "Mismatch")
 	_, err = f.push(t, ctx, f.writer, 1, []PushRequestRow{mismatched})
-	var mismatch *PushReplayMismatchError
+	var mismatch *PushOutcomeError
 	require.ErrorAs(t, err, &mismatch)
 	require.Equal(t, 1, f.businessUserCount(t, ctx))
 }
@@ -220,40 +231,34 @@ func TestDirectPush_InitializationReplaySurvivesLostSuccessAndRestartWithoutMuta
 
 	replayed, err := restarted.PushOneShot(ctx, actor, testSchemaGenerationProofForService(restarted), req)
 	require.NoError(t, err)
-	require.Equal(t, committed.Bundle.BundleSeq, replayed.Bundle.BundleSeq)
-	require.Equal(t, committed.Bundle.BundleHash, replayed.Bundle.BundleHash)
+	require.Equal(t, committed.encoded, replayed.encoded)
 	require.Equal(t, stateAfterCommit, f.durablePushState(t, ctx, actor), "exact initialization replay must not refresh lifecycle state or write rows")
 }
 
-func TestDirectPush_RetiredSourceReplayPrecedesLifecycleAndMismatchDoesNotMutate(t *testing.T) {
+func TestDirectPush_PendingOutcomeBlocksRetirementThenAcknowledgedTupleIsGone(t *testing.T) {
 	ctx := context.Background()
 	f := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
-	rows := []PushRequestRow{f.userRow(uuid.New(), "Retired Replay")}
+	rows := []PushRequestRow{f.userRow(uuid.New(), "Retirement")}
 	committed, err := f.push(t, ctx, f.writer, 1, rows)
 	require.NoError(t, err)
-
-	_, err = f.pool.Exec(ctx, `
-		UPDATE sync.source_state AS ss
-		SET state = 'retired', replaced_by_source_id = 'replacement', retirement_reason = 'test retirement'
-		FROM sync.user_state AS us
-		WHERE ss.user_pk = us.user_pk AND us.user_id = $1 AND ss.source_id = $2
-	`, f.writer.UserID, f.writer.SourceID)
+	retire := `UPDATE sync.source_state AS ss SET state='retired',replaced_by_source_id='replacement',retirement_reason='test retirement' FROM sync.user_state AS us WHERE ss.user_pk=us.user_pk AND us.user_id=$1 AND ss.source_id=$2`
+	before := f.durablePushState(t, ctx, f.writer)
+	_, err = f.pool.Exec(ctx, retire, f.writer.UserID, f.writer.SourceID)
+	require.Error(t, err)
+	require.Equal(t, before, f.durablePushState(t, ctx, f.writer))
+	replay, err := f.push(t, ctx, f.writer, 1, rows)
 	require.NoError(t, err)
-	stateBeforeReplay := f.durablePushState(t, ctx, f.writer)
-
-	replayed, err := f.push(t, ctx, f.writer, 1, rows)
+	require.Equal(t, committed.encoded, replay.encoded)
+	f.acknowledge(t, ctx, f.writer, committed)
+	_, err = f.pool.Exec(ctx, retire, f.writer.UserID, f.writer.SourceID)
 	require.NoError(t, err)
-	require.Equal(t, committed.Bundle.BundleSeq, replayed.Bundle.BundleSeq)
-	require.Equal(t, committed.Bundle.BundleHash, replayed.Bundle.BundleHash)
-	require.Equal(t, stateBeforeReplay, f.durablePushState(t, ctx, f.writer))
-
-	_, err = f.push(t, ctx, f.writer, 1, []PushRequestRow{f.userRow(uuid.New(), "Retired Mismatch")})
-	var mismatch *PushReplayMismatchError
-	require.ErrorAs(t, err, &mismatch)
-	require.Equal(t, stateBeforeReplay, f.durablePushState(t, ctx, f.writer), "replay mismatch must not enter retired-source lifecycle or mutate durable state")
+	after := f.durablePushState(t, ctx, f.writer)
+	_, err = f.push(t, ctx, f.writer, 1, rows)
+	outcomeCode(t, err, "push_outcome_acknowledged")
+	require.Equal(t, after, f.durablePushState(t, ctx, f.writer))
 }
 
-func TestDirectPush_PrunedCommittedTupleReturnsHistoryPrunedWithoutMutation(t *testing.T) {
+func TestDirectPush_PrunedCommittedTupleRetainsExactOutcomeWithoutMutation(t *testing.T) {
 	ctx := context.Background()
 	f := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
 	rows := []PushRequestRow{f.userRow(uuid.New(), "Pruned Replay")}
@@ -268,10 +273,9 @@ func TestDirectPush_PrunedCommittedTupleReturnsHistoryPrunedWithoutMutation(t *t
 	require.NoError(t, err)
 	stateBeforeReplay := f.durablePushState(t, ctx, f.writer)
 
-	_, err = f.push(t, ctx, f.writer, 1, rows)
-	var pruned *SourceTupleHistoryPrunedError
-	require.ErrorAs(t, err, &pruned)
-	require.Equal(t, int64(1), pruned.MaxCommittedSourceBundleIDHint)
+	replay, err := f.push(t, ctx, f.writer, 1, rows)
+	require.NoError(t, err)
+	require.Equal(t, committed.encoded, replay.encoded)
 	require.Equal(t, stateBeforeReplay, f.durablePushState(t, ctx, f.writer))
 }
 
@@ -309,9 +313,7 @@ func TestDirectPush_IndivisibleFuturePullLimitIsExactAndRollsBack(t *testing.T) 
 				require.Equal(t, 2, f.businessUserCount(t, ctx))
 				return
 			}
-			var projection *GenerationProjectionError
-			require.ErrorAs(t, err, &projection)
-			require.Equal(t, BundleProjectionTooLarge, projection.Code)
+			outcomeCode(t, err, "push_outcome_too_large")
 			require.Zero(t, f.businessUserCount(t, ctx))
 			var bundles int
 			require.NoError(t, f.pool.QueryRow(ctx, `SELECT count(*) FROM sync.bundle_log`).Scan(&bundles))
@@ -324,7 +326,6 @@ func TestServerOriginatedBundle_RejectsOversizedVisibleRowBeforePublication(t *t
 	ctx := context.Background()
 	f := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
 	actor := Actor{UserID: f.writer.UserID, SourceID: "server-writer"}
-	resolveConnectForPush(t, ctx, f.svc, actor, false)
 	table := pgx.Identifier{f.schemaName, "users"}.Sanitize()
 	rowID := uuid.New()
 	oversizedName := strings.Repeat("N", int(f.svc.maxBytesPerSnapshotRow()))
@@ -351,10 +352,11 @@ func TestDirectPush_ConflictRollsBackTheWholeRequest(t *testing.T) {
 	newRow := f.userRow(uuid.New(), "Must Roll Back")
 	conflictingWriter := Actor{UserID: f.writer.UserID, SourceID: "conflicting-writer"}
 	resolveConnectForPush(t, ctx, f.svc, conflictingWriter, false)
-	_, err = f.push(t, ctx, conflictingWriter, 1, []PushRequestRow{newRow, existing})
-	var conflict *PushConflictError
-	require.ErrorAs(t, err, &conflict)
-	require.NotNil(t, conflict.Conflict)
+	rejected, err := f.push(t, ctx, conflictingWriter, 1, []PushRequestRow{newRow, existing})
+	require.NoError(t, err)
+	require.Equal(t, "rejected", rejected.Outcome.Status)
+	require.Equal(t, "push_conflict", rejected.Outcome.Rejection.Code)
+	require.NotNil(t, rejected.Outcome.Rejection.Conflict)
 	require.Equal(t, 1, f.businessUserCount(t, ctx))
 }
 
@@ -379,9 +381,7 @@ func TestDirectPush_EnforcesRequestBoundsBeforeMutation(t *testing.T) {
 	ctx := context.Background()
 	f := newDirectPushFixture(t, ctx, directPushFixtureOptions{maxRowsPerBundle: 1})
 	_, err := f.push(t, ctx, f.writer, 1, []PushRequestRow{f.userRow(uuid.New(), "One"), f.userRow(uuid.New(), "Two")})
-	var limit *GenerationProjectionError
-	require.ErrorAs(t, err, &limit)
-	require.Equal(t, BundleLimitExceeded, limit.Code)
+	require.ErrorAs(t, err, new(*PushInvalidError))
 	require.Equal(t, 0, f.businessUserCount(t, ctx))
 }
 

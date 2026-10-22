@@ -10,7 +10,7 @@ import (
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
-// PushApplicationRejectionError is a definitive, noncommitting HTTP 422 response.
+// PushApplicationRejectionError comes only from a validated terminal rejection.
 type PushApplicationRejectionError struct {
 	Operation string
 	Status    int
@@ -90,7 +90,7 @@ func readPendingPushRejection(ctx context.Context, q queryRower) (*PendingPushRe
 		return nil, fmt.Errorf("invalid durable push rejection: %w", err)
 	}
 	pending.Revision = revision
-	if pending.ID == "" || pending.SourceID == "" || pending.SourceBundleID < 1 || !validSchemaGenerationFingerprint(pending.RequestHash) || pending.Generation.ID < 1 || !validSchemaGenerationFingerprint(pending.Generation.Fingerprint) || pending.Operation == "" || pending.Status != 422 || pending.Category == "" {
+	if pending.ID == "" || pending.SourceID == "" || pending.SourceBundleID < 1 || !validSchemaGenerationFingerprint(pending.RequestHash) || pending.Generation.ID < 1 || !validSchemaGenerationFingerprint(pending.Generation.Fingerprint) || pending.Operation == "" || pending.Status != 200 || pending.Category == "" {
 		return nil, fmt.Errorf("invalid durable push rejection identity")
 	}
 	return &pending, nil
@@ -153,18 +153,29 @@ func (c *Client) preservePushRejection(ctx context.Context, snapshot *pushOutbou
 	if _, err := tx.ExecContext(ctx, `UPDATE _sync_push_rejection_state SET pending=? WHERE singleton_key=1`, string(encoded)); err != nil {
 		return nil, err
 	}
+	if err := retainRejectedUploadInTx(ctx, tx); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &pending, nil
 }
 
-// RetryPushRejection clears only the rejection observation and retains the exact request.
+// RetryPushRejection disposes the rejected operation and requeues preserved intent.
+// The next upload uses a successor identity only after its acknowledgment.
 func (c *Client) RetryPushRejection(ctx context.Context, selected PendingPushRejection) error {
 	if err := c.tryBeginSyncOperation(); err != nil {
 		return err
 	}
 	defer c.writeMu.Unlock()
+	snapshot, err := c.loadPushOutboundSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snapshot == nil {
+		return &StalePushRejectionResolutionError{}
+	}
 	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
 		return err
@@ -173,7 +184,13 @@ func (c *Client) RetryPushRejection(ctx context.Context, selected PendingPushRej
 	if err := c.guardPushRejection(ctx, tx, &selected); err != nil {
 		return err
 	}
+	if err := c.requeueSnapshotRowsInTx(ctx, tx, snapshot, nil); err != nil {
+		return err
+	}
 	if err := recordPushRejectionDecision(ctx, tx, &selected, "retry"); err != nil {
+		return err
+	}
+	if err := c.deletePushOutboundSnapshotInTx(ctx, tx, selected.SourceBundleID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -218,7 +235,7 @@ func (c *Client) guardPushRejection(ctx context.Context, q queryRower, selected 
 	if err != nil {
 		return err
 	}
-	if selected == nil || current == nil || *current != *selected || outbox.State != outboxStatePrepared || outbox.SourceID != selected.SourceID || outbox.SourceBundleID != selected.SourceBundleID || outbox.CanonicalRequestHash != selected.RequestHash || selected.Generation != c.schemaGenerationProof {
+	if selected == nil || current == nil || *current != *selected || outbox.State != outboxStateRejected || outbox.SourceID != selected.SourceID || outbox.SourceBundleID != selected.SourceBundleID || outbox.CanonicalRequestHash != selected.RequestHash || selected.Generation != c.schemaGenerationProof {
 		return &StalePushRejectionResolutionError{}
 	}
 	return nil

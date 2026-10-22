@@ -301,7 +301,7 @@ func TestRetryableDatabaseWriteCapability_IsRestrictedAndRequiresCallbackContext
 	}, integrationTestLogger(slog.LevelWarn))
 	actor := Actor{UserID: "retryable-capability-user-" + suffix}
 	source := BundleSource{SourceID: "server-app", SourceBundleID: 1}
-	mustInitializeEmptyScope(t, ctx, service, actor.UserID, source.SourceID)
+	mustInitializeEmptyScope(t, ctx, service, actor.UserID, "bootstrap-client")
 
 	var exposesCommit, exposesRawConn, rowsConnWasNil bool
 	err := service.WithinSyncBundle(ctx, actor, source, retryableBundleWriteOptionsForTest(), func(callbackCtx context.Context, tx DatabaseWriteTx) error {

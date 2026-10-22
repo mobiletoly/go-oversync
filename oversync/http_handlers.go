@@ -242,6 +242,10 @@ func (h *HTTPSyncHandlers) requireActorForMethod(w http.ResponseWriter, r *http.
 		h.writeError(w, http.StatusUnauthorized, "authentication_failed", err.Error(), r)
 		return Actor{}, false
 	}
+	if err := ValidateProtocolHeader(r.Header); err != nil {
+		h.writeError(w, http.StatusUpgradeRequired, "protocol_version_mismatch", "Require exactly Oversync-Protocol-Version: v1", r)
+		return Actor{}, false
+	}
 
 	return actor, true
 }
@@ -378,6 +382,11 @@ func (h *HTTPSyncHandlers) writeGenerationError(w http.ResponseWriter, r *http.R
 }
 
 func (h *HTTPSyncHandlers) writeGenerationOrSourceLifecycleError(w http.ResponseWriter, r *http.Request, sourceID string, err error) bool {
+	// A retained outcome fences source lifecycle changes as well as uploads.
+	// Preserve application admission precedence when its cause is wrapped.
+	if h.writeScopeAdmissionFailure(w, r, err) || h.writePushOutcomeError(w, r, err) {
+		return true
+	}
 	if h.writeGenerationError(w, r, err) {
 		return true
 	}
@@ -521,11 +530,6 @@ func (h *HTTPSyncHandlers) writePushTransactionFailure(w http.ResponseWriter, r 
 	if h.writeScopeAdmissionFailure(w, r, err) {
 		return true
 	}
-	var applicationErr *ApplicationWriteRejectedError
-	if errors.As(err, &applicationErr) {
-		h.writeError(w, http.StatusUnprocessableEntity, applicationErr.Category, "Application rejected the write; resolve the pending intent before retrying", r)
-		return true
-	}
 	var unknownErr *CommitOutcomeUnknownError
 	if errors.As(err, &unknownErr) {
 		h.writeError(
@@ -588,25 +592,11 @@ func (h *HTTPSyncHandlers) HandlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseHistoryProjection(&pushed.historyProjectionRelease)
-	authoritative := make([]PushRequestRow, 0, len(pushed.Bundle.Rows))
-	for _, row := range pushed.Bundle.Rows {
-		authoritative = append(authoritative, PushRequestRow{Schema: row.Schema, Table: row.Table, Key: row.Key, Op: row.Op, BaseRowVersion: row.RowVersion, Payload: row.Payload})
-	}
-	groups, err := CompactGroupsForRows(generationDescriptor(view.contract), authoritative)
-	if err != nil {
-		h.writeError(w, http.StatusInternalServerError, "push_failed", "Failed to encode authoritative compact rows", r)
-		return
-	}
-	h.writeBoundedJSON(w, r, http.StatusOK, CompactPushResponse{BundleSeq: pushed.Bundle.BundleSeq, BundleHash: pushed.Bundle.BundleHash, Rows: groups}, int64(h.service.config.MaxBytesPerBundle)+historyEnvelopeAllowance, "Failed to encode compact push response")
+	h.writeJSONBytes(w, r, http.StatusOK, pushed.encoded)
 }
 
 func (h *HTTPSyncHandlers) writeCompactPushError(w http.ResponseWriter, r *http.Request, sourceID string, err error) {
 	if h.writeScopeAdmissionFailure(w, r, err) {
-		return
-	}
-	var replayMismatchErr *PushReplayMismatchError
-	if errors.As(err, &replayMismatchErr) {
-		h.writeError(w, http.StatusConflict, "push_replay_mismatch", replayMismatchErr.Error(), r)
 		return
 	}
 	var projectionErr *GenerationProjectionError
@@ -619,11 +609,6 @@ func (h *HTTPSyncHandlers) writeCompactPushError(w http.ResponseWriter, r *http.
 		return
 	}
 	if h.writeGenerationOrSourceLifecycleError(w, r, sourceID, err) || h.writePushTransactionFailure(w, r, err) {
-		return
-	}
-	var conflictErr *PushConflictError
-	if errors.As(err, &conflictErr) {
-		h.writePushConflict(w, r, conflictErr)
 		return
 	}
 	var invalidErr *PushInvalidError
@@ -998,7 +983,7 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 
 	response, err := h.service.CreateSnapshotSessionWithRequest(r.Context(), actor, proof, req)
 	if err != nil {
-		if h.writeScopeAdmissionFailure(w, r, err) {
+		if h.writeScopeAdmissionFailure(w, r, err) || h.writePushOutcomeError(w, r, err) {
 			return
 		}
 		if h.writeGenerationOrSourceLifecycleError(w, r, actor.SourceID, err) {
@@ -1049,6 +1034,7 @@ func (h *HTTPSyncHandlers) HandleCreateSnapshotSession(w http.ResponseWriter, r 
 		RowCount:          response.RowCount,
 		LogicalByteCount:  response.ByteCount,
 		ExpiresAt:         response.ExpiresAt,
+		SnapshotHash:      response.SnapshotHash, Recovery: response.Recovery,
 	}, h.service.maxBytesPerSnapshotChunk(), "Failed to encode compact snapshot session response")
 }
 
@@ -1288,27 +1274,6 @@ func (h *HTTPSyncHandlers) writeError(w http.ResponseWriter, statusCode int, err
 		"status_code", statusCode,
 		"error_code", errorCode,
 		"message", message)
-}
-
-func (h *HTTPSyncHandlers) writePushConflict(w http.ResponseWriter, r *http.Request, conflictErr *PushConflictError) {
-	if conflictErr == nil {
-		h.writeError(w, http.StatusConflict, "push_conflict", "push conflict", r)
-		return
-	}
-	defer releaseHistoryProjection(&conflictErr.historyProjectionRelease)
-
-	response := PushConflictResponse{
-		Error:    "push_conflict",
-		Message:  conflictErr.Error(),
-		Conflict: conflictErr.Conflict,
-	}
-	limit := int64(h.service.config.MaxBytesPerBundle) + historyEnvelopeAllowance
-	h.writeBoundedJSON(w, r, http.StatusConflict, response, limit, "Failed to encode push conflict response")
-
-	h.logger.Debug("HTTP push conflict response",
-		"status_code", http.StatusConflict,
-		"error_code", "push_conflict",
-		"message", conflictErr.Error())
 }
 
 // writeScopeAdmissionFailure preserves safe, identical admission envelopes for

@@ -43,6 +43,7 @@ func TestMemberSyncRoutes_DispatchDiscoveryBeforeServeMuxAndGuardOtherSyncTraffi
 			request := httptest.NewRequest(http.MethodGet, path, nil)
 			request.Header.Set("Authorization", authorization)
 			request.Header.Set(oversync.SourceIDHeader, "member-source")
+			request.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
 			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
@@ -64,4 +65,14 @@ func TestMemberSyncRoutes_DispatchDiscoveryBeforeServeMuxAndGuardOtherSyncTraffi
 	wrongPrefix := httptest.NewRecorder()
 	handler.ServeHTTP(wrongPrefix, httptest.NewRequest(http.MethodGet, "/wrong/sync/generations/1", nil))
 	require.Equal(t, http.StatusNoContent, wrongPrefix.Code)
+}
+
+func TestMemberSyncRoutes_RegisterDurableOutcomeHandlers(t *testing.T) {
+	mux := http.NewServeMux()
+	registerMemberSyncRoutes(mux, &oversync.SyncService{}, LocalMemberConfig{})
+	for _, path := range []string{"/sync/push-outcomes/resolve", "/sync/push-outcomes/ack"} {
+		request := httptest.NewRequest(http.MethodPost, path, nil)
+		_, pattern := mux.Handler(request)
+		require.Equal(t, "POST "+path, pattern)
+	}
 }

@@ -80,10 +80,9 @@ func TestAuditHTTPRecovery_DirectPushReplayAndPullAfterConnectionLoss(t *testing
 	})
 	replay := doAuditProcessRequest(t, f.directClient, http.MethodPost, f.process.URL()+"/sync/push", push.userID, push.sourceID, push.request)
 	require.Equal(t, http.StatusOK, replay.statusCode, string(replay.body))
-	var committed CompactPushResponse
-	require.NoError(t, json.Unmarshal(replay.body, &committed))
-	require.EqualValues(t, 1, committed.BundleSeq)
-	pullPath := fmt.Sprintf("/sync/pull?after_bundle_seq=0&max_bundles=10&target_bundle_seq=%d", committed.BundleSeq)
+	committed := decodeAuditHTTPPushOutcome(t, push, replay.body)
+	require.EqualValues(t, 1, committed.Outcome.Committed.BundleSeq)
+	pullPath := fmt.Sprintf("/sync/pull?after_bundle_seq=0&max_bundles=10&target_bundle_seq=%d", committed.Outcome.Committed.BundleSeq)
 	control := doAuditProcessRequest(t, f.directClient, http.MethodGet, f.process.URL()+pullPath, push.userID, push.sourceID, nil)
 	interruptAuditHTTPResponseAfterEffect(t, f, auditResponseGatePull, http.MethodGet, "http://"+f.proxy.Address()+pullPath, push.userID, push.sourceID, nil, func() bool { return true })
 	retry := doAuditProcessRequest(t, f.directClient, http.MethodGet, f.process.URL()+pullPath, push.userID, push.sourceID, nil)

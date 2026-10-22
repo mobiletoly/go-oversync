@@ -18,7 +18,11 @@ import (
 )
 
 func (c *Client) createSnapshotSession(ctx context.Context, req *oversync.SnapshotSessionCreateRequest) (*oversync.SnapshotSession, error) {
-	responseSourceID := c.sourceID
+	return c.createSnapshotSessionAsSource(ctx, req, c.sourceID)
+}
+
+func (c *Client) createSnapshotSessionAsSource(ctx context.Context, req *oversync.SnapshotSessionCreateRequest, source string) (*oversync.SnapshotSession, error) {
+	responseSourceID := source
 	if req != nil && req.SourceReplacement != nil {
 		responseSourceID = req.SourceReplacement.NewSourceID
 	}
@@ -37,73 +41,71 @@ func (c *Client) createSnapshotSession(ctx context.Context, req *oversync.Snapsh
 	if len(reqBody) > 0 {
 		contentType = "application/json"
 	}
-	result, err := c.doAuthenticatedBoundedRequestWithRetry(
+	result, err := c.doAuthenticatedBoundedRequestWithRetryAsSource(
 		ctx, "snapshot_session_create", http.MethodPost, buildSnapshotSessionCreateURL(c.BaseURL),
 		reqBody, contentType, snapshotControlBodyLimit, snapshotControlBodyLimit,
-		map[string]struct{}{"snapshot_build_capacity": {}},
+		source, map[string]struct{}{"snapshot_build_capacity": {}},
 		nil,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send snapshot session request: %w", err)
 	}
 	if result.statusCode != http.StatusOK {
-		if generationErr := decodeSchemaGenerationRequestError(result.statusCode, result.body, c.schemaGenerationProof); generationErr != nil {
-			return nil, generationErr
-		}
-		if result.statusCode == http.StatusConflict {
-			if limitErr := decodeSnapshotSessionLimitExceededError(result.body); limitErr != nil {
-				return nil, limitErr
-			}
-			if retiredResp, ok := decodeSourceRetiredResponse(result.body, c.sourceID); ok {
-				if req != nil && req.SourceReplacement != nil {
-					if retiredResp.ReplacedBySourceID != "" && retiredResp.ReplacedBySourceID != req.SourceReplacement.NewSourceID {
-						return nil, &SourceReplacementDivergedError{}
-					}
-				}
-				return nil, &SourceRecoveryRequiredError{Code: SourceRecoveryRetired}
-			}
-			if errorResp, ok := decodeServerErrorResponse(result.body); ok && errorResp.Error == "source_retired" {
-				return nil, errors.New("invalid source_retired response")
-			}
-		}
-		return nil, fmt.Errorf("server returned status %d: %s", result.statusCode, decodeServerErrorBody(result.body))
+		return nil, c.snapshotCreateResponseError(result, req, source)
 	}
 
-	var wire struct {
-		SnapshotID        string `json:"snapshot_id"`
-		SnapshotBundleSeq int64  `json:"snapshot_bundle_seq"`
-		RowCount          int64  `json:"row_count"`
-		LogicalByteCount  *int64 `json:"logical_byte_count"`
-		ExpiresAt         string `json:"expires_at"`
-	}
+	var wire oversync.CompactSnapshotSessionResponse
 	if err := json.Unmarshal(result.body, &wire); err != nil {
-		if strings.TrimSpace(wire.SnapshotID) != "" {
-			c.deleteSnapshotSessionBestEffortAsSource(wire.SnapshotID, responseSourceID)
+		if wire.SnapshotID != "" {
+			c.retireSnapshotSession(ctx, wire.SnapshotID, responseSourceID)
 		}
-		return nil, fmt.Errorf("failed to decode snapshot session response: %w", err)
+		return nil, &snapshotEvidenceError{"invalid session JSON"}
 	}
-	if err := validateSnapshotSessionResponseFieldPresence(result.body); err != nil {
-		if strings.TrimSpace(wire.SnapshotID) != "" {
-			c.deleteSnapshotSessionBestEffortAsSource(wire.SnapshotID, responseSourceID)
-		}
-		return nil, err
+	var requested *oversync.SnapshotRecovery
+	if req != nil {
+		requested = req.Recovery
 	}
-	if wire.LogicalByteCount == nil {
-		if strings.TrimSpace(wire.SnapshotID) != "" {
-			c.deleteSnapshotSessionBestEffortAsSource(wire.SnapshotID, responseSourceID)
-		}
-		return nil, fmt.Errorf("snapshot session response missing required logical_byte_count")
+	if err := oversync.ValidateSnapshotRecoveryEcho(wire, requested); err != nil {
+		return nil, &snapshotEvidenceError{"recovery echo mismatch"}
 	}
 	session := oversync.SnapshotSession{
 		SnapshotID: wire.SnapshotID, SnapshotBundleSeq: wire.SnapshotBundleSeq,
-		RowCount: wire.RowCount, ByteCount: *wire.LogicalByteCount, ExpiresAt: wire.ExpiresAt,
+		RowCount: wire.RowCount, ByteCount: wire.LogicalByteCount, ExpiresAt: wire.ExpiresAt,
+		SnapshotHash: wire.SnapshotHash, Recovery: wire.Recovery,
 	}
 	if err := validateSnapshotSession(&session); err != nil {
-		c.deleteSnapshotSessionBestEffortAsSource(session.SnapshotID, responseSourceID)
-		return nil, err
+		c.retireSnapshotSession(ctx, session.SnapshotID, responseSourceID)
+		return nil, &snapshotEvidenceError{"invalid session metadata"}
 	}
 	atomic.AddInt64(&c.snapshotStats.sessionsCreated, 1)
 	return &session, nil
+}
+
+func (c *Client) snapshotCreateResponseError(result boundedResponsePayload, req *oversync.SnapshotSessionCreateRequest, source string) error {
+
+	if generationErr := decodeSchemaGenerationRequestError(result.statusCode, result.body, c.schemaGenerationProof); generationErr != nil {
+		return generationErr
+	}
+	if result.statusCode == http.StatusConflict {
+		if limitErr := decodeSnapshotSessionLimitExceededError(result.body); limitErr != nil {
+			return limitErr
+		}
+		if retiredResp, ok := decodeSourceRetiredResponse(result.body, source); ok {
+			if req != nil && req.SourceReplacement != nil {
+				if retiredResp.ReplacedBySourceID != "" && retiredResp.ReplacedBySourceID != req.SourceReplacement.NewSourceID {
+					return &SourceReplacementDivergedError{}
+				}
+			}
+			return &SourceRecoveryRequiredError{Code: SourceRecoveryRetired}
+		}
+		if response, ok := decodeServerErrorResponse(result.body); ok && (response.Error == "recovery_floor_ahead" || response.Error == "push_outcome_pending") {
+			return &snapshotSessionResponseError{StatusCode: result.statusCode, Code: response.Error}
+		}
+		if errorResp, ok := decodeServerErrorResponse(result.body); ok && errorResp.Error == "source_retired" {
+			return errors.New("invalid source_retired response")
+		}
+	}
+	return fmt.Errorf("server returned status %d: %s", result.statusCode, decodeServerErrorBody(result.body))
 }
 
 // SnapshotChunkTooSmallError reports a server row that cannot fit the explicit
@@ -156,7 +158,7 @@ func (c *Client) fetchSnapshotChunkAsSource(ctx context.Context, snapshotID stri
 		}
 		if errorResp, ok := decodeServerErrorResponse(result.body); ok && errorResp.Error == "snapshot_chunk_too_small" {
 			if errorResp.RequiredDecodedBodyBytes <= maxBytes {
-				return nil, 0, fmt.Errorf("snapshot_chunk_too_small response has invalid required_decoded_body_bytes %d for requested max_bytes %d", errorResp.RequiredDecodedBodyBytes, maxBytes)
+				return nil, 0, &snapshotEvidenceError{"invalid required_decoded_body_bytes"}
 			}
 			return nil, 0, &SnapshotChunkTooSmallError{ConfiguredBytes: maxBytes, RequiredBytes: errorResp.RequiredDecodedBodyBytes}
 		}
@@ -169,13 +171,13 @@ func (c *Client) fetchSnapshotChunkAsSource(ctx context.Context, snapshotID stri
 		LogicalByteCount *int64                     `json:"logical_byte_count"`
 	}
 	if err := json.Unmarshal(result.body, &wire); err != nil {
-		return nil, 0, fmt.Errorf("failed to decode snapshot chunk response: %w", err)
+		return nil, 0, &snapshotEvidenceError{"invalid chunk JSON"}
 	}
 	if err := validateSnapshotChunkResponseFieldPresence(result.body); err != nil {
-		return nil, 0, err
+		return nil, 0, &snapshotEvidenceError{"missing required chunk fields"}
 	}
 	if wire.LogicalByteCount == nil {
-		return nil, 0, fmt.Errorf("snapshot chunk response missing required logical_byte_count")
+		return nil, 0, &snapshotEvidenceError{"missing required logical_byte_count"}
 	}
 	if c.discovery == nil {
 		return nil, 0, fmt.Errorf("snapshot chunk requires an admitted discovery contract")
@@ -188,7 +190,7 @@ func (c *Client) fetchSnapshotChunkAsSource(ctx context.Context, snapshotID stri
 			ByteCount: *wire.LogicalByteCount,
 		}
 		if err := validateSnapshotChunkResponseWithExpectedByteCount(&chunk, snapshotID, snapshotBundleSeq, afterRowOrdinal, maxRows, maxBytes, wire.LogicalByteCount); err != nil {
-			return nil, 0, err
+			return nil, 0, &snapshotEvidenceError{"invalid snapshot chunk limits or ordinals"}
 		}
 		return &chunk, result.decodedBodyBytes, nil
 	}
@@ -198,10 +200,10 @@ func (c *Client) fetchSnapshotChunkAsSource(ctx context.Context, snapshotID stri
 	}
 	rows, err := oversync.ExpandCompactPushRows(c.discovery.SchemaGeneration, groups)
 	if err != nil {
-		return nil, 0, fmt.Errorf("expand compact snapshot rows: %w", err)
+		return nil, 0, &snapshotEvidenceError{"invalid compact snapshot rows"}
 	}
 	if err := c.validateAdmittedResponseRows("snapshot response", rows); err != nil {
-		return nil, 0, err
+		return nil, 0, &snapshotEvidenceError{"invalid snapshot response rows"}
 	}
 	snapshotRows := make([]oversync.SnapshotRow, 0, len(rows))
 	for _, row := range rows {
@@ -209,10 +211,10 @@ func (c *Client) fetchSnapshotChunkAsSource(ctx context.Context, snapshotID stri
 	}
 	_, logicalByteCount, err := oversync.CompactGroupsForSnapshotRowsAt(c.discovery.SchemaGeneration, snapshotRows, firstOrdinal)
 	if err != nil {
-		return nil, 0, fmt.Errorf("encode compact snapshot rows: %w", err)
+		return nil, 0, &snapshotEvidenceError{"invalid snapshot rows"}
 	}
 	if logicalByteCount != *wire.LogicalByteCount {
-		return nil, 0, fmt.Errorf("snapshot chunk logical_byte_count %d does not match computed %d", *wire.LogicalByteCount, logicalByteCount)
+		return nil, 0, &snapshotEvidenceError{"snapshot chunk logical_byte_count mismatch"}
 	}
 	chunk := oversync.SnapshotChunkResponse{
 		SnapshotID: snapshotID, SnapshotBundleSeq: snapshotBundleSeq,
@@ -220,7 +222,7 @@ func (c *Client) fetchSnapshotChunkAsSource(ctx context.Context, snapshotID stri
 		ByteCount: *wire.LogicalByteCount,
 	}
 	if err := validateSnapshotChunkResponseWithExpectedByteCount(&chunk, snapshotID, snapshotBundleSeq, afterRowOrdinal, maxRows, maxBytes, wire.LogicalByteCount); err != nil {
-		return nil, 0, err
+		return nil, 0, &snapshotEvidenceError{"invalid snapshot chunk limits or ordinals"}
 	}
 	atomic.AddInt64(&c.snapshotStats.chunksFetched, 1)
 	atomicRecordMax(&c.snapshotStats.maxChunkRows, int64(len(chunk.Rows)))
@@ -233,13 +235,22 @@ func (c *Client) deleteSnapshotSessionBestEffort(snapshotID string) {
 }
 
 func (c *Client) deleteSnapshotSessionBestEffortAsSource(snapshotID string, sourceID string) {
-	if strings.TrimSpace(snapshotID) == "" {
+	if snapshotID == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotRetirementTimeout)
 	defer cancel()
 
 	_ = c.deleteSnapshotSessionAsSource(ctx, snapshotID, sourceID)
+}
+
+func (c *Client) retireSnapshotSession(ctx context.Context, id, source string) {
+	if ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, snapshotRetirementTimeout)
+	defer cancel()
+	_ = c.deleteSnapshotSessionAsSource(ctx, id, source)
 }
 
 func (c *Client) deleteSnapshotSessionAsSource(ctx context.Context, snapshotID string, sourceID string) error {

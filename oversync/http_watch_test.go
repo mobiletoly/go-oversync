@@ -22,6 +22,7 @@ func newWatchHTTPTestServer(t *testing.T, svc *SyncService, actor Actor) *httpte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		setTestSchemaGenerationHeaders(r, svc)
 		r = r.WithContext(ContextWithActor(r.Context(), actor))
+		r.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 		handlers.HandleWatch(w, r)
 	}))
 	t.Cleanup(server.Close)
@@ -70,6 +71,7 @@ func TestHTTPSyncHandlers_HandleWatchRequiresAuthenticatedActor(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/sync/watch", nil)
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleWatch(rec, req)
 
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
@@ -84,6 +86,7 @@ func TestHTTPSyncHandlers_HandleWatchRejectsInvalidAfterBundleSeq(t *testing.T) 
 	setTestSchemaGenerationHeaders(req, f.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleWatch(rec, req)
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -100,6 +103,7 @@ func TestHTTPSyncHandlers_HandleWatchRejectsDisabledFeature(t *testing.T) {
 	_, err := f.svc.Connect(req.Context(), Actor{UserID: "user", SourceID: "device-a"}, testSchemaGenerationProofForService(f.svc), &ConnectRequest{HasLocalPendingRows: false})
 	require.NoError(t, err)
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleWatch(rec, req)
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
@@ -118,6 +122,7 @@ func TestHTTPSyncHandlers_HandleWatchRejectsForbiddenActor(t *testing.T) {
 	setTestSchemaGenerationHeaders(req, f.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "user", SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleWatch(rec, req)
 
 	require.Equal(t, http.StatusForbidden, rec.Code)
@@ -174,6 +179,7 @@ func TestHTTPSyncHandlers_HandleWatchUnregistersSubscriberOnWriteFailure(t *test
 	setTestSchemaGenerationHeaders(req, f.svc)
 	req = req.WithContext(ContextWithActor(req.Context(), actor))
 	writer := &failingWatchResponseWriter{header: make(http.Header)}
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	h.HandleWatch(writer, req)
 
 	require.True(t, writer.writeCount > 0)

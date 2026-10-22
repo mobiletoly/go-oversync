@@ -36,6 +36,12 @@ func pushRowsWithGeneration(
 	if err != nil {
 		return nil, "", err
 	}
+	if response.Outcome.Status == "rejected" && response.Outcome.Rejection != nil {
+		if response.Outcome.Rejection.Conflict != nil {
+			return nil, "", &PushConflictError{Conflict: response.Outcome.Rejection.Conflict}
+		}
+		return nil, "", fmt.Errorf("terminal push rejection: %s", response.Outcome.Rejection.Code)
+	}
 	return response.Bundle, "", nil
 }
 
@@ -129,13 +135,17 @@ func TestGenerationVisibleDataPlane_DifferingViewsPushReplayPullSnapshotAndCover
 		SourceBundleID: 1, CanonicalRequestHash: requestHash, Rows: request,
 	})
 	require.NoError(t, err)
-	require.Equal(t, committed.RowCount, replay.Bundle.RowCount)
-	require.Equal(t, committed.ByteCount, replay.Bundle.ByteCount)
-	require.Equal(t, committed.BundleHash, replay.Bundle.BundleHash)
+	require.NotNil(t, replay.Outcome)
+	require.Equal(t, "committed", replay.Outcome.Status)
+	require.Equal(t, committed.BundleSeq, replay.Outcome.Committed.BundleSeq)
+	require.Equal(t, committed.RowCount, replay.Outcome.Committed.RowCount)
+	require.Equal(t, committed.BundleHash, replay.Outcome.Committed.BundleHash)
+	acknowledgeRetainedOutcomeForTest(t, ctx, service, oldActor, oldProof)
 
 	oldPull, err := service.ProcessPull(ctx, oldActor, oldProof, 0, 10, 0)
 	require.NoError(t, err)
 	require.Len(t, oldPull.Bundles, 1)
+	require.Equal(t, committed.ByteCount, oldPull.Bundles[0].ByteCount)
 	require.Len(t, oldPull.Bundles[0].Rows, 1)
 	require.Empty(t, oldPull.Bundles[0].CanonicalRequestHash)
 	require.JSONEq(t, fmt.Sprintf(`{"id":%q,"name":"BOB"}`, rowID), string(oldPull.Bundles[0].Rows[0].Payload))
@@ -182,6 +192,7 @@ func TestGenerationVisibleDataPlane_DifferingViewsPushReplayPullSnapshotAndCover
 	conflictWire, err := json.Marshal(conflictErr)
 	require.NoError(t, err)
 	require.NotContains(t, string(conflictWire), "hidden@example.com")
+	acknowledgeRetainedOutcomeForTest(t, ctx, service, oldActor, oldProof)
 
 	// A generation-2-only audit write becomes an explicit empty envelope for
 	// the old client and still advances its stable canonical checkpoint.
@@ -209,7 +220,7 @@ func TestGenerationVisibleDataPlane_DifferingViewsPushReplayPullSnapshotAndCover
 	}}
 	hash, err := computeGenerationPinnedPushRequestHash(oldProof, suppressed)
 	require.NoError(t, err)
-	_, err = service.PushOneShot(ctx, oldActor, oldProof, &OneShotPushRequest{SourceBundleID: 2, CanonicalRequestHash: hash, Rows: suppressed})
+	_, err = service.PushOneShot(ctx, oldActor, oldProof, &OneShotPushRequest{SourceBundleID: 3, CanonicalRequestHash: hash, Rows: suppressed})
 	var coverageErr *PushEffectCoverageError
 	require.ErrorAs(t, err, &coverageErr)
 
@@ -223,13 +234,13 @@ func TestGenerationVisibleDataPlane_DifferingViewsPushReplayPullSnapshotAndCover
 	// same rejected one-shot remains non-committed and is evaluated afresh.
 	require.NoError(t, service.Close(ctx))
 	restarted := newBootstrappedIntegrationService(t, ctx, pool, serviceConfig(), nil)
-	_, err = restarted.PushOneShot(ctx, oldActor, oldProof, &OneShotPushRequest{SourceBundleID: 2, CanonicalRequestHash: hash, Rows: suppressed})
+	_, err = restarted.PushOneShot(ctx, oldActor, oldProof, &OneShotPushRequest{SourceBundleID: 3, CanonicalRequestHash: hash, Rows: suppressed})
 	require.ErrorAs(t, err, &coverageErr)
 	var committedCount int
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT count(*) FROM sync.bundle_log
 		WHERE user_pk=(SELECT user_pk FROM sync.user_state WHERE user_id=$1)
-		  AND source_id=$2 AND source_bundle_id=2
+		  AND source_id=$2 AND source_bundle_id=3
 	`, userID, oldActor.SourceID).Scan(&committedCount))
 	require.Zero(t, committedCount)
 }
@@ -259,6 +270,7 @@ func TestGenerationVisibleDataPlane_OmittedVisibleFieldsPreserveValuesAndUseDefa
 	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT name,email FROM %s.users WHERE id=$1`, schemaID), id).Scan(&name, &email))
 	require.Equal(t, "insert", name)
 	require.Equal(t, "visible-default", email)
+	acknowledgeRetainedOutcomeForTest(t, ctx, service, actor, proof)
 	_, _, err = pushRowsWithGeneration(t, ctx, service, actor, proof, 2, []PushRequestRow{{Schema: schema, Table: "users", Key: SyncKey{"id": id}, Op: OpUpdate, BaseRowVersion: first.BundleSeq, Payload: json.RawMessage(fmt.Sprintf(`{"id":%q,"email":"explicit"}`, id))}})
 	require.NoError(t, err)
 	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT name,email FROM %s.users WHERE id=$1`, schemaID), id).Scan(&name, &email))

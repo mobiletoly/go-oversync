@@ -156,9 +156,9 @@ func TestAuditResourceSafety_DirectRequestLimitRejectsWithoutPersistence(t *test
 
 	elapsed := time.Since(startedAt)
 
-	var limitErr *GenerationProjectionError
+	var limitErr *PushInvalidError
 	require.ErrorAs(t, err, &limitErr)
-	require.Equal(t, BundleLimitExceeded, limitErr.Code)
+	require.Equal(t, "push request row count exceeds bounds", limitErr.Message)
 	require.Less(t, elapsed, time.Second)
 	require.Zero(t, fixture.businessUserCount(t, ctx))
 	requireAuditMetadataIntegrity(t, ctx, fixture.pool)
@@ -235,6 +235,9 @@ func TestAuditResourceSafety_RetainedStorageAndFetchChunksStayWithinConfiguredBo
 			))
 		}
 		latest = fixture.pushRows(t, fixture.writer, sourceBundleID, rows)
+		if sourceBundleID < 4 {
+			acknowledgeRetainedOutcomeForTest(t, fixture.ctx, fixture.svc, fixture.writer, testSchemaGenerationProofForService(fixture.svc))
+		}
 	}
 	require.NotNil(t, latest)
 	require.Equal(t, int64(4), latest.BundleSeq)

@@ -379,7 +379,7 @@ func TestScopeManager_ExecWrite_WriterSequencingAcrossScopesAndWriters(t *testin
 	require.Equal(t, int64(1), aOther.Bundle.SourceBundleID)
 }
 
-func TestScopeManager_ExecWrite_CollisionWithClientSourceUsesUnderlyingRuntimeRules(t *testing.T) {
+func TestScopeManager_ExecWrite_RejectsClientSourceBeforeCallback(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -406,7 +406,9 @@ func TestScopeManager_ExecWrite_CollisionWithClientSourceUsesUnderlyingRuntimeRu
 	require.NoError(t, err)
 	require.NotNil(t, bundle)
 
+	called := false
 	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: sharedWriter, RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
+		called = true
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
 			SET name = $3
@@ -415,8 +417,12 @@ func TestScopeManager_ExecWrite_CollisionWithClientSourceUsesUnderlyingRuntimeRu
 		`, pgx.Identifier{schemaName}.Sanitize()), scopeID, rowID, "Server")
 		return err
 	})
-	require.NoError(t, err)
-	require.Equal(t, int64(2), result.Bundle.SourceBundleID)
+	require.ErrorAs(t, err, new(*SourceGenerationError))
+	require.Nil(t, result)
+	require.False(t, called)
+	var name string
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id=$1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&name))
+	require.Equal(t, "Client", name)
 }
 
 func TestScopeManager_ExecWrite_RejectsCrossScopeMutations(t *testing.T) {

@@ -28,9 +28,8 @@ func (e *PushValidationError) Error() string {
 }
 
 type PushConflictError struct {
-	Message                  string
-	Conflict                 *PushConflictDetails
-	historyProjectionRelease func()
+	Message  string
+	Conflict *PushConflictDetails
 }
 
 func (e *PushConflictError) Error() string {
@@ -105,306 +104,201 @@ type OneShotPushRequest struct {
 	Rows                 []PushRequestRow
 }
 
-// OneShotPushResponse is the authoritative committed effect of a one-request
-// push. Replays return the same generation-projected bundle as the original
-// commit.
+// OneShotPushResponse carries the complete retained terminal evidence. Bundle
+// is an in-process convenience for a fresh commit; replay authority is Outcome.
 type OneShotPushResponse struct {
-	Bundle                   *Bundle
-	historyProjectionRelease func()
+	*RetainedPushOutcome
+	Bundle *Bundle
 }
 
-// PushOneShot validates, applies, captures, and commits exactly one complete
-// source bundle in a single transaction. It is also the idempotency boundary:
-// an already committed source tuple is returned only when its row count and
-// generation-pinned request hash match the complete request.
+// PushOneShot shares the ordinary apply/capture engine, but terminal evidence
+// is retained independently of history and every next operation requires ack.
 func (s *SyncService) PushOneShot(ctx context.Context, actor Actor, proof SchemaGenerationProof, req *OneShotPushRequest) (_ *OneShotPushResponse, err error) {
 	defer func() {
-		if err != nil {
-			err = sanitizePushError(s.classifyApplicationWriteError(err))
+		var protocol *PushOutcomeError
+		if err != nil && !errors.As(err, &protocol) {
+			err = sanitizePushError(err)
 		}
 	}()
-	if err := rejectRetryableCallbackContext(ctx, "PushOneShot"); err != nil {
-		return nil, err
-	}
-	if err := s.validateClientActor(actor, true); err != nil {
-		return nil, err
-	}
-	if err := validateSchemaGenerationProof(proof); err != nil {
+	if err := s.validateOutcomeActor(ctx, actor, proof); err != nil {
 		return nil, err
 	}
 	if req == nil {
 		return nil, &PushInvalidError{Message: "push request is required"}
 	}
-	if req.SourceBundleID < 1 {
-		return nil, &PushInvalidError{Message: "source_bundle_id must be positive"}
+	tuple := pushOperationRequest(req)
+	if err := validOperationTuple(tuple.SourceBundleID, tuple.CanonicalRequestHash, tuple.InitializationID); err != nil {
+		return nil, &PushInvalidError{Message: err.Error()}
 	}
-	if len(req.Rows) == 0 {
-		return nil, &PushInvalidError{Message: "rows must not be empty"}
-	}
-	if len(req.Rows) > s.config.MaxRowsPerBundle {
-		return nil, projectionError(BundleLimitExceeded, "push", "push request exceeds configured bundle row limits")
-	}
-
 	done, err := s.beginOperation(ctx)
 	if err != nil {
 		return nil, err
 	}
 	releaseOperation := done
 	defer releaseHistoryProjection(&releaseOperation)
-	view, err := s.resolveRequestGeneration(ctx, actor, proof)
+	releaseProjection, err := s.acquireHistoryProjection(ctx)
 	if err != nil {
 		return nil, err
 	}
-	selection, err := selectionFromResolvedGeneration(proof, view)
+	defer releaseHistoryProjection(&releaseProjection)
+	conn, release, err := s.acquireUserUploadConn(ctx, actor.UserID)
 	if err != nil {
 		return nil, err
 	}
-	preparedRows, err := s.preparePushRowsForGeneration(selection, req.Rows)
+	defer release()
+	var response *OneShotPushResponse
+	err = runRetryableOwnedTransaction(ctx, conn, func(tx pgx.Tx) error {
+		response = nil
+		admission, err := s.admitPushOperation(ctx, tx, actor, proof, tuple, ScopeTransactionClientPush)
+		if err != nil {
+			return err
+		}
+		view, err := s.resolveRequestGeneration(ctx, actor, proof)
+		if err != nil {
+			return err
+		}
+		selection, err := selectionFromResolvedGeneration(proof, view)
+		if err != nil {
+			return err
+		}
+		prepared, err := s.validatePushRequest(selection, req)
+		if err != nil {
+			return err
+		}
+		if admission.retained != nil {
+			response = &OneShotPushResponse{RetainedPushOutcome: admission.retained}
+			return nil
+		}
+		response, err = s.executeNewPushOutcome(ctx, tx, actor, proof, req, selection, admission.userPK, prepared)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	recomputedRequestHash, err := computeGenerationPinnedPushRequestHash(proof, req.Rows)
+	transferHistoryProjectionForHTTP(ctx, &response.historyProjectionRelease, &releaseProjection, &releaseOperation)
+	return response, nil
+}
+func pushOperationRequest(req *OneShotPushRequest) PushOutcomeResolveRequest {
+	var token *string
+	if req.InitializationID != "" {
+		value := req.InitializationID
+		token = &value
+	}
+	return PushOutcomeResolveRequest{SourceBundleID: req.SourceBundleID, CanonicalRequestHash: req.CanonicalRequestHash, InitializationID: token}
+}
+func committedPushEffect(generation SchemaGenerationCapabilities, bundle *Bundle) (*CommittedPushEffect, error) {
+	rows := make([]PushRequestRow, 0, len(bundle.Rows))
+	for _, row := range bundle.Rows {
+		rows = append(rows, PushRequestRow{Schema: row.Schema, Table: row.Table, Key: row.Key, Op: row.Op, BaseRowVersion: row.RowVersion, Payload: row.Payload})
+	}
+	groups, err := CompactGroupsForRows(generation, rows)
 	if err != nil {
 		return nil, err
 	}
-	if recomputedRequestHash != req.CanonicalRequestHash {
+	return &CommittedPushEffect{BundleSeq: bundle.BundleSeq, BundleHash: bundle.BundleHash, RowCount: bundle.RowCount, Rows: groups}, nil
+}
+
+// validatePushRequest checks immutable logical input on both new requests and
+// replays. It does not inspect business rows or rerun mutable admission.
+func (s *SyncService) validatePushRequest(selection generationSelection, req *OneShotPushRequest) ([]pushPreparedRow, error) {
+	if len(req.Rows) == 0 || len(req.Rows) > s.config.MaxRowsPerBundle {
+		return nil, &PushInvalidError{Message: "push request row count exceeds bounds"}
+	}
+	prepared, err := s.preparePushRowsForGeneration(selection, req.Rows)
+	if err != nil {
+		return nil, err
+	}
+	hash, err := computeGenerationPinnedPushRequestHash(selection.proof, req.Rows)
+	if err != nil {
+		return nil, err
+	}
+	if hash != req.CanonicalRequestHash {
 		return nil, &PushInvalidError{Message: "canonical_request_hash does not match push rows"}
 	}
 	for _, row := range req.Rows {
-		rowBytes, sizeErr := ExpandedRowDecodedBytes(row)
-		if sizeErr != nil {
-			return nil, &PushInvalidError{Message: sizeErr.Error()}
+		size, err := ExpandedRowDecodedBytes(row)
+		if err != nil {
+			return nil, &PushInvalidError{Message: err.Error()}
 		}
-		if rowBytes > s.maxBytesPerSnapshotRow() {
+		if size > s.maxBytesPerSnapshotRow() {
 			return nil, &PushInvalidError{Message: "push row exceeds max_row_decoded_bytes"}
 		}
 	}
-	requestBytes, err := compactPushRequestDecodedBytes(generationDescriptor(view.contract), *req)
+	size, err := compactPushRequestDecodedBytes(generationDescriptor(selection.view.contract), *req)
 	if err != nil {
 		return nil, &PushInvalidError{Message: err.Error()}
 	}
-	if requestBytes > int64(s.config.MaxBytesPerBundle)+historyEnvelopeAllowance {
+	if size > int64(s.config.MaxBytesPerBundle)+historyEnvelopeAllowance {
 		return nil, &PushInvalidError{Message: "push request exceeds max_push_decoded_bytes"}
 	}
-
-	var releaseProjection func()
-	defer releaseHistoryProjection(&releaseProjection)
-	conn, releaseConn, err := s.acquireUserUploadConn(ctx, actor.UserID)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseConn()
-
-	var resp *OneShotPushResponse
-	err = runRetryableOwnedTransaction(ctx, conn, func(tx pgx.Tx) error {
-		releaseHistoryProjection(&releaseProjection)
-		resp = nil
-		if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, Kind: ScopeTransactionClientPush, SourceID: actor.SourceID}); err != nil {
-			return err
-		}
-		if err := s.configureUploadTx(ctx, tx); err != nil {
-			return err
-		}
-		var bindingUserPK int64
-		if err := tx.QueryRow(ctx, `SELECT user_pk FROM sync.user_state WHERE user_id=$1`, actor.UserID).Scan(&bindingUserPK); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return sourceGenerationError(SourceGenerationUnbound, proof.ID, 0, "", "source has not connected")
-			}
-			return fmt.Errorf("load source binding user: %w", err)
-		}
-		if _, err := requireExactSourceGenerationBindingStateInTx(ctx, tx, bindingUserPK, actor.SourceID, proof, false); err != nil {
-			return err
-		}
-		releaseProjection, err = s.acquireHistoryProjection(ctx)
-		if err != nil {
-			return err
-		}
-		replay, err := s.replayOneShotPush(ctx, tx, bindingUserPK, actor, selection, req)
-		if err != nil {
-			return err
-		}
-		if replay != nil {
-			resp = replay
-			return nil
-		}
-		releaseHistoryProjection(&releaseProjection)
-
-		// Only a genuinely new source tuple enters mutable admission. Locking,
-		// current lifecycle checks, lease expiry, and sequence mutation all stay
-		// below the committed-history gate.
-		if err := tx.QueryRow(ctx, `SELECT user_pk FROM sync.user_state WHERE user_id=$1 FOR UPDATE`, actor.UserID).Scan(&bindingUserPK); err != nil {
-			return fmt.Errorf("lock source binding user: %w", err)
-		}
-		sourceState, err := requireExactSourceGenerationBindingStateInTx(ctx, tx, bindingUserPK, actor.SourceID, proof, true)
-		if err != nil {
-			return err
-		}
-		if req.SourceBundleID <= sourceState.MaxCommittedSourceBundleID {
-			return &SourceTupleHistoryPrunedError{UserID: actor.UserID, SourceID: actor.SourceID, SourceBundleID: req.SourceBundleID, MaxCommittedSourceBundleIDHint: sourceState.MaxCommittedSourceBundleID}
-		}
-		if sourceState.State == sourceStateRetired {
-			return &SourceRetiredError{UserID: actor.UserID, SourceID: actor.SourceID, ReplacedBySourceID: sourceState.ReplacedBySourceID}
-		}
-		if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
-			return err
-		}
-		scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
-		if err != nil {
-			return err
-		}
-		scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
-		if err != nil {
-			return err
-		}
-
-		initializationID := ""
-		switch scopeState.State {
-		case scopeStateUninitialized:
-			if req.InitializationID != "" {
-				return &InitializationExpiredError{Message: "initialization lease is no longer active"}
-			}
-			return &ScopeUninitializedError{UserID: actor.UserID}
-		case scopeStateInitializing:
-			if req.InitializationID == "" {
-				return &PushInvalidError{Message: "initialization_id is required while the scope is initializing"}
-			}
-			refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
-			leasedState, err := requireActiveInitializationLease(ctx, tx, actor.UserID, actor.SourceID, req.InitializationID, refreshUntil)
-			if err != nil {
-				return err
-			}
-			initializationID = leasedState.InitializationID
-		case scopeStateInitialized:
-			if req.InitializationID != "" {
-				return &PushInvalidError{Message: "initialization_id must be absent once the scope is initialized"}
-			}
-		default:
-			return fmt.Errorf("unexpected scope state %q", scopeState.State)
-		}
-		releaseProjection, err = s.acquireHistoryProjection(ctx)
-		if err != nil {
-			return err
-		}
-
-		expectedSourceBundleID := sourceState.MaxCommittedSourceBundleID + 1
-		switch {
-		case req.SourceBundleID < expectedSourceBundleID:
-			return &SourceTupleHistoryPrunedError{UserID: actor.UserID, SourceID: actor.SourceID, SourceBundleID: req.SourceBundleID, MaxCommittedSourceBundleIDHint: sourceState.MaxCommittedSourceBundleID}
-		case req.SourceBundleID > expectedSourceBundleID:
-			return &SourceSequenceOutOfOrderError{UserID: actor.UserID, SourceID: actor.SourceID, Expected: expectedSourceBundleID, Actual: req.SourceBundleID}
-		}
-
-		if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
-			return fmt.Errorf("defer push constraints: %w", err)
-		}
-		if initializationID != "" {
-			if err := ensureUserStateBaselineWithExec(ctx, tx, actor.UserID); err != nil {
-				return err
-			}
-		} else if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
-			return err
-		}
-		if err := preflightPushPayloadDestinations(ctx, tx, preparedRows); err != nil {
-			return err
-		}
-		if err := setBundleTxContext(ctx, tx, bundleTxContext{UserID: actor.UserID, UserPK: scopeState.UserPK, SourceID: actor.SourceID, SourceBundleID: req.SourceBundleID, InitializationID: initializationID}); err != nil {
-			return err
-		}
-		rowStates, err := loadRowStateSnapshots(ctx, tx, scopeState.UserPK, preparedRows)
-		if err != nil {
-			return err
-		}
-		for i, row := range preparedRows {
-			var state *rowStateSnapshot
-			if rowStates[i].found {
-				state = &rowStates[i].rowStateSnapshot
-			}
-			if err := s.validatePushRowConflictForGeneration(ctx, tx, selection, actor.UserID, row, state); err != nil {
-				return err
-			}
-		}
-		for _, group := range batchPreparedPushRows(preparedRows) {
-			if err := s.applyPreparedPushRowBatchForGeneration(ctx, tx, selection, actor.UserID, group); err != nil {
-				return err
-			}
-		}
-		if err := finishDeferredBundleEffects(ctx, tx); err != nil {
-			return err
-		}
-		plannedRowCount := int64(len(preparedRows))
-		bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, scopeState.UserPK, BundleSource{SourceID: actor.SourceID, SourceBundleID: req.SourceBundleID, PlannedRowCount: &plannedRowCount, CanonicalRequestHash: req.CanonicalRequestHash})
-		if err != nil {
-			return err
-		}
-		if bundle == nil {
-			return &PushEffectCoverageError{}
-		}
-		projected, err := s.projectCommittedBundle(selection, bundle)
-		if err != nil {
-			return err
-		}
-		if err := requireCompletePushEffectCoverage(preparedRows, projected); err != nil {
-			return err
-		}
-		if projected.RowCount <= 0 {
-			return &PushEffectCoverageError{}
-		}
-		pushBytes, err := compactPushResponseDecodedBytes(generationDescriptor(view.contract), projected)
-		if err != nil {
-			return projectionError(BundleProjectionTooLarge, "push", "authoritative push response cannot be represented")
-		}
-		pullBytes, err := compactPullResponseDecodedBytes(generationDescriptor(view.contract), projected.BundleSeq, []Bundle{*projected}, false)
-		if err != nil || pushBytes > int64(s.config.MaxBytesPerBundle)+historyEnvelopeAllowance || pullBytes > s.config.MaxBytesPerPullResponse {
-			return projectionError(BundleProjectionTooLarge, "push", "authoritative bundle cannot be represented within admitted response limits")
-		}
-		if err := activateSourceState(ctx, tx, scopeState.UserPK, scopeState.UserID, actor.SourceID, req.SourceBundleID); err != nil {
-			return err
-		}
-		if err := s.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
-			return err
-		}
-		if initializationID != "" {
-			if err := transitionScopeToInitialized(ctx, tx, actor.UserID, actor.SourceID); err != nil {
-				return err
-			}
-		}
-		resp = &OneShotPushResponse{Bundle: projected}
-		return nil
-	})
-	if err != nil {
-		var conflictErr *PushConflictError
-		if errors.As(err, &conflictErr) {
-			transferHistoryProjectionForHTTP(ctx, &conflictErr.historyProjectionRelease, &releaseProjection, &releaseOperation)
-		}
-		return nil, err
-	}
-	transferHistoryProjectionForHTTP(ctx, &resp.historyProjectionRelease, &releaseProjection, &releaseOperation)
-	return resp, nil
+	return prepared, nil
 }
-
-func (s *SyncService) replayOneShotPush(ctx context.Context, tx pgx.Tx, userPK int64, actor Actor, selection generationSelection, req *OneShotPushRequest) (*OneShotPushResponse, error) {
-	meta, err := loadCommittedPushMetadataBySourceTuple(ctx, tx, userPK, actor.SourceID, req.SourceBundleID)
-	if err != nil || meta == nil {
-		return nil, err
-	}
-	if meta.CanonicalRequestHash != req.CanonicalRequestHash {
-		return nil, &PushReplayMismatchError{}
-	}
-	if meta.PlannedRowCount == nil || *meta.PlannedRowCount != int64(len(req.Rows)) {
-		return nil, &CommittedPushStateError{Code: CommittedPushStateCorrupt, Message: "committed source tuple row count is inconsistent"}
-	}
-	canonical, err := s.loadCommittedBundle(ctx, tx, actor.UserID, meta.BundleSeq)
+func (s *SyncService) applyPushBusiness(ctx context.Context, tx pgx.Tx, actor Actor, selection generationSelection, req *OneShotPushRequest, preparedRows []pushPreparedRow) (*Bundle, error) {
+	scopeState, initializationID, err := s.admitPushInitialization(ctx, tx, actor, req)
 	if err != nil {
 		return nil, err
 	}
-	projected, err := s.projectCommittedBundle(selection, canonical)
+	if err := preflightPushPayloadDestinations(ctx, tx, preparedRows); err != nil {
+		return nil, err
+	}
+	if err := setBundleTxContext(ctx, tx, bundleTxContext{UserID: actor.UserID, UserPK: scopeState.UserPK, SourceID: actor.SourceID, SourceBundleID: req.SourceBundleID, InitializationID: initializationID}); err != nil {
+		return nil, err
+	}
+	rowStates, err := loadRowStateSnapshots(ctx, tx, scopeState.UserPK, preparedRows)
 	if err != nil {
+		return nil, err
+	}
+	for i, row := range preparedRows {
+		var state *rowStateSnapshot
+		if rowStates[i].found {
+			state = &rowStates[i].rowStateSnapshot
+		}
+		if err := s.validatePushRowConflictForGeneration(ctx, tx, selection, actor.UserID, row, state); err != nil {
+			return nil, err
+		}
+	}
+	for _, group := range batchPreparedPushRows(preparedRows) {
+		if err := s.applyPreparedPushRowBatchForGeneration(ctx, tx, selection, actor.UserID, group); err != nil {
+			return nil, err
+		}
+	}
+	if err := finishDeferredBundleEffects(ctx, tx); err != nil {
+		return nil, err
+	}
+	plannedRowCount := int64(len(preparedRows))
+	bundle, err := s.finalizeCapturedBundle(ctx, tx, actor, scopeState.UserPK, BundleSource{SourceID: actor.SourceID, SourceBundleID: req.SourceBundleID, PlannedRowCount: &plannedRowCount, CanonicalRequestHash: req.CanonicalRequestHash})
+	if err != nil {
+		return nil, err
+	}
+	if bundle == nil {
+		return nil, &PushEffectCoverageError{}
+	}
+	projected, err := s.projectCommittedBundle(selection, bundle)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireCompletePushEffectCoverage(preparedRows, projected); err != nil {
 		return nil, err
 	}
 	if projected.RowCount <= 0 {
-		return nil, projectionError(GenerationProjectionIntegrityError, "push_replay", "committed push projection is empty")
+		return nil, &PushEffectCoverageError{}
 	}
-	return &OneShotPushResponse{Bundle: projected}, nil
+	pullBytes, err := compactPullResponseDecodedBytes(generationDescriptor(selection.view.contract), projected.BundleSeq, []Bundle{*projected}, false)
+	if err != nil || pullBytes > s.config.MaxBytesPerPullResponse {
+		return nil, projectionError(BundleProjectionTooLarge, "push", "authoritative bundle exceeds pull response limits")
+	}
+	if err := activateSourceState(ctx, tx, scopeState.UserPK, scopeState.UserID, actor.SourceID, req.SourceBundleID); err != nil {
+		return nil, err
+	}
+	if err := s.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
+		return nil, err
+	}
+	if initializationID != "" {
+		if err := transitionScopeToInitialized(ctx, tx, actor.UserID, actor.SourceID); err != nil {
+			return nil, err
+		}
+	}
+	return projected, nil
 }
 
 func (s *SyncService) preparePushRowsPreservingInput(rows []PushRequestRow) ([]pushPreparedRow, error) {
@@ -1085,4 +979,94 @@ func (s *SyncService) loadCommittedBundle(ctx context.Context, tx pgx.Tx, userID
 		return nil, projectionError(GenerationProjectionIntegrityError, "history", "canonical bundle integrity check failed")
 	}
 	return &bundle, nil
+}
+
+func (s *SyncService) executeNewPushOutcome(ctx context.Context, tx pgx.Tx, actor Actor, proof SchemaGenerationProof, req *OneShotPushRequest, selection generationSelection, userPK int64, prepared []pushPreparedRow) (*OneShotPushResponse, error) {
+	if _, err := tx.Exec(ctx, `SAVEPOINT push_business`); err != nil {
+		return nil, err
+	}
+	bundle, businessErr := s.applyPushBusiness(ctx, tx, actor, selection, req, prepared)
+	outcome := newPushOutcome(actor, proof, pushOperationRequest(req), "committed")
+	if businessErr != nil {
+		rejection := s.terminalPushRejection(businessErr)
+		if rejection == nil {
+			var limit *GenerationProjectionError
+			if errors.As(businessErr, &limit) && (limit.Code == BundleLimitExceeded || limit.Code == BundleProjectionTooLarge) {
+				return nil, outcomeError("push_outcome_too_large")
+			}
+			return nil, businessErr
+		}
+		if err := rollbackPushBusiness(ctx, tx); err != nil {
+			return nil, err
+		}
+		outcome.Status = "rejected"
+		outcome.Rejection = rejection
+	} else {
+		var err error
+		outcome.Committed, err = committedPushEffect(generationDescriptor(selection.view.contract), bundle)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `RELEASE SAVEPOINT push_business`); err != nil {
+			return nil, err
+		}
+	}
+	retained, err := s.encodePushOutcome(outcome, selection.view)
+	if err != nil {
+		return nil, err
+	}
+	if err := persistPushOutcome(ctx, tx, userPK, retained); err != nil {
+		return nil, err
+	}
+	return &OneShotPushResponse{Bundle: bundle, RetainedPushOutcome: retained}, nil
+}
+
+func (s *SyncService) admitPushInitialization(ctx context.Context, tx pgx.Tx, actor Actor, req *OneShotPushRequest) (*scopeStateRow, string, error) {
+	if err := ensureScopeStateExistsWithExec(ctx, tx, actor.UserID); err != nil {
+		return nil, "", err
+	}
+	scopeState, err := loadScopeStateForUpdate(ctx, tx, actor.UserID)
+	if err != nil {
+		return nil, "", err
+	}
+	scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
+	if err != nil {
+		return nil, "", err
+	}
+
+	initializationID := ""
+	switch scopeState.State {
+	case scopeStateUninitialized:
+		if req.InitializationID != "" {
+			return nil, "", &InitializationExpiredError{Message: "initialization lease is no longer active"}
+		}
+		return nil, "", &ScopeUninitializedError{UserID: actor.UserID}
+	case scopeStateInitializing:
+		if req.InitializationID == "" {
+			return nil, "", &PushInvalidError{Message: "initialization_id is required while the scope is initializing"}
+		}
+		refreshUntil := time.Now().UTC().Add(s.initializationLeaseTTL())
+		leasedState, err := requireActiveInitializationLease(ctx, tx, actor.UserID, actor.SourceID, req.InitializationID, refreshUntil)
+		if err != nil {
+			return nil, "", err
+		}
+		initializationID = leasedState.InitializationID
+	case scopeStateInitialized:
+		if req.InitializationID != "" {
+			return nil, "", &PushInvalidError{Message: "initialization_id must be absent once the scope is initialized"}
+		}
+	default:
+		return nil, "", fmt.Errorf("unexpected scope state %q", scopeState.State)
+	}
+	if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
+		return nil, "", fmt.Errorf("defer push constraints: %w", err)
+	}
+	if initializationID != "" {
+		if err := ensureUserStateBaselineWithExec(ctx, tx, actor.UserID); err != nil {
+			return nil, "", err
+		}
+	} else if err := ensureUserStatePresent(ctx, tx, actor.UserID); err != nil {
+		return nil, "", err
+	}
+	return scopeState, initializationID, nil
 }

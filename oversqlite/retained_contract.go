@@ -29,7 +29,7 @@ func decodeDiscoveredContract(raw []byte, selected oversync.SchemaGenerationID) 
 	if _, err := requiredContractFields(root["limits"],
 		"max_push_rows", "max_push_decoded_bytes", "max_pull_bundles", "max_pull_decoded_bytes",
 		"max_snapshot_rows_per_chunk", "max_snapshot_decoded_bytes_per_chunk", "max_snapshot_rows",
-		"max_snapshot_logical_bytes", "max_row_decoded_bytes"); err != nil {
+		"max_snapshot_logical_bytes", "max_row_decoded_bytes", "max_push_outcome_decoded_bytes"); err != nil {
 		return nil, err
 	}
 	var tables []json.RawMessage
@@ -62,11 +62,14 @@ func decodeDiscoveredContract(raw []byte, selected oversync.SchemaGenerationID) 
 		int64(response.Limits.MaxPushRows), response.Limits.MaxPushDecodedBytes, int64(response.Limits.MaxPullBundles),
 		response.Limits.MaxPullDecodedBytes, int64(response.Limits.MaxSnapshotRowsPerChunk),
 		response.Limits.MaxSnapshotDecodedBytesPerChunk, response.Limits.MaxSnapshotRows,
-		response.Limits.MaxSnapshotLogicalBytes, response.Limits.MaxRowDecodedBytes,
+		response.Limits.MaxSnapshotLogicalBytes, response.Limits.MaxRowDecodedBytes, response.Limits.MaxPushOutcomeDecodedBytes,
 	} {
 		if value < 1 {
 			return nil, fmt.Errorf("discovery limits must be positive")
 		}
+	}
+	if response.Limits.MaxPushOutcomeDecodedBytes < 8194 || response.Limits.MaxPushOutcomeDecodedBytes > 64*1024*1024+8192 {
+		return nil, fmt.Errorf("invalid outcome ceiling")
 	}
 	return &response, nil
 }

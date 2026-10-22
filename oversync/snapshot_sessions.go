@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
@@ -102,6 +103,9 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 	if err := validateSchemaGenerationProof(proof); err != nil {
 		return nil, err
 	}
+	if req != nil && req.Recovery != nil && (req.SourceReplacement != nil || req.Recovery.MinimumBundleSeq < 0) {
+		return nil, &SnapshotSessionInvalidError{Message: "invalid recovery snapshot request"}
+	}
 	done, err := s.beginOperation(ctx)
 	if err != nil {
 		return nil, err
@@ -172,6 +176,14 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 			return err
 		}
 
+		if req != nil && req.Recovery != nil {
+			if err := requireNoPendingPushOutcome(ctx, tx, retainedState.UserPK, effectiveSourceID); err != nil {
+				return err
+			}
+			if req.Recovery.MinimumBundleSeq > retainedState.highestBundleSeq() {
+				return &PushOutcomeError{Code: "recovery_floor_ahead"}
+			}
+		}
 		snapshotBundleSeq := retainedState.highestBundleSeq()
 		snapshotID = uuid.NewString()
 		var expiresAt time.Time
@@ -201,7 +213,20 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 				return err
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE sync.snapshot_sessions SET row_count=$2, byte_count=$3 WHERE snapshot_id=$1::uuid`, snapshotID, rowCount, byteCount); err != nil {
+		var recovery *SnapshotRecovery
+		if req != nil && req.Recovery != nil {
+			value := *req.Recovery
+			recovery = &value
+		}
+		snapshotHash, err := s.sealSnapshotRows(ctx, tx, selection, effectiveSourceID, snapshotID, snapshotBundleSeq, recovery, rowCount, byteCount)
+		if err != nil {
+			return err
+		}
+		var floor *int64
+		if recovery != nil {
+			floor = &recovery.MinimumBundleSeq
+		}
+		if _, err := tx.Exec(ctx, `UPDATE sync.snapshot_sessions SET row_count=$2, byte_count=$3,snapshot_hash=$4,recovery_minimum_bundle_seq=$5 WHERE snapshot_id=$1::uuid`, snapshotID, rowCount, byteCount, snapshotHash, floor); err != nil {
 			return fmt.Errorf("finalize snapshot session counts: %w", err)
 		}
 
@@ -211,6 +236,7 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 			RowCount:          rowCount,
 			ByteCount:         byteCount,
 			ExpiresAt:         expiresAt.Format(time.RFC3339Nano),
+			SnapshotHash:      snapshotHash, Recovery: recovery,
 		}
 		return nil
 	})
@@ -332,6 +358,9 @@ func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx
 	if err != nil {
 		return "", err
 	}
+	if err := requireNoPendingPushOutcome(ctx, tx, userPK, replacement.PreviousSourceID); err != nil {
+		return "", err
+	}
 	previousState := states[replacement.PreviousSourceID]
 	newState := states[replacement.NewSourceID]
 	previousBinding := bindings[replacement.PreviousSourceID]
@@ -349,6 +378,9 @@ func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx
 		return "", sourceGenerationError(SourceGenerationStateCorrupt, proof.ID, 0, "source_generation_binding", "source generation state is corrupt")
 	}
 	if err := validateBindingRow(previousBinding, proof.ID); err != nil {
+		return "", err
+	}
+	if err := requireReplacementClientProgress(ctx, tx, userPK, replacement.PreviousSourceID, proof.ID); err != nil {
 		return "", err
 	}
 	if proof.ID < previousBinding.generationID {
@@ -376,6 +408,9 @@ func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx
 		if err := requireBindingPair(newBinding, proof); err != nil {
 			return "", err
 		}
+		if err := requireReplacementClientProgress(ctx, tx, userPK, replacement.NewSourceID, proof.ID); err != nil {
+			return "", err
+		}
 	} else {
 		if previousState.State != sourceStateActive && previousState.State != sourceStateReserved {
 			return "", &SourceReplacementInvalidError{Message: "source replacement is invalid"}
@@ -399,6 +434,20 @@ func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx
 	}
 
 	return replacement.NewSourceID, nil
+}
+
+// The source and binding have already been locked and validated. Missing
+// ownership evidence must not be replaced by a fresh successor or accepted on
+// replay, even when no terminal outcome remains.
+func requireReplacementClientProgress(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string, generationID SchemaGenerationID) error {
+	progress, err := loadPushProgress(ctx, tx, userPK, sourceID)
+	if err != nil {
+		return err
+	}
+	if !progress.present {
+		return sourceGenerationError(SourceGenerationStateCorrupt, generationID, 0, "source_id", "client source ownership is missing")
+	}
+	return nil
 }
 
 func lockReplacementSourceStates(ctx context.Context, tx pgx.Tx, userPK int64, sourceA, sourceB string) (map[string]*sourceStateRow, error) {
@@ -1014,6 +1063,10 @@ func validateSnapshotSessionAccessWithLock(ctx context.Context, tx pgx.Tx, actor
 	if err := tx.QueryRow(ctx, query, snapshotID).Scan(&sessionUserID, &sessionUserPK, &sessionSourceID, &storedGenerationID, &storedFingerprint, &snapshotBundleSeq, &expired); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, 0, &SnapshotSessionNotFoundError{SnapshotID: snapshotID}
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+			return 0, 0, &SnapshotChunkInvalidError{Message: "snapshot_id must be a UUID"}
 		}
 		return 0, 0, fmt.Errorf("query snapshot session: %w", err)
 	}

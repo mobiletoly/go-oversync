@@ -10,8 +10,8 @@ import (
 type snapshotPendingWorkMode string
 
 const (
-	snapshotModeClearAll               snapshotPendingWorkMode = "CLEAR_ALL"
-	snapshotModePreserveSourceRecovery snapshotPendingWorkMode = "PRESERVE_SOURCE_RECOVERY"
+	snapshotModeClean          snapshotPendingWorkMode = "CLEAN"
+	snapshotModeSourceRecovery snapshotPendingWorkMode = "SOURCE_RECOVERY"
 )
 
 type outboxFingerprint struct {
@@ -44,6 +44,8 @@ type snapshotApplyGuard struct {
 	lifecycle          snapshotLifecycleFingerprint
 	remoteReplace      bool
 	remoteTargetUserID string
+	context            string
+	automatic          *automaticRecoveryPin
 }
 
 type SnapshotFinalApplyGateError struct {
@@ -65,10 +67,10 @@ func (e *SnapshotFinalApplyGateError) Unwrap() error {
 }
 
 func snapshotModeForOptions(options snapshotApplyOptions) snapshotPendingWorkMode {
-	if options.PreserveOutbox || options.ClearSourceRecovery {
-		return snapshotModePreserveSourceRecovery
+	if options.ClearSourceRecovery {
+		return snapshotModeSourceRecovery
 	}
-	return snapshotModeClearAll
+	return snapshotModeClean
 }
 
 func loadSnapshotGuardState(ctx context.Context, tx sqliteTransaction, mode snapshotPendingWorkMode) (*snapshotApplyGuard, error) {
@@ -103,7 +105,7 @@ func validateSnapshotGuardMode(guard *snapshotApplyGuard) error {
 		return &DirtyStateRejectedError{DirtyCount: int(guard.dirtyRows)}
 	}
 	switch guard.mode {
-	case snapshotModeClearAll:
+	case snapshotModeClean:
 		if guard.outbox.State != outboxStateNone || guard.outbox.ActualRowCount != 0 {
 			return &PendingPushReplayError{OutboundCount: int(guard.outbox.ActualRowCount)}
 		}
@@ -116,21 +118,12 @@ func validateSnapshotGuardMode(guard *snapshotApplyGuard) error {
 		if guard.lifecycle.BindingState != attachmentBindingAttached || !guard.lifecycle.RebuildRequired || guard.lifecycle.OperationKind != operationKindNone {
 			return &RebuildRequiredError{}
 		}
-	case snapshotModePreserveSourceRecovery:
+	case snapshotModeSourceRecovery:
 		if guard.lifecycle.BindingState != attachmentBindingAttached || !guard.lifecycle.RebuildRequired || guard.lifecycle.OperationKind != operationKindSourceRecovery {
 			return &SourceRecoveryRequiredError{Code: SourceRecoverySequenceChanged, Message: "source-recovery lifecycle guard is not active"}
 		}
-		switch guard.outbox.State {
-		case outboxStateNone:
-			if guard.outbox.ActualRowCount != 0 {
-				return &PendingPushReplayError{OutboundCount: int(guard.outbox.ActualRowCount)}
-			}
-		case outboxStatePrepared:
-			if guard.outbox.SourceID == "" || guard.outbox.SourceBundleID <= 0 || guard.outbox.CanonicalRequestHash == "" || guard.outbox.RowCount <= 0 || guard.outbox.ActualRowCount != guard.outbox.RowCount {
-				return &PendingPushReplayError{OutboundCount: int(guard.outbox.ActualRowCount)}
-			}
-		default:
-			return &SourceRecoveryRequiredError{Code: SourceRecoverySequenceChanged, Message: fmt.Sprintf("outbox state %q cannot be preserved as source recovery", guard.outbox.State)}
+		if guard.outbox.State != outboxStateNone || guard.outbox.ActualRowCount != 0 {
+			return &PendingPushReplayError{OutboundCount: int(guard.outbox.ActualRowCount)}
 		}
 	default:
 		return fmt.Errorf("unsupported snapshot pending-work mode %q", guard.mode)
@@ -144,12 +137,25 @@ func (c *Client) pinSnapshotApplyGuard(ctx context.Context, options snapshotAppl
 		return nil, fmt.Errorf("failed to begin snapshot guard read transaction: %w", err)
 	}
 	defer tx.Rollback()
+	if err := requireNoUnresolvedUpload(ctx, tx); err != nil {
+		return nil, err
+	}
 	guard, err := loadSnapshotGuardState(ctx, tx, snapshotModeForOptions(options))
 	if err != nil {
 		return nil, err
 	}
 	guard.remoteReplace, guard.remoteTargetUserID = options.FinalizeRemoteReplace, options.RemoteTargetUserID
 	if err := validateSnapshotGuardMode(guard); err != nil {
+		return nil, err
+	}
+	if pin, ok := ctx.Value(automaticRecoveryKey{}).(automaticRecoveryPin); ok {
+		guard.automatic = &pin
+		if err = c.validateAutomaticPin(ctx, tx, pin); err != nil {
+			return nil, err
+		}
+	}
+	guard.context, err = c.snapshotContextGuard(ctx, tx)
+	if err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -165,6 +171,11 @@ func (c *Client) validateFinalSnapshotApplyGate(ctx context.Context, tx sqliteTr
 	if pinned == nil {
 		return fmt.Errorf("snapshot final apply gate is missing pinned state")
 	}
+	if pinned.automatic != nil {
+		if err := c.validateAutomaticPin(ctx, tx, *pinned.automatic); err != nil {
+			return err
+		}
+	}
 	current, err := loadSnapshotGuardState(ctx, tx, pinned.mode)
 	if err != nil {
 		return err
@@ -178,10 +189,20 @@ func (c *Client) validateFinalSnapshotApplyGate(ctx context.Context, tx sqliteTr
 	}
 	if !snapshotLifecycleEqual(current.lifecycle, pinned.lifecycle) {
 		cause := error(&RebuildRequiredError{})
-		if pinned.mode == snapshotModePreserveSourceRecovery {
+		if pinned.mode == snapshotModeSourceRecovery {
 			cause = &SourceRecoveryRequiredError{Code: SourceRecoverySequenceChanged, Message: "source-recovery lifecycle guard changed during snapshot transfer"}
 		}
 		return &SnapshotFinalApplyGateError{Mode: string(pinned.mode), Reason: "lifecycle guard changed", Cause: cause}
+	}
+	if err := requireNoUnresolvedUpload(ctx, tx); err != nil {
+		return &SnapshotFinalApplyGateError{Mode: string(pinned.mode), Reason: "pending upload or synchronized edit", Cause: err}
+	}
+	currentContext, err := c.snapshotContextGuard(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if currentContext != pinned.context {
+		return &SnapshotFinalApplyGateError{Mode: string(pinned.mode), Reason: "snapshot context or schema changed", Cause: &RebuildRequiredError{}}
 	}
 	if err := validateSnapshotGuardMode(current); err != nil {
 		return &SnapshotFinalApplyGateError{Mode: string(pinned.mode), Reason: "pending-work mode is no longer valid", Cause: err}

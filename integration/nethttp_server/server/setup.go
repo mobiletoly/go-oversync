@@ -493,6 +493,8 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	}
 	mux.Handle("POST /sync/connect", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointConnect, withSyncActor(connectHandler)), logger))
 	mux.Handle("POST /sync/push", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPush, withSyncActor(http.HandlerFunc(syncHandlers.HandlePush))), logger))
+	mux.Handle("POST /sync/push-outcomes/resolve", LoggingMiddleware(false, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushOutcomeResolve)), logger))
+	mux.Handle("POST /sync/push-outcomes/ack", LoggingMiddleware(false, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushOutcomeAck)), logger))
 	mux.Handle("GET /sync/pull", LoggingMiddleware(false, injectFailureMiddleware(injector, FailureEndpointPull, withSyncActor(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		syncHandlers.HandlePull(w, r)
 		logger.Info("🔥 PULL: Pull handler completed")
@@ -748,6 +750,7 @@ func BrowserTestCORSMiddleware(next http.Handler) http.Handler {
 			"Authorization",
 			"Content-Encoding",
 			"Content-Type",
+			oversync.ProtocolVersionHeader,
 			oversync.SourceIDHeader,
 			oversync.SchemaGenerationIDHeader,
 			oversync.SchemaGenerationFingerprintHeader,

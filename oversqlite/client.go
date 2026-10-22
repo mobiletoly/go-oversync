@@ -48,6 +48,7 @@ type Client struct {
 	syncWorkUsed              int64 // owned by writeMu; one allowance across all bundles in an invocation
 	readyAtomicUnitDispatched bool
 	logger                    *slog.Logger
+	recoveryControlMu         sync.Mutex // One bounded control reader/writer may join a yielded Sync.
 	writeMu                   sync.Mutex // Serialize write operations to prevent SQLite locking issues
 	pkByTable                 map[string]string
 	keyByTable                map[string][]string
@@ -196,6 +197,7 @@ var syncMetadataTableNames = []string{
 	"_sync_dirty_rows",
 	"_sync_snapshot_stage",
 	"_sync_outbox_bundle",
+	"_sync_upload_journal",
 	"_sync_outbox_rows",
 	"_sync_push_stage",
 	"_sync_push_plan", "_sync_push_nodes", "_sync_push_edges",
@@ -552,6 +554,7 @@ const (
 
 // Config holds configuration for the SQLite sync client
 type Config struct {
+	RecoveryMode                  RecoveryMode                          // Initial mode for a fresh coordinator; zero selects automatic_clean.
 	MaxSyncWorkspaceEntries       int64                                 // zero selects 131072
 	MaxSyncWorkspaceBytes         int64                                 // zero selects 256 MiB
 	MaxSyncWorkUnitsPerInvocation int64                                 // internal slice target; zero selects 1000000
@@ -704,6 +707,9 @@ func (c *Client) SetBeforePushCommitHook(hook func(context.Context) error) {
 func prepareClientConfiguration(config *Config) (*Config, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if config.RecoveryMode != "" && !validRecoveryMode(config.RecoveryMode) {
+		return nil, fmt.Errorf("invalid recovery mode %q", config.RecoveryMode)
 	}
 	config = cloneCoordinatorClientConfig(config)
 	if config.MaxSyncWorkspaceEntries < 0 || config.MaxSyncWorkspaceBytes < 0 || config.MaxSyncWorkUnitsPerInvocation < 0 {
@@ -965,6 +971,8 @@ func (c *Client) Close() error {
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.recoveryControlMu.Lock()
+	defer c.recoveryControlMu.Unlock()
 
 	if atomic.LoadUint32(&c.closed) == 1 {
 		return stopErr
@@ -1332,7 +1340,8 @@ func initializeDatabaseInTx(ctx context.Context, e syncMetadataExecutor) error {
 				schema_name              TEXT NOT NULL DEFAULT '',
 				last_bundle_seq_seen     INTEGER NOT NULL DEFAULT 0,
 				rebuild_required         INTEGER NOT NULL DEFAULT 0,
-				pending_initialization_id TEXT NOT NULL DEFAULT ''
+				pending_initialization_id TEXT NOT NULL DEFAULT '',
+                initialization_reconnect_required INTEGER NOT NULL DEFAULT 0 CHECK(initialization_reconnect_required IN (0,1))
 			)`,
 
 		`CREATE TABLE IF NOT EXISTS _sync_operation_state (
@@ -1344,6 +1353,8 @@ func initializeDatabaseInTx(ctx context.Context, e syncMetadataExecutor) error {
 				staged_snapshot_id   TEXT NOT NULL DEFAULT '',
 				snapshot_bundle_seq  INTEGER NOT NULL DEFAULT 0,
 				snapshot_row_count   INTEGER NOT NULL DEFAULT 0,
+                snapshot_transfer TEXT NOT NULL DEFAULT '',
+                recovery_state TEXT NOT NULL DEFAULT '',
                 workspace_context TEXT NOT NULL DEFAULT '',
                 reserved_entries INTEGER NOT NULL DEFAULT 0 CHECK(typeof(reserved_entries)='integer' AND reserved_entries>=0),
                 reserved_bytes INTEGER NOT NULL DEFAULT 0 CHECK(typeof(reserved_bytes)='integer' AND reserved_bytes>=0),
@@ -1408,13 +1419,14 @@ func initializeDatabaseInTx(ctx context.Context, e syncMetadataExecutor) error {
 		`CREATE TABLE IF NOT EXISTS _sync_outbox_bundle (
 				singleton_key           INTEGER NOT NULL PRIMARY KEY CHECK (singleton_key = 1),
 				canonical_json_contract TEXT NOT NULL CHECK (canonical_json_contract = 'jcs_uniform_numeric_strings_v1'),
-				state                   TEXT NOT NULL DEFAULT 'none' CHECK (state IN ('none', 'prepared')),
+				state                   TEXT NOT NULL DEFAULT 'none' CHECK (state IN ('none', 'prepared', 'rejected')),
 				source_id               TEXT NOT NULL DEFAULT '',
 				source_bundle_id        INTEGER NOT NULL DEFAULT 0,
 				canonical_request_hash  TEXT NOT NULL DEFAULT '',
 				row_count               INTEGER NOT NULL DEFAULT 0,
 				initialization_id       TEXT NOT NULL DEFAULT ''
 			)`,
+		uploadJournalDDL,
 
 		`CREATE TABLE IF NOT EXISTS _sync_outbox_rows (
 				source_bundle_id INTEGER NOT NULL,
@@ -1681,15 +1693,24 @@ func (c *Client) Sync(ctx context.Context) (report SyncReport, resultErr error) 
 	if err := c.ensureConnectedSessionLocked(ctx, "Sync()"); err != nil {
 		return SyncReport{}, err
 	}
-	if sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx); err != nil {
+	ctx = context.WithValue(ctx, syncInvocationKey{}, &syncInvocation{})
+	if err := c.acknowledgeUploadJournal(ctx); err != nil {
 		return SyncReport{}, err
-	} else if sourceRecoveryErr != nil {
-		return SyncReport{}, sourceRecoveryErr
+	}
+	frozen, err := c.frozenUploadMayResume(ctx)
+	if err != nil {
+		return SyncReport{}, err
+	}
+	if !frozen {
+		if sourceRecoveryErr, err := c.sourceRecoveryRequiredErrorLocked(ctx); err != nil {
+			return SyncReport{}, err
+		} else if sourceRecoveryErr != nil {
+			return SyncReport{}, sourceRecoveryErr
+		}
 	}
 	if err := c.validateProtocolGateLocked(ctx, "sync_discovery"); err != nil {
 		return SyncReport{}, err
 	}
-	ctx = context.WithValue(ctx, syncInvocationKey{}, &syncInvocation{})
 	defer func() { resultErr = c.withSyncErrorProgress(ctx, resultErr) }()
 	return c.syncLocked(ctx)
 }
@@ -1704,11 +1725,7 @@ func (c *Client) syncLocked(ctx context.Context) (SyncReport, error) {
 		if err := ctx.Err(); err != nil {
 			return SyncReport{}, err
 		}
-		dirty, err := c.pendingChangeCount(ctx)
-		if err != nil {
-			return SyncReport{}, err
-		}
-		outbound, err := c.pendingPushOutboundCount(ctx)
+		dirty, outbound, err := c.pendingPushWorkCounts(ctx)
 		if err != nil {
 			return SyncReport{}, err
 		}
@@ -1717,74 +1734,17 @@ func (c *Client) syncLocked(ctx context.Context) (SyncReport, error) {
 			return SyncReport{}, err
 		}
 		if dirty > 0 || outbound > 0 {
-			if atomic.LoadInt32(&c.uploadPaused) == 1 {
-				return SyncReport{}, c.incompleteSync(ctx, SyncIncompleteUploadsPaused)
-			}
-			before, err := c.pendingWorkIdentity(ctx)
-			if err != nil {
+			if err = c.syncUploadRound(ctx, recovering); err != nil {
 				return SyncReport{}, err
-			}
-			var push PushReport
-			if recovering {
-				push, err = c.pushPendingLockedWithRecovery(ctx, 0, true)
-			} else {
-				push, err = c.pushPendingLocked(ctx, 0)
-			}
-			if err != nil {
-				return SyncReport{}, err
-			}
-			if push.Outcome == PushOutcomeSkippedPaused {
-				return SyncReport{}, c.incompleteSync(ctx, SyncIncompleteUploadsPaused)
-			}
-			if push.Outcome == PushOutcomeNoChange {
-				remainingDirty, err := c.pendingChangeCount(ctx)
-				if err != nil {
-					return SyncReport{}, err
-				}
-				remainingOutbound, err := c.pendingPushOutboundCount(ctx)
-				if err != nil {
-					return SyncReport{}, err
-				}
-				if remainingDirty > 0 || remainingOutbound > 0 {
-					after, err := c.pendingWorkIdentity(ctx)
-					if err != nil {
-						return SyncReport{}, err
-					}
-					if before == after {
-						return SyncReport{}, c.incompleteSync(ctx, SyncIncompleteNoProgress)
-					}
-				}
 			}
 			continue
 		}
-
-		var remote RemoteSyncReport
-		if recovering {
-			var resumed bool
-			remote, resumed, err = c.resumeRequiredRecoveryLocked(ctx)
-			if !resumed && err == nil {
-				continue
-			}
-		} else {
-			remote, err = c.pullToStableLocked(ctx)
-		}
+		remote, retry, err := c.syncRemoteRound(ctx, recovering)
 		if err != nil {
-			var recoveryBlocked *CheckpointRecoveryBlockedError
-			if errors.As(err, &recoveryBlocked) && recoveryBlocked.Reason == CheckpointRecoveryBlockedPendingWork {
-				stillRecovering, stateErr := c.rebuildRequired(ctx)
-				if stateErr != nil {
-					return SyncReport{}, stateErr
-				}
-				if stillRecovering {
-					continue
-				}
-			}
-			var dirtyErr *DirtyStateRejectedError
-			var outboundErr *PendingPushReplayError
-			if errors.As(err, &dirtyErr) || errors.As(err, &outboundErr) {
-				continue
-			}
 			return SyncReport{}, err
+		}
+		if retry {
+			continue
 		}
 		if c.beforeFinalWorkReadHook != nil {
 			c.beforeFinalWorkReadHook()
@@ -1796,15 +1756,115 @@ func (c *Client) syncLocked(ctx context.Context) (SyncReport, error) {
 		if dirty > 0 || outbound > 0 {
 			continue
 		}
-		pushOutcome := invocation.pushOutcome()
-		if pushOutcome == PushOutcomeNoChange && atomic.LoadInt32(&c.uploadPaused) == 1 {
-			pushOutcome = PushOutcomeSkippedPaused
+		push := invocation.pushOutcome()
+		if push == PushOutcomeNoChange && atomic.LoadInt32(&c.uploadPaused) == 1 {
+			push = PushOutcomeSkippedPaused
 		}
-		return SyncReport{
-			PushOutcome: pushOutcome, RemoteOutcome: remote.Outcome,
-			Status: remote.Status, Restore: remote.Restore,
-		}, nil
+		return SyncReport{PushOutcome: push, RemoteOutcome: remote.Outcome, Status: remote.Status, Restore: remote.Restore}, nil
 	}
+}
+
+// The upload phase owns existing push-attempt, disposition and no-progress
+// rules. It finishes before clean baseline eligibility is considered.
+func (c *Client) syncUploadRound(ctx context.Context, recovering bool) error {
+	if atomic.LoadInt32(&c.uploadPaused) == 1 {
+		return c.incompleteSync(ctx, SyncIncompleteUploadsPaused)
+	}
+	before, err := c.pendingWorkIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	var push PushReport
+	if recovering {
+		push, err = c.pushPendingLockedWithRecovery(ctx, 0, true)
+	} else {
+		push, err = c.pushPendingLocked(ctx, 0)
+	}
+	if err != nil {
+		return err
+	}
+	if push.Outcome == PushOutcomeSkippedPaused {
+		return c.incompleteSync(ctx, SyncIncompleteUploadsPaused)
+	}
+	if push.Outcome != PushOutcomeNoChange {
+		return nil
+	}
+	dirty, outbound, err := c.pendingPushWorkCounts(ctx)
+	if err != nil {
+		return err
+	}
+	if dirty == 0 && outbound == 0 {
+		return nil
+	}
+	after, err := c.pendingWorkIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	if before == after {
+		return c.incompleteSync(ctx, SyncIncompleteNoProgress)
+	}
+	return nil
+}
+
+// Ordinary pull owns post-T events. A later snapshot summary supersedes an
+// earlier one, while a normal pull updates status without erasing completion.
+func (c *Client) syncRemoteRound(ctx context.Context, recovering bool) (RemoteSyncReport, bool, error) {
+	var remote RemoteSyncReport
+	var err error
+	if recovering {
+		var resumed bool
+		remote, resumed, err = c.resumeRequiredRecoveryLocked(ctx)
+		if !resumed && err == nil {
+			return remote, true, nil
+		}
+	} else {
+		remote, err = c.pullToStableLocked(ctx)
+	}
+	if err != nil {
+		retry, classificationErr := c.retryOrdinaryLocalWork(ctx, err)
+		if classificationErr != nil {
+			return remote, false, classificationErr
+		}
+		if retry {
+			return remote, true, nil
+		}
+		return remote, false, err
+	}
+	if remote.Outcome == RemoteSyncOutcomeAppliedSnapshot {
+		for {
+			following, pullErr := c.pullToStableLocked(ctx)
+			if pullErr != nil {
+				return remote, false, pullErr
+			}
+			remote.Status = following.Status
+			if following.Restore != nil {
+				remote.Restore = following.Restore
+			}
+			if following.Outcome != RemoteSyncOutcomeAppliedSnapshot {
+				break
+			}
+		}
+	}
+	return remote, false, nil
+}
+
+func (c *Client) retryOrdinaryLocalWork(ctx context.Context, cause error) (bool, error) {
+	recovery, err := c.readRecovery(ctx, c.db)
+	if err != nil {
+		return false, errors.Join(cause, err)
+	}
+	// A new write invalidating snapshot preparation is returned to the caller.
+	// Its intent cannot be consumed merely to make this attempt eligible again.
+	if recovery.Phase != "idle" && recovery.Phase != "completed" {
+		return false, nil
+	}
+	var blocked *CheckpointRecoveryBlockedError
+	if errors.As(cause, &blocked) && blocked.Reason == CheckpointRecoveryBlockedPendingWork {
+		return c.rebuildRequired(ctx)
+	}
+	var dirty *DirtyStateRejectedError
+	var outbound *PendingPushReplayError
+	return errors.As(cause, &dirty) || errors.As(cause, &outbound), nil
 }
 
 // Rebuild rebuilds the managed tables from the current server snapshot.
@@ -1815,6 +1875,12 @@ func (c *Client) Rebuild(ctx context.Context) (report RemoteSyncReport, resultEr
 	defer c.writeMu.Unlock()
 	ctx = context.WithValue(ctx, syncInvocationKey{}, &syncInvocation{})
 	defer func() { resultErr = c.withSyncErrorProgress(ctx, resultErr) }()
+	if err := requireNoUnresolvedUpload(ctx, c.db); err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if err := c.inspectSnapshotCapabilities(ctx); err != nil {
+		return RemoteSyncReport{}, err
+	}
 	if err := c.requireNoPendingConflict(ctx, c.db); err != nil {
 		return RemoteSyncReport{}, err
 	}

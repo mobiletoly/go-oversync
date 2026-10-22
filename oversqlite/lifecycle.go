@@ -95,10 +95,9 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 	if err := validateSourceID(c.sourceID); err != nil {
 		return AttachResult{}, err
 	}
-
 	state, err := c.openLocked(ctx)
-	var pendingRemoteReplaceErr *RemoteReplacePendingError
-	if err != nil && !errors.As(err, &pendingRemoteReplaceErr) {
+	var pendingRemote *RemoteReplacePendingError
+	if err != nil && !errors.As(err, &pendingRemote) {
 		return AttachResult{}, err
 	}
 	c.sourceID = state.SourceID
@@ -111,182 +110,132 @@ func (c *Client) connectLocked(ctx context.Context, userID string) (AttachResult
 			return AttachResult{}, err
 		}
 	}
-
 	if state.PendingTransitionKind == lifecycleTransitionRemote {
-		if strings.TrimSpace(state.PendingTargetScope) != userID || state.SourceID != c.sourceID {
-			return AttachResult{}, &AttachLocalStateConflictError{
-				Reason: "pending remote_replace belongs to a different scope or source",
-			}
-		}
-		restore, err := c.finalizeRemoteReplaceLocked(ctx, state)
-		if err != nil {
-			return AttachResult{}, err
-		}
-		c.pendingInitializationID = ""
-		c.UserID = userID
-		c.sessionConnected = true
-		status, err := c.syncStatusLocked(ctx)
-		if err != nil {
-			return AttachResult{}, err
-		}
-		return AttachResult{
-			Status:     AttachStatusConnected,
-			Outcome:    AttachOutcomeUsedRemote,
-			SyncStatus: status,
-			Restore:    restore,
-		}, nil
+		return c.resumeRemoteAttachLocked(ctx, state, userID)
 	}
-
+	reconnect, err := c.initializationReconnectRequired(ctx)
+	if err != nil {
+		return AttachResult{}, err
+	}
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) == userID && state.PendingTransitionKind == lifecycleTransitionNone {
-		hasAttachedState, err := c.hasAttachedClientStateLocked(ctx, userID, c.sourceID)
+		attached, err := c.hasAttachedClientStateLocked(ctx, userID, c.sourceID)
 		if err != nil {
 			return AttachResult{}, err
 		}
-		if hasAttachedState {
-			c.UserID = userID
-			c.pendingInitializationID = state.PendingInitializationID
-			c.sessionConnected = true
-			status, err := c.syncStatusLocked(ctx)
-			if err != nil {
-				return AttachResult{}, err
-			}
-			return AttachResult{
-				Status:     AttachStatusConnected,
-				Outcome:    AttachOutcomeResumedAttached,
-				SyncStatus: status,
-			}, nil
+		if attached && !reconnect {
+			return c.connectedAttachResultLocked(ctx, userID, state.PendingInitializationID, AttachOutcomeResumedAttached, nil)
 		}
 	}
 	if state.BindingState == lifecycleBindingAttached && strings.TrimSpace(state.BindingScope) != "" && strings.TrimSpace(state.BindingScope) != userID {
-		return AttachResult{}, &AttachBindingConflictError{
-			AttachedUserID:  state.BindingScope,
-			RequestedUserID: userID,
+		return AttachResult{}, &AttachBindingConflictError{AttachedUserID: state.BindingScope, RequestedUserID: userID}
+	}
+	if reconnect {
+		if err := c.requireReleasedInitializationUpload(ctx); err != nil {
+			return AttachResult{}, err
 		}
 	}
-	hasPendingRows, err := c.pendingChangeCount(ctx)
+	pending, err := c.pendingChangeCount(ctx)
 	if err != nil {
 		return AttachResult{}, err
 	}
-	resp, err := c.connectRequest(ctx, userID, c.sourceID, hasPendingRows > 0)
+	response, err := c.connectRequest(ctx, userID, c.sourceID, pending > 0)
 	if err != nil {
 		return AttachResult{}, err
 	}
-
-	switch resp.Resolution {
-	case "retry_later":
-		retryAfter := time.Duration(resp.RetryAfterSec) * time.Second
-		c.sessionConnected = false
-		return AttachResult{Status: AttachStatusRetryLater, RetryAfter: retryAfter}, nil
-	case "initialize_empty":
-		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.sourceID); err != nil {
-			return AttachResult{}, err
-		}
-		if err := c.discardFrozenOutboxForInitializeEmpty(ctx); err != nil {
-			return AttachResult{}, err
-		}
-		c.pendingInitializationID = ""
-		if err := c.persistConnectedLifecycleState(ctx, userID, ""); err != nil {
-			return AttachResult{}, err
-		}
-		c.UserID = userID
-		c.sessionConnected = true
-		status, err := c.syncStatusLocked(ctx)
-		if err != nil {
-			return AttachResult{}, err
-		}
-		return AttachResult{
-			Status:     AttachStatusConnected,
-			Outcome:    AttachOutcomeStartedEmpty,
-			SyncStatus: status,
-		}, nil
-	case "initialize_local":
-		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.sourceID); err != nil {
-			return AttachResult{}, err
-		}
-		c.pendingInitializationID = resp.InitializationID
-		if err := c.persistConnectedLifecycleState(ctx, userID, resp.InitializationID); err != nil {
-			return AttachResult{}, err
-		}
-		c.UserID = userID
-		c.sessionConnected = true
-		status, err := c.syncStatusLocked(ctx)
-		if err != nil {
-			return AttachResult{}, err
-		}
-		return AttachResult{
-			Status:     AttachStatusConnected,
-			Outcome:    AttachOutcomeSeededLocal,
-			SyncStatus: status,
-		}, nil
-	case "remote_authoritative":
-		if err := c.beginRemoteReplaceLocked(ctx, userID, c.sourceID); err != nil {
-			return AttachResult{}, err
-		}
-		state, err = c.loadLifecycleState(ctx)
-		if err != nil {
-			return AttachResult{}, err
-		}
-		restore, err := c.finalizeRemoteReplaceLocked(ctx, state)
-		if err != nil {
-			return AttachResult{}, err
-		}
-		c.pendingInitializationID = ""
-		c.UserID = userID
-		c.sessionConnected = true
-		status, err := c.syncStatusLocked(ctx)
-		if err != nil {
-			return AttachResult{}, err
-		}
-		return AttachResult{
-			Status:     AttachStatusConnected,
-			Outcome:    AttachOutcomeUsedRemote,
-			SyncStatus: status,
-			Restore:    restore,
-		}, nil
-	default:
-		return AttachResult{}, fmt.Errorf("unexpected connect resolution %q", resp.Resolution)
-	}
+	return c.applyConnectResolutionLocked(ctx, userID, reconnect, response)
 }
 
-// discardFrozenOutboxForInitializeEmpty removes only the immutable request
-// snapshot created for an expired initialization lease. Dirty rows remain so
-// the next direct push can freeze a new request under the fresh lifecycle
-// admission state.
-func (c *Client) discardFrozenOutboxForInitializeEmpty(ctx context.Context) error {
+// Mutable connection admission cannot replace or discard a frozen obligation.
+func (c *Client) requireReleasedInitializationUpload(ctx context.Context) error {
 	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_outbox_rows`); err != nil {
-		return fmt.Errorf("discard expired initialization outbox rows: %w", err)
-	}
-	if err := clearOutboxBundle(ctx, tx); err != nil {
-		return fmt.Errorf("discard expired initialization outbox bundle: %w", err)
-	}
-	return tx.Commit(ctx)
-}
-
-func (c *Client) clearStalePendingInitializationStateLocked(ctx context.Context) error {
-	state, err := c.loadLifecycleState(ctx)
+	journal, err := loadUploadJournal(ctx, tx)
 	if err != nil {
 		return err
 	}
-	state.BindingState = lifecycleBindingAnonymous
-	state.BindingScope = ""
-	state.PendingTransitionKind = lifecycleTransitionNone
-	state.PendingTargetScope = ""
-	state.PendingStagedSnapshotID = ""
-	state.PendingSnapshotBundleSeq = 0
-	state.PendingSnapshotRowCount = 0
-	state.PendingInitializationID = ""
-	if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
+	outbox, err := loadOutboxBundle(ctx, tx)
+	if err != nil {
 		return err
 	}
-	c.pendingInitializationID = ""
-	c.UserID = ""
-	c.sessionConnected = false
+	var rows int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM _sync_outbox_rows`).Scan(&rows); err != nil {
+		return err
+	}
+	if journal != nil || outbox.State != outboxStateNone || rows != 0 {
+		return &PendingPushReplayError{OutboundCount: max(rows, 1)}
+	}
 	return nil
+}
+
+// Initialization and a same-source refreshed lease retain unsatisfied intent.
+// Remote replacement remains owned by its existing snapshot lifecycle.
+func (c *Client) applyConnectResolutionLocked(ctx context.Context, userID string, reconnect bool, response *oversync.ConnectResponse) (AttachResult, error) {
+	switch response.Resolution {
+	case "retry_later":
+		c.sessionConnected = false
+		return AttachResult{Status: AttachStatusRetryLater, RetryAfter: time.Duration(response.RetryAfterSec) * time.Second}, nil
+	case "initialize_empty", "initialize_local":
+		if err := c.ensureAttachedClientStateLocked(ctx, userID, c.sourceID); err != nil {
+			return AttachResult{}, err
+		}
+		initializationID := ""
+		outcome := AttachOutcomeStartedEmpty
+		if response.Resolution == "initialize_empty" {
+			if err := c.requireReleasedInitializationUpload(ctx); err != nil {
+				return AttachResult{}, err
+			}
+		} else {
+			initializationID = response.InitializationID
+			outcome = AttachOutcomeSeededLocal
+		}
+		if err := c.persistConnectedLifecycleState(ctx, userID, initializationID); err != nil {
+			return AttachResult{}, err
+		}
+		return c.connectedAttachResultLocked(ctx, userID, initializationID, outcome, nil)
+	case "remote_authoritative":
+		if reconnect {
+			if err := c.persistConnectedLifecycleState(ctx, userID, ""); err != nil {
+				return AttachResult{}, err
+			}
+			return c.connectedAttachResultLocked(ctx, userID, "", AttachOutcomeResumedAttached, nil)
+		}
+		if err := c.beginRemoteReplaceLocked(ctx, userID, c.sourceID); err != nil {
+			return AttachResult{}, err
+		}
+		state, err := c.loadLifecycleState(ctx)
+		if err != nil {
+			return AttachResult{}, err
+		}
+		return c.resumeRemoteAttachLocked(ctx, state, userID)
+	default:
+		return AttachResult{}, fmt.Errorf("unexpected connect resolution %q", response.Resolution)
+	}
+}
+
+func (c *Client) resumeRemoteAttachLocked(ctx context.Context, state *lifecycleState, userID string) (AttachResult, error) {
+	if strings.TrimSpace(state.PendingTargetScope) != userID || state.SourceID != c.sourceID {
+		return AttachResult{}, &AttachLocalStateConflictError{Reason: "pending remote_replace belongs to a different scope or source"}
+	}
+	restore, err := c.finalizeRemoteReplaceLocked(ctx, state)
+	if err != nil {
+		return AttachResult{}, err
+	}
+	return c.connectedAttachResultLocked(ctx, userID, "", AttachOutcomeUsedRemote, restore)
+}
+
+// Publish process-local connection state only after its durable owner completes.
+func (c *Client) connectedAttachResultLocked(ctx context.Context, userID, initializationID string, outcome AttachOutcome, restore *RestoreSummary) (AttachResult, error) {
+	c.pendingInitializationID = initializationID
+	c.UserID = userID
+	c.sessionConnected = true
+	status, err := c.syncStatusLocked(ctx)
+	if err != nil {
+		return AttachResult{}, err
+	}
+	return AttachResult{Status: AttachStatusConnected, Outcome: outcome, SyncStatus: status, Restore: restore}, nil
 }
 
 // Detach clears attached synced state after verifying that no attached durable sync state remains.
@@ -738,6 +687,7 @@ func (c *Client) persistConnectedLifecycleState(ctx context.Context, userID, ini
 	attachment.BindingState = attachmentBindingAttached
 	attachment.AttachedUserID = userID
 	attachment.PendingInitializationID = initializationID
+	attachment.InitializationReconnectRequired = false
 	if strings.TrimSpace(attachment.SchemaName) == "" {
 		attachment.SchemaName = c.config.schema
 	}
@@ -832,30 +782,8 @@ func (c *Client) finalizeRemoteReplaceLocked(ctx context.Context, state *lifecyc
 		return nil, err
 	}
 	options.PinnedGuard = guard
-	if err := c.clearSnapshotStage(ctx); err != nil {
-		return nil, err
-	}
-	state.PendingStagedSnapshotID = ""
-	state.PendingSnapshotBundleSeq = 0
-	state.PendingSnapshotRowCount = 0
-	if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
-		return nil, err
-	}
-
 	startedAt := time.Now()
-	session, err := c.createSnapshotSession(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer c.deleteSnapshotSessionBestEffort(session.SnapshotID)
-
-	state.PendingStagedSnapshotID = session.SnapshotID
-	state.PendingSnapshotBundleSeq = session.SnapshotBundleSeq
-	state.PendingSnapshotRowCount = session.RowCount
-	if err := c.persistLifecycleStateInTxless(ctx, state); err != nil {
-		return nil, err
-	}
-	transfer, err := c.downloadSnapshotSession(ctx, session, limits)
+	session, transfer, err := c.stageOperationSnapshot(ctx, options, limits)
 	if err != nil {
 		return nil, err
 	}
@@ -867,6 +795,7 @@ func (c *Client) finalizeRemoteReplaceLocked(ctx context.Context, state *lifecyc
 	if err := c.applyStagedSnapshotLocked(ctx, session, options); err != nil {
 		return nil, err
 	}
+	c.retireSnapshotSession(ctx, session.SnapshotID, c.sourceID)
 	if c.snapshotObserver != nil {
 		c.snapshotObserver(snapshotRestoreObservation{
 			StagedRows: transfer.rows, DeclaredWireBytes: transfer.bytes,

@@ -23,6 +23,7 @@ func (c *Client) requireNoUnresolvedWork(ctx context.Context, tx sqliteTransacti
 
 func unresolvedWorkTable(ctx context.Context, tx sqliteTransaction) (string, error) {
 	checks := []struct{ table, predicate string }{
+		{"_sync_upload_journal", "1"},
 		{"_sync_dirty_rows", "1"}, {"_sync_outbox_bundle", "state != 'none'"}, {"_sync_outbox_rows", "1"},
 		{"_sync_push_stage", "1"}, {"_sync_snapshot_stage", "1"},
 		{"_sync_attachment_state", "pending_initialization_id != '' OR rebuild_required != 0"},

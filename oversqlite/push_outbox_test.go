@@ -253,7 +253,7 @@ func TestPushPending_FKCycleAboveHardLimitDoesNotFreeze(t *testing.T) {
 	require.Equal(t, int64(1), nextBundleID)
 }
 
-func TestCommitPushOutboundSnapshot_NewRowLimitPreservesFrozenIntent(t *testing.T) {
+func TestCommitPushOutboundSnapshot_LoweredDecodeLimitPreservesFrozenIntent(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -272,9 +272,11 @@ func TestCommitPushOutboundSnapshot_NewRowLimitPreservesFrozenIntent(t *testing.
 	client.HTTP = &http.Client{Transport: server}
 
 	_, err = client.commitPushOutboundSnapshot(ctx, snapshot)
-	var limit *PushRowExceedsAdmittedLimitError
+	var limit *AdmittedRowTooLargeError
 	require.ErrorAs(t, err, &limit)
-	require.Empty(t, server.pushRequests)
+	require.Len(t, server.pushRequests, 1)
+	require.Empty(t, server.ackRequests)
+	require.Zero(t, countA3(t, db, `SELECT length(outcome_body) FROM _sync_upload_journal`))
 	var frozenRows, dirtyRows int
 	var nextSourceBundleID int64
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM _sync_outbox_rows`).Scan(&frozenRows))
@@ -549,6 +551,11 @@ func TestPushPending_ResumesFrozenOutboundSnapshotAfterCrashBeforeCommit(t *test
 	require.NoError(t, err)
 	require.Equal(t, AttachStatusConnected, result.Status)
 	mustPushPending(t, restarted, ctx)
+	require.Empty(t, server.pushRequests)
+	require.Len(t, server.resolveRequests, 1)
+	require.Len(t, server.ackRequests, 1)
+	require.EqualValues(t, 3, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`))
+	mustPushPending(t, restarted, ctx)
 	require.Len(t, server.pushRequests, 1)
 
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboundCount))
@@ -560,7 +567,7 @@ func TestPushPending_ResumesFrozenOutboundSnapshotAfterCrashBeforeCommit(t *test
 
 	var nextSourceBundleID int64
 	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, restarted.UserID).Scan(&nextSourceBundleID))
-	require.Equal(t, int64(2), nextSourceBundleID)
+	require.Equal(t, int64(3), nextSourceBundleID)
 }
 
 func TestPushPending_MovesFrozenRowsIntoOutboundAtomically(t *testing.T) {

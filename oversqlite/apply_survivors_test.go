@@ -274,7 +274,9 @@ func TestA1LostSettlementResponseReplaysAfterReopen(t *testing.T) {
 	dirty, outbox, _ := pushStateCounts(t, db)
 	require.Zero(t, dirty)
 	require.Zero(t, outbox)
-	require.Len(t, server.pushRequests, 2)
+	require.Len(t, server.pushRequests, 1)
+	require.Len(t, server.resolveRequests, 1)
+	require.Len(t, server.ackRequests, 1)
 }
 
 func TestA1SettlementPreservesDirtyGrandchild(t *testing.T) {

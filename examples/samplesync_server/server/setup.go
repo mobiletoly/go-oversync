@@ -177,6 +177,8 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		return auth.Middleware(actorMiddleware(next))
 	}
 	mux.Handle("POST /sync/push", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePush)), logger))
+	mux.Handle("POST /sync/push-outcomes/resolve", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushOutcomeResolve)), logger))
+	mux.Handle("POST /sync/push-outcomes/ack", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushOutcomeAck)), logger))
 	mux.Handle("POST /sync/connect", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleConnect)), logger))
 	mux.Handle("GET /sync/pull", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePull)), logger))
 	// Keep SSE responses off the body-capturing logger so http.Flusher remains available.

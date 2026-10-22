@@ -3,10 +3,13 @@ package oversqlite
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -61,6 +64,12 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 	target, err := strconv.ParseInt(os.Getenv("OVERSQLITE_AUDIT_TARGET"), 10, 64)
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(root, 0700))
+	phase := func(name string) {
+		raw, e := json.Marshal(map[string]string{"phase": name})
+		require.NoError(t, e)
+		require.NoError(t, os.WriteFile(filepath.Join(root, "audit-phase.json"), raw, 0600))
+	}
+	phase("initial")
 	ctx, cancel := context.WithTimeout(context.Background(), 570*time.Second)
 	defer cancel()
 	user := "cleanup-go-" + uuid.NewString()
@@ -70,9 +79,13 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 	}
 	type owner struct {
 		c           *Client
+		db          *sql.DB
 		path, token string
 	}
 	owners := make([]owner, 2)
+	loseAck := false
+	var loseAckCancel context.CancelFunc
+	ackLosses := 0
 	open := func(i int) {
 		o := &owners[i]
 		config := DefaultConfig(1, []SyncTable{{TableName: "categories", SyncKeyColumnName: "id"}})
@@ -81,12 +94,39 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 		config.LocalVersion = 1
 		config.MaxSyncWorkUnitsPerInvocation = target
 		config.UploadLimit = 40
-		opening, e := NewOpening(&OpeningConfig{DatabasePath: o.path, BaseURL: base, Token: func(context.Context) (string, error) { return o.token, nil }, TargetClientConfig: config, Plan: &UpgradePlan{PlanID: "cleanup-fresh-v1", Mode: UpgradeModeFresh, DatabaseID: config.DatabaseID, ServiceID: config.ServiceID, TargetGenerationID: 1, TargetVersion: 1, Migrator: cleanupAuditMigrator{}}})
+		// The fixture supplies FULL in the DSN so every physical pooled connection,
+		// including a replacement after cancellation, has the required durability.
+		dsn := url.URL{Scheme: "file", Path: o.path}
+		query := url.Values{"_foreign_keys": {"on"}, "_journal_mode": {"WAL"}, "_synchronous": {"FULL"}, "_busy_timeout": {"5000"}, "_txlock": {"immediate"}}
+		dsn.RawQuery = query.Encode()
+		var e error
+		o.db, e = sql.Open("sqlite3", dsn.String())
+		require.NoError(t, e)
+		o.db.SetMaxOpenConns(4)
+		opening, e := newOpeningFromDB(o.db, &openingRuntimeConfig{BaseURL: base, Token: func(context.Context) (string, error) { return o.token, nil }, TargetClientConfig: config, PlanProvided: true, Plan: UpgradePlan{PlanID: "cleanup-fresh-v1", Mode: UpgradeModeFresh, DatabaseID: config.DatabaseID, ServiceID: config.ServiceID, TargetGenerationID: 1, TargetVersion: 1, Migrator: cleanupAuditMigrator{}}})
 		require.NoError(t, e)
 		ready, e := opening.Advance(ctx)
 		require.NoError(t, e)
 		o.c = ready.Ready
 		require.NotNil(t, o.c)
+		validated, e := validateSyncTables(o.db, o.c.tableInfo, config.Tables)
+		require.NoError(t, e)
+		require.NoError(t, installClientRuntime(ctx, o.db, o.c, validated))
+		require.NoError(t, o.c.open(ctx))
+		o.c.HTTP = &http.Client{Transport: rawRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			response, e := http.DefaultTransport.RoundTrip(req)
+			if e == nil && req.URL.Path == "/sync/push-outcomes/ack" && loseAck {
+				require.Equal(t, http.StatusNoContent, response.StatusCode)
+				_, e = io.Copy(io.Discard, response.Body)
+				require.NoError(t, e)
+				require.NoError(t, response.Body.Close())
+				loseAck = false
+				ackLosses++
+				loseAckCancel()
+				return nil, context.Canceled
+			}
+			return response, e
+		})}
 		body, _ := json.Marshal(map[string]string{"user": user, "password": "anything", "device": o.c.sourceID})
 		req, e := http.NewRequestWithContext(ctx, http.MethodPost, base+"/dummy-signin", bytes.NewReader(body))
 		require.NoError(t, e)
@@ -101,17 +141,20 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 		_, e = o.c.Attach(ctx, user)
 		require.NoError(t, e)
 	}
-	for i := range owners {
-		owners[i].path = filepath.Join(root, fmt.Sprintf("%d.sqlite", i))
-		open(i)
-	}
 	defer func() {
 		for i := range owners {
 			if owners[i].c != nil {
 				require.NoError(t, owners[i].c.Close())
 			}
+			if owners[i].db != nil {
+				require.NoError(t, owners[i].db.Close())
+			}
 		}
 	}()
+	for i := range owners {
+		owners[i].path = filepath.Join(root, fmt.Sprintf("%d.sqlite", i))
+		open(i)
+	}
 	census := func(label string) {
 		for i, o := range owners {
 			db := o.c.Database()
@@ -131,14 +174,21 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 			for _, p := range []string{"page_count", "freelist_count", "page_size"} {
 				report[p] = countA3(t, db, "PRAGMA "+p)
 			}
+			report["synchronous"] = countA3(t, db, "PRAGMA synchronous")
+			report["foreign_keys"] = countA3(t, db, "PRAGMA foreign_keys")
+			require.EqualValues(t, 2, report["synchronous"], "normal SQLite FULL durability")
+			require.EqualValues(t, 1, report["foreign_keys"])
+			for _, p := range []string{"page_count", "freelist_count", "page_size"} {
+				report["temp_"+p] = countA3(t, db, "PRAGMA temp."+p)
+			}
 			report["business_rows"] = countA3(t, db, `SELECT count(*) FROM categories`)
 			report["foreign_key_errors"] = countA3(t, db, `SELECT count(*) FROM pragma_foreign_key_check`)
 			report["reservations"] = countA3(t, db, `SELECT reserved_entries+reserved_bytes+length(workspace_context) FROM _sync_operation_state`)
 			require.Zero(t, report["foreign_key_errors"], "foreign keys at %s", label)
 			require.Zero(t, report["reservations"], "outer release at %s", label)
 			require.Zero(t, countA3(t, db, `SELECT apply_mode FROM _sync_apply_state`))
-			if label != "cancelled" {
-				for _, table := range []string{"_sync_dirty_rows", "_sync_outbox_rows", "_sync_apply_plan", "_sync_apply_rows", "_sync_apply_edges", "_sync_push_plan", "_sync_push_nodes", "_sync_push_edges", "_sync_push_stage", "_sync_snapshot_stage"} {
+			if label != "cancelled" && label != "ack-pending" {
+				for _, table := range []string{"_sync_upload_journal", "_sync_dirty_rows", "_sync_outbox_rows", "_sync_apply_plan", "_sync_apply_rows", "_sync_apply_edges", "_sync_push_plan", "_sync_push_nodes", "_sync_push_edges", "_sync_push_stage", "_sync_snapshot_stage"} {
 					require.Zero(t, report["tables"].(map[string]int64)[table], "%s at %s", table, label)
 				}
 			}
@@ -162,6 +212,8 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 			o := &owners[i]
 			require.NoError(t, o.c.Close())
 			o.c = nil
+			require.NoError(t, o.db.Close())
+			o.db = nil
 			for _, suffix := range []string{"", "-wal", "-shm"} {
 				raw, e := os.ReadFile(o.path + suffix)
 				if errors.Is(e, os.ErrNotExist) {
@@ -193,6 +245,7 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 	}
 	syncPair()
 	save("initial")
+	phase("steady")
 	resume()
 	for cycle := 1; cycle <= 10; cycle++ {
 		for i := 1; i <= 10; i++ {
@@ -210,7 +263,9 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 		}
 		syncPair()
 		if cycle == 5 {
+			phase("explicit-rebuild")
 			_, e := owners[1].c.Rebuild(ctx)
+			phase("steady")
 			require.NoError(t, e)
 		}
 		for _, o := range owners {
@@ -250,16 +305,41 @@ func TestDatabaseCleanupAudit(t *testing.T) {
 	var frozen string
 	require.NoError(t, owners[0].c.db.QueryRow(`SELECT canonical_request_hash FROM _sync_outbox_bundle`).Scan(&frozen))
 	require.NotEmpty(t, frozen)
+	vector := func() qualificationVector {
+		v := qualificationState(t, owners[0].c.db, "categories")
+		for _, table := range []string{"_sync_upload_journal", "_sync_apply_plan", "_sync_apply_rows", "_sync_apply_edges", "_sync_push_plan", "_sync_push_nodes", "_sync_push_edges", "_sync_snapshot_stage"} {
+			v[table] = qualificationState(t, owners[0].c.db, table)[table]
+		}
+		return v
+	}
+	cancelledVector := vector()
 	save("cancelled")
 	resume()
 	var retained string
 	require.NoError(t, owners[0].c.db.QueryRow(`SELECT canonical_request_hash FROM _sync_outbox_bundle`).Scan(&retained))
 	require.Equal(t, frozen, retained)
+	require.Equal(t, cancelledVector, vector(), "full F/C, typed bases/captures and pending intent across physical reopen")
+	loseAck = true
+	ackAttempt, cancelAck := context.WithCancel(ctx)
+	defer cancelAck()
+	loseAckCancel = cancelAck
+	_, err = owners[0].c.PushPending(ackAttempt)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 1, ackLosses, "actual authority committed the deliberately lost ack")
+	var journalPhase string
+	require.NoError(t, owners[0].c.db.QueryRow(`SELECT phase FROM _sync_upload_journal`).Scan(&journalPhase))
+	require.Equal(t, "ack_pending", journalPhase)
+	require.Zero(t, countA3(t, owners[0].c.db, `SELECT count(*) FROM _sync_outbox_rows`))
+	ackVector := vector()
+	save("ack-pending")
+	resume()
+	require.Equal(t, ackVector, vector(), "full ack_pending certificate/completion/later intent survives physical reopen")
 	syncPair()
 	for _, o := range owners {
 		require.EqualValues(t, 124, countA3(t, o.c.db, `SELECT count(*) FROM categories WHERE name='recovered'`))
 	}
 	save("recovered")
-	manifest, _ := json.Marshal(map[string]any{"user": user, "target": target, "keys": ids, "cancelled_hash": frozen})
+	manifest, _ := json.Marshal(map[string]any{"user": user, "target": target, "keys": ids, "cancelled_hash": frozen, "ack_losses": ackLosses, "ack_reopened": true, "cycles": 10, "keys_count": 125})
 	require.NoError(t, os.WriteFile(filepath.Join(root, "manifest.json"), manifest, 0600))
+	t.Logf("RECOVERY_RETAINED_AUDIT_COMPLETE go target=%d cycles=10 keys=125 cancelled_reopen=true ack_reopen=true", target)
 }

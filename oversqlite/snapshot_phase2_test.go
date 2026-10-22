@@ -108,7 +108,7 @@ func TestSnapshotExpiryAfterCompleteLocalStagingDoesNotPreventApply(t *testing.T
 		case r.URL.Path == "/sync/generations/1":
 			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case r.Method == http.MethodPost:
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: "snapshot-expiry", SnapshotBundleSeq: 5, RowCount: 1, ByteCount: snapshotBytes, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-expiry", 5, snapshotRows), nil
 		case r.Method == http.MethodGet:
 			require.False(t, expired.Load(), "all remote reads must finish before simulated expiry")
 			return jsonResponse(oversync.SnapshotChunkResponse{SnapshotID: "snapshot-expiry", SnapshotBundleSeq: 5, Rows: snapshotRows, NextRowOrdinal: 1, ByteCount: snapshotBytes}), nil
@@ -165,19 +165,21 @@ func TestSnapshotRetirement_EveryTerminalPathUsesIndependentBoundedContext(t *te
 			if sessionBytes == 0 {
 				sessionBytes = 1
 			}
+			terminalRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote"}, RowVersion: 7, Payload: mustJSONPayload(t, map[string]any{"id": "remote", "name": "Remote", "email": "remote@example.com"})}}
 			var retired atomic.Int64
 			client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 				switch {
 				case r.URL.Path == "/sync/generations/1":
 					return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 				case r.Method == http.MethodPost:
-					return jsonResponse(oversync.SnapshotSession{SnapshotID: "snapshot-terminal", SnapshotBundleSeq: 7, RowCount: 1, ByteCount: sessionBytes, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+					return snapshotFixtureResponse(t, client, r, "snapshot-terminal", 7, terminalRows), nil
 				case r.Method == http.MethodGet:
 					if testCase.cancelGet {
 						cancel()
 					}
 					return testCase.chunk(t), nil
 				case r.Method == http.MethodDelete:
+					require.Equal(t, []string{requiredProtocolVersion}, r.Header.Values(oversync.ProtocolVersionHeader))
 					retired.Add(1)
 					deadline, ok := r.Context().Deadline()
 					require.True(t, ok)
@@ -194,7 +196,15 @@ func TestSnapshotRetirement_EveryTerminalPathUsesIndependentBoundedContext(t *te
 			} else {
 				require.NoError(t, err)
 			}
-			require.Equal(t, int64(1), retired.Load())
+			if testCase.wantError {
+				require.Zero(t, retired.Load(), "failed or canceled sealed attempt is retained for resume; remote TTL owns cleanup")
+				var retained string
+				require.NoError(t, db.QueryRow(`SELECT staged_snapshot_id FROM _sync_operation_state`).Scan(&retained))
+				require.Equal(t, "snapshot-terminal", retained)
+				requireUserCount(t, db, "old", 1)
+			} else {
+				require.Equal(t, int64(1), retired.Load())
+			}
 		})
 	}
 }
@@ -219,10 +229,11 @@ func TestSnapshotRetirement_DeleteBodyIsNeverBuffered(t *testing.T) {
 		case r.URL.Path == "/sync/generations/1":
 			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case r.Method == http.MethodPost:
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: "snapshot-delete-body", SnapshotBundleSeq: 0, RowCount: 0, ByteCount: 0, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-delete-body", 0, nil), nil
 		case r.Method == http.MethodGet:
 			return rawJSONResponse(http.StatusOK, `{"rows":[],"next_row_ordinal":0,"has_more":false,"logical_byte_count":0}`), nil
 		case r.Method == http.MethodDelete:
+			require.Equal(t, []string{requiredProtocolVersion}, r.Header.Values(oversync.ProtocolVersionHeader))
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: deleteBody}, nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, oversync.ErrorResponse{Error: "not_found"}), nil
@@ -251,7 +262,7 @@ func TestSnapshotFailedAttemptsKeepOneLocalStageIdentity(t *testing.T) {
 			n := sessionNumber.Add(1)
 			id := "snapshot-" + strconv.FormatInt(n, 10)
 			rows := append(partialRows(id), oversync.SnapshotRow{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": id + "-later"}, RowVersion: 8, Payload: mustJSONPayload(t, map[string]any{"id": id + "-later", "name": "Later", "email": "later@example.com"})})
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: id, SnapshotBundleSeq: 8, RowCount: 2, ByteCount: testSnapshotRowsByteCount(rows), ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return snapshotFixtureResponse(t, client, r, id, 8, rows), nil
 		case r.Method == http.MethodDelete:
 			return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody}, nil
 		case r.Method == http.MethodGet:
@@ -270,15 +281,17 @@ func TestSnapshotFailedAttemptsKeepOneLocalStageIdentity(t *testing.T) {
 	})}
 
 	for attempt := 1; attempt <= 2; attempt++ {
+		previous := sessionNumber.Load()
 		_, err := client.Rebuild(context.Background())
 		require.ErrorContains(t, err, "snapshot_session_expired")
+		require.LessOrEqual(t, sessionNumber.Load()-previous, int64(2), "at most one expired incomplete replacement")
 		var identities, rows int
 		require.NoError(t, db.QueryRow(`SELECT COUNT(DISTINCT snapshot_id), COUNT(*) FROM _sync_snapshot_stage`).Scan(&identities, &rows))
 		require.Equal(t, 1, identities)
 		require.Equal(t, 1, rows)
 		var id string
 		require.NoError(t, db.QueryRow(`SELECT snapshot_id FROM _sync_snapshot_stage LIMIT 1`).Scan(&id))
-		require.Equal(t, "snapshot-"+strconv.Itoa(attempt), id)
+		require.Equal(t, "snapshot-"+strconv.FormatInt(sessionNumber.Load(), 10), id)
 	}
 }
 
@@ -298,7 +311,7 @@ func TestSnapshotDiagnostics_PerRestoreAndStreamingApplyHighWater(t *testing.T) 
 		case r.URL.Path == "/sync/generations/1":
 			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case r.Method == http.MethodPost:
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: "snapshot-diagnostics", SnapshotBundleSeq: 9, RowCount: 2, ByteCount: snapshotBytes, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-diagnostics", 9, snapshotRows), nil
 		case r.Method == http.MethodGet:
 			return jsonResponse(oversync.SnapshotChunkResponse{
 				SnapshotID: "snapshot-diagnostics", SnapshotBundleSeq: 9,
@@ -371,7 +384,7 @@ func TestSnapshotCommitSurvivesRetirementFailureAndNextPullIsIdempotent(t *testi
 		case r.URL.Path == "/sync/generations/1":
 			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case r.Method == http.MethodPost && r.URL.Path == "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: "snapshot-committed-before-retire", SnapshotBundleSeq: 9, RowCount: 1, ByteCount: snapshotBytes, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-committed-before-retire", 9, snapshotRows), nil
 		case r.Method == http.MethodGet && r.URL.Path == "/sync/snapshot-sessions/snapshot-committed-before-retire":
 			return jsonResponse(oversync.SnapshotChunkResponse{
 				SnapshotID: "snapshot-committed-before-retire", SnapshotBundleSeq: 9,

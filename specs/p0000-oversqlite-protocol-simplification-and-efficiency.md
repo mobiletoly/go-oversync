@@ -1,5 +1,7 @@
 # p0000: Oversqlite Protocol Simplification and Efficiency
 
+> Current durable-recovery authority: [r0001](r0001-oversqlite-durable-recovery.md) and the active `swagger/two_way_sync.yaml` supersede conflicting lifecycle/envelope, request-count, source-sequence and pending-source-retargeting statements below. The sole marker remains `v1`; every sync request now requires its exact protocol header. All terminal outcomes consume source sequence, durable local disposition precedes ack, and ack precedes the successor. Old acceptance/evidence records below retain their historical status. Existing typed codecs, request/bundle hashes and unrelated contracts remain in force. Runtime phases after C01 remain pending.
+
 Status: **REMEDIATED AFTER BLOCKING REREVIEW; INDEPENDENT REREVIEW REQUIRED;
 NOT OWNER-ACCEPTED; SQLITENOW K0 NOT AUTHORIZED**
 
@@ -1028,3 +1030,30 @@ failed attempts and source-revision evidence are unchanged. This amendment does 
 retroactively qualify convergent-sync remediation or grant review, acceptance or
 delivery. Specification hash changes require a new authority record; no OpenAPI,
 wire fixture, corpus manifest or runtime behavior changes are made by this amendment.
+
+## Prospective section17 command amendment — 2026-10-26
+
+For future explicitly bound full-profile candidates, [r0001 validation section9](r0001-oversqlite-durable-recovery-validation.md) and its owner-approved manifest supersede section17 command repetition/envelopes with the approved300s normal-entry schedule and explicitly reduce the separate load maximum to25users/25concurrency; old50/100 load claims earn zero current credit. Preserve every protocol/codec/request/transport/legacy-absence/build/packaging obligation and both ordinary/heavy and normal/observed paths. Section9.2 byte evidence remains seven workloads: six valid sync traffic workloads plus the exact opaque incompressible production-compression-selector witness, with no protocol-semantic claim for that opaque body. Fetch uses actual server-wire encoded capture and actual decoded receipts. E41 changes no wire, SDK default, algorithm or qualification outcome.
+
+### Approved E42 repair amendment — 2026-10-27
+
+The owner approved the [combined repair amendment](../.artifacts/qualification-efficiency-e42-20261026T110553+0200/approved-repair-20261027T0338Z/owner-approval-and-plan.json). The current version2
+profile binds its [successor review packet](../.artifacts/qualification-efficiency-e42-20261026T110553+0200/approved-repair-20261027T0338Z/reviewed-profile/proposal.md):508 declarations,
+499 normal entries and9 orchestration controllers. The original80-method local
+Node entry is partitioned into32/48 whole-class groups, retaining all methods and
+300-second wall /270-second work /30-second cleanup caps. Other entry membership,
+source workload sizes, body deadlines and the25-user maximum remain unchanged.
+
+The three identified stale fixture files use causal cascade-observation phases
+and exclusive-lifetime migration ownership. The worker client immediately owns
+its internal readiness rejection while preserving caller-visible errors and
+bounded cleanup; only its client asset size/hash changes in the manifest.
+These are approved fixture/ownership repairs, with no wire/schema/provider or
+SDK-default change. Original coverage columns remain frozen baseline evidence;
+additive current fixture bindings identify the four repaired method bodies.
+
+Historical receipts and predecessor seals retain their original identities.
+Reuse requires reviewed dependency nonreach; affected web Worker/Fetch/Browser
+isolation evidence must be refreshed after the client repair. Linuxx64/ARM64
+retain97selected methods each and remain owner-blocked. Approval does not grant
+native qualification, E43 acceptance, commit, push, release or deployment.

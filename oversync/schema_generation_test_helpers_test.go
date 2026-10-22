@@ -56,6 +56,9 @@ func testSchemaGenerationProofForTables(t *testing.T, tables []RegisteredTable) 
 }
 
 func setTestSchemaGenerationHeaders(request *http.Request, service *SyncService) {
+	if len(exactHeaderValues(request.Header, ProtocolVersionHeader)) == 0 {
+		request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
+	}
 	proof := testSchemaGenerationProofForService(service)
 	request.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(proof.ID))
 	request.Header.Set(SchemaGenerationFingerprintHeader, proof.Fingerprint)

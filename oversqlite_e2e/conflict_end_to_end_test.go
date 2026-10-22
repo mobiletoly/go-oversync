@@ -210,7 +210,7 @@ func TestEndToEnd_ConflictRetryExhaustionLeavesReplayableDirtyState(t *testing.T
 
 	nextSourceBundleID := requireNextSourceBundleID(t, f.dbB)
 	lastBundleSeqSeen := requireLastBundleSeqSeen(t, f.dbB)
-	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, int64(1+commitAttempts), nextSourceBundleID, "each terminal rejection consumes its original source sequence")
 	require.Equal(t, int64(1), lastBundleSeqSeen)
 	require.Equal(t, 3, commitAttempts)
 }

@@ -113,6 +113,7 @@ func runTableEvolutionMobileJourney(t *testing.T, extension func(mobileRolloutSt
 	require.NoError(t, a.ApplyTableEvolution(ctx, evolution.TablesBaseline))
 	publish(a, evolution.TablesBaseline)
 	s := startTableHTTP(t, dsn, evolution.TablesBaseline)
+	address, retarget := newStableMobileAuthority(t, s.URL())
 	require.NoError(t, evolution.ReopenTableServing(ctx, pool, []*oversync.SyncService{s.SyncService}))
 	_, err = evolution.CreateScope(ctx, pool, "scope")
 	require.NoError(t, err)
@@ -125,10 +126,10 @@ func runTableEvolutionMobileJourney(t *testing.T, extension func(mobileRolloutSt
 		return oversqlite.UpgradePlan{PlanID: "table_evolution-fresh-" + id, Mode: oversqlite.UpgradeModeFresh, DatabaseID: id, ServiceID: "table_evolution", TargetVersion: 1, TargetGenerationID: old.Contract.Proof.ID, LocalOnlyTables: old.LocalOnlyTables, Migrator: old.Migrator}
 	}
 	path := filepath.Join(t.TempDir(), "same.sqlite")
-	first, _, err := openVersionedApplication(ctx, path, s.URL(), provider, http.DefaultClient, fresh("first"), old)
+	first, _, err := openVersionedApplication(ctx, path, address, provider, http.DefaultClient, fresh("first"), old)
 	require.NoError(t, err)
 	attachVersionedTestApp(t, first, "scope")
-	second, _, err := openVersionedApplication(ctx, filepath.Join(t.TempDir(), "second.sqlite"), s.URL(), provider, http.DefaultClient, fresh("second"), old)
+	second, _, err := openVersionedApplication(ctx, filepath.Join(t.TempDir(), "second.sqlite"), address, provider, http.DefaultClient, fresh("second"), old)
 	require.NoError(t, err)
 	defer second.Close()
 	attachVersionedTestApp(t, second, "scope")
@@ -183,7 +184,7 @@ func runTableEvolutionMobileJourney(t *testing.T, extension func(mobileRolloutSt
 	require.NoError(t, a.ActivateTableEvolution(ctx, uuid.New(), evolution.TableBounds{Bounds: b, CleanupRows: 1, CleanupSessions: 1, CleanupBytes: 8192, MaxCleanupBatches: 100}, cap))
 	publish(a, evolution.TablesCleanup)
 	s = startTableHTTP(t, dsn, evolution.TablesCleanup)
-	second.Client.BaseURL = s.URL()
+	retarget(s.URL())
 	second.Client.HTTP = http.DefaultClient
 	_, err = second.Client.PushPending(ctx)
 	require.Error(t, err)
@@ -201,12 +202,14 @@ func runTableEvolutionMobileJourney(t *testing.T, extension func(mobileRolloutSt
 	require.NoError(t, a.ApplyTableEvolution(ctx, evolution.TablesAppend))
 	publish(a, evolution.TablesAppend)
 	s = startTableHTTP(t, dsn, evolution.TablesAppend)
+	retarget(s.URL())
 	s.Close()
 	a, err = evolution.OpenAuthority(ctx, drain)
 	require.NoError(t, err)
 	require.NoError(t, a.ApplyTableEvolution(ctx, evolution.TablesBackfill))
 	publish(a, evolution.TablesBackfill)
 	s = startTableHTTP(t, dsn, evolution.TablesBackfill)
+	retarget(s.URL())
 	w.Service = s.SyncService
 	require.NoError(t, w.Populate(ctx))
 	s.Close()
@@ -214,11 +217,10 @@ func runTableEvolutionMobileJourney(t *testing.T, extension func(mobileRolloutSt
 	require.NoError(t, err)
 	publish(a, evolution.TablesServing)
 	s = startTableHTTP(t, dsn, evolution.TablesServing)
+	retarget(s.URL())
 	require.NoError(t, evolution.ReopenTableServing(ctx, pool, []*oversync.SyncService{s.SyncService}))
-	second.Client.BaseURL = s.URL()
 	_, err = second.Client.Sync(ctx)
 	require.NoError(t, err)
-	first.Client.BaseURL = s.URL()
 	first.Client.HTTP = http.DefaultClient
 	// Dirty DELETE on an old-only table must also reach PostgreSQL before DROP.
 	_, err = first.DB.Exec(`DELETE FROM legacy_notes WHERE body='delete me'`)
@@ -234,7 +236,7 @@ func runTableEvolutionMobileJourney(t *testing.T, extension func(mobileRolloutSt
 	pausedPlan.Migrator = mobileUpgradeMigrator{MigrateFunc: func(context.Context, oversqlite.LocalMigrationTx, oversqlite.LocalMigrationStep) error {
 		return errors.New("pause before application DDL")
 	}}
-	opening, err := oversqlite.NewOpening(&oversqlite.OpeningConfig{DatabasePath: path, Plan: &pausedPlan, BaseURL: s.URL(), Token: provider, TargetClientConfig: versionedTargetConfig(pausedPlan, target)})
+	opening, err := oversqlite.NewOpening(&oversqlite.OpeningConfig{DatabasePath: path, Plan: &pausedPlan, BaseURL: address, Token: provider, TargetClientConfig: versionedTargetConfig(pausedPlan, target)})
 	require.NoError(t, err)
 	blocked, err := opening.Advance(ctx)
 	require.Error(t, err)
@@ -252,14 +254,14 @@ func runTableEvolutionMobileJourney(t *testing.T, extension func(mobileRolloutSt
 	// Actual process death rolls back local DDL, then resumes a staged snapshot.
 	for _, boundary := range boundaries {
 		child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMobileFlow_TableEvolutionProcessHelper$")
-		child.Env = append(os.Environ(), "TABLE_EVOLUTION_SQLITE="+path, "TABLE_EVOLUTION_URL="+s.URL(), "TABLE_EVOLUTION_TOKEN="+token, "TABLE_EVOLUTION_BOUNDARY="+boundary)
+		child.Env = append(os.Environ(), "TABLE_EVOLUTION_SQLITE="+path, "TABLE_EVOLUTION_URL="+address, "TABLE_EVOLUTION_TOKEN="+token, "TABLE_EVOLUTION_BOUNDARY="+boundary)
 		out, err := child.CombinedOutput()
 		require.Error(t, err, string(out))
 		var exit *exec.ExitError
 		require.ErrorAs(t, err, &exit)
 		require.Equal(t, 97, exit.ExitCode(), string(out))
 	}
-	upgraded, result, err := openVersionedApplication(ctx, path, s.URL(), provider, http.DefaultClient, tableMobilePlan(old, target), target)
+	upgraded, result, err := openVersionedApplication(ctx, path, address, provider, http.DefaultClient, tableMobilePlan(old, target), target)
 	require.NoError(t, err)
 	defer upgraded.Close()
 	attachVersionedTestApp(t, upgraded, "scope")
@@ -301,7 +303,7 @@ func runTableEvolutionMobileJourney(t *testing.T, extension func(mobileRolloutSt
 	require.NoError(t, upgraded.DB.QueryRow(`SELECT project_id FROM people WHERE id=?`, late).Scan(&nullable))
 	require.Nil(t, nullable)
 	if extension != nil {
-		extension(mobileRolloutState{ctx: ctx, pool: pool, server: s, old: second, target: upgraded, token: token, secret: "table_evolution-local-secret", scope: "scope", table: true})
+		extension(mobileRolloutState{ctx: ctx, pool: pool, server: s, address: address, retarget: retarget, old: second, target: upgraded, token: token, secret: "table_evolution-local-secret", scope: "scope", table: true})
 	}
 	t.Logf("table_evolution same-file journey old=%s target=%s removed=legacy_notes added=projects,attachments restart=migration,snapshot source_rotated=%t", old.Contract.Proof.Fingerprint, target.Contract.Proof.Fingerprint, source != newSource)
 }

@@ -179,8 +179,9 @@ func TestPendingConflict_RuntimeReopenAndDestructiveGuards(t *testing.T) {
 	require.NoError(t, err)
 	snapshot := requireOutboxBundle(t, c.db)
 	_, err = c.Rebuild(ctx)
+	var gate *UploadJournalIntegrityError
+	require.ErrorAs(t, err, &gate)
 	var needs *ConflictNeedsResolutionError
-	require.ErrorAs(t, err, &needs)
 	_, err = c.PullToStable(ctx)
 	require.ErrorAs(t, err, &needs)
 	require.ErrorAs(t, c.UninstallSync(ctx), &needs)

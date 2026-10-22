@@ -83,14 +83,15 @@ func (c *Client) resolvePushConflict(ctx context.Context, snapshot *pushOutbound
 		return err
 	}
 
-	// The upgrade-only deferral already has a durable journal. Ordinary sync
-	// records its definitive rejection before invoking an application resolver.
-	if _, ok := c.Resolver.(deferUpgradeResolver); ok {
-		return conflictErr
-	}
 	pending, err := c.preserveConflict(ctx, snapshot, conflictErr, conflictContext)
 	if err != nil {
 		return err
+	}
+	if err := c.acknowledgeUploadJournal(ctx); err != nil {
+		return err
+	}
+	if _, ok := c.Resolver.(deferUpgradeResolver); ok {
+		return conflictErr
 	}
 	snapshot.conflict = pending
 	snapshot.automatic = true
@@ -256,6 +257,7 @@ func (c *Client) resolvePushConflictAcceptServerSlice(ctx context.Context, snaps
 			return err
 		}
 	}
+	ctx = withUniqueApplyContext(ctx)
 	if err := c.prepareConflictApply(ctx, tx, snapshot, conflictingRow, desired); err != nil {
 		return commitApplyProgress(ctx, tx, err)
 	}
@@ -266,6 +268,9 @@ func (c *Client) resolvePushConflictAcceptServerSlice(ctx context.Context, snaps
 		return err
 	}
 
+	if err := c.installUniqueFinalStateOwned(ctx, tx); err != nil {
+		return err
+	}
 	if err := c.applyAcceptedConflictRow(ctx, tx, conflictingRow, conflict); err != nil {
 		return err
 	}
@@ -460,6 +465,7 @@ func (c *Client) applyConflictResolutionPlanSlice(ctx context.Context, snapshot 
 	if err != nil {
 		return err
 	}
+	ctx = withUniqueApplyContext(ctx)
 	if err := c.prepareConflictApply(ctx, tx, snapshot, conflictingRow, desired); err != nil {
 		return commitApplyProgress(ctx, tx, err)
 	}
@@ -470,6 +476,9 @@ func (c *Client) applyConflictResolutionPlanSlice(ctx context.Context, snapshot 
 		return err
 	}
 
+	if err := c.installUniqueFinalStateOwned(ctx, tx); err != nil {
+		return err
+	}
 	normalizedLocalPayload, err := c.applyConflictLocalAction(ctx, tx, tableName, conflictingRow, plan.localRowAction)
 	if err != nil {
 		return err
@@ -621,6 +630,15 @@ func (c *Client) requeueSnapshotRowsInTx(ctx context.Context, tx sqliteTransacti
 }
 
 func (c *Client) deletePushOutboundSnapshotInTx(ctx context.Context, tx sqliteTransaction, sourceBundleID int64) error {
+	outbox, err := loadOutboxBundle(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if outbox.State != outboxStateRejected {
+		if err := markUploadDispositionInTx(ctx, tx); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_outbox_rows WHERE source_bundle_id = ?`, sourceBundleID); err != nil {
 		return fmt.Errorf("failed to clear outbound push snapshot for source_bundle_id %d: %w", sourceBundleID, err)
 	}
@@ -635,6 +653,16 @@ func (c *Client) deleteStructuredRowStateInTx(ctx context.Context, tx sqliteTran
 }
 
 func (c *Client) deleteLocalRowInTx(ctx context.Context, tx sqliteTransaction, tableName, localPK string) error {
+	return c.deleteLocalRowInTxUsing(ctx, tx, tx, tableName, localPK)
+}
+
+func (c *Client) deleteLocalRowInTxUsing(ctx context.Context, execer execContexter, tx sqliteTransaction, tableName, localPK string) error {
+	if ctx.Value(uniqueRawContextKey{}) == nil {
+		handled, err := c.reuseInstalledUniqueRow(ctx, tx, tableName, localPK)
+		if err != nil || handled {
+			return err
+		}
+	}
 	pkColumn, err := c.primaryKeyColumnForTable(tableName)
 	if err != nil {
 		return err
@@ -644,7 +672,7 @@ func (c *Client) deleteLocalRowInTx(ctx context.Context, tx sqliteTransaction, t
 		return fmt.Errorf("failed to convert local key for delete: %w", err)
 	}
 	query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", quoteIdent(tableName), quoteIdent(pkColumn))
-	if _, err := tx.ExecContext(ctx, query, pkValue); err != nil {
+	if _, err := execer.ExecContext(ctx, query, pkValue); err != nil {
 		return fmt.Errorf("failed to delete local row %s.%s: %w", tableName, localPK, err)
 	}
 	return nil

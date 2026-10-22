@@ -48,6 +48,12 @@ type mobileUpgradeCommitted struct {
 	bytes       int64
 }
 
+type mobileUpgradeAcknowledgment struct {
+	request               oversync.PushOutcomeAckRequest
+	generationID          string
+	generationFingerprint string
+}
+
 type mobileUpgradeServerFixture struct {
 	t                      *testing.T
 	mu                     sync.Mutex
@@ -55,6 +61,8 @@ type mobileUpgradeServerFixture struct {
 	target                 oversqlite.LocalGenerationContract
 	nextSeq                int64
 	committed              map[string]*mobileUpgradeCommitted
+	outcomes               map[string]*oversync.PushOutcome
+	acknowledged           map[string]mobileUpgradeAcknowledgment
 	replacements           []oversync.SnapshotSourceReplacement
 	loseReplacementReply   bool
 	replacementReplyLosses int
@@ -69,6 +77,8 @@ func newMobileUpgradeServerFixture(t *testing.T, old, target oversqlite.LocalGen
 	return &mobileUpgradeServerFixture{
 		t: t, old: old, target: target, nextSeq: 1,
 		committed:            map[string]*mobileUpgradeCommitted{},
+		outcomes:             map[string]*oversync.PushOutcome{},
+		acknowledged:         map[string]mobileUpgradeAcknowledgment{},
 		offlineSnapshotAfter: -1,
 		targetRows: []oversync.SnapshotRow{{Schema: "main", Table: "upgrade_people", Key: oversync.SyncKey{"id": id}, RowVersion: 1,
 			Payload: json.RawMessage(`{"id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","name":"server-converted","new_label":"new-only"}`)}},
@@ -95,8 +105,73 @@ func mobileUpgradeDiscovery(local oversqlite.LocalGenerationContract) oversync.G
 	return oversync.GenerationDiscoveryResponse{
 		ProtocolVersion:  oversync.SyncProtocolVersion,
 		SchemaGeneration: oversync.SchemaGenerationCapabilities{ID: fmt.Sprint(local.Proof.ID), Fingerprint: local.Proof.Fingerprint, Tables: tables},
-		Limits:           oversync.WireLimits{MaxPushRows: 10000, MaxPushDecodedBytes: 16 << 20, MaxPullBundles: 5000, MaxPullDecodedBytes: 32 << 20, MaxSnapshotRowsPerChunk: 1, MaxSnapshotDecodedBytesPerChunk: 8 << 20, MaxSnapshotRows: 10000, MaxSnapshotLogicalBytes: 16 << 20, MaxRowDecodedBytes: 1 << 20},
+		Limits:           oversync.WireLimits{MaxPushRows: 10000, MaxPushDecodedBytes: 16 << 20, MaxPushOutcomeDecodedBytes: 16*1024*1024 + 8192, MaxPullBundles: 5000, MaxPullDecodedBytes: 32 << 20, MaxSnapshotRowsPerChunk: 1, MaxSnapshotDecodedBytesPerChunk: 8 << 20, MaxSnapshotRows: 10000, MaxSnapshotLogicalBytes: 16 << 20, MaxRowDecodedBytes: 1 << 20},
 	}
+}
+
+func (s *mobileUpgradeServerFixture) generation(id string) oversync.SchemaGenerationCapabilities {
+	if id == fmt.Sprint(s.old.Proof.ID) {
+		return mobileUpgradeDiscovery(s.old).SchemaGeneration
+	}
+	return mobileUpgradeDiscovery(s.target).SchemaGeneration
+}
+
+func (s *mobileUpgradeServerFixture) retainOutcome(source string, generation oversync.SchemaGenerationCapabilities, request oversync.PushOutcomeResolveRequest, effect *oversync.CommittedPushEffect, rejection *oversync.PushOutcomeRejection) (*oversync.PushOutcome, error) {
+	status := "cancelled"
+	if effect != nil {
+		status = "committed"
+	}
+	if rejection != nil {
+		status = "rejected"
+	}
+	outcome := &oversync.PushOutcome{
+		SourceID: source, GenerationID: generation.ID, GenerationFingerprint: generation.Fingerprint,
+		SourceBundleID: request.SourceBundleID, CanonicalRequestHash: request.CanonicalRequestHash,
+		InitializationID: request.InitializationID, Status: status, Committed: effect, Rejection: rejection,
+	}
+	hash, err := oversync.HashPushOutcome(*outcome, generation)
+	if err != nil {
+		return nil, err
+	}
+	outcome.OutcomeHash = hash
+	s.outcomes[source+"/"+strconv.FormatInt(request.SourceBundleID, 10)] = outcome
+	return outcome, nil
+}
+
+func mobileUpgradeOutcomeResponse(outcome *oversync.PushOutcome, source string, generation oversync.SchemaGenerationCapabilities, request oversync.PushOutcomeResolveRequest) (*http.Response, error) {
+	err := oversync.ValidatePushOutcomeBinding(*outcome, oversync.PushOperationBinding{
+		SourceID: source, GenerationID: generation.ID, GenerationFingerprint: generation.Fingerprint,
+		SourceBundleID: request.SourceBundleID, CanonicalRequestHash: request.CanonicalRequestHash, InitializationID: request.InitializationID,
+	}, generation)
+	return mobileUpgradeJSON(http.StatusOK, outcome), err
+}
+
+func (s *mobileUpgradeServerFixture) snapshotMetadata(source string, generation oversync.SchemaGenerationCapabilities, rows []oversync.SnapshotRow, recovery *oversync.SnapshotRecovery) (oversync.CompactSnapshotSessionResponse, error) {
+	boundary := max(1, s.nextSeq-1)
+	seal, err := oversync.NewSnapshotHashWriter(source, generation, "mobile-upgrade-snapshot", boundary, recovery)
+	if err != nil {
+		return oversync.CompactSnapshotSessionResponse{}, err
+	}
+	for _, row := range rows {
+		for index, table := range generation.Tables {
+			if table.Schema == row.Schema && table.Table == row.Table {
+				key := make([]any, len(table.SyncKeyColumns))
+				for i, column := range table.SyncKeyColumns {
+					key[i] = row.Key[column]
+				}
+				if err := seal.Add(index, key, row.RowVersion, row.Payload); err != nil {
+					return oversync.CompactSnapshotSessionResponse{}, err
+				}
+				break
+			}
+		}
+	}
+	_, logicalBytes, err := oversync.CompactGroupsForSnapshotRowsAt(generation, rows, 1)
+	if err != nil {
+		return oversync.CompactSnapshotSessionResponse{}, err
+	}
+	hash, err := seal.Sum(int64(len(rows)), logicalBytes)
+	return oversync.CompactSnapshotSessionResponse{SnapshotID: "mobile-upgrade-snapshot", SnapshotBundleSeq: boundary, RowCount: int64(len(rows)), LogicalByteCount: logicalBytes, SnapshotHash: hash, Recovery: recovery, ExpiresAt: "2030-01-01T00:00:00Z"}, err
 }
 
 func (s *mobileUpgradeServerFixture) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -114,11 +189,37 @@ func (s *mobileUpgradeServerFixture) RoundTrip(request *http.Request) (*http.Res
 		return mobileUpgradeJSON(http.StatusOK, mobileUpgradeDiscovery(selected)), nil
 	case request.Method == http.MethodPost && request.URL.Path == "/sync/connect":
 		return mobileUpgradeJSON(http.StatusOK, oversync.ConnectResponse{Resolution: "initialize_empty"}), nil
-	case request.Method == http.MethodPost && request.URL.Path == "/sync/push":
-		if s.rejectNextPushCreate {
-			s.rejectNextPushCreate = false
-			return mobileUpgradeJSON(http.StatusUnprocessableEntity, oversync.ErrorResponse{Error: "payload_invalid", Message: "explicit resolution required"}), nil
+	case request.Method == http.MethodPost && request.URL.Path == "/sync/push-outcomes/resolve":
+		var resolve oversync.PushOutcomeResolveRequest
+		if err := json.NewDecoder(request.Body).Decode(&resolve); err != nil {
+			return nil, err
 		}
+		key := source + "/" + strconv.FormatInt(resolve.SourceBundleID, 10)
+		if outcome := s.outcomes[key]; outcome != nil {
+			return mobileUpgradeOutcomeResponse(outcome, source, s.generation(generation), resolve)
+		}
+		if resolve.SourceBundleID <= s.acknowledged[source].request.SourceBundleID {
+			return mobileUpgradeJSON(http.StatusGone, oversync.ErrorResponse{Error: "push_outcome_acknowledged"}), nil
+		}
+		outcome, err := s.retainOutcome(source, s.generation(generation), resolve, nil, nil)
+		return mobileUpgradeJSON(http.StatusOK, outcome), err
+	case request.Method == http.MethodPost && request.URL.Path == "/sync/push-outcomes/ack":
+		var ack oversync.PushOutcomeAckRequest
+		if err := json.NewDecoder(request.Body).Decode(&ack); err != nil {
+			return nil, err
+		}
+		key := source + "/" + strconv.FormatInt(ack.SourceBundleID, 10)
+		if outcome := s.outcomes[key]; outcome != nil {
+			if outcome.GenerationID != generation || outcome.GenerationFingerprint != request.Header.Get(oversync.SchemaGenerationFingerprintHeader) || outcome.CanonicalRequestHash != ack.CanonicalRequestHash || outcome.OutcomeHash != ack.OutcomeHash {
+				return nil, fmt.Errorf("fixture acknowledgment binding mismatch")
+			}
+			delete(s.outcomes, key)
+			s.acknowledged[source] = mobileUpgradeAcknowledgment{ack, generation, outcome.GenerationFingerprint}
+		} else if retained := s.acknowledged[source]; retained.request != ack || retained.generationID != generation || retained.generationFingerprint != request.Header.Get(oversync.SchemaGenerationFingerprintHeader) {
+			return nil, fmt.Errorf("fixture acknowledgment has no retained outcome")
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody}, nil
+	case request.Method == http.MethodPost && request.URL.Path == "/sync/push":
 		var push oversync.CompactPushRequest
 		if err := json.NewDecoder(request.Body).Decode(&push); err != nil {
 			return nil, err
@@ -128,13 +229,22 @@ func (s *mobileUpgradeServerFixture) RoundTrip(request *http.Request) (*http.Res
 			selected = s.old
 		}
 		discovery := mobileUpgradeDiscovery(selected)
+		var initializationID *string
+		if push.InitializationID != "" {
+			initializationID = &push.InitializationID
+		}
+		operation := oversync.PushOutcomeResolveRequest{SourceBundleID: push.SourceBundleID, CanonicalRequestHash: push.CanonicalRequestHash, InitializationID: initializationID}
 		key := source + "/" + strconv.FormatInt(push.SourceBundleID, 10)
-		if committed := s.committed[key]; committed != nil {
-			groups, err := oversync.CompactGroupsForBundleRows(discovery.SchemaGeneration, committed.rows)
-			if err != nil {
-				return nil, err
-			}
-			return mobileUpgradeJSON(http.StatusOK, oversync.CompactPushResponse{BundleSeq: committed.seq, BundleHash: committed.hash, Rows: groups}), nil
+		if outcome := s.outcomes[key]; outcome != nil {
+			return mobileUpgradeOutcomeResponse(outcome, source, discovery.SchemaGeneration, operation)
+		}
+		if _, exists := s.committed[key]; exists || push.SourceBundleID <= s.acknowledged[source].request.SourceBundleID {
+			return mobileUpgradeJSON(http.StatusGone, oversync.ErrorResponse{Error: "push_outcome_acknowledged"}), nil
+		}
+		if s.rejectNextPushCreate {
+			s.rejectNextPushCreate = false
+			outcome, err := s.retainOutcome(source, discovery.SchemaGeneration, operation, nil, &oversync.PushOutcomeRejection{Code: "payload_invalid"})
+			return mobileUpgradeJSON(http.StatusOK, outcome), err
 		}
 		pendingRows, err := oversync.ExpandCompactPushRows(discovery.SchemaGeneration, push.Rows)
 		if err != nil {
@@ -159,7 +269,9 @@ func (s *mobileUpgradeServerFixture) RoundTrip(request *http.Request) (*http.Res
 		if err != nil {
 			return nil, err
 		}
-		return mobileUpgradeJSON(http.StatusOK, oversync.CompactPushResponse{BundleSeq: committed.seq, BundleHash: hash, Rows: groups}), nil
+		outcome, err := s.retainOutcome(source, discovery.SchemaGeneration, operation,
+			&oversync.CommittedPushEffect{BundleSeq: committed.seq, BundleHash: hash, RowCount: int64(len(rows)), Rows: groups}, nil)
+		return mobileUpgradeJSON(http.StatusOK, outcome), err
 	case request.Method == http.MethodGet && request.URL.Path == "/sync/pull":
 		if s.offlineOldPull && generation == fmt.Sprint(s.old.Proof.ID) {
 			return nil, io.ErrUnexpectedEOF
@@ -190,11 +302,15 @@ func (s *mobileUpgradeServerFixture) RoundTrip(request *http.Request) (*http.Res
 		if generation == fmt.Sprint(s.old.Proof.ID) {
 			selected = s.old
 		}
-		_, logicalByteCount, err := oversync.CompactGroupsForSnapshotRowsAt(mobileUpgradeDiscovery(selected).SchemaGeneration, snapshotRows, 1)
+		snapshotSource := source
+		if create.SourceReplacement != nil {
+			snapshotSource = create.SourceReplacement.NewSourceID
+		}
+		metadata, err := s.snapshotMetadata(snapshotSource, mobileUpgradeDiscovery(selected).SchemaGeneration, snapshotRows, create.Recovery)
 		if err != nil {
 			return nil, err
 		}
-		return mobileUpgradeJSON(http.StatusOK, oversync.CompactSnapshotSessionResponse{SnapshotID: "mobile-upgrade-snapshot", SnapshotBundleSeq: max(1, s.nextSeq-1), RowCount: int64(len(snapshotRows)), LogicalByteCount: logicalByteCount, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+		return mobileUpgradeJSON(http.StatusOK, metadata), nil
 	case request.Method == http.MethodGet && request.URL.Path == "/sync/snapshot-sessions/mobile-upgrade-snapshot":
 		snapshotRows := append([]oversync.SnapshotRow(nil), s.targetRows...)
 		if generation == fmt.Sprint(s.old.Proof.ID) {
@@ -219,9 +335,69 @@ func (s *mobileUpgradeServerFixture) RoundTrip(request *http.Request) (*http.Res
 		}
 		return mobileUpgradeJSON(http.StatusOK, oversync.CompactSnapshotChunkResponse{Rows: groups, NextRowOrdinal: end, HasMore: end < int64(len(snapshotRows)), LogicalByteCount: logicalByteCount}), nil
 	case request.Method == http.MethodDelete && request.URL.Path == "/sync/snapshot-sessions/mobile-upgrade-snapshot":
-		return mobileUpgradeJSON(http.StatusOK, map[string]string{"status": "deleted"}), nil
+		return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody}, nil
 	}
 	return nil, fmt.Errorf("unexpected mobile upgrade request %s %s", request.Method, request.URL.Path)
+}
+
+func TestMobileUpgradeFixture_DuplicateAcknowledgmentRetainsOriginalGeneration(t *testing.T) {
+	old, target, err := mobileUpgradeDefinitions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newMobileUpgradeServerFixture(t, old.Contract, target.Contract)
+	source := uuid.NewString()
+	generation := mobileUpgradeDiscovery(old.Contract).SchemaGeneration
+	outcome, err := fixture.retainOutcome(source, generation, oversync.PushOutcomeResolveRequest{
+		SourceBundleID: 1, CanonicalRequestHash: strings.Repeat("a", 64),
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := oversync.PushOutcomeAckRequest{SourceBundleID: 1, CanonicalRequestHash: outcome.CanonicalRequestHash, OutcomeHash: outcome.OutcomeHash}
+	body, err := json.Marshal(ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(id, fingerprint string) error {
+		request, err := http.NewRequest(http.MethodPost, "http://mobile.fixture/sync/push-outcomes/ack", bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		request.Header.Set(oversync.SourceIDHeader, source)
+		request.Header.Set(oversync.SchemaGenerationIDHeader, id)
+		request.Header.Set(oversync.SchemaGenerationFingerprintHeader, fingerprint)
+		response, err := fixture.RoundTrip(request)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			return fmt.Errorf("acknowledgment returned %d", response.StatusCode)
+		}
+		return nil
+	}
+	if err := send(generation.ID, generation.Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	retained := fixture.acknowledged[source]
+	for _, test := range []struct {
+		name, id, fingerprint string
+		wantError             bool
+	}{
+		{"exact duplicate", generation.ID, generation.Fingerprint, false},
+		{"changed generation", fmt.Sprint(target.Contract.Proof.ID), generation.Fingerprint, true},
+		{"changed fingerprint", generation.ID, target.Contract.Proof.Fingerprint, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := send(test.id, test.fingerprint); (err != nil) != test.wantError {
+				t.Fatalf("duplicate ack error=%v wantError=%t", err, test.wantError)
+			}
+			if fixture.acknowledged[source] != retained || len(fixture.outcomes) != 0 {
+				t.Fatal("duplicate acknowledgment changed the original fence or resurrected terminal evidence")
+			}
+		})
+	}
 }
 
 func attachVersionedTestApp(t *testing.T, app *versionedApplication, user string) {

@@ -76,8 +76,8 @@ func validatePullResponseFieldPresence(body []byte) error {
 }
 
 func validateSnapshotSessionResponseFieldPresence(body []byte) error {
-	return requireSnapshotResponseFields(body, "snapshot session",
-		"snapshot_id", "snapshot_bundle_seq", "row_count", "logical_byte_count", "expires_at")
+	_, err := requireJSONObjectFieldsWithOptional(body, "snapshot session", []string{"snapshot_id", "snapshot_bundle_seq", "row_count", "logical_byte_count", "expires_at", "snapshot_hash"}, []string{"recovery"})
+	return err
 }
 
 func validateSnapshotChunkResponseFieldPresence(body []byte) error {

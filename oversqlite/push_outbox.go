@@ -37,6 +37,7 @@ type dirtyUploadState struct {
 }
 
 type pushOutboundSnapshot struct {
+	Fresh          bool
 	conflict       *PendingConflict
 	decision       MergeResult
 	automatic      bool
@@ -317,6 +318,13 @@ func (c *Client) freezePushOutboundSnapshotInTx(ctx context.Context, tx sqliteTr
 	if err != nil {
 		return nil, err
 	}
+	body, err := c.compactPushRequestBody(sourceBundleID, c.pendingInitializationID, dirtyRows)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.freezeUploadJournalInTx(ctx, tx, &outboxBundleRecord{SourceID: c.sourceID, SourceBundleID: sourceBundleID, CanonicalRequestHash: canonicalRequestHash, InitializationID: c.pendingInitializationID}, body); err != nil {
+		return nil, err
+	}
 	if err := persistOutboxBundle(ctx, tx, &outboxBundleRecord{
 		State:                outboxStatePrepared,
 		SourceID:             c.sourceID,
@@ -355,6 +363,7 @@ func (c *Client) freezePushOutboundSnapshotInTx(ctx context.Context, tx sqliteTr
 		return nil, err
 	}
 	return &pushOutboundSnapshot{
+		Fresh:          true,
 		SourceBundleID: sourceBundleID,
 		Rows:           dirtyRows,
 	}, nil

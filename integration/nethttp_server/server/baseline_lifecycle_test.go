@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mobiletoly/go-oversync/oversqlite"
+	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,7 +33,18 @@ func TestBaselineLive_LostResponsePhysicalReopenAndSettlement(t *testing.T) {
 	var loseResponse atomic.Bool
 	var duringResponse func()
 	var requestBodies [][]byte
+	var controlRequests []baselineProtocolRequest
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sync/push-outcomes/resolve" || r.URL.Path == "/sync/push-outcomes/ack" {
+			body, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				t.Errorf("read outcome control request: %v", readErr)
+				w.WriteHeader(500)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			controlRequests = append(controlRequests, baselineProtocolRequest{r.URL.Path, r.Method, r.Header.Clone(), body})
+		}
 		if r.URL.Path != "/sync/push" {
 			authority.Handler.ServeHTTP(w, r)
 			return
@@ -112,6 +125,13 @@ func TestBaselineLive_LostResponsePhysicalReopenAndSettlement(t *testing.T) {
 	require.Len(t, hash, 64)
 	require.NoError(t, db.QueryRow(`SELECT source_id,next_source_bundle_id FROM _sync_source_state`).Scan(&source, &nextID))
 	require.NoError(t, db.QueryRow(`SELECT last_bundle_seq_seen FROM _sync_attachment_state`).Scan(&checkpoint))
+	var frozenBody []byte
+	var frozenDigest, frozenPhase, retainedOutcomeHash string
+	require.NoError(t, db.QueryRow(`SELECT request_body,request_digest,phase FROM _sync_upload_journal`).Scan(&frozenBody, &frozenDigest, &frozenPhase))
+	require.Equal(t, requestBodies[1], frozenBody)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(frozenBody)), frozenDigest)
+	require.Equal(t, "frozen", frozenPhase)
+	require.NoError(t, authority.Pool.QueryRow(ctx, `SELECT outcome_hash FROM sync.push_outcomes WHERE source_id=$1`, source).Scan(&retainedOutcomeHash))
 	before := baselineLiveVector(t, db)
 	var remoteName, remoteParent string
 	require.NoError(t, authority.Pool.QueryRow(ctx, `SELECT name,parent_id::text FROM business.categories WHERE id=$1`, c).Scan(&remoteName, &remoteParent))
@@ -125,8 +145,22 @@ func TestBaselineLive_LostResponsePhysicalReopenAndSettlement(t *testing.T) {
 	require.NoError(t, err)
 	_, err = client.PushPending(ctx)
 	require.NoError(t, err)
-	require.Len(t, requestBodies, 3)
-	require.Equal(t, requestBodies[1], requestBodies[2], "replay must send the exact original request")
+	require.Len(t, requestBodies, 2, "uncertain F resolves its original tuple without retransmitting push")
+	require.Equal(t, frozenBody, requestBodies[1])
+	require.Len(t, controlRequests, 3) // first commit ack, original F resolve, original C ack
+	resolved, acknowledged := controlRequests[1], controlRequests[2]
+	require.Equal(t, "/sync/push-outcomes/resolve", resolved.Path)
+	require.Equal(t, "/sync/push-outcomes/ack", acknowledged.Path)
+	for _, request := range []baselineProtocolRequest{resolved, acknowledged} {
+		require.Equal(t, http.MethodPost, request.Method)
+		require.Equal(t, oversync.SyncProtocolVersion, request.Header.Get(oversync.ProtocolVersionHeader))
+		require.Equal(t, source, request.Header.Get(oversync.SourceIDHeader))
+		require.Equal(t, "1", request.Header.Get(oversync.SchemaGenerationIDHeader))
+		require.NotEmpty(t, request.Header.Get(oversync.SchemaGenerationFingerprintHeader))
+	}
+	require.Equal(t, resolved.Header.Get(oversync.SchemaGenerationFingerprintHeader), acknowledged.Header.Get(oversync.SchemaGenerationFingerprintHeader))
+	require.JSONEq(t, fmt.Sprintf(`{"source_bundle_id":%d,"canonical_request_hash":%q,"initialization_id":null}`, nextID, hash), string(resolved.Body))
+	require.JSONEq(t, fmt.Sprintf(`{"source_bundle_id":%d,"canonical_request_hash":%q,"outcome_hash":%q}`, nextID, hash, retainedOutcomeHash), string(acknowledged.Body))
 	var a, b, l, serverParent, desiredParent, newSource string
 	var settledNext, settledCheckpoint int64
 	require.NoError(t, db.QueryRow(`SELECT json_extract(server_payload,'$.name.value') FROM _sync_row_state WHERE json_extract(key_json,'$.id')=?`, c).Scan(&a))
@@ -243,7 +277,18 @@ func TestBaselineLive_ConfirmedTombstoneReinsertion(t *testing.T) {
 func baselineLiveVector(t *testing.T, db *sql.DB) string {
 	t.Helper()
 	values := map[string][]json.RawMessage{}
-	for _, table := range []string{"categories", "_sync_row_state", "_sync_dirty_rows", "_sync_relationships", "_sync_outbox_rows", "_sync_outbox_bundle", "_sync_source_state", "_sync_attachment_state", "_sync_operation_state", "_sync_conflict_state"} {
+	tables, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND (name='categories' OR substr(name,1,6)='_sync_') ORDER BY name`)
+	require.NoError(t, err)
+	var names []string
+	for tables.Next() {
+		var name string
+		require.NoError(t, tables.Scan(&name))
+		names = append(names, name)
+	}
+	require.NoError(t, tables.Err())
+	require.NoError(t, tables.Close())
+	require.Contains(t, names, "_sync_upload_journal")
+	for _, table := range names {
 		rows, err := db.Query(`PRAGMA table_info("` + table + `")`)
 		require.NoError(t, err)
 		var columns []string
@@ -279,9 +324,19 @@ func baselineLiveVector(t *testing.T, db *sql.DB) string {
 	return string(encoded)
 }
 
-type baselineCommittedResponseLoss struct{ lose atomic.Bool }
+type baselineProtocolRequest struct {
+	Path, Method string
+	Header       http.Header
+	Body         []byte
+}
+
+type baselineCommittedResponseLoss struct {
+	lose     atomic.Bool
+	requests atomic.Int64
+}
 
 func (transport *baselineCommittedResponseLoss) RoundTrip(request *http.Request) (*http.Response, error) {
+	transport.requests.Add(1)
 	response, err := http.DefaultTransport.RoundTrip(request)
 	if err == nil && request.URL.Path == "/sync/push" && transport.lose.Swap(false) {
 		if response.StatusCode != http.StatusOK {
@@ -346,8 +401,13 @@ func TestBaselineLive_SourceRecoverySnapshotPreservesFrozenOwners(t *testing.T) 
 	_, err = tx.Exec(`UPDATE _sync_operation_state SET kind='source_recovery',reason='source_sequence_changed',replacement_source_id=?`, replacement)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
+	before := baselineLiveVector(t, db)
+	requestsBefore := transport.requests.Load()
 	_, err = client.Rebuild(ctx)
-	require.NoError(t, err)
+	var unresolved *oversqlite.UploadJournalIntegrityError
+	require.ErrorAs(t, err, &unresolved)
+	require.Equal(t, before, baselineLiveVector(t, db), "snapshot must preserve every frozen owner byte")
+	require.Equal(t, requestsBefore, transport.requests.Load(), "unresolved F/C refuses before HTTP")
 	var newBase, newProvenance, newWire, newLocal, newHash, source, kind, name string
 	var version, next, checkpoint, bundleID int64
 	require.NoError(t, db.QueryRow(`SELECT base_payload,base_provenance,wire_payload,local_payload,source_bundle_id FROM _sync_outbox_rows`).Scan(&newBase, &newProvenance, &newWire, &newLocal, &bundleID))
@@ -355,10 +415,20 @@ func TestBaselineLive_SourceRecoverySnapshotPreservesFrozenOwners(t *testing.T) 
 	require.Equal(t, provenance, newProvenance)
 	require.Equal(t, wire, newWire)
 	require.Equal(t, local, newLocal)
-	require.Equal(t, int64(1), bundleID)
+	require.Equal(t, int64(2), bundleID, "the original frozen operation is never rebound to replacement sequence1")
 	require.NoError(t, db.QueryRow(`SELECT canonical_request_hash,source_id FROM _sync_outbox_bundle`).Scan(&newHash, &source))
 	require.Equal(t, hash, newHash)
-	require.Equal(t, replacement, source)
+	require.NotEqual(t, replacement, source)
+	settlement, err := client.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeCommitted, settlement.Outcome)
+	for _, table := range []string{"_sync_upload_journal", "_sync_outbox_rows", "_sync_dirty_rows"} {
+		var count int
+		require.NoError(t, db.QueryRow("SELECT count(*) FROM "+table).Scan(&count))
+		require.Zero(t, count)
+	}
+	_, err = client.Rebuild(ctx)
+	require.NoError(t, err)
 	require.NoError(t, db.QueryRow(`SELECT server_kind,row_version,json_extract(server_payload,'$.name.value') FROM _sync_row_state`).Scan(&kind, &version, &name))
 	require.Equal(t, "live", kind)
 	require.Equal(t, int64(2), version)
@@ -375,6 +445,14 @@ func TestBaselineLive_SourceRecoverySnapshotPreservesFrozenOwners(t *testing.T) 
 	}
 	require.NoError(t, authority.Pool.QueryRow(ctx, `SELECT name FROM business.categories WHERE id=$1`, id).Scan(&remote))
 	require.Equal(t, "frozen", remote)
-	t.Log("baseline-live: public recovery newer A and immutable original frozen B/wire verified")
+	_, err = db.Exec(`UPDATE categories SET name='replacement-write' WHERE id=?`, id)
+	require.NoError(t, err)
+	_, err = client.PushPending(ctx)
+	require.NoError(t, err)
+	require.NoError(t, authority.Pool.QueryRow(ctx, `SELECT name FROM business.categories WHERE id=$1`, id).Scan(&remote))
+	require.Equal(t, "replacement-write", remote)
+	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id=?`, replacement).Scan(&next))
+	require.EqualValues(t, 2, next, "fresh replacement write consumes its own first sequence")
+	t.Log("baseline-live: original F/C preserved through refusal and settled before clean source replacement; fresh replacement write converged")
 	t.Log(baselineLiveVector(t, db))
 }

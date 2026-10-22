@@ -53,9 +53,14 @@ func replayDiagnosticBacklog(t *testing.T, c *Client, db *sql.DB, n int, widths 
 	c.config.MaxSyncWorkUnitsPerInvocation = 100000000
 	_, err := db.Exec(`UPDATE nodes SET name='changed parent' WHERE id='P'`)
 	require.NoError(t, err)
-	c.SetBeforePushCommitHook(func(context.Context) error { return context.Canceled })
+	// Freeze a committed certificate before replay, as in BacklogBound. A cut
+	// before commit is resolved as cancelled by the v1 fence and cannot measure
+	// settlement of the original committed outcome.
+	c.HTTP = &http.Client{Transport: a1SettlementServer(t)}
+	c.SetBeforePushReplayHook(func(context.Context) error { return context.Canceled })
 	_, err = c.PushPending(context.Background())
 	require.ErrorIs(t, err, context.Canceled)
+	require.EqualValues(t, 1, countA3(t, db, `SELECT count(*) FROM _sync_upload_journal WHERE phase='frozen' AND length(outcome_body)>0`))
 	_, err = db.Exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO nodes SELECT printf('Z%05d',i),?,NULL FROM n`, n, strings.Repeat("b", width))
 	require.NoError(t, err)
 	_, err = db.Exec(`UPDATE _sync_row_state SET row_version=1,server_kind='live',
@@ -83,8 +88,8 @@ func TestReplayDiagnostics_Public(t *testing.T) {
 				start := time.Now()
 				c, db, path := qualificationDurableClient(t)
 				retained := replayDiagnosticBacklog(t, c, db, n, width)
-				server := a1SettlementServer(t)
-				c.HTTP = &http.Client{Transport: server}
+				// Keep the authority that committed C: its retained outcome is also
+				// the owner of the final ack obligation.
 				var frozen string
 				require.NoError(t, db.QueryRow(`SELECT canonical_request_hash FROM _sync_outbox_bundle`).Scan(&frozen))
 				setup := time.Since(start)

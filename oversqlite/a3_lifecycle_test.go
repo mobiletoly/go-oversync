@@ -69,6 +69,13 @@ func TestA3Lifecycle_ActionsAndSurvivors(t *testing.T) {
 			s := stageUserSnapshotRowsForGate(t, c, "a3-action", 2, a3SnapshotRows(t, values))
 			_, err := db.Exec(`CREATE TRIGGER snapshot_rewrite AFTER INSERT ON nodes WHEN NEW.id='Q' BEGIN UPDATE nodes SET name='trigger damage' WHERE id='D'; END`)
 			require.NoError(t, err)
+			before := qualificationState(t, db, "nodes")
+			var blocked *FinalStateApplyBlockedError
+			require.ErrorAs(t, c.applyStagedSnapshotLocked(context.Background(), s, snapshotApplyOptions{}), &blocked)
+			require.Equal(t, "unsafe_trigger_or_dependency", blocked.Reason)
+			require.Equal(t, before, qualificationState(t, db, "nodes"))
+			_, err = db.Exec(`DROP TRIGGER snapshot_rewrite`)
+			require.NoError(t, err)
 			require.NoError(t, c.applyStagedSnapshotLocked(context.Background(), s, snapshotApplyOptions{}))
 			require.Equal(t, "final grandchild", baselineText(t, db, `SELECT name FROM nodes WHERE id='D'`))
 			require.Equal(t, "C", baselineText(t, db, `SELECT parent_id FROM nodes WHERE id='D'`))

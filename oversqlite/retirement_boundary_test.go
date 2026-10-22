@@ -34,7 +34,7 @@ func TestRetirement_MaintenanceAndUploadBoundaries(t *testing.T) {
 			require.NoError(t, err)
 			remote := newMockPushServer(t)
 			client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-				hit := vector.Boundary == "push" && r.Method == http.MethodPost && r.URL.Path == "/sync/push"
+				hit := vector.Boundary == "push" && r.Method == http.MethodPost && (r.URL.Path == "/sync/push" || r.URL.Path == "/sync/push-outcomes/resolve")
 				if hit {
 					return errorJSONResponse(vector.Status, map[string]any{"error": vector.Error, "retryable": vector.Retryable, "remediation": vector.Remediation}), nil
 				}

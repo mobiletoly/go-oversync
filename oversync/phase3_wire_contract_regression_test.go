@@ -159,20 +159,15 @@ func TestPhase3PersistedAndNotificationSourceIDsFailClosed(t *testing.T) {
 		require.NotContains(t, err.Error(), invalidSourceID)
 	})
 
-	t.Run("bundle_log", func(t *testing.T) {
-		tx := &phase3Tx{row: phase3RowFunc(func(dest ...any) error {
-			planned := int64(1)
-			*dest[0].(*int64) = 1
-			*dest[1].(*string) = invalidSourceID
-			*dest[2].(*int64) = 1
-			*dest[3].(*int64) = 0
-			*dest[4].(**int64) = &planned
-			*dest[5].(*[]byte) = []byte{1}
-			*dest[6].(*string) = strings.Repeat("a", 64)
-			return nil
-		})}
-		_, err := loadCommittedPushMetadataBySourceTuple(context.Background(), tx, 1, "request-source", 1)
+	t.Run("retained upload outcome", func(t *testing.T) {
+		raw := []byte(`{"source_id":"valid-source","schema_generation_id":"1","schema_generation_fingerprint":"` + strings.Repeat("a", 64) + `","source_bundle_id":1,"canonical_request_hash":"` + strings.Repeat("b", 64) + `","initialization_id":null,"status":"cancelled","outcome_hash":"` + strings.Repeat("c", 64) + `"}`)
+		var valid PushOutcome
+		require.NoError(t, json.Unmarshal(raw, &valid), "the witness must otherwise be a valid terminal envelope")
+		raw = []byte(strings.Replace(string(raw), "valid-source", invalidSourceID, 1))
+		tx := &phase3Tx{row: phase3RowFunc(func(dest ...any) error { *dest[0].(*[]byte) = raw; return nil })}
+		_, err := loadRetainedPushOutcome(context.Background(), tx, 1, "request-source")
 		require.Error(t, err)
+		require.Contains(t, err.Error(), "source")
 		require.NotContains(t, err.Error(), invalidSourceID)
 	})
 

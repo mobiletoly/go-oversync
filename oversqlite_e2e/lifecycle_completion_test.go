@@ -338,6 +338,7 @@ func rawDoSyncJSON(
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set(oversync.SourceIDHeader, sourceID)
+	req.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 	proof, err := rawSelectedGenerationProof(server, userID, sourceID)
 	require.NoError(t, err)
 	req.Header.Set(oversync.SchemaGenerationIDHeader, strconv.FormatInt(int64(proof.ID), 10))

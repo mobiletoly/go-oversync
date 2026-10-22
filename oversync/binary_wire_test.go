@@ -227,7 +227,7 @@ func TestBinaryWire_ScalarFloatExpansionDoesNotConsumeLogicalBundleBudget(t *tes
 	trustedActor := Actor{UserID: "trusted"}
 	mustInitializeEmptyScope(t, ctx, service, trustedActor.UserID, "server")
 	trustedID := uuid.New()
-	err = service.WithinSyncBundle(ctx, trustedActor, BundleSource{SourceID: "server", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err = service.WithinSyncBundle(ctx, trustedActor, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		args := []any{trustedActor.UserID, trustedID}
 		returnErr := error(nil)
 		_, returnErr = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.metrics (%s) VALUES (%s)`, schemaIdent, strings.Join(insertColumns, ","), strings.Join(values, ",")), args...)
@@ -274,7 +274,7 @@ func TestRetainedWirePayloadFormattingDoesNotConsumeLogicalLimits(t *testing.T) 
 	reader := Actor{UserID: userID, SourceID: "reader"}
 	mustInitializeEmptyScope(t, ctx, service, reader.UserID, reader.SourceID)
 	rowID := uuid.New()
-	err = service.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err = service.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id) VALUES ($1)`, tableIdent), rowID)
 		return execErr
 	})
@@ -506,12 +506,14 @@ func TestBinaryWire_PhysicalExpansionDoesNotConsumeLogicalBundleBudget(t *testin
 		SourceBundleID: 1, CanonicalRequestHash: requestHash, InitializationID: initializationID, Rows: []PushRequestRow{pushRow},
 	})
 	require.NoError(t, err)
-	require.LessOrEqual(t, committed.Bundle.ByteCount, int64(logicalLimit))
+	require.Equal(t, "committed", committed.Outcome.Status)
+	committed.Bundle = loadCommittedBundleForUser(t, ctx, restarted, actor.UserID, committed.Outcome.Committed.BundleSeq)
+	require.LessOrEqual(t, loadCommittedBundleForUser(t, ctx, restarted, actor.UserID, committed.Outcome.Committed.BundleSeq).ByteCount, int64(logicalLimit))
 
 	trustedActor := Actor{UserID: "trusted"}
 	mustInitializeEmptyScope(t, ctx, restarted, trustedActor.UserID, "server")
 	trustedID := uuid.New()
-	err = restarted.WithinSyncBundle(ctx, trustedActor, BundleSource{SourceID: "server", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err = restarted.WithinSyncBundle(ctx, trustedActor, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.files (id,name,data) VALUES ($1,$2,$3)`, pgx.Identifier{schemaName}.Sanitize()), trustedID, "t", fileData)
 		return execErr
 	})
@@ -594,7 +596,9 @@ func TestBinaryWire_JSONBExpansionDoesNotConsumeLogicalBundleBudget(t *testing.T
 		SourceBundleID: 1, CanonicalRequestHash: requestHash, InitializationID: initializationID, Rows: []PushRequestRow{pushRow},
 	})
 	require.NoError(t, err)
-	require.LessOrEqual(t, committed.Bundle.ByteCount, int64(logicalLimit))
+	require.Equal(t, "committed", committed.Outcome.Status)
+	committed.Bundle = loadCommittedBundleForUser(t, ctx, restarted, actor.UserID, committed.Outcome.Committed.BundleSeq)
+	require.LessOrEqual(t, loadCommittedBundleForUser(t, ctx, restarted, actor.UserID, committed.Outcome.Committed.BundleSeq).ByteCount, int64(logicalLimit))
 	committedBundle := loadCommittedBundleForUser(t, ctx, restarted, actor.UserID, committed.Bundle.BundleSeq)
 	require.JSONEq(t, fmt.Sprintf(`{"document":%q,"id":"%s"}`, innerJSON, rowID), string(committedBundle.Rows[0].Payload))
 	_, err = pushRowsOneShot(t, ctx, restarted, Actor{UserID: actor.UserID, SourceID: "conflict-device"}, 1, []PushRequestRow{{
@@ -609,7 +613,7 @@ func TestBinaryWire_JSONBExpansionDoesNotConsumeLogicalBundleBudget(t *testing.T
 	trustedActor := Actor{UserID: "trusted"}
 	mustInitializeEmptyScope(t, ctx, restarted, trustedActor.UserID, "server")
 	trustedID := uuid.New()
-	err = restarted.WithinSyncBundle(ctx, trustedActor, BundleSource{SourceID: "server", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err = restarted.WithinSyncBundle(ctx, trustedActor, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.items (id,document) VALUES ($1,$2::jsonb)`, schemaIdent), trustedID, innerJSON)
 		return execErr
 	})
@@ -699,7 +703,9 @@ func TestBinaryWire_JSONBRetainedScaleDoesNotConsumeLogicalBundleBudget(t *testi
 		SourceBundleID: 1, CanonicalRequestHash: requestHash, InitializationID: initializationID, Rows: []PushRequestRow{pushRow},
 	})
 	require.NoError(t, err)
-	require.LessOrEqual(t, committed.Bundle.ByteCount, int64(logicalLimit))
+	require.Equal(t, "committed", committed.Outcome.Status)
+	committed.Bundle = loadCommittedBundleForUser(t, ctx, restarted, actor.UserID, committed.Outcome.Committed.BundleSeq)
+	require.LessOrEqual(t, loadCommittedBundleForUser(t, ctx, restarted, actor.UserID, committed.Outcome.Committed.BundleSeq).ByteCount, int64(logicalLimit))
 	committedBundle := loadCommittedBundleForUser(t, ctx, restarted, actor.UserID, committed.Bundle.BundleSeq)
 	require.JSONEq(t, fmt.Sprintf(`{"document":%q,"id":"%s"}`, canonicalInner, rowID), string(committedBundle.Rows[0].Payload))
 	snapshot, err := restarted.CreateSnapshotSession(ctx, actor, testSchemaGenerationProofForService(restarted))
@@ -720,7 +726,7 @@ func TestBinaryWire_JSONBRetainedScaleDoesNotConsumeLogicalBundleBudget(t *testi
 	trustedActor := Actor{UserID: "trusted"}
 	mustInitializeEmptyScope(t, ctx, restarted, trustedActor.UserID, "server")
 	trustedID := uuid.New()
-	err = restarted.WithinSyncBundle(ctx, trustedActor, BundleSource{SourceID: "server", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err = restarted.WithinSyncBundle(ctx, trustedActor, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.items (id,document) VALUES ($1,$2::jsonb)`, schemaIdent), trustedID, canonicalInner)
 		return execErr
 	})

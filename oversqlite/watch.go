@@ -254,6 +254,7 @@ func (c *Client) openBundleChangeWatch(ctx context.Context, afterBundleSeq int64
 		return nil, err
 	}
 	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set(oversync.ProtocolVersionHeader, requiredProtocolVersion)
 
 	resp, err := c.doHTTP(req)
 	if err != nil {

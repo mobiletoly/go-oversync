@@ -68,14 +68,14 @@ func jsonResponse(v any) *http.Response {
 		if typed.RowCount > 0 && typed.ByteCount == 0 {
 			typed.ByteCount = typed.RowCount
 		}
-		v = oversync.CompactSnapshotSessionResponse{SnapshotID: typed.SnapshotID, SnapshotBundleSeq: typed.SnapshotBundleSeq, RowCount: typed.RowCount, LogicalByteCount: typed.ByteCount, ExpiresAt: typed.ExpiresAt}
+		v = oversync.CompactSnapshotSessionResponse{SnapshotID: typed.SnapshotID, SnapshotBundleSeq: typed.SnapshotBundleSeq, RowCount: typed.RowCount, LogicalByteCount: typed.ByteCount, ExpiresAt: typed.ExpiresAt, SnapshotHash: typed.SnapshotHash, Recovery: typed.Recovery}
 	case *oversync.SnapshotSession:
 		if typed != nil {
 			copy := *typed
 			if copy.RowCount > 0 && copy.ByteCount == 0 {
 				copy.ByteCount = copy.RowCount
 			}
-			v = oversync.CompactSnapshotSessionResponse{SnapshotID: copy.SnapshotID, SnapshotBundleSeq: copy.SnapshotBundleSeq, RowCount: copy.RowCount, LogicalByteCount: copy.ByteCount, ExpiresAt: copy.ExpiresAt}
+			v = oversync.CompactSnapshotSessionResponse{SnapshotID: copy.SnapshotID, SnapshotBundleSeq: copy.SnapshotBundleSeq, RowCount: copy.RowCount, LogicalByteCount: copy.ByteCount, ExpiresAt: copy.ExpiresAt, SnapshotHash: copy.SnapshotHash, Recovery: copy.Recovery}
 		}
 	case oversync.SnapshotChunkResponse:
 		if typed.Rows == nil {
@@ -180,7 +180,7 @@ func testSnapshotRowsByteCount(rows []oversync.SnapshotRow) int64 {
 
 func testWireLimits() oversync.WireLimits {
 	return oversync.WireLimits{
-		MaxPushRows: 1000, MaxPushDecodedBytes: 1 << 20,
+		MaxPushRows: 1000, MaxPushDecodedBytes: 1 << 20, MaxPushOutcomeDecodedBytes: 16*1024*1024 + 8192,
 		MaxPullBundles: 1000, MaxPullDecodedBytes: 4 << 20,
 		MaxSnapshotRowsPerChunk: 1000, MaxSnapshotDecodedBytesPerChunk: 4 << 20,
 		MaxSnapshotRows: 100_000, MaxSnapshotLogicalBytes: 64 << 20, MaxRowDecodedBytes: 1 << 20,

@@ -344,7 +344,7 @@ func TestRegisteredTableGuard_RejectsDirectAndWithinSyncBundleTruncate(t *testin
 	}, integrationTestLogger(slog.LevelWarn))
 	userID := "truncate-guard-user-" + suffix
 	sourceID := "server-app"
-	mustInitializeEmptyScope(t, ctx, svc, userID, sourceID)
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
 	tableIdent := pgx.Identifier{schemaName, "users"}.Sanitize()
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: sourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, $2, $3)`, tableIdent), uuid.New(), "Before Truncate", "before@example.com")
@@ -400,7 +400,7 @@ func TestRegisteredTableGuard_RejectsCascadeAndMultiTableTruncate(t *testing.T) 
 		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	userID := "truncate-cascade-user-" + suffix
-	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (id, name, email) VALUES ($1, 'User', 'user@example.com')`, userTableIdent), uuid.New())
 		return err
@@ -495,7 +495,7 @@ func TestWithinSyncBundle_CapturesDirectServerWrite(t *testing.T) {
 	rowID := uuid.New()
 	actor := Actor{UserID: userID}
 	source := BundleSource{SourceID: "server-app", SourceBundleID: 1}
-	mustInitializeEmptyScope(t, ctx, svc, userID, source.SourceID)
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
 
 	err := svc.WithinSyncBundle(ctx, actor, source, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -614,7 +614,7 @@ func TestWithinSyncBundle_RollbackLeavesNoVisibleBundle(t *testing.T) {
 
 	userID := "bundle-rollback-user-" + suffix
 	rowID := uuid.New()
-	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
 
 	err := svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -672,7 +672,7 @@ func TestWithinSyncBundle_RetriesDatabaseOnlyCallbackAndCommitsExactlyOneTransac
 	}, logger)
 
 	userID := "bundle-single-attempt-user-" + suffix
-	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
 	rowID := uuid.New()
 
 	attempts := 0
@@ -696,6 +696,7 @@ func TestWithinSyncBundle_RetriesDatabaseOnlyCallbackAndCommitsExactlyOneTransac
 		SELECT COUNT(*)
 		FROM sync.source_state
 		WHERE user_pk = (SELECT user_pk FROM sync.user_state WHERE user_id = $1)
+		  AND source_id = 'server-app'
 	`, userID).Scan(&sourceStateCount))
 	require.Equal(t, 1, sourceStateCount)
 
@@ -726,19 +727,17 @@ func TestWithinSyncBundle_RetiredSourceFailsClosed(t *testing.T) {
 	userID := "bundle-retired-user-" + suffix
 	oldSourceID := "server-old"
 	newSourceID := "server-new"
-	mustInitializeEmptyScope(t, ctx, svc, userID, oldSourceID)
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
+	// Trusted source retirement is independent of client snapshot replacement.
+	require.NoError(t, pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		userPK, err := lookupUserPK(ctx, tx, userID)
+		if err != nil {
+			return err
+		}
+		return retireSourceState(ctx, tx, userPK, oldSourceID, newSourceID, "test")
+	}))
 
-	_, err := svc.CreateSnapshotSessionWithRequest(ctx, Actor{UserID: userID, SourceID: oldSourceID}, testSchemaGenerationProofForService(svc), &SnapshotSessionCreateRequest{
-		SourceReplacement: &SnapshotSourceReplacement{
-			PreviousSourceID: oldSourceID,
-			NewSourceID:      newSourceID,
-			Reason:           "history_pruned",
-		},
-	})
-
-	require.NoError(t, err)
-
-	err = svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: oldSourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err := svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: oldSourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`
 			INSERT INTO %s.users (id, name, email)
 			VALUES ($1, $2, $3)
@@ -775,7 +774,7 @@ func TestWithinSyncBundle_CapturesCascadeDeletes(t *testing.T) {
 	userID := "bundle-cascade-user-" + suffix
 	userRowID := uuid.New()
 	postRowID := uuid.New()
-	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
 
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -875,7 +874,7 @@ func TestWithinSyncBundle_CapturesCascadeUpdates(t *testing.T) {
 	parentID := uuid.New()
 	newParentID := uuid.New()
 	childID := uuid.New()
-	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
 
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -1014,7 +1013,7 @@ func TestWithinSyncBundle_CapturesServerSideTriggerWritesOnRegisteredTables(t *t
 
 	userID := "bundle-trigger-write-user-" + suffix
 	rowID := uuid.New()
-	mustInitializeEmptyScope(t, ctx, svc, userID, "server-app")
+	mustInitializeEmptyScope(t, ctx, svc, userID, "bootstrap-client")
 
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: userID}, BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
@@ -1088,7 +1087,7 @@ func newBundleOwnerGuardFixture(t *testing.T, schemaPrefix, appName string) *bun
 func (f *bundleOwnerGuardFixture) initializeOwner(t *testing.T, ownerID string) {
 	t.Helper()
 
-	mustInitializeEmptyScope(t, f.ctx, f.svc, ownerID, "server-app")
+	mustInitializeEmptyScope(t, f.ctx, f.svc, ownerID, "bootstrap-client")
 }
 
 func (f *bundleOwnerGuardFixture) source(bundleID int64) BundleSource {

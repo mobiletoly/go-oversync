@@ -63,7 +63,8 @@ func newWatchMobileClient(t *testing.T, cfg *oversqlite.Config, watchSupported b
 				ProtocolVersion: "v1", SchemaGeneration: watchTestDescriptor, WatchEnabled: watchSupported,
 				Limits: oversync.WireLimits{
 					MaxPushRows: 10000, MaxPushDecodedBytes: 16 << 20,
-					MaxPullBundles: 5000, MaxPullDecodedBytes: 32 << 20,
+					MaxPushOutcomeDecodedBytes: 16*1024*1024 + 8192,
+					MaxPullBundles:             5000, MaxPullDecodedBytes: 32 << 20,
 					MaxSnapshotRowsPerChunk: 1, MaxSnapshotDecodedBytesPerChunk: 1024,
 					MaxSnapshotRows: 50000, MaxSnapshotLogicalBytes: 128 << 20, MaxRowDecodedBytes: 1024,
 				},

@@ -189,8 +189,8 @@ func requireNextSourceBundleIDInSourceState(t *testing.T, db *sql.DB, client *Cl
 	require.Equal(t, expected, nextSourceBundleID)
 }
 
-func TestDecodePushConflictError_RequiresStructuredConflict(t *testing.T) {
-	structured := decodePushConflictError(http.StatusConflict, mustJSONPayload(t, map[string]any{
+func TestHistoricalPushConflictFixture_RequiresStructuredConflict(t *testing.T) {
+	structured := decodeHistoricalPushConflictFixture(http.StatusConflict, mustJSONPayload(t, map[string]any{
 		"error":   "push_conflict",
 		"message": "bundle conflict",
 		"conflict": map[string]any{
@@ -211,7 +211,7 @@ func TestDecodePushConflictError_RequiresStructuredConflict(t *testing.T) {
 	require.NotNil(t, structured)
 	require.NotNil(t, structured.Conflict())
 
-	unstructured := decodePushConflictError(http.StatusConflict, mustJSONPayload(t, map[string]any{
+	unstructured := decodeHistoricalPushConflictFixture(http.StatusConflict, mustJSONPayload(t, map[string]any{
 		"error":   "push_conflict",
 		"message": "bundle conflict",
 	}))
@@ -309,7 +309,7 @@ func TestPushPending_StructuredConflictServerWinsResolverRecoversToServerState(t
 	require.Equal(t, 0, outboundCount)
 
 	nextSourceBundleID, lastBundleSeqSeen := requireClientBundleState(t, db, client.UserID)
-	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, int64(2), nextSourceBundleID)
 	require.Equal(t, int64(0), lastBundleSeqSeen)
 }
 
@@ -345,7 +345,7 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 		}
 		var nextSourceBundleID int64
 		require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, client.UserID).Scan(&nextSourceBundleID))
-		require.Equal(t, int64(1), nextSourceBundleID)
+		require.Equal(t, int64(2), nextSourceBundleID)
 		require.Equal(t, int64(2), session.Rows[0].BaseRowVersion)
 		return successHook(session)
 	}
@@ -356,7 +356,7 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 	name, _, exists := loadUserForKey(t, db, userID)
 	require.True(t, exists)
 	require.Equal(t, "Ada Local", name)
-	require.Equal(t, []int64{1, 1}, sourceBundleIDs)
+	require.Equal(t, []int64{1, 2}, sourceBundleIDs)
 
 	rowVersion, deleted, rowStateExists := loadUserRowStateForKey(t, db, rowKeyJSON(userID))
 	require.True(t, rowStateExists)
@@ -364,7 +364,7 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 	require.Equal(t, int64(3), rowVersion)
 
 	nextSourceBundleID, lastBundleSeqSeen := requireClientBundleState(t, db, client.UserID)
-	require.Equal(t, int64(2), nextSourceBundleID)
+	require.Equal(t, int64(3), nextSourceBundleID)
 	require.Equal(t, int64(0), lastBundleSeqSeen)
 }
 
@@ -535,7 +535,7 @@ func TestPushPending_StructuredConflictPreservesSiblingRowsFromRejectedBundle(t 
 			})
 		}
 		require.Len(t, session.Rows, 2)
-		require.Equal(t, int64(1), session.SourceBundleID)
+		require.Equal(t, int64(2), session.SourceBundleID)
 		seenIDs := []string{
 			session.Rows[0].Key["id"].(string),
 			session.Rows[1].Key["id"].(string),
@@ -568,7 +568,7 @@ func TestPushPending_StructuredConflictInvalidKeepMergedForDeleteRestoresDirtyIn
 	requireInvalidConflictResolution(t, client, ctx)
 	requireReplayableDirtyUser(t, db, userID, oversync.OpDelete, 1, false)
 	requireDirtyOutboxCounts(t, db, 1, 0)
-	requireClientBundleStateValues(t, db, client.UserID, 1, 0)
+	requireClientBundleStateValues(t, db, client.UserID, 2, 0)
 }
 
 func TestPushPending_StructuredConflictInvalidResolutionForDeletedAuthoritativeUpdateRestoresDirtyIntent(t *testing.T) {
@@ -604,7 +604,7 @@ func TestPushPending_StructuredConflictInvalidResolutionForDeletedAuthoritativeU
 			requireDirtyOutboxCounts(t, db, 1, 0)
 			if tc.requireNextSourceBundle {
 				nextSourceBundleID, _ := requireClientBundleState(t, db, client.UserID)
-				require.Equal(t, int64(1), nextSourceBundleID)
+				require.Equal(t, int64(2), nextSourceBundleID)
 			}
 		})
 	}
@@ -655,7 +655,7 @@ func TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState
 	var sourceBundleIDs []int64
 	server.pushHook = func(session *mockDirectPush) *http.Response {
 		sourceBundleIDs = append(sourceBundleIDs, session.SourceBundleID)
-		requireNextSourceBundleIDInSourceState(t, db, client, 1)
+		requireNextSourceBundleIDInSourceState(t, db, client, int64(len(sourceBundleIDs)))
 		return structuredConflictResponse(session.Rows[0], 2, false, serverConflictUserRow(userID, "Ada Server", "ada@example.com"))
 	}
 	client.HTTP = &http.Client{Transport: server}
@@ -666,9 +666,28 @@ func TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState
 	require.ErrorAs(t, err, &exhaustedErr)
 	require.Equal(t, 2, exhaustedErr.RetryCount)
 	require.Equal(t, 1, exhaustedErr.RemainingDirtyCount)
-	require.Equal(t, []int64{1, 1, 1}, sourceBundleIDs)
+	require.Equal(t, []int64{1, 2, 3}, sourceBundleIDs)
+	require.Len(t, server.ackRequests, 3)
 
 	requireReplayableDirtyUser(t, db, userID, oversync.OpUpdate, 2, true)
 	requireDirtyOutboxCounts(t, db, 1, 0)
-	requireClientBundleStateValues(t, db, client.UserID, 1, 0)
+	requireClientBundleStateValues(t, db, client.UserID, 4, 0)
+}
+
+// Historical fixture input only; ordinary transport accepts terminal certificates.
+func decodeHistoricalPushConflictFixture(status int, body []byte) *PushConflictError {
+	if status != http.StatusConflict {
+		return nil
+	}
+
+	response, err := completeConflictResponse(body)
+	if err != nil {
+		return nil
+	}
+	response.Message = ""
+	return &PushConflictError{
+		Status:   status,
+		RawBody:  "",
+		Response: *response,
+	}
 }

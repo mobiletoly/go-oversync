@@ -2,11 +2,12 @@ package oversync
 
 import (
 	"context"
-	"encoding/json"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -101,13 +102,30 @@ func TestGenerationLifecycle_RetiredProofEveryDirectOperation(t *testing.T) {
 			return err
 		}},
 		{name: "push", call: func() error {
-			rows := []PushRequestRow{{Schema: "business", Table: "items", Key: SyncKey{"id": "item"}, Op: OpInsert, Payload: json.RawMessage(`{"id":"item"}`)}}
-			hash, hashErr := computeGenerationPinnedPushRequestHash(missing, rows)
-			if hashErr != nil {
-				return hashErr
-			}
-			_, err := service.PushOneShot(context.Background(), actor, missing, &OneShotPushRequest{SourceBundleID: 1, CanonicalRequestHash: hash, Rows: rows})
-			return err
+			// Current push admission first owns the durable source/outcome.
+			// A nil-pool service cannot stand in for that direct runtime boundary.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			f := newDirectPushFixture(t, ctx, directPushFixtureOptions{})
+			old := testSchemaGenerationProofForService(f.svc)
+			declarations := append([]SchemaGeneration(nil), f.svc.config.SchemaGenerations...)
+			declarations[0].ID = 3
+			registry, compileErr := CompileSchemaGenerationRegistry(f.svc.config.RegisteredTables, declarations)
+			require.NoError(t, compileErr)
+			current, _ := registry.Generation(3)
+			f.svc.schemaGenerationRegistry = registry
+			f.svc.config.Readiness.Expected.GenerationLedger = &GenerationLedger{Revision: 3, Entries: []GenerationLifecycle{
+				{Proof: old, State: "retired", AllocatedRevision: 1, RetiredRevision: 3},
+				{Proof: SchemaGenerationProof{ID: 3, Fingerprint: current.Fingerprint()}, State: "supported", AllocatedRevision: 2},
+			}}
+			rows := []PushRequestRow{f.userRow(uuid.New(), "retired")}
+			hash, hashErr := computeGenerationPinnedPushRequestHash(old, rows)
+			require.NoError(t, hashErr)
+			_, pushErr := f.svc.PushOneShot(ctx, f.writer, old, &OneShotPushRequest{SourceBundleID: 1, CanonicalRequestHash: hash, Rows: rows})
+			var count int
+			require.NoError(t, f.pool.QueryRow(ctx, `SELECT count(*) FROM `+pgx.Identifier{f.schemaName, "users"}.Sanitize()).Scan(&count))
+			require.Zero(t, count, "retired fresh push cannot publish business DML")
+			return pushErr
 		}},
 		{name: "pull", call: func() error { _, err := service.ProcessPull(context.Background(), actor, missing, 0, 1, 0); return err }},
 		{name: "watch", call: func() error {

@@ -243,6 +243,14 @@ func pushRowsOneShot(
 	if err != nil {
 		return nil, err
 	}
+	// Business-focused fixtures unwrap the current terminal rejection. Exact
+	// outcome/ack tests use PushOneShot directly and retain the entire envelope.
+	if response.Outcome.Status == "rejected" && response.Outcome.Rejection != nil {
+		if response.Outcome.Rejection.Conflict != nil {
+			return nil, &PushConflictError{Conflict: response.Outcome.Rejection.Conflict}
+		}
+		return nil, fmt.Errorf("terminal push rejection: %s", response.Outcome.Rejection.Code)
+	}
 	return response.Bundle, nil
 }
 

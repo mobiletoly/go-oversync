@@ -177,16 +177,20 @@ type SnapshotRow struct {
 
 type SnapshotSessionCreateRequest struct {
 	SourceReplacement *SnapshotSourceReplacement `json:"source_replacement,omitempty"`
+	Recovery          *SnapshotRecovery          `json:"recovery,omitempty"`
 }
 
 func (request *SnapshotSessionCreateRequest) UnmarshalJSON(data []byte) error {
 	type plain SnapshotSessionCreateRequest
-	if err := validateJSONObjectFields(data, "snapshot session create request", nil, []string{"source_replacement"}); err != nil {
+	if err := decodeRecoveryObject(data, nil, []string{"source_replacement", "recovery"}, "", new(map[string]json.RawMessage)); err != nil {
 		return err
 	}
 	var decoded plain
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
+	}
+	if decoded.SourceReplacement != nil && decoded.Recovery != nil {
+		return fmt.Errorf("source replacement and recovery are mutually exclusive")
 	}
 	*request = SnapshotSessionCreateRequest(decoded)
 	return nil
@@ -214,11 +218,13 @@ func (replacement *SnapshotSourceReplacement) UnmarshalJSON(data []byte) error {
 
 // SnapshotSession describes one frozen server-side snapshot session.
 type SnapshotSession struct {
-	SnapshotID        string `json:"snapshot_id"`
-	SnapshotBundleSeq int64  `json:"snapshot_bundle_seq"`
-	RowCount          int64  `json:"row_count"`
-	ByteCount         int64  `json:"byte_count"`
-	ExpiresAt         string `json:"expires_at"`
+	SnapshotID        string            `json:"snapshot_id"`
+	SnapshotBundleSeq int64             `json:"snapshot_bundle_seq"`
+	RowCount          int64             `json:"row_count"`
+	ByteCount         int64             `json:"byte_count"`
+	ExpiresAt         string            `json:"expires_at"`
+	SnapshotHash      string            `json:"snapshot_hash"`
+	Recovery          *SnapshotRecovery `json:"recovery,omitempty"`
 }
 
 // SnapshotChunkResponse returns one chunk of snapshot rows from a frozen session.
@@ -232,11 +238,13 @@ type SnapshotChunkResponse struct {
 }
 
 type CompactSnapshotSessionResponse struct {
-	SnapshotID        string `json:"snapshot_id"`
-	SnapshotBundleSeq int64  `json:"snapshot_bundle_seq"`
-	RowCount          int64  `json:"row_count"`
-	LogicalByteCount  int64  `json:"logical_byte_count"`
-	ExpiresAt         string `json:"expires_at"`
+	SnapshotID        string            `json:"snapshot_id"`
+	SnapshotBundleSeq int64             `json:"snapshot_bundle_seq"`
+	RowCount          int64             `json:"row_count"`
+	LogicalByteCount  int64             `json:"logical_byte_count"`
+	ExpiresAt         string            `json:"expires_at"`
+	SnapshotHash      string            `json:"snapshot_hash"`
+	Recovery          *SnapshotRecovery `json:"recovery,omitempty"`
 }
 
 type CompactSnapshotChunkResponse struct {
@@ -270,6 +278,7 @@ type WireLimits struct {
 	MaxSnapshotRows                 int64 `json:"max_snapshot_rows"`
 	MaxSnapshotLogicalBytes         int64 `json:"max_snapshot_logical_bytes"`
 	MaxRowDecodedBytes              int64 `json:"max_row_decoded_bytes"`
+	MaxPushOutcomeDecodedBytes      int64 `json:"max_push_outcome_decoded_bytes"`
 }
 
 type SchemaGenerationCapabilities struct {

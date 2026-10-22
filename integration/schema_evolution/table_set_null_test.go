@@ -116,10 +116,18 @@ func TestTableEvolution_CapturedSetNull(t *testing.T) {
 			replayRequest := c.Request.oneShot([]oversync.PushRequestRow{c.Row})
 			replay, err := s.PushOneShot(ctx, actor, g, &replayRequest)
 			require.NoError(t, err)
-			require.Equal(t, committed.Bundle.BundleSeq, replay.Bundle.BundleSeq)
-			require.Equal(t, expectedHash, replay.Bundle.BundleHash)
-			require.Equal(t, expectedBytes, replay.Bundle.ByteCount)
-			require.Equal(t, committed.Bundle.RowCount, replay.Bundle.RowCount)
+			require.Nil(t, replay.Bundle)
+			require.Equal(t, committed.Outcome, replay.Outcome)
+			require.NotNil(t, replay.Outcome.Committed)
+			require.Equal(t, committed.Bundle.BundleSeq, replay.Outcome.Committed.BundleSeq)
+			require.Equal(t, expectedHash, replay.Outcome.Committed.BundleHash)
+			require.EqualValues(t, committed.Bundle.RowCount, replay.Outcome.Committed.RowCount)
+			require.Equal(t, expectedBytes, bundle.ByteCount) // exact projected bytes were verified above
+			require.NoError(t, s.AcknowledgePushOutcome(ctx, actor, g, oversync.PushOutcomeAckRequest{
+				SourceBundleID:       replay.Outcome.SourceBundleID,
+				CanonicalRequestHash: replay.Outcome.CanonicalRequestHash,
+				OutcomeHash:          replay.Outcome.OutcomeHash,
+			}))
 		}
 		snapshot, err := s.CreateSnapshotSession(ctx, actor, g)
 		require.NoError(t, err)

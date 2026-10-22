@@ -81,7 +81,7 @@ func TestPendingConflict_ProcessDeathKeepsAtomicDecision(t *testing.T) {
 			if boundary == "before_commit" {
 				require.NotNil(t, pending)
 				require.Equal(t, p.ID, pending.ID)
-				require.Equal(t, outboxStatePrepared, requireOutboxBundle(t, db).State)
+				require.Equal(t, outboxStateRejected, requireOutboxBundle(t, db).State)
 			} else {
 				require.Nil(t, pending)
 				require.Equal(t, outboxStateNone, requireOutboxBundle(t, db).State)

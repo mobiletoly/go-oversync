@@ -24,7 +24,7 @@ var applicationErrorCategory = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 func validateApplicationWriteRejections(entries []ApplicationWriteRejection) error {
 	seen := map[string]bool{}
 	for _, entry := range entries {
-		if !applicationSQLState.MatchString(entry.SQLState) || !applicationErrorCategory.MatchString(entry.Category) || seen[entry.SQLState] {
+		if !applicationSQLState.MatchString(entry.SQLState) || !applicationErrorCategory.MatchString(entry.Category) || entry.Category == "push_conflict" || seen[entry.SQLState] {
 			return readinessFailure(DeploymentContractMismatch)
 		}
 		seen[entry.SQLState] = true

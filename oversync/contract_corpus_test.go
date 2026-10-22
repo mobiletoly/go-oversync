@@ -220,13 +220,15 @@ func TestContractCorpus_CurrentProtocolFixtureCoverage(t *testing.T) {
 	}
 	readContractFixture(t, root, "CLASSIFICATIONS.json", &classifications)
 	registered := map[string]string{
-		"local-apply/a1.json":             "local apply limits and survivor reducer",
-		"protocol-handshake/connect.json": "handshake reducer",
-		"protocol-http/requests.json":     "HTTP request builder reducer",
-		"pull-snapshot/basic.json":        "pull/snapshot state reducer",
-		"push/basic-insert.json":          "normative hash execution",
-		"watch/basic.json":                "SSE and watch conflation reducers",
-		"wire/":                           "wire boundary executors",
+		"local-apply/unique-final-state.json": "oversqlite SQLite runtime consumer",
+		"local-apply/a1.json":                 "local apply limits and survivor reducer",
+		"protocol-handshake/connect.json":     "handshake reducer",
+		"protocol-http/requests.json":         "HTTP request builder reducer",
+		"watch/basic.json":                    "SSE and watch conflation reducers",
+		"wire/compact-rows.json":              "compact codec",
+		"wire/compression.json":               "transport framing",
+		"wire/limits.json":                    "wire limits",
+		"recovery/protocol.json":              "exact outcomes, snapshots and workflow contracts",
 	}
 	currentSet := make(map[string]struct{}, len(classifications.Current))
 	for _, current := range classifications.Current {
@@ -268,7 +270,7 @@ func TestContractCorpus_CurrentProtocolFixtureCoverage(t *testing.T) {
 		"max_push_rows": true, "max_push_decoded_bytes": true, "max_pull_bundles": true,
 		"max_pull_decoded_bytes": true, "max_snapshot_rows_per_chunk": true,
 		"max_snapshot_decoded_bytes_per_chunk": true, "max_snapshot_rows": true,
-		"max_snapshot_logical_bytes": true, "max_row_decoded_bytes": true,
+		"max_snapshot_logical_bytes": true, "max_row_decoded_bytes": true, "max_push_outcome_decoded_bytes": true,
 	}
 	for _, test := range handshake.DiscoveryCases {
 		limits, _ := test.Discovery["limits"].(map[string]any)
@@ -301,10 +303,14 @@ func TestContractCorpus_CurrentProtocolFixtureCoverage(t *testing.T) {
 	}
 
 	var requests struct {
-		Cases   []protocolHTTPRequestCase `json:"cases"`
-		Removed []string                  `json:"removedOperations"`
+		Cases                  []protocolHTTPRequestCase    `json:"cases"`
+		Removed                []string                     `json:"removedOperations"`
+		RequiredProtocolHeader struct{ Name, Value string } `json:"requiredProtocolHeader"`
 	}
 	readContractFixture(t, root, "protocol-http/requests.json", &requests)
+	if requests.RequiredProtocolHeader.Name != ProtocolVersionHeader || requests.RequiredProtocolHeader.Value != SyncProtocolVersion {
+		t.Fatal("required protocol header fixture mismatch")
+	}
 	var pushFixture struct {
 		Cases []struct {
 			PushRequest json.RawMessage `json:"pushRequest"`

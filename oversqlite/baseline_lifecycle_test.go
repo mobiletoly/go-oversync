@@ -37,9 +37,11 @@ func TestBaselineLifecycle_LocalCaptureFreezeRequeue(t *testing.T) {
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	require.NoError(t, c.installAuthoritativeBaseline(ctx, tx, "main", "nodes", rowKeyJSON("C"), "live", 2, []byte(`{"id":"C","name":"remote","parent_id":"Q"}`), baselineObservation{Origin: "explicit_conflict"}))
-	require.NoError(t, c.requeueSnapshotRowsInTx(ctx, tx, frozen, nil))
-	require.NoError(t, c.deletePushOutboundSnapshotInTx(ctx, tx, frozen.SourceBundleID))
 	require.NoError(t, tx.Commit())
+	// Only resolve's durable cancelled outcome proves non-commit in v1.
+	_, err = c.PushPending(ctx)
+	require.NoError(t, err)
+	require.Empty(t, qualificationState(t, db, "nodes")["_sync_outbox_rows"])
 	require.JSONEq(t, before, baselineText(t, db, `SELECT base_payload FROM _sync_dirty_rows WHERE key_json=?`, rowKeyJSON("C")))
 	require.Equal(t, "during flight", baselineText(t, db, `SELECT json_extract(payload,'$.name.value') FROM _sync_dirty_rows WHERE key_json=?`, rowKeyJSON("C")))
 	require.Equal(t, "remote", baselineText(t, db, `SELECT json_extract(server_payload,'$.name.value') FROM _sync_row_state WHERE key_json=?`, rowKeyJSON("C")))

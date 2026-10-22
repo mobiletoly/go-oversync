@@ -26,7 +26,7 @@ func TestBrowserTestCORSMiddleware_GzipPushPreflight(t *testing.T) {
 	request := httptest.NewRequest(http.MethodOptions, "/sync/push", nil)
 	request.Header.Set("Origin", "http://localhost:9876")
 	request.Header.Set("Access-Control-Request-Method", http.MethodPost)
-	request.Header.Set("Access-Control-Request-Headers", "authorization,content-encoding,content-type,oversync-source-id,oversync-schema-generation-id,oversync-schema-generation-fingerprint")
+	request.Header.Set("Access-Control-Request-Headers", "authorization,content-encoding,content-type,oversync-protocol-version,oversync-source-id,oversync-schema-generation-id,oversync-schema-generation-fingerprint")
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -127,6 +127,7 @@ func TestGuardSyncRoutes_DispatchesMalformedDiscoveryBeforeServeMux(t *testing.T
 			request := httptest.NewRequest(http.MethodGet, path, nil)
 			request.Header.Set("Authorization", "Bearer routing-token")
 			request.Header.Set(oversync.SourceIDHeader, "routing-source")
+			request.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
 			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())

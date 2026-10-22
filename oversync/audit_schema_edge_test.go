@@ -121,7 +121,7 @@ func auditSchemaEdgePushRow(
 	op string,
 	baseRowVersion int64,
 	payload map[string]any,
-) (*Bundle, error) {
+) (*OneShotPushResponse, error) {
 	t.Helper()
 
 	row := PushRequestRow{
@@ -134,7 +134,29 @@ func auditSchemaEdgePushRow(
 	if payload != nil {
 		row.Payload = auditSchemaEdgePayload(t, payload)
 	}
-	return pushRowsOneShot(t, h.ctx, svc, actor, sourceBundleID, []PushRequestRow{row})
+	proof := testSchemaGenerationProofForService(svc)
+	initializationID := resolveConnectForPush(t, h.ctx, svc, actor, true)
+	hash := mustCanonicalPushRequestHash(t, svc, []PushRequestRow{row})
+	response, err := svc.PushOneShot(h.ctx, actor, proof, &OneShotPushRequest{
+		SourceBundleID: sourceBundleID, CanonicalRequestHash: hash, InitializationID: initializationID, Rows: []PushRequestRow{row},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response.Outcome.Status != "committed" {
+		return nil, fmt.Errorf("schema-edge push returned terminal status %s", response.Outcome.Status)
+	}
+	contract, ok := svc.schemaGenerationRegistry.Generation(proof.ID)
+	require.True(t, ok)
+	var initialization *string
+	if initializationID != "" {
+		initialization = &initializationID
+	}
+	require.NoError(t, ValidatePushOutcomeBinding(*response.Outcome, PushOperationBinding{
+		SourceID: actor.SourceID, GenerationID: canonicalSchemaGenerationID(proof.ID), GenerationFingerprint: proof.Fingerprint,
+		SourceBundleID: sourceBundleID, CanonicalRequestHash: hash, InitializationID: initialization,
+	}, generationDescriptor(contract)))
+	return response, nil
 }
 
 func auditSchemaEdgePayloadObject(t *testing.T, payload json.RawMessage) map[string]any {
@@ -213,11 +235,12 @@ func TestAuditSchemaEdge_GeneratedColumnRoundTripsOrBootstrapRejectsAtomically(t
 	rowID := uuid.NewString()
 	writer := Actor{UserID: "generated-owner-" + rowID, SourceID: "writer"}
 	reader := Actor{UserID: writer.UserID, SourceID: "reader"}
-	insertBundle, err := auditSchemaEdgePushRow(t, h, svc, writer, 1, "records", "id", rowID, OpInsert, 0, map[string]any{
+	insert, err := auditSchemaEdgePushRow(t, h, svc, writer, 1, "records", "id", rowID, OpInsert, 0, map[string]any{
 		"id":   rowID,
 		"body": "alpha",
 	})
 	require.NoError(t, err)
+	insertBundle := insert.Bundle
 	require.NotNil(t, insertBundle)
 	require.Len(t, insertBundle.Rows, 1)
 	insertAfterImage := auditSchemaEdgePayloadObject(t, insertBundle.Rows[0].Payload)
@@ -235,7 +258,8 @@ func TestAuditSchemaEdge_GeneratedColumnRoundTripsOrBootstrapRejectsAtomically(t
 	// partial support.
 	updatePayload := insertAfterImage
 	updatePayload["body"] = "beta"
-	updateBundle, updateErr := auditSchemaEdgePushRow(
+	acknowledgeRetainedOutcomeForTest(t, h.ctx, svc, writer, testSchemaGenerationProofForService(svc))
+	update, updateErr := auditSchemaEdgePushRow(
 		t, h, svc, writer, 2, "records", "id", rowID, OpUpdate, insertBundle.BundleSeq, updatePayload,
 	)
 	if updateErr != nil {
@@ -250,6 +274,7 @@ func TestAuditSchemaEdge_GeneratedColumnRoundTripsOrBootstrapRejectsAtomically(t
 		requireAuditMetadataIntegrity(t, h.ctx, h.pool)
 		t.Fatalf("bootstrap accepted a generated column but its emitted after-image could not round-trip through push: %v", updateErr)
 	}
+	updateBundle := update.Bundle
 	require.NotNil(t, updateBundle)
 	require.Len(t, updateBundle.Rows, 1)
 	updateAfterImage := auditSchemaEdgePayloadObject(t, updateBundle.Rows[0].Payload)
@@ -260,8 +285,8 @@ func TestAuditSchemaEdge_GeneratedColumnRoundTripsOrBootstrapRejectsAtomically(t
 		t, h, svc, writer, 2, "records", "id", rowID, OpUpdate, insertBundle.BundleSeq, updatePayload,
 	)
 	require.NoError(t, err)
-	require.Equal(t, updateBundle.BundleSeq, replayed.BundleSeq)
-	require.Equal(t, updateBundle.BundleHash, replayed.BundleHash)
+	require.Equal(t, update.Outcome, replayed.Outcome)
+	require.Equal(t, update.encoded, replayed.encoded)
 	requireAuditSchemaEdgePullAndSnapshot(
 		t, h, svc, reader, "records", "id", rowID, updateBundle.BundleSeq, updateAfterImage,
 	)
@@ -295,19 +320,22 @@ func TestAuditSchemaEdge_PartitionedRegisteredTableIsCoherentOrRejectedAtomicall
 	rowID := uuid.NewString()
 	writer := Actor{UserID: "partition-owner-" + rowID, SourceID: "writer"}
 	reader := Actor{UserID: writer.UserID, SourceID: "reader"}
-	insertBundle, err := auditSchemaEdgePushRow(t, h, svc, writer, 1, "records", "id", rowID, OpInsert, 0, map[string]any{
+	insert, err := auditSchemaEdgePushRow(t, h, svc, writer, 1, "records", "id", rowID, OpInsert, 0, map[string]any{
 		"id":   rowID,
 		"body": "alpha",
 	})
 	require.NoError(t, err)
+	insertBundle := insert.Bundle
 	require.NotNil(t, insertBundle)
 
 	updatePayload := auditSchemaEdgePayloadObject(t, insertBundle.Rows[0].Payload)
 	updatePayload["body"] = "beta"
-	updateBundle, err := auditSchemaEdgePushRow(
+	acknowledgeRetainedOutcomeForTest(t, h.ctx, svc, writer, testSchemaGenerationProofForService(svc))
+	update, err := auditSchemaEdgePushRow(
 		t, h, svc, writer, 2, "records", "id", rowID, OpUpdate, insertBundle.BundleSeq, updatePayload,
 	)
 	require.NoError(t, err)
+	updateBundle := update.Bundle
 	require.NotNil(t, updateBundle)
 	require.Len(t, updateBundle.Rows, 1)
 	updateAfterImage := auditSchemaEdgePayloadObject(t, updateBundle.Rows[0].Payload)
@@ -325,8 +353,8 @@ func TestAuditSchemaEdge_PartitionedRegisteredTableIsCoherentOrRejectedAtomicall
 		t, h, svc, writer, 2, "records", "id", rowID, OpUpdate, insertBundle.BundleSeq, updatePayload,
 	)
 	require.NoError(t, err)
-	require.Equal(t, updateBundle.BundleSeq, replayed.BundleSeq)
-	require.Equal(t, updateBundle.BundleHash, replayed.BundleHash)
+	require.Equal(t, update.Outcome, replayed.Outcome)
+	require.Equal(t, update.encoded, replayed.encoded)
 	requireAuditSchemaEdgePullAndSnapshot(
 		t, h, svc, reader, "records", "id", rowID, updateBundle.BundleSeq, updateAfterImage,
 	)
@@ -389,10 +417,11 @@ func TestAuditSchemaEdge_ReservedIdentifiersRoundTrip(t *testing.T) {
 		"from":   "origin",
 		"where":  `{"nested":"value"}`,
 	}
-	bundle, err := auditSchemaEdgePushRow(
+	response, err := auditSchemaEdgePushRow(
 		t, h, svc, writer, 1, tableName, keyColumn, keyValue, OpInsert, 0, wantPayload,
 	)
 	require.NoError(t, err)
+	bundle := response.Bundle
 	require.NotNil(t, bundle)
 	require.Len(t, bundle.Rows, 1)
 	require.Equal(t, wantPayload, auditSchemaEdgePayloadObject(t, bundle.Rows[0].Payload))

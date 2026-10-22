@@ -597,6 +597,7 @@ func TestSnapshotSessions_TextKeysUseCanonicalByteOrderAcrossPages(t *testing.T)
 			BaseRowVersion: 0, Payload: payload,
 		}})
 		require.NoError(t, err)
+		acknowledgeRetainedOutcomeForTest(t, ctx, svc, writer, testSchemaGenerationProofForService(svc))
 	}
 
 	reader := Actor{UserID: userID, SourceID: "reader"}
@@ -708,7 +709,7 @@ func TestSnapshotSessions_ChunkPayloadPreservesCurrentAfterImage(t *testing.T) {
 
 	fixture.pushUserAs(t, actor, 1, row1, "Alpha")
 	fixture.pushUserAs(t, actor, 2, row2, "Gamma")
-	require.NoError(t, fixture.svc.WithinSyncBundle(fixture.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 3}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	require.NoError(t, fixture.svc.WithinSyncBundle(fixture.ctx, actor, BundleSource{SourceID: "server-after-image", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.users WHERE id = $1`, fixture.schemaName), row2)
 		return err
 	}))

@@ -608,7 +608,7 @@ func TestReplayStatementCleanup_PreparationCheckpoint(t *testing.T) {
 		for _, reuse := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s/reuse=%t", phase, reuse), func(t *testing.T) {
 				mutatingProgress := 0
-				for _, room := range []int64{100, 112, 120, 128, 136, 144, 152, 160, 176, 192, 208, 224, 240} {
+				for _, room := range []int64{100, 112, 120, 128, 136, 144, 152, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320, 352, 384} {
 					t.Run(fmt.Sprint(room), func(t *testing.T) {
 						c, db, path := qualificationDurableClient(t)
 						if phase == "exception" {
@@ -639,7 +639,7 @@ func TestReplayStatementCleanup_PreparationCheckpoint(t *testing.T) {
 							require.NoError(t, c.putApplySurvivor(context.Background(), tx, p, row))
 						}
 						if phase == "walk" || phase == "clear edges" {
-							_, err := tx.ExecContext(context.Background(), `INSERT INTO _sync_apply_edges VALUES(1,'nodes','P','nodes','C',136)`)
+							_, err := tx.ExecContext(context.Background(), `INSERT INTO _sync_apply_edges(ordinal,parent_table,parent_pk,child_table,child_pk,bytes) VALUES(1,'nodes','P','nodes','C',136)`)
 							require.NoError(t, err)
 							p.edgeEntries, p.edgeBytes = 1, 136
 						}
@@ -656,10 +656,14 @@ func TestReplayStatementCleanup_PreparationCheckpoint(t *testing.T) {
 						require.NoError(t, saveApplyPlan(context.Background(), tx, p))
 						beforeRows, beforeEdges := p.entries, p.edgeEntries
 						err = c.prepareApplySurvivors(ctx, q, lease.unit, roots, seed, p.kind)
+						t.Logf("checkpoint budget room=%d reuse=%v kind=%s phase=%s work=%d rows=%d edges=%d err=%v", room, reuse, p.kind, p.phase, c.syncWorkUsed, p.entries, p.edgeEntries, err)
 						var pending *SyncWorkLimitError
 						if errors.As(err, &pending) {
 							require.NoError(t, cache.closeAndRelease(ctx))
 							require.ErrorIs(t, commitApplyProgress(ctx, tx, err), err)
+						} else if err == nil {
+							require.NoError(t, cache.closeAndRelease(ctx))
+							require.NoError(t, tx.Commit(ctx))
 						} else {
 							var capacity *SyncWorkspaceLimitError
 							require.ErrorAs(t, err, &capacity)

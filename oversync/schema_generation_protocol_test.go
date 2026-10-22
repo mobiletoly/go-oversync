@@ -128,6 +128,7 @@ func TestSchemaGenerationProofIsRequiredByEveryBoundSyncHTTPHandler(t *testing.T
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			request := httptest.NewRequest(test.method, test.path, nil)
+			request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 			request = request.WithContext(ContextWithActor(request.Context(), actor))
 			recorder := httptest.NewRecorder()
 			test.serve(recorder, request)

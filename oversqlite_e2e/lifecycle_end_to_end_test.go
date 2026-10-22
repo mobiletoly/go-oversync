@@ -792,9 +792,10 @@ func TestEndToEnd_StaleInitializerLeaseExpiryRejectsSeedPush(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	_, err = client.PushPending(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "initialization_expired")
+	requireExpiredSeedPushE2E(t, client, db)
+	var authoritativeRows int
+	require.NoError(t, server.Pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.users`, pgx.Identifier{schema}.Sanitize())).Scan(&authoritativeRows))
+	require.Zero(t, authoritativeRows)
 }
 
 func TestEndToEnd_ExpiredInitializerReconnectCanSeedAgain(t *testing.T) {
@@ -817,16 +818,24 @@ func TestEndToEnd_ExpiredInitializerReconnectCanSeedAgain(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	_, err = client.PushPending(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "initialization_expired")
+	oldInitialization := requireExpiredSeedPushE2E(t, client, db)
+	cancelled, err := client.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeNoChange, cancelled.Outcome, "resolve fences and acknowledges the expired original operation")
+	var journals, dirty int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM _sync_upload_journal`).Scan(&journals))
+	require.Zero(t, journals)
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM _sync_dirty_rows`).Scan(&dirty))
+	require.Equal(t, 1, dirty, "original seed intent remains pending after cancellation")
 
 	pendingInitializationID := requirePendingInitializationID(t, db)
-	require.Empty(t, pendingInitializationID)
+	require.Equal(t, oldInitialization, pendingInitializationID)
 
 	reconnectResult, err := client.Attach(ctx, userID)
 	require.NoError(t, err)
-	require.Equal(t, oversqlite.AttachOutcomeStartedEmpty, reconnectResult.Outcome)
+	require.Equal(t, oversqlite.AttachOutcomeSeededLocal, reconnectResult.Outcome)
+	require.NotEmpty(t, requirePendingInitializationID(t, db))
+	require.NotEqual(t, oldInitialization, requirePendingInitializationID(t, db))
 
 	rowID = uuid.NewString()
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, rowID, "Seed", "seed@example.com")
@@ -863,9 +872,30 @@ func TestEndToEnd_RebuildRequiredAutomaticallyResumesFromNormalSync(t *testing.T
 	require.NoError(t, err)
 	mustPushPendingE2E(t, clientA, ctx)
 
-	_, err = dbB.Exec(`UPDATE _sync_attachment_state SET rebuild_required = 1 WHERE singleton_key = 1`)
+	// Reach a real history gap so the complete durable automatic-recovery
+	// owner is captured. A naked rebuild_required bit is not that owner.
+	_, err = server.Pool.Exec(ctx, `UPDATE sync.user_state SET retained_bundle_floor=2 WHERE user_id=$1`, userID)
 	require.NoError(t, err)
-
+	_, err = server.Pool.Exec(ctx, `DELETE FROM sync.bundle_log WHERE user_pk=(SELECT user_pk FROM sync.user_state WHERE user_id=$1) AND bundle_seq<=2`, userID)
+	require.NoError(t, err)
+	originalHTTP := *clientB.HTTP
+	var snapshotAttempts atomic.Int64
+	blockedHTTP := originalHTTP
+	blockedHTTP.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if strings.HasPrefix(request.URL.Path, "/sync/snapshot-sessions") {
+			snapshotAttempts.Add(1)
+			return nil, context.DeadlineExceeded
+		}
+		return http.DefaultTransport.RoundTrip(request)
+	})
+	clientB.HTTP = &blockedHTTP
+	_, err = clientB.PullToStable(ctx)
+	require.Error(t, err)
+	require.Positive(t, snapshotAttempts.Load())
+	interrupted, err := clientB.RecoveryStatus(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "stage_baseline", interrupted.Phase, "transport interruption retains resumable download phase")
+	require.NotEmpty(t, interrupted.RecoveryID)
 	info := mustSourceInfoE2E(t, clientB, ctx)
 	require.True(t, info.RebuildRequired)
 	require.False(t, info.SourceRecoveryRequired)
@@ -881,9 +911,14 @@ func TestEndToEnd_RebuildRequiredAutomaticallyResumesFromNormalSync(t *testing.T
 	require.ErrorAs(t, err, &rebuildErr)
 	require.Zero(t, requestCount.Load())
 
-	clientB.HTTP = &http.Client{Transport: http.DefaultTransport}
-	_, err = clientB.Sync(ctx)
+	clientB.HTTP = &originalHTTP
+	report, err := clientB.Sync(ctx)
 	require.NoError(t, err)
+	require.Equal(t, oversqlite.RemoteSyncOutcomeAppliedSnapshot, report.RemoteOutcome)
+	completed, err := clientB.RecoveryStatus(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "completed", completed.Phase)
+	require.Equal(t, interrupted.RecoveryID, completed.RecoveryID)
 
 	info = mustSourceInfoE2E(t, clientB, ctx)
 	require.False(t, info.RebuildRequired)
@@ -929,6 +964,12 @@ func TestEndToEnd_SourceRecoveryPersistsAcrossRestartAndFailsClosedUntilRebuild(
 
 	clientB.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodPost && r.URL.Path == "/sync/push" {
+			response, dispatchErr := http.DefaultTransport.RoundTrip(r)
+			if dispatchErr != nil {
+				return nil, dispatchErr
+			}
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.NoError(t, response.Body.Close())
 			return errorJSONResponse(http.StatusConflict, map[string]any{
 				"error":   "source_sequence_out_of_order",
 				"message": "expected source_bundle_id 2",
@@ -959,8 +1000,24 @@ func TestEndToEnd_SourceRecoveryPersistsAcrossRestartAndFailsClosedUntilRebuild(
 	require.Equal(t, oversqlite.AttachStatusConnected, restartedResult.Status)
 
 	var requestCount atomic.Int64
+	var originalBinding string
+	require.NoError(t, restartedDB.QueryRow(`SELECT binding FROM _sync_upload_journal`).Scan(&originalBinding))
+	var frozen struct {
+		Operation oversync.PushOperationBinding `json:"operation"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(originalBinding), &frozen))
+	require.Equal(t, originalSourceID, frozen.Operation.SourceID)
+	beforeOffline := durableRecoveryVectorE2E(t, restartedDB)
 	restartedClient.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		requestCount.Add(1)
+		require.Equal(t, "/sync/push-outcomes/resolve", r.URL.Path)
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, originalSourceID, r.Header.Get(oversync.SourceIDHeader))
+		var request oversync.PushOutcomeResolveRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.Equal(t, frozen.Operation.SourceBundleID, request.SourceBundleID)
+		require.Equal(t, frozen.Operation.CanonicalRequestHash, request.CanonicalRequestHash)
+		require.Equal(t, frozen.Operation.InitializationID, request.InitializationID)
 		return nil, context.DeadlineExceeded
 	})}
 
@@ -973,15 +1030,34 @@ func TestEndToEnd_SourceRecoveryPersistsAcrossRestartAndFailsClosedUntilRebuild(
 		{name: "Sync", run: func() error { _, err := restartedClient.Sync(ctx); return err }},
 	} {
 		t.Run(op.name, func(t *testing.T) {
+			beforeRequests := requestCount.Load()
 			err := op.run()
-			var recoveryErr *oversqlite.SourceRecoveryRequiredError
-			require.ErrorAs(t, err, &recoveryErr)
-			require.Equal(t, oversqlite.SourceRecoverySequenceOutOfOrder, recoveryErr.Code)
+			if op.name == "PullToStable" {
+				var recoveryErr *oversqlite.SourceRecoveryRequiredError
+				require.ErrorAs(t, err, &recoveryErr)
+				require.Equal(t, oversqlite.SourceRecoverySequenceOutOfOrder, recoveryErr.Code)
+				require.Equal(t, beforeRequests, requestCount.Load())
+			} else {
+				var exhausted *oversqlite.RetryExhaustedError
+				require.ErrorAs(t, err, &exhausted)
+				require.Equal(t, 3, exhausted.Attempts)
+				require.Equal(t, "transport", exhausted.LastFailure.Kind)
+				require.Equal(t, "push_resolve", exhausted.LastFailure.Operation)
+				require.EqualValues(t, 3, requestCount.Load()-beforeRequests)
+			}
+			info := mustSourceInfoE2E(t, restartedClient, ctx)
+			require.True(t, info.SourceRecoveryRequired)
+			require.Equal(t, oversqlite.SourceRecoverySequenceOutOfOrder, info.SourceRecoveryReason)
 		})
 	}
-	require.Zero(t, requestCount.Load())
-
+	require.Positive(t, requestCount.Load(), "only original operation resolution may be attempted while transport is offline")
+	require.Equal(t, beforeOffline, durableRecoveryVectorE2E(t, restartedDB))
+	require.Equal(t, originalSourceID, requireCurrentSourceIDE2E(t, restartedClient, ctx))
+	requireFrozenRebuildRefusalE2E(t, restartedClient, restartedDB)
 	restartedClient.HTTP = &http.Client{Transport: http.DefaultTransport}
+	settled, err := restartedClient.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeCommitted, settled.Outcome)
 	mustRebuildE2E(t, restartedClient, ctx)
 
 	info = mustSourceInfoE2E(t, restartedClient, ctx)
@@ -1034,6 +1110,12 @@ func TestEndToEnd_SourceRecoveryRebuildRotatesManagedSourceAndSurvivesRestart(t 
 	clientB.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if failCreate && r.Method == http.MethodPost && r.URL.Path == "/sync/push" {
 			failCreate = false
+			response, dispatchErr := baseTransport.RoundTrip(r)
+			if dispatchErr != nil {
+				return nil, dispatchErr
+			}
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.NoError(t, response.Body.Close())
 			return errorJSONResponse(http.StatusConflict, map[string]any{
 				"error":   "history_pruned",
 				"message": "source tuple is below retained history floor",
@@ -1052,7 +1134,11 @@ func TestEndToEnd_SourceRecoveryRebuildRotatesManagedSourceAndSurvivesRestart(t 
 	require.True(t, info.SourceRecoveryRequired)
 	require.Equal(t, oversqlite.SourceRecoveryHistoryPruned, info.SourceRecoveryReason)
 
+	requireFrozenRebuildRefusalE2E(t, clientB, dbB)
 	clientB.HTTP = &http.Client{Transport: baseTransport}
+	settled, err := clientB.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeCommitted, settled.Outcome)
 	mustRebuildE2E(t, clientB, ctx)
 	info = mustSourceInfoE2E(t, clientB, ctx)
 	rotatedSourceID := info.CurrentSourceID
@@ -1106,6 +1192,12 @@ func TestEndToEnd_SourceRetirementIsVisibleOverHTTPAndReplacementBecomesActive(t
 		switch {
 		case failCreate && r.Method == http.MethodPost && r.URL.Path == "/sync/push":
 			failCreate = false
+			response, dispatchErr := baseTransport.RoundTrip(r)
+			if dispatchErr != nil {
+				return nil, dispatchErr
+			}
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			require.NoError(t, response.Body.Close())
 			return errorJSONResponse(http.StatusConflict, map[string]any{
 				"error":   "history_pruned",
 				"message": "source tuple is below retained history floor",
@@ -1129,6 +1221,10 @@ func TestEndToEnd_SourceRetirementIsVisibleOverHTTPAndReplacementBecomesActive(t
 	require.ErrorAs(t, err, &recoveryErr)
 	require.Equal(t, oversqlite.SourceRecoveryHistoryPruned, recoveryErr.Code)
 
+	requireFrozenRebuildRefusalE2E(t, clientB, dbB)
+	settled, err := clientB.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeCommitted, settled.Outcome)
 	report, err := clientB.Rebuild(ctx)
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
@@ -1154,7 +1250,9 @@ func TestEndToEnd_SourceRetirementIsVisibleOverHTTPAndReplacementBecomesActive(t
 	require.Equal(t, info.CurrentSourceID, oldReplacedBy)
 
 	var retiredResp oversync.SourceRetiredResponse
-	rawPush(t, server, userID, originalSourceID, http.StatusConflict, 1, "", nil, &retiredResp)
+	acknowledged := rawPushError(t, server, userID, originalSourceID, http.StatusGone, 1, "", nil)
+	require.Equal(t, "push_outcome_acknowledged", acknowledged.Error, "the compact original ack fence precedes mutable source retirement")
+	rawPush(t, server, userID, originalSourceID, http.StatusConflict, 2, "", nil, &retiredResp)
 	require.Equal(t, "source_retired", retiredResp.Error)
 	require.Equal(t, originalSourceID, retiredResp.SourceID)
 	require.Equal(t, info.CurrentSourceID, retiredResp.ReplacedBySourceID)
@@ -1175,4 +1273,124 @@ func TestEndToEnd_SourceRetirementIsVisibleOverHTTPAndReplacementBecomesActive(t
 	`, userPK, info.CurrentSourceID).Scan(&newState, &newMaxCommitted))
 	require.Equal(t, "active", newState)
 	require.Equal(t, int64(1), newMaxCommitted)
+}
+
+// durableRecoveryVectorE2E includes every persisted sync owner and its storage
+// types, including the frozen request, certificates, stages and resource charges.
+func durableRecoveryVectorE2E(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	names, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND (name='users' OR substr(name,1,6)='_sync_') ORDER BY name`)
+	require.NoError(t, err)
+	var tables []string
+	for names.Next() {
+		var name string
+		require.NoError(t, names.Scan(&name))
+		tables = append(tables, name)
+	}
+	require.NoError(t, names.Err())
+	require.NoError(t, names.Close())
+	require.Contains(t, tables, "_sync_upload_journal")
+	values := map[string][]json.RawMessage{}
+	for _, table := range tables {
+		quoted := `"` + strings.ReplaceAll(table, `"`, `""`) + `"`
+		info, err := db.Query(`PRAGMA table_info(` + quoted + `)`)
+		require.NoError(t, err)
+		var columns []string
+		for info.Next() {
+			var id, required, pk int
+			var name, kind string
+			var defaultValue any
+			require.NoError(t, info.Scan(&id, &name, &kind, &required, &defaultValue, &pk))
+			columns = append(columns, name)
+		}
+		require.NoError(t, info.Err())
+		require.NoError(t, info.Close())
+		require.NotEmpty(t, columns, table)
+		var projections, ordering []string
+		for _, column := range columns {
+			q := `"` + strings.ReplaceAll(column, `"`, `""`) + `"`
+			ordering = append(ordering, q)
+			projections = append(projections, fmt.Sprintf(`'%s',json_object('storage',typeof(%s),'value',CASE WHEN typeof(%s)='blob' THEN lower(hex(%s)) WHEN %s IS NULL THEN NULL ELSE CAST(%s AS TEXT) END)`, strings.ReplaceAll(column, "'", "''"), q, q, q, q, q))
+		}
+		rows, err := db.Query(`SELECT json_object(` + strings.Join(projections, ",") + `) FROM ` + quoted + ` ORDER BY ` + strings.Join(ordering, ","))
+		require.NoError(t, err)
+		values[table] = []json.RawMessage{}
+		for rows.Next() {
+			var raw string
+			require.NoError(t, rows.Scan(&raw))
+			values[table] = append(values[table], json.RawMessage(raw))
+		}
+		require.NoError(t, rows.Err())
+		require.NoError(t, rows.Close())
+	}
+	encoded, err := json.Marshal(values)
+	require.NoError(t, err)
+	return string(encoded)
+}
+
+func requireFrozenRebuildRefusalE2E(t *testing.T, client *oversqlite.Client, db *sql.DB) {
+	t.Helper()
+	before := durableRecoveryVectorE2E(t, db)
+	previousHTTP := client.HTTP
+	defer func() { client.HTTP = previousHTTP }()
+	requests := 0
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { requests++; return nil, context.DeadlineExceeded })}
+	_, err := client.Rebuild(context.Background())
+	var frozen *oversqlite.UploadJournalIntegrityError
+	require.ErrorAs(t, err, &frozen)
+	require.Zero(t, requests, "frozen F/C refuses snapshot before HTTP")
+	require.Equal(t, before, durableRecoveryVectorE2E(t, db))
+}
+
+func requireExpiredSeedPushE2E(t *testing.T, client *oversqlite.Client, db *sql.DB) string {
+	t.Helper()
+	initialization := requirePendingInitializationID(t, db)
+	require.NotEmpty(t, initialization)
+	previousHTTP := client.HTTP
+	transport := previousHTTP.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	defer func() { client.HTTP = previousHTTP }()
+	var status int
+	var code string
+	observedHTTP := *previousHTTP
+	observedHTTP.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		response, err := transport.RoundTrip(request)
+		if err == nil && request.URL.Path == "/sync/push" {
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				return nil, readErr
+			}
+			response.Body = io.NopCloser(bytes.NewReader(body))
+			status = response.StatusCode
+			var decoded oversync.ErrorResponse
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				return nil, err
+			}
+			code = decoded.Error
+		}
+		return response, err
+	})
+	client.HTTP = &observedHTTP
+	_, err := client.PushPending(context.Background())
+	require.ErrorContains(t, err, "status 410")
+	require.Equal(t, http.StatusGone, status)
+	require.Equal(t, "initialization_expired", code, "actual authority response, not SDK error wording")
+	require.Equal(t, initialization, requirePendingInitializationID(t, db), "admission failure cannot erase the original initialization binding")
+	var binding, phase string
+	var request, certificate []byte
+	require.NoError(t, db.QueryRow(`SELECT binding,phase,request_body,outcome_body FROM _sync_upload_journal`).Scan(&binding, &phase, &request, &certificate))
+	var frozen struct {
+		Operation oversync.PushOperationBinding `json:"operation"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(binding), &frozen))
+	require.NotNil(t, frozen.Operation.InitializationID)
+	require.Equal(t, initialization, *frozen.Operation.InitializationID)
+	require.Equal(t, "frozen", phase)
+	require.NotEmpty(t, request)
+	require.Empty(t, certificate)
+	requireFrozenRebuildRefusalE2E(t, client, db)
+	return initialization
 }

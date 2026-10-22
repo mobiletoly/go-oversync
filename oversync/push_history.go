@@ -11,22 +11,12 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mobiletoly/go-oversync/internal/protocolhash"
-	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
 // PushInvalidError reports an accepted push envelope whose logical contents
 // cannot be admitted. It intentionally carries no database detail.
 type PushInvalidError struct {
 	Message string
-}
-
-// PushReplayMismatchError reports reuse of a committed source tuple with a
-// different canonical request. It is a deterministic conflict, not malformed
-// logical input and not permission to attempt a second write.
-type PushReplayMismatchError struct{}
-
-func (*PushReplayMismatchError) Error() string {
-	return "canonical_request_hash does not match the committed source tuple"
 }
 
 func (e *PushInvalidError) Error() string { return e.Message }
@@ -70,10 +60,6 @@ func sanitizePushError(err error) error {
 	var invalidErr *PushInvalidError
 	if errors.As(err, &invalidErr) {
 		return invalidErr
-	}
-	var replayMismatchErr *PushReplayMismatchError
-	if errors.As(err, &replayMismatchErr) {
-		return replayMismatchErr
 	}
 	var validationErr *PushValidationError
 	if errors.As(err, &validationErr) {
@@ -216,30 +202,6 @@ func preflightPushPayloadDestinations(ctx context.Context, tx pgx.Tx, rows []pus
 		}
 	}
 	return nil
-}
-
-func loadCommittedPushMetadataBySourceTuple(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string, sourceBundleID int64) (*committedBundleMeta, error) {
-	if err := sourceid.Validate(sourceID); err != nil {
-		return nil, fmt.Errorf("committed bundle lookup source_id is invalid: %w", err)
-	}
-	var meta committedBundleMeta
-	var bundleHash []byte
-	if err := tx.QueryRow(ctx, `
-		SELECT bl.bundle_seq, bl.source_id, bl.source_bundle_id, bl.row_count, bl.planned_row_count, bl.bundle_hash, bl.canonical_request_hash
-		FROM sync.bundle_log AS bl
-		JOIN sync.user_state AS us ON us.user_pk = bl.user_pk
-		WHERE bl.user_pk = $1 AND bl.source_id = $2 AND bl.source_bundle_id = $3 AND bl.bundle_seq > us.retained_bundle_floor
-	`, userPK, sourceID, sourceBundleID).Scan(&meta.BundleSeq, &meta.SourceID, &meta.SourceBundleID, &meta.RowCount, &meta.PlannedRowCount, &bundleHash, &meta.CanonicalRequestHash); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("query committed push metadata: %w", err)
-	}
-	if err := sourceid.Validate(meta.SourceID); err != nil {
-		return nil, fmt.Errorf("persisted bundle_log source_id is invalid: %w", err)
-	}
-	meta.BundleHash = renderBundleHash(bundleHash)
-	return &meta, nil
 }
 
 func loadNextExpectedSourceBundleIDForUpdate(ctx context.Context, tx pgx.Tx, userPK int64, userID, sourceID string) (int64, int64, error) {

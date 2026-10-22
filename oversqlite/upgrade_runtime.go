@@ -35,6 +35,71 @@ func (deferUpgradeResolver) Resolve(ConflictContext) MergeResult {
 	return deferUpgradeConflictResolution{}
 }
 
+// A retained upload predates the proposed upgrade. Finish only that obligation
+// before mutable target admission; never freeze a successor or run a pull here.
+func (c *Opening) finishPreAdmissionUpload(ctx context.Context) error {
+	journal, err := loadUploadJournal(ctx, c.db)
+	if err != nil || journal == nil {
+		return err
+	}
+	client, err := c.newPhysicalClient(c.installedContract, c.config.OldClientConfig)
+	if err != nil {
+		return err
+	}
+	attachment, err := loadAttachmentState(ctx, c.db)
+	if err != nil {
+		return err
+	}
+	client.sourceID = attachment.CurrentSourceID
+	client.UserID = c.config.Plan.UserID
+	client.pendingInitializationID = attachment.PendingInitializationID
+	client.sessionConnected = true
+	client.Resolver = deferUpgradeResolver{}
+	if journal.Phase == "ack_pending" {
+		return client.acknowledgeUploadJournal(ctx)
+	}
+	_, err = client.PushPending(ctx)
+	if err != nil && uploadPolicyDeferralOnly(err) {
+		remaining, readErr := loadUploadJournal(ctx, c.db)
+		if readErr != nil {
+			return readErr
+		}
+		outbox, readErr := loadOutboxBundle(ctx, c.db)
+		if readErr != nil {
+			return readErr
+		}
+		op := journal.Binding.Operation
+		if remaining == nil && outbox.State == outboxStateRejected && outbox.SourceID == op.SourceID &&
+			outbox.SourceBundleID == op.SourceBundleID && outbox.CanonicalRequestHash == op.CanonicalRequestHash {
+			// Protocol completion precedes mutable U0 admission. The ordinary
+			// old-intent phase retains and exposes the actual policy decision.
+			return nil
+		}
+	}
+	return err
+}
+
+// Cleanup failures cannot be hidden by a joined policy-deferral error.
+func uploadPolicyDeferralOnly(err error) bool {
+	for err != nil {
+		switch current := err.(type) {
+		case *ConflictNeedsResolutionError, *PushRejectionNeedsResolutionError, *PushConflictError:
+			return true
+		case interface{ Unwrap() []error }:
+			children := current.Unwrap()
+			if len(children) != 1 {
+				return false
+			}
+			err = children[0]
+		case interface{ Unwrap() error }:
+			err = current.Unwrap()
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 func (c *Opening) resolveOldIntent(ctx context.Context, rec *upgradeJournalRecord) error {
 	if rec.DrainComplete {
 		return c.enterLocalMigration(ctx, rec)
@@ -155,11 +220,14 @@ func (c *Opening) restoreOldIntentDecision(ctx context.Context, client *Client, 
 		if err != nil {
 			return err
 		}
-		if outbox.State == outboxStatePrepared {
+		if outbox.State == outboxStatePrepared || outbox.State == outboxStateRejected {
 			if rec.ResolutionRequestHash == "" || outbox.CanonicalRequestHash != rec.ResolutionRequestHash {
 				return &UpgradeError{Outcome: UpgradeOutcomeNeedsResolution, Cause: fmt.Errorf("durable resolution no longer matches the frozen request")}
 			}
-			committed, err := c.settleDefinitivePreparedPush(ctx, client, outbox)
+			committed := false
+			if outbox.State == outboxStatePrepared {
+				committed, err = c.settleDefinitivePreparedPush(ctx, client, outbox)
+			}
 			if err != nil {
 				return err
 			}
@@ -356,6 +424,7 @@ func inspectOldDrain(ctx context.Context, q queryRower) (bool, string, error) {
 		table string
 		name  string
 	}{
+		{"_sync_upload_journal", "upload outcome or acknowledgment"},
 		{"_sync_dirty_rows", "dirty synchronized rows"},
 		{"_sync_outbox_rows", "frozen outbox rows"},
 		{"_sync_push_stage", "staged push results"},
@@ -613,12 +682,20 @@ func refreshTargetTriggersInTx(ctx context.Context, tx *immediateTx, local Local
 	for _, table := range local.Tables {
 		byName[table.TableName] = table
 	}
+	// U4 publishes capture ownership for the validated target in the same
+	// transaction as application DDL. Omitted old tables may now be gone.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_managed_tables`); err != nil {
+		return err
+	}
 	for _, table := range compiled.contract.Tables() {
 		info, err := provider.Get(tx, table.Table)
 		if err != nil {
 			return err
 		}
 		if err := createTriggersForTableWithInfo(tx, table.Schema, byName[table.Table], info); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO _sync_managed_tables(schema_name,table_name) VALUES(?,?)`, table.Schema, table.Table); err != nil {
 			return err
 		}
 	}
@@ -671,7 +748,16 @@ func (c *Opening) prepareReplacement(ctx context.Context, rec *upgradeJournalRec
 	if err := setApplyMode(ctx, tx, true); err != nil {
 		return err
 	}
-	if err := targetClient.clearManagedTablesInTxWithOptions(ctx, tx, clearManagedTablesOptions{}); err != nil {
+	if err := requireNoUnresolvedUpload(ctx, tx); err != nil {
+		return err
+	}
+	floor, err := targetClient.snapshotFloor(ctx, tx)
+	if err != nil {
+		return err
+	}
+	// A completed local migration may invalidate old-generation baselines. Keep
+	// the migrated business rows in place for the shared snapshot delta.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_row_state`); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_snapshot_stage`); err != nil {
@@ -699,7 +785,7 @@ func (c *Opening) prepareReplacement(ctx context.Context, rec *upgradeJournalRec
 	attachment.BindingState = attachmentBindingAttached
 	attachment.AttachedUserID = plan.UserID
 	attachment.SchemaName = targetClient.config.schema
-	attachment.LastBundleSeqSeen = 0
+	attachment.LastBundleSeqSeen = floor
 	attachment.RebuildRequired = true
 	attachment.PendingInitializationID = ""
 	if err := persistAttachmentState(ctx, tx, attachment, true); err != nil {
@@ -746,6 +832,17 @@ func (c *Opening) confirmReplacement(ctx context.Context, rec *upgradeJournalRec
 	client.sourceID = rec.OldSourceID
 	client.UserID = c.config.Plan.UserID
 	client.sessionConnected = true
+	if err := requireNoUnresolvedUpload(ctx, c.db); err != nil {
+		return err
+	}
+	if err := client.inspectSnapshotCapabilities(ctx); err != nil {
+		return err
+	}
+	authority, err := client.snapshotReplacementContext(ctx, rec)
+	if err != nil {
+		return err
+	}
+	ctx = context.WithValue(ctx, snapshotDispatchAdmissionKey{}, snapshotDispatchAdmission{replacement: rec, replacementContext: authority})
 	req, err := snapshotSessionCreateRequestFromOptions(rec.OldSourceID, snapshotApplyOptions{
 		RotateSource: true, NewSourceID: rec.NewSourceID, ReplacementReason: rec.ReplacementReason,
 	})
@@ -785,6 +882,10 @@ func (c *Opening) confirmReplacement(ctx context.Context, rec *upgradeJournalRec
 	if err := persistUpgradeJournal(ctx, tx, current); err != nil {
 		return err
 	}
+	client.sourceID = current.NewSourceID
+	if err := client.retainUpgradeSnapshot(ctx, tx, current, session); err != nil {
+		return err
+	}
 	c.reachTestBoundary("before_U6_commit")
 	if err := ctx.Err(); err != nil {
 		return err
@@ -801,6 +902,7 @@ func (c *Opening) confirmReplacement(ctx context.Context, rec *upgradeJournalRec
 }
 
 func (c *Opening) resumeTargetSnapshot(ctx context.Context, rec *upgradeJournalRecord) error {
+	ctx = context.WithValue(ctx, snapshotDispatchAdmissionKey{}, snapshotDispatchAdmission{upgrade: rec})
 	plan := c.config.Plan
 	if err := validatePhysicalLocalContract(ctx, c.db, c.targetContract, plan.LocalOnlyTables); err != nil {
 		return &UpgradeError{Outcome: UpgradeOutcomeLocalContractMismatch, Cause: err}
@@ -812,6 +914,10 @@ func (c *Opening) resumeTargetSnapshot(ctx context.Context, rec *upgradeJournalR
 	client.sourceID = rec.NewSourceID
 	client.UserID = plan.UserID
 	client.sessionConnected = true
+	session, err := client.upgradeSnapshotDescriptor(ctx, c.db, rec)
+	if err != nil {
+		return err
+	}
 	limits, err := client.negotiateSnapshotLimits(ctx)
 	if err != nil {
 		return err
@@ -825,6 +931,9 @@ func (c *Opening) resumeTargetSnapshot(ctx context.Context, rec *upgradeJournalR
 		return &UpgradeError{Outcome: UpgradeOutcomeIntegrityFailed, Cause: fmt.Errorf("staged snapshot progress does not match durable journal")}
 	}
 	for rows < rec.SnapshotRowCount {
+		if err := client.validateUpgradeSnapshotDispatch(ctx, rec); err != nil {
+			return err
+		}
 		chunk, _, fetchErr := client.fetchSnapshotChunkAsSource(ctx, rec.SnapshotID, rec.SnapshotBundleSeq, rows, limits.maxRows, limits.maxBytes, rec.NewSourceID)
 		if fetchErr != nil {
 			if isRestartableSnapshotSessionError(fetchErr) {
@@ -842,10 +951,6 @@ func (c *Opening) resumeTargetSnapshot(ctx context.Context, rec *upgradeJournalR
 	}
 	if rows != rec.SnapshotRowCount || bytes != rec.SnapshotByteCount {
 		return &UpgradeError{Outcome: UpgradeOutcomeIntegrityFailed, Cause: fmt.Errorf("staged snapshot totals do not match descriptor")}
-	}
-	session := &oversync.SnapshotSession{
-		SnapshotID: rec.SnapshotID, SnapshotBundleSeq: rec.SnapshotBundleSeq,
-		RowCount: rec.SnapshotRowCount, ByteCount: rec.SnapshotByteCount,
 	}
 	options := snapshotApplyOptions{
 		RotateSource: true, NewSourceID: rec.NewSourceID, ReplacementReason: rec.ReplacementReason,
@@ -1050,6 +1155,12 @@ func (c *Opening) stageTargetSnapshotChunk(
 	chunkBytes := chunk.ByteCount
 	var committed *upgradeJournalRecord
 	err := client.stageSnapshotChunkWithFinalizer(ctx, chunk, afterRowOrdinal, func(finalCtx context.Context, tx *immediateTx) error {
+		if err := requireNoUnresolvedUpload(finalCtx, tx); err != nil {
+			return err
+		}
+		if _, err := client.upgradeSnapshotDescriptor(finalCtx, tx, rec); err != nil {
+			return err
+		}
 		current, err := loadUpgradeJournal(finalCtx, tx)
 		if err != nil || current == nil || current.Phase != UpgradePhaseRebuildRunning || current.SnapshotID != rec.SnapshotID {
 			return fmt.Errorf("snapshot progress journal changed")
@@ -1098,7 +1209,15 @@ func isRestartableSnapshotSessionError(err error) bool {
 }
 
 func (c *Opening) replaceExpiredTargetSnapshot(ctx context.Context, rec *upgradeJournalRecord, client *Client) error {
-	session, err := client.createSnapshotSession(ctx, nil)
+	ctx = context.WithValue(ctx, snapshotDispatchAdmissionKey{}, snapshotDispatchAdmission{upgrade: rec})
+	if err := client.validateUpgradeSnapshotDispatch(ctx, rec); err != nil {
+		return err
+	}
+	floor, err := client.snapshotFloor(ctx, c.db)
+	if err != nil {
+		return err
+	}
+	session, err := client.createSnapshotSession(ctx, &oversync.SnapshotSessionCreateRequest{Recovery: &oversync.SnapshotRecovery{MinimumBundleSeq: floor}})
 	if err != nil {
 		return err
 	}
@@ -1122,6 +1241,9 @@ func (c *Opening) replaceExpiredTargetSnapshot(ctx context.Context, rec *upgrade
 	current.SnapshotBytesStaged = 0
 	current.Revision++
 	if err := persistUpgradeJournal(ctx, tx, current); err != nil {
+		return err
+	}
+	if err := client.retainUpgradeSnapshot(ctx, tx, current, session); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1187,6 +1309,24 @@ func (c *Opening) ResolvePendingIntent(ctx context.Context, resolution PendingIn
 }
 
 func (c *Opening) recordPendingIntentResolution(ctx context.Context, rec *upgradeJournalRecord, action PendingIntentResolutionAction, payload json.RawMessage) error {
+	var policyClient *Client
+	var snapshot *pushOutboundSnapshot
+	if action == "" {
+		var err error
+		policyClient, err = c.newPhysicalClient(c.installedContract, c.config.OldClientConfig)
+		if err != nil {
+			return err
+		}
+		policyClient.sourceID = rec.OldSourceID
+		policyClient.UserID = c.config.Plan.UserID
+		snapshot, err = policyClient.loadPushOutboundSnapshot(ctx)
+		if err != nil {
+			return err
+		}
+		if snapshot == nil {
+			return fmt.Errorf("retry requires retained rejected intent")
+		}
+	}
 	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
 		return err
@@ -1197,10 +1337,23 @@ func (c *Opening) recordPendingIntentResolution(ctx context.Context, rec *upgrad
 		return fmt.Errorf("pending-intent journal changed")
 	}
 	if action == "" {
+		outbox, err := loadOutboxBundle(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if outbox.State != outboxStateRejected || outbox.CanonicalRequestHash != current.PendingRequestHash {
+			return fmt.Errorf("retry requires exact policy-owned rejected intent")
+		}
+		if err := policyClient.requeueSnapshotRowsInTx(ctx, tx, snapshot, nil); err != nil {
+			return err
+		}
 		if err := clearConflictForUpgradeDecision(ctx, tx, current.PendingRequestHash, "upgrade_retry"); err != nil {
 			return err
 		}
 		if err := clearPushRejectionForUpgradeDecision(ctx, tx, current.PendingRequestHash, "upgrade_retry"); err != nil {
+			return err
+		}
+		if err := policyClient.deletePushOutboundSnapshotInTx(ctx, tx, outbox.SourceBundleID); err != nil {
 			return err
 		}
 	}
@@ -1232,7 +1385,7 @@ func (c *Opening) discardPendingIntent(ctx context.Context, rec *upgradeJournalR
 	if err != nil {
 		return err
 	}
-	if outbox.State != outboxStatePrepared || outbox.CanonicalRequestHash != rec.PendingRequestHash {
+	if (outbox.State != outboxStatePrepared && outbox.State != outboxStateRejected) || outbox.CanonicalRequestHash != rec.PendingRequestHash {
 		return fmt.Errorf("discard is allowed only for the exact definitively uncommitted request")
 	}
 	client, err := c.newPhysicalClient(c.installedContract, c.config.OldClientConfig)
@@ -1246,7 +1399,7 @@ func (c *Opening) discardPendingIntent(ctx context.Context, rec *upgradeJournalR
 	if err != nil {
 		return err
 	}
-	if rejection == nil {
+	if rejection == nil && outbox.State == outboxStatePrepared {
 		committed, err := c.settleDefinitivePreparedPush(ctx, client, outbox)
 		if err != nil {
 			return err
@@ -1269,7 +1422,7 @@ func (c *Opening) discardPendingIntent(ctx context.Context, rec *upgradeJournalR
 	if err != nil {
 		return err
 	}
-	if outbox.State != outboxStatePrepared || outbox.CanonicalRequestHash != rec.PendingRequestHash {
+	if (outbox.State != outboxStatePrepared && outbox.State != outboxStateRejected) || outbox.CanonicalRequestHash != rec.PendingRequestHash {
 		return fmt.Errorf("discard is allowed only for the exact definitively uncommitted request")
 	}
 	if err := clearConflictForUpgradeDecision(ctx, tx, current.PendingRequestHash, "upgrade_discard"); err != nil {

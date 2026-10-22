@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mobiletoly/go-oversync/oversync"
 )
 
 const (
@@ -284,6 +286,10 @@ func (c *Client) doAuthenticatedBoundedRequestAsSource(
 	sourceID string,
 	onDecodedBodyRead func(int64),
 ) (boundedResponsePayload, error) {
+	return c.doAuthenticatedBoundedRequestForBinding(ctx, operation, method, endpoint, requestBody, contentType, successLimit, errorLimit, sourceID, c.schemaGenerationProof, onDecodedBodyRead)
+}
+
+func (c *Client) doAuthenticatedBoundedRequestForBinding(ctx context.Context, operation, method, endpoint string, requestBody []byte, contentType string, successLimit, errorLimit int64, sourceID string, proof oversync.SchemaGenerationProof, onDecodedBodyRead func(int64)) (boundedResponsePayload, error) {
 	encodedRequestBody := requestBody
 	compressedRequest := false
 	var err error
@@ -314,7 +320,7 @@ func (c *Client) doAuthenticatedBoundedRequestAsSource(
 	// Setting this explicitly disables net/http's transparent unbounded gzip
 	// decoding. The bounded reader performs decoding below.
 	req.Header.Set("Accept-Encoding", "gzip")
-	if err := applyAuthenticatedSyncHeadersWithSourceID(req, token, sourceID, c.schemaGenerationProof); err != nil {
+	if err := applyAuthenticatedSyncHeadersWithSourceID(req, token, sourceID, proof); err != nil {
 		return boundedResponsePayload{}, err
 	}
 
@@ -322,6 +328,21 @@ func (c *Client) doAuthenticatedBoundedRequestAsSource(
 }
 
 func (c *Client) executeBoundedRequest(ctx context.Context, operation string, req *http.Request, successLimit, errorLimit int64, onDecodedBodyRead func(int64)) (boundedResponsePayload, error) {
+	if operation == "snapshot_session_create" || operation == "snapshot_chunk_fetch" {
+		if err := c.validateSnapshotRequestAdmission(ctx); err != nil {
+			return boundedResponsePayload{}, err
+		}
+	}
+	if values := responseHeaderValues(req.Header, oversync.ProtocolVersionHeader); len(values) == 0 {
+		req.Header.Set(oversync.ProtocolVersionHeader, requiredProtocolVersion)
+	} else if err := oversync.ValidateProtocolHeader(req.Header); err != nil {
+		return boundedResponsePayload{}, err
+	}
+	if strings.HasPrefix(operation, "snapshot_") || operation == "push_resolve" || operation == "push_ack" {
+		if err := c.chargeRecoveryExchange(ctx); err != nil {
+			return boundedResponsePayload{}, err
+		}
+	}
 	resp, err := c.doHTTP(req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -379,8 +400,12 @@ func (c *Client) doAuthenticatedSessionDeleteAsSource(
 	if err != nil {
 		return 0, nil, err
 	}
+	req.Header.Set(oversync.ProtocolVersionHeader, requiredProtocolVersion)
 	req.Header.Set("Accept-Encoding", "gzip")
 	if err := applyAuthenticatedSyncHeadersWithSourceID(req, token, sourceID, c.schemaGenerationProof); err != nil {
+		return 0, nil, err
+	}
+	if err := c.chargeRecoveryExchange(ctx); err != nil {
 		return 0, nil, err
 	}
 	resp, err := c.doHTTP(req)

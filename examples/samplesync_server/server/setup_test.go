@@ -72,6 +72,7 @@ func TestSampleReadinessGuard_DispatchesAuthenticatedMalformedDiscoveryBeforeSer
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.Header.Set("Authorization", "Bearer "+token)
 		request.Header.Set(oversync.SourceIDHeader, "sample-source")
+		request.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 		require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())

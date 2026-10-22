@@ -519,3 +519,12 @@ func (c *Client) ensureConnectedSessionLocked(ctx context.Context, operation str
 	}
 	return nil
 }
+
+// Lease admission is distinct from the already completed original ack.
+func (c *Client) initializationReconnectRequired(ctx context.Context) (bool, error) {
+	a, err := loadAttachmentState(ctx, c.db)
+	if err != nil {
+		return false, err
+	}
+	return a.InitializationReconnectRequired, nil
+}

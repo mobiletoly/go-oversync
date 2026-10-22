@@ -83,6 +83,7 @@ func (s *SyncService) generationDiscoveryResponse(contract SchemaGenerationContr
 			MaxSnapshotRows:                 maxSnapshotRows,
 			MaxSnapshotLogicalBytes:         maxSnapshotLogicalBytes,
 			MaxRowDecodedBytes:              s.maxBytesPerSnapshotRow(),
+			MaxPushOutcomeDecodedBytes:      s.config.MaxPushOutcomeDecodedBytes,
 		},
 		WatchEnabled: watchEnabled,
 	}

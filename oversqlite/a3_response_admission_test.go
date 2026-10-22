@@ -93,8 +93,8 @@ func TestA3ResponseAdmission_PublicProgressAndReplay(t *testing.T) {
 	c.config.MaxSyncWorkspaceBytes = 256 << 20
 	_, err = c.PushPending(context.Background())
 	require.NoError(t, err)
-	require.Len(t, server.pushRequests, 2)
-	require.Equal(t, server.pushRequests[0], server.pushRequests[1])
+	require.Len(t, server.pushRequests, 1, "resolve reuses immutable original F without a second push")
+	require.Len(t, server.ackRequests, 1)
 	requireA1Survivors(t, db)
 	requireA1ControlState(t, db, 3)
 }

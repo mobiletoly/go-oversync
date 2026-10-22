@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,138 +17,133 @@ import (
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
-// commitPushOutboundSnapshot sends the entire frozen outbox exactly once. A
-// response loss is recovered by replaying the same source tuple and complete
-// request; no upload locator, chunk cursor, or result-page cursor is stored.
+// An existing frozen request is conservatively possibly dispatched. Only a
+// fresh freeze sends push first; resumed work resolves the exact original tuple.
 func (c *Client) commitPushOutboundSnapshot(ctx context.Context, snapshot *pushOutboundSnapshot) (*committedPushBundle, error) {
-	if snapshot == nil || len(snapshot.Rows) == 0 || c == nil || c.discovery == nil {
-		return nil, fmt.Errorf("complete push requires a frozen outbox and admitted discovery contract")
+	if snapshot == nil || len(snapshot.Rows) == 0 || c.discovery == nil {
+		return nil, fmt.Errorf("complete push requires frozen rows and an admitted generation")
 	}
 	outbox, err := loadOutboxBundle(ctx, c.db)
 	if err != nil {
 		return nil, err
 	}
-	if outbox.State != outboxStatePrepared || outbox.SourceBundleID != snapshot.SourceBundleID || outbox.RowCount != int64(len(snapshot.Rows)) {
-		return nil, fmt.Errorf("frozen outbox changed before whole-request push")
-	}
-	rows, err := c.buildPushRequestRows(snapshot.Rows)
+	j, err := loadUploadJournal(ctx, c.db)
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) > c.discovery.Limits.MaxPushRows {
-		return nil, &InvalidAdmittedContractError{Message: "frozen outbox exceeds max_push_rows"}
-	}
-	for _, row := range rows {
-		rowBytes, sizeErr := oversync.ExpandedRowDecodedBytes(row)
-		if sizeErr != nil {
-			return nil, sizeErr
-		}
-		if rowBytes > c.discovery.Limits.MaxRowDecodedBytes {
-			return nil, &PushRowExceedsAdmittedLimitError{Limit: c.discovery.Limits.MaxRowDecodedBytes}
-		}
-	}
-	groups, err := oversync.CompactGroupsForRows(c.discovery.SchemaGeneration, rows)
-	if err != nil {
-		return nil, fmt.Errorf("compact frozen outbox: %w", err)
-	}
-	body, err := json.Marshal(oversync.CompactPushRequest{
-		SourceBundleID: outbox.SourceBundleID, CanonicalRequestHash: outbox.CanonicalRequestHash,
-		InitializationID: outbox.InitializationID, Rows: groups,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal complete push request: %w", err)
-	}
-	if int64(len(body)) > c.discovery.Limits.MaxPushDecodedBytes {
-		return nil, &InvalidAdmittedContractError{Message: "frozen outbox exceeds max_push_decoded_bytes"}
-	}
-	if err := c.runBeforePushCommitHook(ctx); err != nil {
+	if err = c.guardUploadJournal(ctx, c.db, j); err != nil {
 		return nil, err
 	}
-	result, err := c.doAuthenticatedPushRequest(ctx, "push", http.MethodPost, buildPushURL(c.BaseURL), body, "application/json", c.discovery.Limits.MaxPushDecodedBytes, snapshotControlBodyLimit, nil)
+	if j.Phase != "frozen" || outbox.State != outboxStatePrepared || outbox.SourceBundleID != snapshot.SourceBundleID || outbox.RowCount != int64(len(snapshot.Rows)) || j.Binding.Operation.SourceBundleID != outbox.SourceBundleID || j.Binding.Operation.CanonicalRequestHash != outbox.CanonicalRequestHash {
+		return nil, &UploadJournalIntegrityError{"frozen outbox changed"}
+	}
+	requestBody, err := c.journalRequestBody(ctx, j)
+	if err != nil {
+		return nil, err
+	}
+	var raw []byte
+	if j.OutcomeBytes > 0 {
+		if err = c.growPushHTTPBuffers(ctx, 2*j.OutcomeBytes+65536, 32); err != nil {
+			return nil, err
+		}
+		err = c.db.QueryRowContext(ctx, `SELECT outcome_body FROM _sync_upload_journal WHERE singleton_key=1`).Scan(&raw)
+	} else {
+		raw, err = c.fetchUploadOutcome(ctx, snapshot, j, requestBody)
+	}
+	if err != nil {
+		return nil, err
+	}
+	outcome, committed, rows, err := c.decodeJournalOutcome(ctx, raw, j, snapshot.Rows)
+	if err != nil {
+		return nil, err
+	}
+	if j.OutcomeBytes == 0 {
+		if err = c.persistUploadOutcome(ctx, j, raw, outcome); err != nil {
+			return nil, err
+		}
+	}
+	switch outcome.Status {
+	case "cancelled":
+		return nil, &cancelledUploadOutcome{}
+	case "rejected":
+		return nil, terminalPushError(outcome)
+	}
+	if err = c.stageAuthoritativePushRows(ctx, committed, rows); err != nil {
+		return nil, err
+	}
+	return committed, nil
+}
+
+type cancelledUploadOutcome struct{}
+
+func (*cancelledUploadOutcome) Error() string {
+	return "upload was durably cancelled; local intent remains pending"
+}
+
+func (c *Client) fetchUploadOutcome(ctx context.Context, snapshot *pushOutboundSnapshot, j *uploadJournal, frozenBody []byte) ([]byte, error) {
+	var body []byte
+	var err error
+	operation, path := "push", "/sync/push"
+	if snapshot.Fresh {
+		body = frozenBody
+	} else {
+		operation, path = "push_resolve", "/sync/push-outcomes/resolve"
+		o := j.Binding.Operation
+		body, err = json.Marshal(oversync.PushOutcomeResolveRequest{SourceBundleID: o.SourceBundleID, CanonicalRequestHash: o.CanonicalRequestHash, InitializationID: o.InitializationID})
+	}
+	if err != nil {
+		return nil, err
+	}
+	if snapshot.Fresh {
+		if err = c.runBeforePushCommitHook(ctx); err != nil {
+			return nil, err
+		}
+	}
+	result, err := c.doAuthenticatedPushRequestForBinding(ctx, operation, http.MethodPost, strings.TrimRight(j.Binding.Authority, "/")+path, body, "application/json", c.discovery.Limits.MaxPushOutcomeDecodedBytes, snapshotControlBodyLimit, j.Binding.Operation, nil)
 	if err != nil {
 		return nil, err
 	}
 	if result.statusCode != http.StatusOK {
 		return nil, c.decodeCompletePushError(ctx, result.statusCode, result.body)
 	}
-	committed, authoritative, err := c.decodeCommittedPushResponse(ctx, result.body, outbox)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.stageAuthoritativePushRows(ctx, committed, authoritative); err != nil {
-		return nil, err
-	}
-	c.pendingInitializationID = ""
-	if err := c.clearPersistedPendingInitializationID(ctx); err != nil {
-		return nil, err
-	}
-	return committed, nil
+	return result.body, nil
 }
 
-// Admit the response representation, then verify its complete authority before
-// the caller stages any effects or clears initialization metadata.
+// Kept as the owning decoder entry point for pure boundary consumers.
 func (c *Client) decodeCommittedPushResponse(ctx context.Context, body []byte, outbox *outboxBundleRecord) (*committedPushBundle, []oversync.PushRequestRow, error) {
-	shape, err := responseAllocationShape(ctx, body)
+	j, err := loadUploadJournal(ctx, c.db)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err = c.growPushHTTPBuffers(ctx, 2*int64(len(body))+65536, shape); err != nil {
-		return nil, nil, err
-	}
-	if _, err := requireJSONObjectFields(body, "complete push", "bundle_seq", "bundle_hash", "rows"); err != nil {
-		return nil, nil, err
-	}
-	var response oversync.CompactPushResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, nil, fmt.Errorf("decode complete push response: %w", err)
-	}
-	if response.BundleSeq < 1 || !protocolhash.IsCanonicalHash(response.BundleHash) {
-		return nil, nil, fmt.Errorf("complete push response has invalid bundle identity")
-	}
-	authoritative, err := oversync.ExpandCompactPushRows(c.discovery.SchemaGeneration, response.Rows)
+	snapshot, err := c.loadPushOutboundSnapshot(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("expand complete push response: %w", err)
-	}
-	if err := c.validateAdmittedResponseRows("push response", authoritative); err != nil {
 		return nil, nil, err
 	}
-	if len(authoritative) == 0 {
-		return nil, nil, fmt.Errorf("complete push response has no authoritative rows")
+	if snapshot == nil {
+		return nil, nil, &UploadJournalIntegrityError{"missing frozen rows"}
 	}
-	logicalRows := make([]protocolhash.BundleRow, 0, len(authoritative))
-	for _, row := range authoritative {
-		logicalRows = append(logicalRows, protocolhash.BundleRow{Schema: row.Schema, Table: row.Table, Key: row.Key, Op: row.Op, RowVersion: row.BaseRowVersion, Payload: row.Payload})
-	}
-	computedHash, byteCount, err := protocolhash.CommittedBundle(logicalRows)
-	if err != nil || computedHash != response.BundleHash {
-		return nil, nil, fmt.Errorf("complete push response hash does not match authoritative rows")
-	}
-	committed := &committedPushBundle{BundleSeq: response.BundleSeq, SourceID: c.sourceID, SourceBundleID: outbox.SourceBundleID, PlannedRowCount: outbox.RowCount, RowCount: int64(len(authoritative)), ByteCount: byteCount, BundleHash: response.BundleHash, CanonicalRequestHash: outbox.CanonicalRequestHash}
-	if err := validateCommittedPushBundleHardLimits(committed); err != nil {
+	outcome, committed, rows, err := c.decodeJournalOutcome(ctx, body, j, snapshot.Rows)
+	if err != nil {
 		return nil, nil, err
 	}
-	return committed, authoritative, nil
+	if outcome.Status != "committed" {
+		return nil, nil, fmt.Errorf("expected committed terminal outcome")
+	}
+	return committed, rows, nil
 }
 
 func (c *Client) decodeCompletePushError(ctx context.Context, status int, body []byte) error {
 	if generationErr := decodeSchemaGenerationRequestError(status, body, c.schemaGenerationProof); generationErr != nil {
 		return generationErr
 	}
-	if response, ok := decodeServerErrorResponse(body); ok {
-		switch {
-		case status == http.StatusConflict && response.Error == "push_replay_mismatch":
-			return &PushReplayMismatchError{}
-		case status == http.StatusUnprocessableEntity && response.Error == "bundle_projection_too_large":
-			return &BundleProjectionTooLargeError{}
-		case status == http.StatusUnprocessableEntity:
-			return decodePushApplicationRejection("push", status, body)
-		}
+	if response, ok := decodeServerErrorResponse(body); ok &&
+		((status == http.StatusUnprocessableEntity && response.Error == "bundle_projection_too_large") ||
+			(status == http.StatusRequestEntityTooLarge && response.Error == "push_outcome_too_large")) {
+		// Intrinsic capacity stops automatic retries without disposing F.
+		return &BundleProjectionTooLargeError{}
 	}
-	if initErr, handled := c.handleInitializationLeaseErrorLocked(ctx, status, body); handled {
-		return initErr
-	}
-	if conflictErr := decodePushConflictError(status, body); conflictErr != nil {
-		return conflictErr
+	if response, ok := decodeServerErrorResponse(body); ok && status == http.StatusGone && response.Error == "push_outcome_acknowledged" {
+		return &UploadJournalIntegrityError{"server acknowledged operation without local disposition"}
 	}
 	if response, ok := decodeServerErrorResponse(body); ok && status == http.StatusConflict {
 		switch response.Error {
@@ -166,33 +162,19 @@ func (c *Client) decodeCompletePushError(ctx context.Context, status int, body [
 	return &retryHTTPError{Operation: "push", StatusCode: status}
 }
 
-func decodePushApplicationRejection(operation string, status int, body []byte) error {
-	response, ok := decodeServerErrorResponse(body)
-	if !ok || response.Error == "" {
-		return &PushApplicationRejectionError{Operation: operation, Status: status, Category: "invalid_422_response", Message: "server returned an invalid application rejection"}
-	}
-	if response.Error == "push_effect_coverage_incomplete" {
-		return &PushEffectCoverageError{Operation: operation, Status: status, Message: response.Message}
-	}
-	return &PushApplicationRejectionError{Operation: operation, Status: status, Category: response.Error, Message: response.Message}
-}
-
-func (c *Client) handleInitializationLeaseErrorLocked(ctx context.Context, statusCode int, body []byte) (error, bool) {
-	resp, ok := decodeServerErrorResponse(body)
-	if !ok || resp.Error != "initialization_expired" && resp.Error != "initialization_stale" {
-		return nil, false
-	}
-	if err := c.clearStalePendingInitializationStateLocked(ctx); err != nil {
-		return fmt.Errorf("clear stale initialization state after %s: %w", resp.Error, err), true
-	}
-	return fmt.Errorf("server returned status %d: %s; reconnect required", statusCode, decodeServerErrorBody(body)), true
-}
-
 func (c *Client) doAuthenticatedPushRequest(ctx context.Context, operation, method, endpoint string, requestBody []byte, contentType string, successLimit, errorLimit int64, onDecodedBodyRead func(int64)) (boundedResponsePayload, error) {
+	return c.doAuthenticatedPushRequestForBinding(ctx, operation, method, endpoint, requestBody, contentType, successLimit, errorLimit, oversync.PushOperationBinding{SourceID: c.sourceID, GenerationID: strconv.FormatInt(int64(c.schemaGenerationProof.ID), 10), GenerationFingerprint: c.schemaGenerationProof.Fingerprint}, onDecodedBodyRead)
+}
+
+func (c *Client) doAuthenticatedPushRequestForBinding(ctx context.Context, operation, method, endpoint string, requestBody []byte, contentType string, successLimit, errorLimit int64, binding oversync.PushOperationBinding, onDecodedBodyRead func(int64)) (boundedResponsePayload, error) {
+	generationID, err := strconv.ParseInt(binding.GenerationID, 10, 32)
+	if err != nil {
+		return boundedResponsePayload{}, err
+	}
 	policy := c.normalizedPushCapacityRetryPolicy()
 	started := time.Now()
 	for {
-		result, err := c.doAuthenticatedBoundedRequest(ctx, operation, method, endpoint, requestBody, contentType, successLimit, errorLimit, onDecodedBodyRead)
+		result, err := c.doAuthenticatedBoundedRequestForBinding(ctx, operation, method, endpoint, requestBody, contentType, successLimit, errorLimit, binding.SourceID, oversync.SchemaGenerationProof{ID: oversync.SchemaGenerationID(generationID), Fingerprint: binding.GenerationFingerprint}, onDecodedBodyRead)
 		if err != nil || !isHistoryProjectionCapacityResponse(result) {
 			return result, err
 		}

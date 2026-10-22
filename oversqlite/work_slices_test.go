@@ -42,7 +42,7 @@ func TestWorkSliceCompletion_BackgroundPushDoesNotBackOffForLocalSlices(t *testi
 		}
 	}
 	require.NoError(t, c.Stop(ctx))
-	require.EqualValues(t, 1, requests.Load())
+	require.EqualValues(t, 2, requests.Load(), "one push and its essential acknowledgement")
 	require.Positive(t, c.a3Stats.workSlices)
 	require.EqualValues(t, 0, countA3(t, db, `SELECT count(*) FROM _sync_outbox_rows`))
 	require.EqualValues(t, 0, countA3(t, db, `SELECT reserved_entries+reserved_bytes FROM _sync_operation_state`))
@@ -54,7 +54,7 @@ func TestWorkSliceCompletion_OnePushAndOneSync(t *testing.T) {
 			c, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `CREATE TABLE users(id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL)`)
 			server := newMockPushServer(t)
 			c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				if r.URL.Path == "/sync/push" {
+				if r.URL.Path == "/sync/push" || r.URL.Path == "/sync/push-outcomes/resolve" || r.URL.Path == "/sync/push-outcomes/ack" {
 					return server.RoundTrip(r)
 				}
 				require.Equal(t, "/sync/pull", r.URL.Path)
@@ -163,7 +163,7 @@ func TestWorkSliceCompletion_RebuildKeepsOneSnapshot(t *testing.T) {
 	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodPost {
 			creates++
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: "one-snapshot", SnapshotBundleSeq: 9, RowCount: 2, ByteCount: testSnapshotRowsByteCount(rows), ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return snapshotFixtureResponse(t, c, r, "one-snapshot", 9, rows), nil
 		}
 		if r.Method == http.MethodDelete {
 			return &http.Response{StatusCode: 204, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil

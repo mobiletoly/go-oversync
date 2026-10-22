@@ -50,6 +50,7 @@ func TestBootstrap_PopulatedAdoptionReadiness(t *testing.T) {
 	setTestSchemaGenerationHeaders(req, svc)
 	req = req.WithContext(ContextWithActor(req.Context(), actor))
 	rec := httptest.NewRecorder()
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	handlers.HandleConnect(rec, req)
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	require.Contains(t, rec.Body.String(), `"service_not_ready"`)

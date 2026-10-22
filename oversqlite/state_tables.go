@@ -19,17 +19,19 @@ const (
 
 	outboxStateNone     = "none"
 	outboxStatePrepared = "prepared"
+	outboxStateRejected = "rejected" // Retained policy evidence; never dispatchable.
 )
 
 type attachmentStateRecord struct {
-	AttachmentEpoch         int64
-	CurrentSourceID         string
-	BindingState            string
-	AttachedUserID          string
-	SchemaName              string
-	LastBundleSeqSeen       int64
-	RebuildRequired         bool
-	PendingInitializationID string
+	AttachmentEpoch                 int64
+	CurrentSourceID                 string
+	BindingState                    string
+	AttachedUserID                  string
+	SchemaName                      string
+	LastBundleSeqSeen               int64
+	RebuildRequired                 bool
+	PendingInitializationID         string
+	InitializationReconnectRequired bool
 }
 
 type sourceStateRecord struct {
@@ -46,6 +48,7 @@ type operationStateRecord struct {
 	StagedSnapshotID    string
 	SnapshotBundleSeq   int64
 	SnapshotRowCount    int64
+	SnapshotTransfer    string
 }
 
 type outboxBundleRecord struct {
@@ -71,7 +74,7 @@ func loadAttachmentState(ctx context.Context, q queryRower) (*attachmentStateRec
 		rebuildRequired int
 	)
 	if err := q.QueryRowContext(ctx, `
-		SELECT attachment_epoch, current_source_id, binding_state, attached_user_id, schema_name, last_bundle_seq_seen, rebuild_required, pending_initialization_id
+		SELECT attachment_epoch, current_source_id, binding_state, attached_user_id, schema_name, last_bundle_seq_seen, rebuild_required, pending_initialization_id, initialization_reconnect_required
 		FROM _sync_attachment_state
 		WHERE singleton_key = 1
 	`).Scan(
@@ -83,6 +86,7 @@ func loadAttachmentState(ctx context.Context, q queryRower) (*attachmentStateRec
 		&rec.LastBundleSeqSeen,
 		&rebuildRequired,
 		&rec.PendingInitializationID,
+		&rec.InitializationReconnectRequired,
 	); err != nil {
 		return nil, fmt.Errorf("failed to load attachment state: %w", err)
 	}
@@ -123,9 +127,9 @@ func persistAttachmentState(ctx context.Context, e execer, rec *attachmentStateR
 			schema_name = ?,
 			last_bundle_seq_seen = ?,
 			rebuild_required = ?,
-			pending_initialization_id = ?
+			pending_initialization_id = ?, initialization_reconnect_required=?
 		WHERE singleton_key = 1
-	`, alreadyAdvanced, rec.CurrentSourceID, rec.BindingState, rec.AttachedUserID, rec.CurrentSourceID, rec.BindingState, rec.AttachedUserID, rec.SchemaName, rec.LastBundleSeqSeen, rebuildRequired, rec.PendingInitializationID); err != nil {
+	`, alreadyAdvanced, rec.CurrentSourceID, rec.BindingState, rec.AttachedUserID, rec.CurrentSourceID, rec.BindingState, rec.AttachedUserID, rec.SchemaName, rec.LastBundleSeqSeen, rebuildRequired, rec.PendingInitializationID, rec.InitializationReconnectRequired); err != nil {
 		return fmt.Errorf("failed to persist attachment state: %w", err)
 	}
 	return bindLocalBaselineContext(ctx, e)
@@ -144,10 +148,10 @@ func advanceAttachmentEpoch(ctx context.Context, e execer) error {
 func loadOperationState(ctx context.Context, q queryRower) (*operationStateRecord, error) {
 	var rec operationStateRecord
 	if err := q.QueryRowContext(ctx, `
-		SELECT kind, target_user_id, reason, replacement_source_id, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count
+		SELECT kind, target_user_id, reason, replacement_source_id, staged_snapshot_id, snapshot_bundle_seq, snapshot_row_count, snapshot_transfer
 		FROM _sync_operation_state
 		WHERE singleton_key = 1
-	`).Scan(&rec.Kind, &rec.TargetUserID, &rec.Reason, &rec.ReplacementSourceID, &rec.StagedSnapshotID, &rec.SnapshotBundleSeq, &rec.SnapshotRowCount); err != nil {
+	`).Scan(&rec.Kind, &rec.TargetUserID, &rec.Reason, &rec.ReplacementSourceID, &rec.StagedSnapshotID, &rec.SnapshotBundleSeq, &rec.SnapshotRowCount, &rec.SnapshotTransfer); err != nil {
 		return nil, fmt.Errorf("failed to load operation state: %w", err)
 	}
 	if strings.TrimSpace(rec.Kind) == "" {
@@ -177,9 +181,9 @@ func persistOperationState(ctx context.Context, e execer, rec *operationStateRec
 			replacement_source_id = ?,
 			staged_snapshot_id = ?,
 			snapshot_bundle_seq = ?,
-			snapshot_row_count = ?
+			snapshot_row_count = ?, snapshot_transfer = ?
 		WHERE singleton_key = 1
-	`, rec.Kind, rec.TargetUserID, rec.Reason, rec.ReplacementSourceID, rec.StagedSnapshotID, rec.SnapshotBundleSeq, rec.SnapshotRowCount); err != nil {
+	`, rec.Kind, rec.TargetUserID, rec.Reason, rec.ReplacementSourceID, rec.StagedSnapshotID, rec.SnapshotBundleSeq, rec.SnapshotRowCount, rec.SnapshotTransfer); err != nil {
 		return fmt.Errorf("failed to persist operation state: %w", err)
 	}
 	return nil
@@ -317,6 +321,15 @@ func persistOutboxBundle(ctx context.Context, e execer, rec *outboxBundleRecord)
 }
 
 func clearOutboxBundle(ctx context.Context, e execer) error {
+	if tx, ok := e.(sqliteTransaction); ok {
+		j, err := loadUploadJournal(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if j != nil && j.Phase != "ack_pending" {
+			return &UploadJournalIntegrityError{"cannot release an unsettled frozen upload"}
+		}
+	}
 	return persistOutboxBundle(ctx, e, &outboxBundleRecord{})
 }
 

@@ -14,11 +14,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type settlementReservationCase struct {
+	target      int64
+	rows, limit int
+}
+
 func TestSettlementReservation_PublicCompletion(t *testing.T) {
-	for _, tc := range []struct {
-		target      int64
-		rows, limit int
-	}{{1, 125, 40}, {8, 125, 40}, {17, 125, 40}, {1000000, 125, 40}, {1000000, 1000, 1000}} {
+	testSettlementReservation(t, []settlementReservationCase{
+		{1, 125, 40}, {8, 125, 40}, {17, 125, 40}, {1000000, 125, 40}, {1000000, 1000, 1000},
+	})
+}
+
+// A small semantic regression; the full scale witnesses remain above.
+func TestSettlementReservation_Continuation(t *testing.T) {
+	testSettlementReservation(t, []settlementReservationCase{
+		{1, 9, 4}, {8, 9, 4}, {17, 9, 4}, {1000000, 9, 4},
+	})
+}
+
+func testSettlementReservation(t *testing.T, cases []settlementReservationCase) {
+	t.Helper()
+	for _, tc := range cases {
 		t.Run(fmt.Sprintf("target_%d_rows_%d", tc.target, tc.rows), func(t *testing.T) {
 			tableCount := 8
 			if tc.rows == 1000 {
@@ -73,6 +89,12 @@ CREATE TRIGGER reservation_witness_update AFTER UPDATE OF workspace_context ON _
 				require.Positive(t, c.a3Stats.workSlices)
 			}
 			t.Logf("target=%d rows=%d slices=%d reservation_peak_entries=%d bytes=%d", tc.target, tc.rows, c.a3Stats.workSlices, peak, countA3(t, db, `SELECT peak_bytes FROM reservation_witness`))
+			// Peak and release are fully asserted for the measured PushPending
+			// above. Remove its bookkeeping trigger before the unmeasured drain:
+			// its measurement is complete, so later workspace updates no longer
+			// need the extra bookkeeping DML. Keep every row and the same target.
+			_, err = db.Exec(`DROP TRIGGER reservation_witness_update`)
+			require.NoError(t, err)
 			_, err = c.Sync(ctx)
 			require.NoError(t, err)
 			require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`))

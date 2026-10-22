@@ -162,7 +162,7 @@ func TestMobileApp_OnDetach_KeepsOfflineWritesPending(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(oversync.GenerationDiscoveryResponse{
 				ProtocolVersion:  oversync.SyncProtocolVersion,
 				SchemaGeneration: descriptor,
-				Limits:           oversync.WireLimits{MaxPushRows: 10000, MaxPushDecodedBytes: 16 << 20, MaxPullBundles: 5000, MaxPullDecodedBytes: 32 << 20, MaxSnapshotRowsPerChunk: 1, MaxSnapshotDecodedBytesPerChunk: 1024, MaxSnapshotRows: 10000, MaxSnapshotLogicalBytes: 16 << 20, MaxRowDecodedBytes: 1024},
+				Limits:           oversync.WireLimits{MaxPushRows: 10000, MaxPushDecodedBytes: 16 << 20, MaxPushOutcomeDecodedBytes: 16*1024*1024 + 8192, MaxPullBundles: 5000, MaxPullDecodedBytes: 32 << 20, MaxSnapshotRowsPerChunk: 1, MaxSnapshotDecodedBytesPerChunk: 1024, MaxSnapshotRows: 10000, MaxSnapshotLogicalBytes: 16 << 20, MaxRowDecodedBytes: 1024},
 			})
 		case "/sync/connect":
 			_ = json.NewEncoder(w).Encode(oversync.ConnectResponse{Resolution: "initialize_empty"})

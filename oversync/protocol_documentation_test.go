@@ -112,6 +112,8 @@ func TestSchemaGenerationOpenAPIGolden(t *testing.T) {
 		"/sync/generations/{generation_id}":     {"get"},
 		"/sync/connect":                         {"post"},
 		"/sync/push":                            {"post"},
+		"/sync/push-outcomes/resolve":           {"post"},
+		"/sync/push-outcomes/ack":               {"post"},
 		"/sync/pull":                            {"get"},
 		"/sync/watch":                           {"get"},
 		"/sync/snapshot-sessions":               {"post"},
@@ -120,6 +122,8 @@ func TestSchemaGenerationOpenAPIGolden(t *testing.T) {
 	expectedStatuses := map[string][]string{
 		"GET /sync/generations/{generation_id}":        {"200", "400", "401", "409", "426", "500", "503"},
 		"POST /sync/connect":                           {"200", "400", "401", "403", "409", "410", "413", "415", "426", "500", "503"},
+		"POST /sync/push-outcomes/resolve":             {"200", "400", "401", "403", "409", "410", "413", "415", "426", "500", "503"},
+		"POST /sync/push-outcomes/ack":                 {"204", "400", "401", "403", "409", "410", "413", "415", "426", "500", "503"},
 		"POST /sync/push":                              {"200", "400", "401", "403", "409", "410", "413", "415", "422", "426", "500", "503"},
 		"GET /sync/pull":                               {"200", "400", "401", "409", "410", "413", "426", "500", "503"},
 		"GET /sync/watch":                              {"200", "400", "401", "403", "409", "410", "426", "500", "503"},
@@ -140,6 +144,7 @@ func TestSchemaGenerationOpenAPIGolden(t *testing.T) {
 					refs[ref] = true
 				}
 			}
+			require.True(t, refs["#/components/parameters/ProtocolVersionHeader"], "%s %s protocol header", method, path)
 			require.True(t, refs["#/components/parameters/SourceIDHeader"], "%s %s source header", method, path)
 			if path != "/sync/generations/{generation_id}" {
 				require.True(t, refs["#/components/parameters/SchemaGenerationIDHeader"], "%s %s generation ID", method, path)
@@ -169,7 +174,7 @@ func TestSchemaGenerationOpenAPIGolden(t *testing.T) {
 	require.ElementsMatch(t, []any{"protocol_version", "schema_generation", "limits", "watch_enabled"}, discovery["required"].([]any))
 	require.Equal(t, false, discovery["additionalProperties"])
 	limits := schemas["WireLimits"].(map[string]any)
-	require.ElementsMatch(t, []any{"max_push_rows", "max_push_decoded_bytes", "max_pull_bundles", "max_pull_decoded_bytes", "max_snapshot_rows_per_chunk", "max_snapshot_decoded_bytes_per_chunk", "max_snapshot_rows", "max_snapshot_logical_bytes", "max_row_decoded_bytes"}, limits["required"].([]any))
+	require.ElementsMatch(t, []any{"max_push_rows", "max_push_decoded_bytes", "max_pull_bundles", "max_pull_decoded_bytes", "max_snapshot_rows_per_chunk", "max_snapshot_decoded_bytes_per_chunk", "max_snapshot_rows", "max_snapshot_logical_bytes", "max_row_decoded_bytes", "max_push_outcome_decoded_bytes"}, limits["required"].([]any))
 	token := schemas["CanonicalInitializationToken"].(map[string]any)
 	require.Equal(t, "uuid", token["format"])
 	require.EqualValues(t, 36, token["minLength"])
@@ -192,7 +197,10 @@ func TestSchemaGenerationOpenAPIGolden(t *testing.T) {
 		require.Contains(t, schemas, schemaName)
 	}
 	pushResponse := schemas["PushResponse"].(map[string]any)
-	require.Equal(t, "#/components/schemas/NonEmptyCompactRowGroups", pushResponse["properties"].(map[string]any)["rows"].(map[string]any)["$ref"])
+	require.ElementsMatch(t, []any{"source_id", "schema_generation_id", "schema_generation_fingerprint", "source_bundle_id", "canonical_request_hash", "initialization_id", "status", "outcome_hash"}, pushResponse["required"])
+	require.Len(t, pushResponse["oneOf"], 3)
+	require.NotContains(t, pushResponse["properties"], "rows")
+	require.Equal(t, "#/components/schemas/NonEmptyCompactRowGroups", schemas["CommittedPushEffect"].(map[string]any)["properties"].(map[string]any)["rows"].(map[string]any)["$ref"])
 	compactBundle := schemas["CompactBundle"].(map[string]any)
 	require.Equal(t, "#/components/schemas/CompactRowGroups", compactBundle["properties"].(map[string]any)["rows"].(map[string]any)["$ref"])
 	compactGroup := schemas["CompactRowGroup"].(map[string]any)
@@ -207,9 +215,10 @@ func TestSchemaGenerationOpenAPIGolden(t *testing.T) {
 	require.EqualValues(t, 4, snapshotTuple["minItems"])
 	require.EqualValues(t, 4, snapshotTuple["maxItems"])
 	require.Equal(t, false, snapshotTuple["items"])
-	errorAlternatives := schemas["ErrorResponse"].(map[string]any)["properties"].(map[string]any)["error"].(map[string]any)["oneOf"].([]any)
+	errorAlternatives := schemas["ErrorResponse"].(map[string]any)["properties"].(map[string]any)["error"].(map[string]any)["anyOf"].([]any)
 	errorValues := errorAlternatives[0].(map[string]any)["enum"].([]any)
-	for _, code := range []string{"invalid_request", "push_invalid", "push_replay_mismatch", "invalid_gzip", "encoded_body_too_large", "decoded_body_too_large", "bundle_projection_too_large", "committed_bundle_unrepresentable", "snapshot_chunk_too_small"} {
+	require.NotContains(t, errorValues, "push_replay_mismatch")
+	for _, code := range []string{"invalid_request", "push_invalid", "push_outcome_pending", "push_outcome_acknowledged", "push_outcome_mismatch", "push_outcome_too_large", "invalid_gzip", "encoded_body_too_large", "decoded_body_too_large", "bundle_projection_too_large", "committed_bundle_unrepresentable", "snapshot_chunk_too_small"} {
 		require.Contains(t, errorValues, code)
 	}
 }

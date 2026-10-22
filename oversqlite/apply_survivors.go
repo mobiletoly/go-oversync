@@ -28,12 +28,14 @@ const applyRowsDDL = `CREATE TABLE IF NOT EXISTS _sync_apply_rows (
 	payload TEXT, wire INTEGER NOT NULL, pending INTEGER NOT NULL, bytes INTEGER NOT NULL,
     role TEXT NOT NULL DEFAULT 'survivor' CHECK(role IN ('intended','survivor','exception')),
     owner_revision INTEGER NOT NULL DEFAULT 0 CHECK(typeof(owner_revision)='integer' AND owner_revision>=0),
+    saved_rowid INTEGER,
 	UNIQUE(table_name,local_pk))`
 
 const applyEdgesDDL = `CREATE TABLE IF NOT EXISTS _sync_apply_edges (
     ordinal INTEGER PRIMARY KEY, parent_table TEXT NOT NULL, parent_pk TEXT NOT NULL,
     child_table TEXT NOT NULL, child_pk TEXT NOT NULL, bytes INTEGER NOT NULL,
-    UNIQUE(parent_table,parent_pk,child_table,child_pk))`
+    edge_kind TEXT NOT NULL DEFAULT 'f' CHECK(edge_kind IN ('f','u')),
+    UNIQUE(parent_table,parent_pk,child_table,child_pk,edge_kind))`
 
 // The existing apply transaction owns this derived state. The persisted cursor
 // is also the traversal frontier; no separate graph, coordinator or write guard.
@@ -57,6 +59,7 @@ type applySurvivor struct {
 	payload   sql.NullString
 	wire      bool
 	role      string
+	rowid     sql.NullInt64
 }
 
 func applyUnit(kind string, seq int64, hash string) string {
@@ -377,7 +380,7 @@ func (c *Client) prepareApplySurvivors(ctx context.Context, tx sqliteTransaction
 	if len(operationKind) == 1 {
 		kind = operationKind[0]
 	}
-	guard, err := c.applyGuard(ctx, tx, unit)
+	guard, err := c.applyPreparationGuard(ctx, tx, unit)
 	if err != nil {
 		return err
 	}
@@ -394,13 +397,10 @@ func (c *Client) prepareApplySurvivors(ctx context.Context, tx sqliteTransaction
 		p.unit, p.guard, p.phase = unit, guard, "clear"
 		p.kind = kind
 	}
-	if kind == "snapshot" && (p.phase == "index" || p.phase == "walk") {
-		return fmt.Errorf("obsolete snapshot count phase requires fresh installation")
-	}
 	if err := saveApplyPlan(ctx, tx, p); err != nil {
 		return err
 	}
-	for p.phase != "ready" {
+	for p.phase != "ready" && p.phase != "installed" {
 		if err := c.prepareApplySurvivorStep(ctx, tx, p, roots, seed); err != nil {
 			return err
 		}
@@ -413,7 +413,13 @@ func (c *Client) prepareApplySurvivors(ctx context.Context, tx sqliteTransaction
 	if err := c.preflightApplySurvivors(ctx, tx, p, roots); err != nil {
 		return err
 	}
-	return c.validateApplyDependencies(ctx, tx, p)
+	if err := c.validateApplyDependencies(ctx, tx, p); err != nil {
+		return err
+	}
+	if v := uniqueInvocation(ctx); v != nil && v.required {
+		return c.preflightUniqueApply(ctx, tx, p)
+	}
+	return nil
 }
 
 // Every mutating transition owns a complete checkpoint before it starts.
@@ -455,9 +461,6 @@ func (c *Client) advanceApplySurvivors(ctx context.Context, tx sqliteTransaction
 	case "roots":
 		if p.root == int64(roots) {
 			p.phase, p.fk = "index", -1
-			if p.kind == "snapshot" {
-				p.phase = "ready"
-			}
 			return nil
 		}
 		row, err := seed(int(p.root))
@@ -473,6 +476,10 @@ func (c *Client) advanceApplySurvivors(ctx context.Context, tx sqliteTransaction
 		return c.indexApplyStep(ctx, tx, p)
 	case "walk":
 		return c.walkApplyStep(ctx, tx, p)
+	case "unique":
+		return c.prepareUniqueStep(ctx, tx, p)
+	case "unique_schedule":
+		return c.prepareUniqueScheduleStep(ctx, tx, p)
 	default:
 		return fmt.Errorf("invalid survivor plan phase %q", p.phase)
 	}
@@ -639,7 +646,7 @@ func (c *Client) indexApplyForeignKey(ctx context.Context, tx sqliteTransaction,
 	if err = scanTransactionRow(ctx, tx, `SELECT `+parentExpr+tail, []any{value}, &parent); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO _sync_apply_edges VALUES(?,?,?,?,?,?)`, p.edgeEntries+1, parentTable, parent, table, p.cursor.String, size)
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO _sync_apply_edges(ordinal,parent_table,parent_pk,child_table,child_pk,bytes) VALUES(?,?,?,?,?,?)`, p.edgeEntries+1, parentTable, parent, table, p.cursor.String, size)
 	if err != nil {
 		return err
 	}
@@ -663,7 +670,7 @@ func (c *Client) putApplySurvivor(ctx context.Context, tx sqliteTransaction, p *
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	size := int64(len(row.payload.String) + 6*len(row.table) + 6*len(row.pk) + 64)
+	size := int64(len(row.payload.String) + 6*len(row.table) + 6*len(row.pk) + 96)
 	if err := c.checkApplyWorkspace(p, 7, 6*size); err != nil {
 		return err
 	}
@@ -677,7 +684,15 @@ func (c *Client) putApplySurvivor(ctx context.Context, tx sqliteTransaction, p *
 	if role == "exception" {
 		pending = 0
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO _sync_apply_rows(ordinal,table_name,local_pk,payload,wire,pending,bytes,role,owner_revision) VALUES(?,?,?,?,?,?,?,?,(SELECT revision FROM _sync_conflict_state WHERE singleton_key=1))`, p.entries+1, row.table, row.pk, row.payload, row.wire, pending, size, role)
+	// Physical identity preservation belongs to the snapshot delta. Ordinary
+	// settlement retains its established whole-row restoration semantics.
+	if p.kind == "snapshot" {
+		row.rowid, err = c.captureApplyRowID(ctx, tx, row.table, row.pk)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO _sync_apply_rows(ordinal,table_name,local_pk,payload,wire,pending,bytes,role,owner_revision,saved_rowid) VALUES(?,?,?,?,?,?,?,?,(SELECT revision FROM _sync_conflict_state WHERE singleton_key=1),?)`, p.entries+1, row.table, row.pk, row.payload, row.wire, pending, size, role, row.rowid)
 	if err == nil {
 		p.entries++
 		p.bytes += size
@@ -692,6 +707,12 @@ func (c *Client) walkApplyStep(ctx context.Context, tx sqliteTransaction, p *app
 		err := scanTransactionRow(ctx, tx, `SELECT ordinal FROM _sync_apply_rows WHERE pending=1 ORDER BY ordinal LIMIT 1`, nil, &p.visit)
 		if errors.Is(err, sql.ErrNoRows) {
 			p.phase = "ready"
+			if v := uniqueInvocation(ctx); v != nil && v.required {
+				p.phase = "unique"
+				p.fk = 0
+				p.root = 0
+				p.cursor = sql.NullString{}
+			}
 			return nil
 		}
 		if err != nil {
@@ -713,7 +734,7 @@ func (c *Client) walkApplyStep(ctx context.Context, tx sqliteTransaction, p *app
 		return err
 	}
 	table := strings.ToLower(c.config.Tables[p.table].TableName)
-	tail := ` FROM _sync_apply_edges WHERE parent_table=? AND parent_pk=? AND child_table=?`
+	tail := ` FROM _sync_apply_edges WHERE edge_kind='f' AND parent_table=? AND parent_pk=? AND child_table=?`
 	args := []any{parentTable, parentPK, table}
 	if p.cursor.Valid {
 		tail += ` AND child_pk>?`
@@ -815,7 +836,7 @@ func (c *Client) loadApplySurvivor(ctx context.Context, tx sqliteTransaction, p 
 	if err := c.checkApplyWorkspace(p, 6, 6*size); err != nil {
 		return row, 0, err
 	}
-	err := scanTransactionRow(ctx, tx, `SELECT table_name,local_pk,payload,wire FROM _sync_apply_rows WHERE ordinal=?`, []any{ordinal}, &row.table, &row.pk, &row.payload, &row.wire)
+	err := scanTransactionRow(ctx, tx, `SELECT table_name,local_pk,payload,wire,saved_rowid FROM _sync_apply_rows WHERE ordinal=?`, []any{ordinal}, &row.table, &row.pk, &row.payload, &row.wire, &row.rowid)
 	return row, size, err
 }
 
@@ -862,6 +883,12 @@ func (c *Client) applySurvivorMatches(ctx context.Context, tx sqliteTransaction,
 	if !row.payload.Valid {
 		return true, nil
 	}
+	if row.rowid.Valid {
+		rowid, err := c.captureApplyRowID(ctx, tx, row.table, row.pk)
+		if err != nil || rowid != row.rowid {
+			return false, err
+		}
+	}
 	if !row.wire {
 		return canonicalPayloadEqual(live.payload, row.payload)
 	}
@@ -878,6 +905,7 @@ func (c *Client) applySurvivorMatches(ctx context.Context, tx sqliteTransaction,
 
 func (c *Client) restoreApplySurvivor(ctx context.Context, tx sqliteTransaction, cache *txStmtCache, row applySurvivor) error {
 	if row.payload.Valid {
+		ctx = context.WithValue(ctx, applyRowIDKey{}, row.rowid)
 		payload, err := jcs.DecodeObject([]byte(row.payload.String))
 		if err != nil {
 			return err

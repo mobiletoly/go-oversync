@@ -112,7 +112,7 @@ func validateSnapshotSession(resp *oversync.SnapshotSession) error {
 	if resp == nil {
 		return fmt.Errorf("snapshot session response missing body")
 	}
-	if strings.TrimSpace(resp.SnapshotID) == "" {
+	if resp.SnapshotID == "" {
 		return fmt.Errorf("snapshot session response missing snapshot_id")
 	}
 	if resp.SnapshotBundleSeq < 0 {
@@ -135,6 +135,9 @@ func validateSnapshotSession(resp *oversync.SnapshotSession) error {
 	}
 	if strings.TrimSpace(resp.ExpiresAt) == "" {
 		return fmt.Errorf("snapshot session response missing expires_at")
+	}
+	if len(resp.SnapshotHash) != 64 || strings.Trim(resp.SnapshotHash, "0123456789abcdef") != "" {
+		return fmt.Errorf("snapshot session hash must be lowercase SHA-256")
 	}
 	return nil
 }

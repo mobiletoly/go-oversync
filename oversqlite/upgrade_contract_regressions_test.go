@@ -95,10 +95,7 @@ func TestUpgradeRegression_CoordinatorPhysicalClientLogsCheckpointRecovery(t *te
 		case request.Method == http.MethodGet && request.URL.Path == "/sync/pull":
 			return errorJSONResponse(http.StatusConflict, map[string]any{"error": "history_pruned"}), nil
 		case request.Method == http.MethodPost && request.URL.Path == "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID: "checkpoint-recovery", SnapshotBundleSeq: 4,
-				RowCount: 0, ByteCount: 0, ExpiresAt: "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponseForGeneration(t, upgradeCapabilities(t, contract).SchemaGeneration, request, "checkpoint-recovery", 4, nil), nil
 		case request.Method == http.MethodGet && request.URL.Path == "/sync/snapshot-sessions/checkpoint-recovery":
 			return jsonResponse(oversync.SnapshotChunkResponse{
 				SnapshotID: "checkpoint-recovery", SnapshotBundleSeq: 4,

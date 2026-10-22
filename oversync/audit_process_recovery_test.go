@@ -24,6 +24,7 @@ type auditHTTPDirectPush struct {
 	userID, sourceID string
 	sourceBundleID   int64
 	request          CompactPushRequest
+	generation       SchemaGenerationCapabilities
 }
 
 func newAuditProcessRequest(t *testing.T, method, url, user, source string, body any) *http.Request {
@@ -36,6 +37,7 @@ func newAuditProcessRequest(t *testing.T, method, url, user, source string, body
 	}
 	req, err := http.NewRequest(method, url, reader)
 	require.NoError(t, err)
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -111,15 +113,36 @@ func prepareAuditHTTPPush(t *testing.T, client *http.Client, baseURL, schema, us
 	require.True(t, ok)
 	groups, err := CompactGroupsForRows(generationDescriptor(contract), []PushRequestRow{row})
 	require.NoError(t, err)
-	return auditHTTPDirectPush{user, source, sourceBundleID, CompactPushRequest{SourceBundleID: sourceBundleID, CanonicalRequestHash: hash, InitializationID: init, Rows: groups}}
+	return auditHTTPDirectPush{
+		userID: user, sourceID: source, sourceBundleID: sourceBundleID,
+		request:    CompactPushRequest{SourceBundleID: sourceBundleID, CanonicalRequestHash: hash, InitializationID: init, Rows: groups},
+		generation: generationDescriptor(contract),
+	}
 }
-func sendAuditHTTPPush(t *testing.T, client *http.Client, baseURL string, push auditHTTPDirectPush) CompactPushResponse {
+
+func decodeAuditHTTPPushOutcome(t *testing.T, push auditHTTPDirectPush, raw []byte) *RetainedPushOutcome {
+	t.Helper()
+	var outcome PushOutcome
+	require.NoError(t, json.Unmarshal(raw, &outcome))
+	var initializationID *string
+	if push.request.InitializationID != "" {
+		initializationID = &push.request.InitializationID
+	}
+	require.NoError(t, ValidatePushOutcomeBinding(outcome, PushOperationBinding{
+		SourceID: push.sourceID, GenerationID: push.generation.ID,
+		GenerationFingerprint: push.generation.Fingerprint, SourceBundleID: push.sourceBundleID,
+		CanonicalRequestHash: push.request.CanonicalRequestHash, InitializationID: initializationID,
+	}, push.generation))
+	require.Equal(t, "committed", outcome.Status)
+	require.NotNil(t, outcome.Committed)
+	return &RetainedPushOutcome{Outcome: &outcome, encoded: append([]byte(nil), raw...)}
+}
+
+func sendAuditHTTPPush(t *testing.T, client *http.Client, baseURL string, push auditHTTPDirectPush) *RetainedPushOutcome {
 	t.Helper()
 	result := doAuditProcessRequest(t, client, http.MethodPost, baseURL+"/sync/push", push.userID, push.sourceID, push.request)
 	require.Equal(t, http.StatusOK, result.statusCode, string(result.body))
-	var response CompactPushResponse
-	require.NoError(t, json.Unmarshal(result.body, &response))
-	return response
+	return decodeAuditHTTPPushOutcome(t, push, result.body)
 }
 
 func TestAuditProcessRecovery_DirectReplayAfterHelperRestart(t *testing.T) {
@@ -134,7 +157,7 @@ func TestAuditProcessRecovery_DirectReplayAfterHelperRestart(t *testing.T) {
 	require.NoError(t, first.Kill())
 	second := startAuditHTTPHelperProcess(t, databaseURL, schema)
 	replay := sendAuditHTTPPush(t, client, second.URL(), push)
-	require.Equal(t, committed.BundleSeq, replay.BundleSeq)
-	require.Equal(t, committed.BundleHash, replay.BundleHash)
+	require.Equal(t, committed.Outcome, replay.Outcome)
+	require.Equal(t, committed.encoded, replay.encoded, "helper restart must preserve the exact unacknowledged terminal envelope")
 	requireAuditMetadataIntegrity(t, ctx, pool)
 }

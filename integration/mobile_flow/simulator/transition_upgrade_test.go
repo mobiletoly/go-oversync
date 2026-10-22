@@ -9,6 +9,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +35,27 @@ func startEvolutionHTTP(t *testing.T, dsn string, cfg *oversync.ServiceConfig, a
 	require.NoError(t, err)
 	t.Cleanup(server.Close)
 	return server
+}
+
+// newStableMobileAuthority keeps the journal authority fixed while this test
+// restarts only its owned HTTP handlers against the same PostgreSQL authority.
+func newStableMobileAuthority(t *testing.T, initial string) (string, func(string)) {
+	t.Helper()
+	var target atomic.Pointer[url.URL]
+	retarget := func(address string) {
+		t.Helper()
+		parsed, err := url.Parse(address)
+		require.NoError(t, err)
+		require.Equal(t, "http", parsed.Scheme)
+		require.Equal(t, "127.0.0.1", parsed.Hostname())
+		target.Store(parsed)
+	}
+	retarget(initial)
+	proxy := httptest.NewServer(&httputil.ReverseProxy{Rewrite: func(request *httputil.ProxyRequest) {
+		request.SetURL(target.Load())
+	}})
+	t.Cleanup(proxy.Close)
+	return proxy.URL, retarget
 }
 
 func TestMobileFlow_TransitionPostgreSQLTransitionAndUpgrade(t *testing.T) {
@@ -77,6 +101,7 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 	var allowed atomic.Value
 	allowed.Store("")
 	server := startEvolutionHTTP(t, dsn, cfg, &allowed)
+	address, retarget := newStableMobileAuthority(t, server.URL())
 	require.NoError(t, evolution.ReopenServing(ctx, pool, []*oversync.SyncService{server.SyncService}))
 	scope := "mobile-transition"
 	_, err = evolution.CreateScope(ctx, pool, scope)
@@ -93,11 +118,11 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 		return oversqlite.UpgradePlan{PlanID: "transition-fresh-" + id, Mode: oversqlite.UpgradeModeFresh, DatabaseID: id, ServiceID: "transition", TargetVersion: 1, TargetGenerationID: old.Contract.Proof.ID, LocalOnlyTables: old.LocalOnlyTables, Migrator: old.Migrator}
 	}
 	mainPath := filepath.Join(t.TempDir(), "same-file.sqlite")
-	first, _, err := openVersionedApplication(ctx, mainPath, server.URL(), provider, http.DefaultClient, fresh("first"), old)
+	first, _, err := openVersionedApplication(ctx, mainPath, address, provider, http.DefaultClient, fresh("first"), old)
 	require.NoError(t, err)
 	attachVersionedTestApp(t, first, scope)
 	secondPath := filepath.Join(t.TempDir(), "second.sqlite")
-	second, _, err := openVersionedApplication(ctx, secondPath, server.URL(), provider, http.DefaultClient, fresh("second"), old)
+	second, _, err := openVersionedApplication(ctx, secondPath, address, provider, http.DefaultClient, fresh("second"), old)
 	require.NoError(t, err)
 	defer second.Close()
 	attachVersionedTestApp(t, second, scope)
@@ -152,15 +177,15 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 	a.Close()
 	server.Close()
 	server = startEvolutionHTTP(t, dsn, cfg, &allowed)
+	retarget(server.URL())
 	require.Error(t, evolution.ReopenServing(ctx, pool, []*oversync.SyncService{server.SyncService}))
 	first.Client.HTTP = http.DefaultClient
 	second.Client.HTTP = http.DefaultClient
-	first.Client.BaseURL = server.URL()
-	second.Client.BaseURL = server.URL()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL()+"/sync/generations/"+fmt.Sprint(target.Contract.Proof.ID), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address+"/sync/generations/"+fmt.Sprint(target.Contract.Proof.ID), nil)
 	require.NoError(t, err)
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set(oversync.SourceIDHeader, "target-probe")
+	request.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 	response, err := http.DefaultClient.Do(request)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusConflict, response.StatusCode)
@@ -202,9 +227,8 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 	a.Close()
 	server.Close()
 	server = startEvolutionHTTP(t, dsn, cfg, &allowed)
+	retarget(server.URL())
 	require.NoError(t, evolution.ReopenServing(ctx, pool, []*oversync.SyncService{server.SyncService}))
-	second.Client.BaseURL = server.URL()
-	first.Client.BaseURL = server.URL()
 	// Exact committed receipt replay settles first, then catches up backfill.
 	_, err = first.Client.Sync(ctx)
 	require.NoError(t, err)
@@ -213,9 +237,10 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 	require.Equal(t, 1, commits)
 	// Unsupported runtime is denied despite an unchanged valid schema proof.
 	allowed.Store("revoked-runtime")
-	unsupported, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, server.URL()+"/sync/generations/"+fmt.Sprint(target.Contract.Proof.ID), nil)
+	unsupported, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, address+"/sync/generations/"+fmt.Sprint(target.Contract.Proof.ID), nil)
 	require.NoError(t, requestErr)
 	unsupported.Header.Set("Authorization", "Bearer "+token)
+	unsupported.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 	rejected, requestErr := http.DefaultClient.Do(unsupported)
 	require.NoError(t, requestErr)
 	require.Equal(t, vector.RuntimeRejectionStatus, rejected.StatusCode)
@@ -244,7 +269,7 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 	require.NoError(t, second.DB.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id=?`, sourceBefore).Scan(&sequenceBefore))
 	require.NoError(t, second.Close())
 	allowed.Store("Bearer " + token)
-	second, _, err = openVersionedApplication(ctx, secondPath, server.URL(), provider, http.DefaultClient, fresh("second"), old)
+	second, _, err = openVersionedApplication(ctx, secondPath, address, provider, http.DefaultClient, fresh("second"), old)
 	require.NoError(t, err)
 	defer second.Close()
 	var sourceAfter string
@@ -274,7 +299,7 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 	require.NoError(t, err)
 	require.NoError(t, first.Close())
 	plan := oversqlite.UpgradePlan{PlanID: "transition-upgrade", Mode: oversqlite.UpgradeModeGeneration, DatabaseID: "first", ServiceID: "transition", InstalledVersion: 1, UserID: scope, TargetVersion: 2, InstalledGenerationID: old.Contract.Proof.ID, TargetGenerationID: target.Contract.Proof.ID, LocalOnlyTables: target.LocalOnlyTables, Migrator: target.Migrator}
-	upgraded, result, err := openVersionedApplication(ctx, mainPath, server.URL(), provider, http.DefaultClient, plan, target)
+	upgraded, result, err := openVersionedApplication(ctx, mainPath, address, provider, http.DefaultClient, plan, target)
 	require.NoError(t, err)
 	defer upgraded.Close()
 	attachVersionedTestApp(t, upgraded, scope)
@@ -307,7 +332,7 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 	require.NoError(t, pool.QueryRow(ctx, `SELECT s.replaced_by_source_id FROM sync.source_state s JOIN sync.user_state u USING(user_pk) WHERE u.user_id=$1 AND s.source_id=$2`, scope, oldSource).Scan(&replaced))
 	require.Equal(t, newSource, replaced)
 	if extension != nil {
-		extension(mobileRolloutState{ctx: ctx, pool: pool, server: server, old: second, target: upgraded, token: token, secret: "transition-test-secret", scope: scope})
+		extension(mobileRolloutState{ctx: ctx, pool: pool, server: server, address: address, retarget: retarget, old: second, target: upgraded, token: token, secret: "transition-test-secret", scope: scope})
 		return
 	}
 	// A permanent application rejection returns through real HTTP and preserves
@@ -317,16 +342,20 @@ func runTransitionMobileJourney(t *testing.T, extension func(mobileRolloutState)
 	_, err = second.Client.Sync(ctx)
 	var rejection *oversqlite.PushRejectionNeedsResolutionError
 	require.ErrorAs(t, err, &rejection)
-	require.Equal(t, http.StatusUnprocessableEntity, rejection.Pending.Status)
+	require.Equal(t, http.StatusOK, rejection.Pending.Status)
+	require.Equal(t, "transition_input_invalid", rejection.Pending.Category)
 	var pendingID int64
 	var pendingHash, pendingState string
 	require.NoError(t, second.DB.QueryRow(`SELECT source_bundle_id,canonical_request_hash,state FROM _sync_outbox_bundle WHERE singleton_key=1`).Scan(&pendingID, &pendingHash, &pendingState))
-	require.Equal(t, "prepared", pendingState)
+	require.Equal(t, "rejected", pendingState)
+	require.Equal(t, rejection.Pending.SourceBundleID, pendingID)
+	require.Equal(t, rejection.Pending.RequestHash, pendingHash)
 	require.NotEmpty(t, pendingHash)
 	_, err = second.Client.Sync(ctx)
 	rejection = nil
 	require.ErrorAs(t, err, &rejection)
-	require.Equal(t, http.StatusUnprocessableEntity, rejection.Pending.Status)
+	require.Equal(t, http.StatusOK, rejection.Pending.Status)
+	require.Equal(t, "transition_input_invalid", rejection.Pending.Category)
 	var sameID int64
 	var sameHash string
 	require.NoError(t, second.DB.QueryRow(`SELECT source_bundle_id,canonical_request_hash FROM _sync_outbox_bundle WHERE singleton_key=1`).Scan(&sameID, &sameHash))

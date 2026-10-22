@@ -59,21 +59,17 @@ func TestResultContract_AttachAndSyncStatus(t *testing.T) {
 
 	t.Run("restore result shape", func(t *testing.T) {
 		snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "remote-1"}, RowVersion: 9, Payload: mustJSONPayload(t, map[string]any{"id": "remote-1", "name": "Remote", "email": "remote@example.com"})}}
-		snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
-		client, db := newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
+
+		var client *Client
+		var db *sql.DB
+		client, db = newLifecycleTestClientWithTransport(t, func(r *http.Request) (*http.Response, error) {
 			switch r.URL.Path {
 			case "/sync/generations/1":
 				return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 			case "/sync/connect":
 				return jsonResponse(&oversync.ConnectResponse{Resolution: "remote_authoritative"}), nil
 			case "/sync/snapshot-sessions":
-				return jsonResponse(&oversync.SnapshotSession{
-					SnapshotID:        "snapshot-result-contract",
-					SnapshotBundleSeq: 9,
-					RowCount:          1,
-					ByteCount:         snapshotBytes,
-					ExpiresAt:         time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
-				}), nil
+				return snapshotFixtureResponse(t, client, r, "snapshot-result-contract", 9, snapshotRows), nil
 			case "/sync/snapshot-sessions/snapshot-result-contract":
 				switch r.Method {
 				case http.MethodGet:
@@ -225,17 +221,11 @@ func TestResultContract_RemoteSyncAndRotationOutcomes(t *testing.T) {
 	t.Run("rebuild snapshot keeps managed source outside source recovery", func(t *testing.T) {
 		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, lifecycleUsersDDL)
 		snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "user-1"}, RowVersion: 5, Payload: mustJSONPayload(t, map[string]any{"id": "user-1", "name": "Ada", "email": "ada@example.com"})}}
-		snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
+
 		client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			switch r.URL.Path {
 			case "/sync/snapshot-sessions":
-				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID:        "snapshot-result-contract",
-					SnapshotBundleSeq: 5,
-					RowCount:          1,
-					ByteCount:         snapshotBytes,
-					ExpiresAt:         "2030-01-01T00:00:00Z",
-				}), nil
+				return snapshotFixtureResponse(t, client, r, "snapshot-result-contract", 5, snapshotRows), nil
 			case "/sync/snapshot-sessions/snapshot-result-contract":
 				switch r.Method {
 				case http.MethodGet:

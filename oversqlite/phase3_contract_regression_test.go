@@ -48,12 +48,11 @@ func TestPhase3RetryClassificationUsesTypedCausesOnly(t *testing.T) {
 
 func TestPhase3BufferedControlResponseIsBoundedAndClosed(t *testing.T) {
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
-	client.sourceID = "phase3-source"
 	_, err := db.Exec(`INSERT INTO users(id,name,email) VALUES('phase3-row','Phase 3','phase3@example.com')`)
 	require.NoError(t, err)
 	snapshot, err := client.ensurePushOutboundSnapshot(context.Background())
 	require.NoError(t, err)
-	body := &phase3TrackingBody{Reader: strings.NewReader(strings.Repeat("x", int(client.discovery.Limits.MaxPushDecodedBytes+1)))}
+	body := &phase3TrackingBody{Reader: strings.NewReader(strings.Repeat("x", int(client.discovery.Limits.MaxPushOutcomeDecodedBytes+1)))}
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -70,34 +69,47 @@ func TestPhase3BufferedControlResponseIsBoundedAndClosed(t *testing.T) {
 }
 
 func TestAutomaticLoopsStopOnTerminalRepresentationErrorsAndPreserveState(t *testing.T) {
-	t.Run("upload projection overflow", func(t *testing.T) {
-		client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
-		client.config.BackoffMin = time.Millisecond
-		client.config.BackoffMax = 2 * time.Millisecond
-		_, err := db.Exec(`INSERT INTO users(id,name,email) VALUES('terminal-row','Terminal','terminal@example.com')`)
-		require.NoError(t, err)
-		var requests atomic.Int64
-		client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
-			requests.Add(1)
-			return errorJSONResponse(http.StatusUnprocessableEntity, oversync.ErrorResponse{Error: "bundle_projection_too_large"}), nil
-		})}
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			client.uploaderLoop(context.Background())
-		}()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Fatal("uploader loop did not stop on terminal projection overflow")
-		}
-		require.EqualValues(t, 1, requests.Load())
-		var frozenRows, nextSourceBundleID int64
-		require.NoError(t, db.QueryRow(`SELECT count(*) FROM _sync_outbox_rows`).Scan(&frozenRows))
-		require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1)`).Scan(&nextSourceBundleID))
-		require.Equal(t, int64(1), frozenRows)
-		require.Equal(t, int64(1), nextSourceBundleID)
-	})
+	for _, capacity := range []struct {
+		name, code string
+		status     int
+	}{
+		{"upload projection overflow", "bundle_projection_too_large", http.StatusUnprocessableEntity},
+		{"upload outcome overflow", "push_outcome_too_large", http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(capacity.name, func(t *testing.T) {
+			client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)
+			client.config.BackoffMin = time.Millisecond
+			client.config.BackoffMax = 2 * time.Millisecond
+			_, err := db.Exec(`INSERT INTO users(id,name,email) VALUES('terminal-row','Terminal','terminal@example.com')`)
+			require.NoError(t, err)
+			var requests atomic.Int64
+			client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				requests.Add(1)
+				require.Equal(t, "/sync/push", r.URL.Path)
+				return errorJSONResponse(capacity.status, oversync.ErrorResponse{Error: capacity.code}), nil
+			})}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				client.uploaderLoop(ctx)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				cancel()
+				<-done
+				t.Fatal("uploader loop did not stop on intrinsic capacity failure")
+			}
+			require.EqualValues(t, 1, requests.Load())
+			var frozenRows, nextSourceBundleID int64
+			require.NoError(t, db.QueryRow(`SELECT count(*) FROM _sync_outbox_rows`).Scan(&frozenRows))
+			require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1)`).Scan(&nextSourceBundleID))
+			require.Equal(t, int64(1), frozenRows)
+			require.Equal(t, int64(1), nextSourceBundleID)
+		})
+	}
 
 	t.Run("download committed bundle corruption", func(t *testing.T) {
 		client, _ := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, usersTestDDL)

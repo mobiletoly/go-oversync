@@ -26,7 +26,6 @@ func TestPullToStable_HistoryPrunedFallsBackToSnapshot(t *testing.T) {
 		)
 	`)
 	snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 9, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")}}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 
 	requests := 0
 	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -39,13 +38,7 @@ func TestPullToStable_HistoryPrunedFallsBackToSnapshot(t *testing.T) {
 			}), nil
 		case "/sync/snapshot-sessions":
 			if r.Method == http.MethodPost {
-				return jsonResponse(oversync.SnapshotSession{
-					SnapshotID:        "snapshot-pruned",
-					SnapshotBundleSeq: 9,
-					RowCount:          1,
-					ByteCount:         snapshotBytes,
-					ExpiresAt:         "2030-01-01T00:00:00Z",
-				}), nil
+				return snapshotFixtureResponse(t, client, r, "snapshot-pruned", 9, snapshotRows), nil
 			}
 		case "/sync/snapshot-sessions/snapshot-pruned":
 			switch r.Method {
@@ -88,7 +81,6 @@ func TestPullToStable_CheckpointAheadFallsBackToSnapshot(t *testing.T) {
 		)
 	`)
 	snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 9, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")}}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 	_, err := db.ExecContext(ctx, `UPDATE _sync_attachment_state SET last_bundle_seq_seen = 99 WHERE singleton_key = 1`)
 	require.NoError(t, err)
 
@@ -100,19 +92,13 @@ func TestPullToStable_CheckpointAheadFallsBackToSnapshot(t *testing.T) {
 				Message: "requested checkpoint 99 is ahead of current committed bundle sequence 9",
 			}), nil
 		case "/sync/snapshot-sessions":
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-ahead",
-				SnapshotBundleSeq: 9,
-				RowCount:          1,
-				ByteCount:         snapshotBytes,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-ahead", 109, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-ahead":
 			switch r.Method {
 			case http.MethodGet:
 				return jsonResponse(oversync.SnapshotChunkResponse{
 					SnapshotID:        "snapshot-ahead",
-					SnapshotBundleSeq: 9,
+					SnapshotBundleSeq: 109,
 					Rows:              snapshotRows,
 					NextRowOrdinal:    1,
 					HasMore:           false,
@@ -127,7 +113,7 @@ func TestPullToStable_CheckpointAheadFallsBackToSnapshot(t *testing.T) {
 	report, err := client.PullToStable(ctx)
 	require.NoError(t, err)
 	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
-	require.Equal(t, int64(9), report.Status.LastBundleSeqSeen)
+	require.Equal(t, int64(109), report.Status.LastBundleSeqSeen)
 	require.Equal(t, operationKindNone, requireOperationKind(t, db))
 
 	var rebuildRequired int
@@ -139,7 +125,7 @@ func TestPullToStable_CheckpointAheadFallsBackToSnapshot(t *testing.T) {
 	require.Equal(t, "ada@example.com", email)
 }
 
-func TestRebuild_KeepsManagedSourceAndBundleStateOutsideSourceRecovery(t *testing.T) {
+func TestRebuild_PreservesSourceAndUnrelatedLegacyOwners(t *testing.T) {
 	ctx := context.Background()
 	client, db := newBundleClient(t, "main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, `
 		CREATE TABLE users (
@@ -163,7 +149,6 @@ func TestRebuild_KeepsManagedSourceAndBundleStateOutsideSourceRecovery(t *testin
 		{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 8, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")},
 		{Schema: "main", Table: "users", Key: mustBundleKey("user-2"), RowVersion: 9, Payload: mustBundlePayload(t, "user-2", "Grace", "grace@example.com")},
 	}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 	tx, err := db.Begin()
 	require.NoError(t, err)
 	require.NoError(t, client.seedFixtureRowStateInTx(ctx, tx, "main", "users", rowKeyJSON("stale"), 4, false))
@@ -199,13 +184,7 @@ func TestRebuild_KeepsManagedSourceAndBundleStateOutsideSourceRecovery(t *testin
 			var rebuildRequired int
 			require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID).Scan(&rebuildRequired))
 			require.Equal(t, 1, rebuildRequired)
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-recover",
-				SnapshotBundleSeq: 9,
-				RowCount:          2,
-				ByteCount:         snapshotBytes,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-recover", 9, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-recover":
 			switch r.Method {
 			case http.MethodGet:
@@ -252,20 +231,21 @@ func TestRebuild_KeepsManagedSourceAndBundleStateOutsideSourceRecovery(t *testin
 	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 'stale'`).Scan(&count))
 	require.Equal(t, 0, count)
+	// Snapshot authority owns its S staging, not an unrelated staged push.
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_push_stage`).Scan(&count))
-	require.Equal(t, 0, count)
+	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_snapshot_stage`).Scan(&count))
 	require.Equal(t, 0, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM legacy_docs`).Scan(&count))
-	require.Equal(t, 0, count)
+	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`
 		SELECT COUNT(*)
 		FROM _sync_row_state
-		WHERE schema_name = 'main' AND table_name = 'users' AND key_json = ?
+		WHERE schema_name = 'main' AND table_name = 'users' AND key_json = ? AND server_kind='absent' AND row_version=0
 	`, rowKeyJSON("stale")).Scan(&count))
-	require.Equal(t, 0, count)
+	require.Equal(t, 1, count)
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM _sync_row_state WHERE table_name = 'legacy_docs'`).Scan(&count))
-	require.Equal(t, 0, count)
+	require.Equal(t, 1, count)
 }
 
 func TestRebuildRequired_NormalSyncAutomaticallyResumesCheckpointRecovery(t *testing.T) {
@@ -279,10 +259,8 @@ func TestRebuildRequired_NormalSyncAutomaticallyResumesCheckpointRecovery(t *tes
 			`)
 	originalSourceID := client.sourceID
 	snapshotRows := []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: mustBundleKey("user-1"), RowVersion: 7, Payload: mustBundlePayload(t, "user-1", "Ada", "ada@example.com")}}
-	snapshotBytes := testSnapshotRowsByteCount(snapshotRows)
 
-	_, err := db.Exec(`UPDATE _sync_attachment_state SET rebuild_required = 1 WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID)
-	require.NoError(t, err)
+	require.NoError(t, client.captureAutomaticRecovery(ctx, "history_pruned", 0, ""))
 
 	snapshotRequests := 0
 	pullRequests := 0
@@ -294,13 +272,7 @@ func TestRebuildRequired_NormalSyncAutomaticallyResumesCheckpointRecovery(t *tes
 			var rebuildRequired int
 			require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID).Scan(&rebuildRequired))
 			require.Equal(t, 1, rebuildRequired)
-			return jsonResponse(oversync.SnapshotSession{
-				SnapshotID:        "snapshot-rebuild-required",
-				SnapshotBundleSeq: 7,
-				RowCount:          1,
-				ByteCount:         snapshotBytes,
-				ExpiresAt:         "2030-01-01T00:00:00Z",
-			}), nil
+			return snapshotFixtureResponse(t, client, r, "snapshot-rebuild-required", 7, snapshotRows), nil
 		case "/sync/snapshot-sessions/snapshot-rebuild-required":
 			switch r.Method {
 			case http.MethodGet:
@@ -331,7 +303,7 @@ func TestRebuildRequired_NormalSyncAutomaticallyResumesCheckpointRecovery(t *tes
 	require.NoError(t, err)
 	require.Equal(t, RemoteSyncOutcomeAppliedSnapshot, report.RemoteOutcome)
 	require.Equal(t, 1, snapshotRequests)
-	require.Equal(t, 0, pullRequests)
+	require.Equal(t, 1, pullRequests)
 
 	var rebuildRequired int
 	require.NoError(t, db.QueryRow(`SELECT rebuild_required FROM _sync_attachment_state WHERE singleton_key = 1 AND ? IS NOT NULL`, client.UserID).Scan(&rebuildRequired))
@@ -341,7 +313,7 @@ func TestRebuildRequired_NormalSyncAutomaticallyResumesCheckpointRecovery(t *tes
 
 	_, err = client.Sync(ctx)
 	require.NoError(t, err)
-	require.Equal(t, 1, pullRequests)
+	require.Equal(t, 2, pullRequests)
 
 	name, email, exists := loadUserForKey(t, db, "user-1")
 	require.True(t, exists)

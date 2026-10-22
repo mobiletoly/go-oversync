@@ -27,6 +27,7 @@ func TestActorMiddleware_InjectsActorFromContextAndHeader(t *testing.T) {
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/sync/pull", nil)
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	req.Header.Set(SourceIDHeader, "source-1")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -47,6 +48,7 @@ func TestActorMiddleware_FailsClosedWhenUserIDCannotBeResolved(t *testing.T) {
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/sync/pull", nil)
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	req.Header.Set(SourceIDHeader, "source-1")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -79,6 +81,7 @@ func TestActorMiddleware_FailsClosedWhenSourceHeaderIsMissingOrInvalid(t *testin
 			}))
 
 			req := httptest.NewRequest(http.MethodGet, "/sync/pull", nil)
+			req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 			if tc.headerValue != "" {
 				req.Header.Set(SourceIDHeader, tc.headerValue)
 			}
@@ -107,7 +110,9 @@ func TestActorMiddleware_RejectsDuplicateAndCaseCollidingSourceHeaders(t *testin
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/sync/pull", nil)
+			req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 			req.Header = tc.headers
+			req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, req)
 			require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -125,6 +130,7 @@ func TestActorMiddleware_RejectsReservedServerSourceWithoutEnumeration(t *testin
 		t.Fatal("reserved server source must not reach the handler")
 	}))
 	req := httptest.NewRequest(http.MethodPost, "/sync/push", nil)
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	req.Header.Set(SourceIDHeader, "server-writer")
 	rec := httptest.NewRecorder()
 

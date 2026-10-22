@@ -1161,7 +1161,6 @@ func TestOpening_I09GenerationRebuildReady(t *testing.T) {
 		Schema: "main", Table: "people", Key: oversync.SyncKey{"id": personID}, RowVersion: 2,
 		Payload: json.RawMessage(`{"id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","name":"server name","new_label":"hydrated"}`),
 	}}
-	targetBytes := testSnapshotRowsByteCount(targetRows)
 	replacementRequests := 0
 	requestCount := 0
 	var replacementSourceID string
@@ -1195,7 +1194,7 @@ func TestOpening_I09GenerationRebuildReady(t *testing.T) {
 			if replacementRequests == 1 {
 				return nil, io.ErrUnexpectedEOF
 			}
-			return jsonResponse(oversync.SnapshotSession{SnapshotID: "upgrade-snapshot", SnapshotBundleSeq: 2, RowCount: 1, ByteCount: targetBytes, ExpiresAt: "2030-01-01T00:00:00Z"}), nil
+			return jsonResponse(sealedTestSnapshotForGeneration(t, upgradeCapabilities(t, targetContract).SchemaGeneration, replacementSourceID, "upgrade-snapshot", 2, targetRows, nil)), nil
 		case request.Method == http.MethodGet && request.URL.Path == "/sync/snapshot-sessions/upgrade-snapshot":
 			return jsonResponse(oversync.SnapshotChunkResponse{SnapshotID: "upgrade-snapshot", SnapshotBundleSeq: 2, Rows: targetRows, NextRowOrdinal: 1, HasMore: false}), nil
 		case request.Method == http.MethodDelete && request.URL.Path == "/sync/snapshot-sessions/upgrade-snapshot":
@@ -1225,6 +1224,12 @@ func TestOpening_I09GenerationRebuildReady(t *testing.T) {
 		BaseURL: "http://upgrade.invalid", Token: tokenProviderForTests, HTTP: httpClient,
 	})
 	require.NoError(t, err)
+	coordinator.config.testBoundary = func(boundary string) {
+		if boundary == "after_U5_commit" {
+			require.EqualValues(t, 1, countA3(t, db, `SELECT last_bundle_seq_seen FROM _sync_attachment_state`), "U5 retains the maximum installed observation before clearing A")
+			require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_row_state`))
+		}
+	}
 	result, err := coordinator.Advance(ctx)
 	require.NoError(t, err)
 	require.Equal(t, UpgradeOutcomeReady, result.Status.Outcome)
@@ -1292,4 +1297,30 @@ func TestOpening_I09ProductionSnapshotNotFoundIsRestartable(t *testing.T) {
 	_, _, err := client.fetchSnapshotChunkAsSource(context.Background(), "expired", 7, 0, 1, 1024, "source-new")
 	require.Error(t, err)
 	require.True(t, isRestartableSnapshotSessionError(err))
+}
+
+func TestOpening_I09RejectsSnapshotBelowInstalledFloor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "floor.sqlite")
+	plan := prepareU8ProcessTestDatabase(t, path)
+	db, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`UPDATE _sync_attachment_state SET last_bundle_seq_seen=8`)
+	require.NoError(t, err)
+	opening, err := newTestOpening(db, &openingRuntimeConfig{Plan: plan, BaseURL: "http://process.invalid"})
+	require.NoError(t, err)
+	defer opening.Close()
+	client, err := opening.newPhysicalClient(plan.testTarget, opening.config.TargetClientConfig)
+	require.NoError(t, err)
+	client.sourceID, client.UserID = "source-new", plan.UserID
+	record, err := loadUpgradeJournal(context.Background(), db)
+	require.NoError(t, err)
+	seal := sealedTestSnapshotForGeneration(t, upgradeCapabilities(t, plan.testTarget).SchemaGeneration, "source-new", "lower-boundary", 7, []oversync.SnapshotRow{processSnapshotRow()}, nil)
+	before := recoveryVector(t, db, "people", "local_notes", "_sync_operation_state", "_sync_attachment_state", "_sync_upgrade_journal")
+	tx, err := beginImmediateTx(context.Background(), db)
+	require.NoError(t, err)
+	require.ErrorContains(t, client.retainUpgradeSnapshot(context.Background(), tx, record, seal), "installed observation floor")
+	require.NoError(t, tx.Rollback())
+	require.Equal(t, before, recoveryVector(t, db, "people", "local_notes", "_sync_operation_state", "_sync_attachment_state", "_sync_upgrade_journal"))
 }

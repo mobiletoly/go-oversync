@@ -31,6 +31,8 @@ type mobileRolloutState struct {
 	ctx                  context.Context
 	pool                 *pgxpool.Pool
 	server               *serverpkg.TestServer
+	address              string
+	retarget             func(string)
 	old, target          *versionedApplication
 	token, secret, scope string
 	table                bool
@@ -178,10 +180,10 @@ func qualifyMobileRetirement(t *testing.T, s mobileRolloutState) {
 	if s.table {
 		cfg, successor = mobileEnableSuccessor(t, s, cfg, role)
 	}
-	address := mobileReopenFleet(t, s, cfg, finalStage, role, successor)
+	backend := mobileReopenFleet(t, s, cfg, finalStage, role, successor)
+	s.retarget(backend)
+	address := s.address
 	mobileRetiredHTTPMatrix(t, s, address, ledger.Entries[0].Proof)
-	s.old.Client.BaseURL = address
-	s.target.Client.BaseURL = address
 	checkpoint, err := s.old.Client.LastBundleSeqSeen(s.ctx)
 	require.NoError(t, err)
 	_, err = s.old.Client.Sync(s.ctx)
@@ -374,6 +376,7 @@ func mobileRetiredHTTPMatrix(t *testing.T, s mobileRolloutState, address string,
 			request, err := http.NewRequestWithContext(s.ctx, vector.Method, address+vector.Path, strings.NewReader(vector.Body))
 			require.NoError(t, err)
 			request.Header.Set(oversync.SourceIDHeader, corpus.SourceID)
+			request.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 			// Generation discovery is the sole proof-less endpoint: attaching a
 			// generation proof would exercise request validation (400), not the
 			// retired-generation behavior this corpus qualifies.
@@ -421,6 +424,7 @@ func mobileRetiredHTTPMatrix(t *testing.T, s mobileRolloutState, address string,
 		require.NoError(t, err)
 		request.Header.Set("Authorization", "Bearer "+s.token)
 		request.Header.Set(oversync.SourceIDHeader, corpus.SourceID)
+		request.Header.Set(oversync.ProtocolVersionHeader, oversync.SyncProtocolVersion)
 		if variant.header != "" {
 			request.Header.Set(variant.header, variant.value)
 		}
@@ -490,7 +494,7 @@ func mobileEmptyRetirementDevice(t *testing.T, s mobileRolloutState) (*versioned
 	}
 	old := s.old.Definition
 	plan := oversqlite.UpgradePlan{PlanID: "rollout-empty-old", Mode: oversqlite.UpgradeModeFresh, DatabaseID: "empty", ServiceID: id, TargetVersion: old.LocalVersion, TargetGenerationID: old.Contract.Proof.ID, LocalOnlyTables: old.LocalOnlyTables, Migrator: old.Migrator}
-	app, _, err := openVersionedApplication(s.ctx, filepath.Join(t.TempDir(), "empty-old.sqlite"), s.server.URL(), func(context.Context) (string, error) { return s.token, nil }, http.DefaultClient, plan, old)
+	app, _, err := openVersionedApplication(s.ctx, filepath.Join(t.TempDir(), "empty-old.sqlite"), s.address, func(context.Context) (string, error) { return s.token, nil }, http.DefaultClient, plan, old)
 	if err != nil {
 		return nil, err
 	}

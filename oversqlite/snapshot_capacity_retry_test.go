@@ -19,11 +19,11 @@ func TestSnapshotCapacityRetry_UsesElapsedBudgetIndependentOfTransientAttempts(t
 		Enabled: true, MaxWait: 100 * time.Millisecond, FallbackDelay: time.Millisecond,
 	}
 	var attempts atomic.Int64
-	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(*http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if attempts.Add(1) == 1 {
 			return errorJSONResponse(http.StatusTooManyRequests, oversync.ErrorResponse{Error: "snapshot_build_capacity"}), nil
 		}
-		return rawJSONResponse(http.StatusOK, `{"snapshot_id":"snapshot-1","snapshot_bundle_seq":0,"row_count":0,"logical_byte_count":0,"expires_at":"2030-01-01T00:00:00Z"}`), nil
+		return snapshotFixtureResponse(t, client, r, "snapshot-1", 0, nil), nil
 	})}
 
 	_, err := client.createSnapshotSession(context.Background(), nil)

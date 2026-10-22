@@ -266,7 +266,15 @@ func TestBaselineQualification_AdoptionLocalDeleteNoopAndChainedRekey(t *testing
 	server.pushHook = nil
 	_, err = c.PushPending(ctx)
 	require.NoError(t, err)
-	require.Equal(t, request, server.pushRequests[requests+1])
+	require.Len(t, server.pushRequests, requests+1, "resolve cancels uncommitted F; no retransmission")
+	require.Len(t, server.resolveRequests, 1)
+	require.Equal(t, request.CanonicalRequestHash, server.resolveRequests[0].CanonicalRequestHash)
+	_, err = c.PushPending(ctx)
+	require.NoError(t, err)
+	successor := server.pushRequests[requests+1]
+	require.Equal(t, request.SourceBundleID+1, successor.SourceBundleID)
+	require.Equal(t, request.CanonicalRequestHash, successor.CanonicalRequestHash)
+	require.Equal(t, request.Rows, successor.Rows)
 	require.Len(t, server.pushRequests, requests+2)
 	settled := qualificationState(t, db, "nodes")
 	require.Empty(t, settled["_sync_dirty_rows"])
@@ -282,7 +290,7 @@ func TestBaselineQualification_AdoptionLocalDeleteNoopAndChainedRekey(t *testing
 	require.Equal(t, "3", qualificationText(qualificationRow(t, settled, "_sync_row_state", "S"), "row_version"))
 	require.Equal(t, qualificationText(chain["_sync_attachment_state"][0], "current_source_id"), qualificationText(settled["_sync_attachment_state"][0], "current_source_id"))
 	require.Equal(t, qualificationPayload(t, qualificationRow(t, chain, "_sync_dirty_rows", "S"), "payload"), qualificationPayload(t, qualificationRow(t, settled, "_sync_row_state", "S"), "server_payload"))
-	require.Equal(t, "4", baselineText(t, db, `SELECT next_source_bundle_id FROM _sync_source_state`))
+	require.Equal(t, "5", baselineText(t, db, `SELECT next_source_bundle_id FROM _sync_source_state`))
 	require.Equal(t, "3", baselineText(t, db, `SELECT last_bundle_seq_seen FROM _sync_attachment_state`))
 	remote := map[string]json.RawMessage{}
 	for seq := int64(1); seq < server.nextBundleSeq; seq++ {
@@ -384,9 +392,10 @@ func TestBaselineQualification_DeferredConflictAndExplicitRebaseFullOwners(t *te
 	var needs *ConflictNeedsResolutionError
 	require.ErrorAs(t, err, &needs)
 	pending := qualificationState(t, db, "nodes")
-	for _, table := range []string{"nodes", "_sync_row_state", "_sync_source_state", "_sync_attachment_state"} {
+	for _, table := range []string{"nodes", "_sync_row_state", "_sync_attachment_state"} {
 		require.Equal(t, before[table], pending[table], table)
 	}
+	require.EqualValues(t, 3, countA3(t, db, `SELECT next_source_bundle_id FROM _sync_source_state`))
 	require.Empty(t, pending["_sync_dirty_rows"])
 	for _, key := range []string{"C", "Q"} {
 		b := qualificationRow(t, before, "_sync_dirty_rows", key)
@@ -413,7 +422,7 @@ func TestBaselineQualification_DeferredConflictAndExplicitRebaseFullOwners(t *te
 	for _, col := range []string{"base_kind", "base_row_version", "base_payload", "base_provenance", "payload"} {
 		require.Equal(t, qualificationRow(t, before, "_sync_dirty_rows", "Q")[col], qualificationRow(t, resolved, "_sync_dirty_rows", "Q")[col], col)
 	}
-	for _, table := range []string{"nodes", "_sync_source_state", "_sync_attachment_state"} {
+	for _, table := range []string{"nodes", "_sync_attachment_state"} {
 		require.Equal(t, before[table], resolved[table], table)
 	}
 	require.Empty(t, resolved["_sync_outbox_rows"])
@@ -479,9 +488,13 @@ func TestBaselineQualification_OlderPullAndValidatedSnapshotNeverRegressOrFabric
 	require.NoError(t, c.applyStagedSnapshotLocked(ctx, session, options))
 	complete := qualificationState(t, db, "nodes")
 	require.Len(t, complete["nodes"], 3)
-	require.Len(t, complete["_sync_row_state"], 3)
+	require.Len(t, complete["_sync_row_state"], 4)
 	for _, a := range complete["_sync_row_state"] {
-		require.NotEqual(t, rowKeyJSON("Q"), qualificationText(a, "key_json"))
+		if qualificationText(a, "key_json") == rowKeyJSON("Q") {
+			require.Equal(t, "absent", qualificationText(a, "server_kind"))
+			require.Equal(t, "0", qualificationText(a, "row_version"))
+			continue
+		}
 		require.Equal(t, "9", qualificationText(a, "row_version"))
 		require.Equal(t, "snapshot", qualificationPayload(t, a, "server_provenance").(map[string]any)["origin"])
 	}
@@ -532,11 +545,9 @@ func TestBaselineQualification_FreezeNewerEditRequeueFullOwners(t *testing.T) {
 	require.Equal(t, frozenState["_sync_outbox_bundle"], newer["_sync_outbox_bundle"])
 	current := qualificationRow(t, newer, "_sync_dirty_rows", "C")
 	require.Equal(t, qualificationPayload(t, a, "server_payload"), qualificationPayload(t, current, "base_payload"))
-	tx, err := db.BeginTx(ctx, nil)
+	_, err = c.PushPending(ctx)
 	require.NoError(t, err)
-	require.NoError(t, c.requeueSnapshotRowsInTx(ctx, tx, frozen, nil))
-	require.NoError(t, c.deletePushOutboundSnapshotInTx(ctx, tx, frozen.SourceBundleID))
-	require.NoError(t, tx.Commit())
+	require.EqualValues(t, frozen.SourceBundleID+1, countA3(t, db, `SELECT next_source_bundle_id FROM _sync_source_state`))
 	requeued := qualificationState(t, db, "nodes")
 	r := qualificationRow(t, requeued, "_sync_dirty_rows", "C")
 	for _, col := range []string{"base_kind", "base_row_version", "base_payload", "base_provenance"} {
@@ -544,7 +555,7 @@ func TestBaselineQualification_FreezeNewerEditRequeueFullOwners(t *testing.T) {
 	}
 	require.Equal(t, qualificationPayload(t, current, "payload"), qualificationPayload(t, r, "payload"))
 	require.Empty(t, requeued["_sync_outbox_rows"])
-	for _, table := range []string{"nodes", "_sync_row_state", "_sync_source_state", "_sync_attachment_state"} {
+	for _, table := range []string{"nodes", "_sync_row_state", "_sync_attachment_state"} {
 		require.Equal(t, newer[table], requeued[table], table)
 	}
 	require.Equal(t, "P", baselineText(t, db, `SELECT json_extract(parent_key,'$.id') FROM _sync_relationships WHERE view='server' AND child_key=?`, rowKeyJSON("C")))
@@ -580,31 +591,21 @@ func TestBaselineQualification_SourceRecoveryPreservesFrozenBaseAndWire(t *testi
 	attachment.RebuildRequired = true
 	require.NoError(t, persistAttachmentState(ctx, db, attachment))
 	setOperationStateForTest(t, db, &operationStateRecord{Kind: operationKindSourceRecovery, Reason: string(SourceRecoveryHistoryPruned), ReplacementSourceID: "qualification-replacement"})
-	options := snapshotApplyOptions{RotateSource: true, NewSourceID: "qualification-replacement", ReplacementReason: string(SourceRecoveryHistoryPruned), PreserveOutbox: true, ClearSourceRecovery: true, RequireFreshRotatedSource: true}
-	guard, err := c.pinSnapshotApplyGuard(ctx, options)
-	require.NoError(t, err)
-	options.PinnedGuard = guard
-	session := stageUserSnapshotForGate(t, c, "qualification-snapshot", "C", 9, []byte(`{"id":"C","name":"snapshot-newer","email":"remote@example.com"}`))
-	require.NoError(t, c.applyStagedSnapshotLocked(ctx, session, options))
+	options := snapshotApplyOptions{RotateSource: true, NewSourceID: "qualification-replacement", ReplacementReason: string(SourceRecoveryHistoryPruned), ClearSourceRecovery: true, RequireFreshRotatedSource: true}
+	before := qualificationState(t, db, "users")
+	_, err = c.pinSnapshotApplyGuard(ctx, options)
+	var pending *UploadJournalIntegrityError
+	require.ErrorAs(t, err, &pending)
 	recovered := qualificationState(t, db, "users")
-	a := qualificationRow(t, recovered, "_sync_row_state", "C")
+	require.Equal(t, before, recovered)
 	o := qualificationRow(t, recovered, "_sync_outbox_rows", "C")
 	original := qualificationRow(t, frozen, "_sync_outbox_rows", "C")
 	for _, column := range []string{"key_json", "wire_key_json", "op", "base_row_version", "base_kind", "base_payload", "base_provenance", "wire_payload", "local_payload", "row_ordinal"} {
 		require.Equal(t, original[column], o[column], column)
 	}
-	require.Equal(t, frozen["users"], recovered["users"])
-	require.Equal(t, "9", qualificationText(a, "row_version"))
-	require.Equal(t, "snapshot-newer", baselineText(t, db, `SELECT json_extract(server_payload,'$.name.value') FROM _sync_row_state WHERE key_json=?`, rowKeyJSON("C")))
 	require.Equal(t, qualificationPayload(t, qualificationRow(t, initial, "_sync_row_state", "C"), "server_payload"), qualificationPayload(t, o, "base_payload"))
-	require.Equal(t, qualificationText(frozen["_sync_outbox_bundle"][0], "canonical_request_hash"), qualificationText(recovered["_sync_outbox_bundle"][0], "canonical_request_hash"))
-	require.Empty(t, recovered["_sync_dirty_rows"])
-	require.Empty(t, recovered["_sync_relationships"])
-	require.Equal(t, "qualification-replacement", qualificationText(recovered["_sync_attachment_state"][0], "current_source_id"))
-	require.Equal(t, "9", qualificationText(recovered["_sync_attachment_state"][0], "last_bundle_seq_seen"))
-	require.Equal(t, "1", baselineText(t, db, `SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id='qualification-replacement'`))
-	require.NoError(t, validateCompleteRetainedRuntime(ctx, db))
-	t.Log("baseline-qualification: snapshot newer A with immutable full B/wire verified")
+	require.Equal(t, c.sourceID, qualificationText(recovered["_sync_outbox_bundle"][0], "source_id"))
+	t.Log("immutable pending upload blocks snapshot/source replacement; full original base, captures, wire and operation identity preserved")
 }
 
 func TestBaselineQualification_CleanupAndAccountGuardsPreserveFullOwners(t *testing.T) {
@@ -632,7 +633,10 @@ func TestBaselineQualification_CleanupAndAccountGuardsPreserveFullOwners(t *test
 	require.ErrorContains(t, c.UninstallSync(ctx), "unresolved work")
 	require.Equal(t, frozen, qualificationState(t, db, "nodes"))
 	_, err = c.PushPending(ctx)
-	require.NoError(t, err)
+	require.NoError(t, err) // Resolve cancels the locally frozen, undispatched F.
+	require.NotZero(t, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`))
+	_, err = c.PushPending(ctx)
+	require.NoError(t, err) // A new operation publishes the retained intent.
 	settled := qualificationState(t, db, "nodes")
 	require.JSONEq(t, `{"id":{"storage":"text","value":"C"},"name":{"storage":"text","value":"pending"},"parent_id":{"storage":"text","value":"P"}}`, qualificationText(qualificationRow(t, settled, "_sync_row_state", "C"), "server_payload").(string))
 	detach, err = c.Detach(ctx)
@@ -718,7 +722,8 @@ func TestBaselineQualification_PublishedAndFrozenIntermediateRekeyBases(t *testi
 			if ambiguous {
 				_, err = c.PushPending(ctx)
 				require.NoError(t, err)
-				require.Equal(t, server.pushRequests[1], server.pushRequests[2])
+				require.Len(t, server.pushRequests, 2)
+				require.Len(t, server.resolveRequests, 1)
 				ack := qualificationState(t, db, "nodes")
 				r := qualificationRow(t, ack, "_sync_dirty_rows", "R")
 				a := qualificationRow(t, ack, "_sync_row_state", "R")
@@ -757,7 +762,11 @@ func TestBaselineQualification_IndependentOldDeleteCommitSurvivesRestart(t *test
 	require.NoError(t, err)
 	intermediate := qualificationState(t, db, "nodes")
 	require.Equal(t, "live", qualificationText(qualificationRow(t, intermediate, "_sync_row_state", "R"), "server_kind"))
-	frozen, err := c.ensurePushOutboundSnapshot(ctx)
+	c.SetBeforePushReplayHook(func(context.Context) error { return context.Canceled })
+	_, err = c.PushPending(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	c.SetBeforePushReplayHook(nil)
+	frozen, err := c.loadPushOutboundSnapshot(ctx)
 	require.NoError(t, err)
 	require.Len(t, frozen.Rows, 1)
 	require.Equal(t, rowKeyJSON("Q"), frozen.Rows[0].KeyJSON)

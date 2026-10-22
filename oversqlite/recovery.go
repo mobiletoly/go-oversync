@@ -282,7 +282,7 @@ func (c *Client) markCheckpointRecoveryRequiredLocked(ctx context.Context, reaso
 
 func isCheckpointRecoveryReason(reason string) bool {
 	switch strings.TrimSpace(reason) {
-	case "history_pruned", "checkpoint_ahead", "explicit_rebuild", "resume":
+	case "history_pruned", "checkpoint_ahead", "historical_repair_required", "conflicting_desired_state", "explicit_rebuild", "resume":
 		return true
 	default:
 		return false
@@ -373,11 +373,8 @@ func (c *Client) setRebuildRequired(ctx context.Context, required bool) error {
 	return persistAttachmentState(ctx, c.db, attachment)
 }
 
-type clearManagedTablesOptions struct {
-	PreserveOutbox bool
-}
-
-func (c *Client) clearManagedTablesInTxWithOptions(ctx context.Context, tx sqliteTransaction, options clearManagedTablesOptions) error {
+// Explicit local reset owns destructive clearing. Snapshot installation never calls this path.
+func (c *Client) clearManagedTablesInTx(ctx context.Context, tx sqliteTransaction) error {
 	managedTables, err := c.loadManagedSyncTablesForUninstall(ctx, tx)
 	if err != nil {
 		return err
@@ -403,7 +400,7 @@ func (c *Client) clearManagedTablesInTxWithOptions(ctx context.Context, tx sqlit
 	if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_dirty_rows`); err != nil {
 		return fmt.Errorf("failed to clear dirty row queue during recovery: %w", err)
 	}
-	if !options.PreserveOutbox {
+	{
 		if _, err := tx.ExecContext(ctx, `DELETE FROM _sync_outbox_rows`); err != nil {
 			return fmt.Errorf("failed to clear outbound push snapshot during recovery: %w", err)
 		}
@@ -415,10 +412,6 @@ func (c *Client) clearManagedTablesInTxWithOptions(ctx context.Context, tx sqlit
 		return fmt.Errorf("failed to clear staged push bundle rows during recovery: %w", err)
 	}
 	return nil
-}
-
-func (c *Client) clearManagedTablesInTx(ctx context.Context, tx sqliteTransaction) error {
-	return c.clearManagedTablesInTxWithOptions(ctx, tx, clearManagedTablesOptions{})
 }
 
 func (c *Client) clearFullLocalSyncStateInTx(ctx context.Context, tx sqliteTransaction) error {

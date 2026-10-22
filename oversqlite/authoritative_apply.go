@@ -85,11 +85,33 @@ func (c *Client) bundleRowKeyToLocalKey(tx tableInfoQueryer, tableName string, k
 		}
 		localPK = hex.EncodeToString(uuidBytes)
 	}
-	keyJSONBytes, err := json.Marshal(map[string]any{strings.ToLower(keyColumns[0]): localPK})
+	keyJSON, err := localKeyJSON(tx, strings.ToLower(keyColumns[0]), localPK)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to encode local key json for %s: %w", tableName, err)
 	}
-	return string(keyJSONBytes), localPK, nil
+	return keyJSON, localPK, nil
+}
+
+// The capture triggers and metadata owners use the same SQLite encoder. Go's
+// HTML escaping would create a second metadata identity for an exact text key.
+// Values stay typed parameters; no trimming, substitution or key normalization.
+func localKeyJSON(q tableInfoQueryer, column, key string) (string, error) {
+	rows, err := q.Query(`SELECT json_object(?,?)`, column, key)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("local key encoder returned no row")
+	}
+	var encoded string
+	if err := rows.Scan(&encoded); err != nil {
+		return "", err
+	}
+	return encoded, rows.Err()
 }
 
 type structuredRowState struct {
@@ -132,17 +154,8 @@ func (c *Client) applyBundleRowAuthoritativelyInTxUsing(ctx context.Context, exe
 			return fmt.Errorf("failed to apply authoritative upsert for %s.%s: %w", row.Schema, row.Table, err)
 		}
 	case oversync.OpDelete:
-		pkColumn, err := c.primaryKeyColumnForTable(row.Table)
-		if err != nil {
+		if err := c.deleteLocalRowInTxUsing(ctx, execer, tx, row.Table, localPK); err != nil {
 			return err
-		}
-		pkValue, err := c.convertPKForQueryInTx(tx, row.Table, localPK)
-		if err != nil {
-			return fmt.Errorf("failed to convert local key for delete: %w", err)
-		}
-		query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", quoteIdent(row.Table), quoteIdent(pkColumn))
-		if _, err := execer.ExecContext(ctx, query, pkValue); err != nil {
-			return fmt.Errorf("failed to apply authoritative delete for %s.%s: %w", row.Schema, row.Table, err)
 		}
 	default:
 		return fmt.Errorf("unsupported bundle row op %q", row.Op)

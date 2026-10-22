@@ -282,7 +282,7 @@ func TestScopeWriteReceipt_RollbackExpiredAndUnavailableHistoryOutcomes(t *testi
 	require.False(t, callbackCalled)
 
 	historyUser := f.userID + "-explicit"
-	mustInitializeEmptyScope(t, f.ctx, f.service, historyUser, "server-app")
+	mustInitializeEmptyScope(t, f.ctx, f.service, historyUser, "bootstrap-client")
 	bundleOpts := RetryableBundleWriteOptions{
 		OperationHash:       sha256.Sum256([]byte("explicit-history-" + historyUser)),
 		OperationValidUntil: time.Now().UTC().Truncate(time.Microsecond).Add(time.Hour),
@@ -326,7 +326,7 @@ func TestScopeWriteReceipt_LostCommitResponseResolvesByExactReplay(t *testing.T)
 			f := newRetryableReceiptFixture(t)
 			scopeID := f.userID + "-lost-" + test.name
 			source := BundleSource{SourceID: "server-app", SourceBundleID: 1}
-			mustInitializeEmptyScope(t, f.ctx, f.service, scopeID, source.SourceID)
+			mustInitializeEmptyScope(t, f.ctx, f.service, scopeID, "bootstrap-client")
 			opts := RetryableBundleWriteOptions{
 				OperationHash:       sha256.Sum256([]byte("lost-response-" + scopeID)),
 				OperationValidUntil: time.Now().UTC().Truncate(time.Microsecond).Add(time.Hour),

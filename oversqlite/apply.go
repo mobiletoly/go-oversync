@@ -5,7 +5,7 @@ package oversqlite
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -33,56 +33,28 @@ func (c *Client) upsertPayloadInTxUsing(ctx context.Context, execer execContexte
 		return err
 	}
 
-	if storedLocal {
-		if err := c.validateAndUnwrapCapturedPayload(table, payload); err != nil {
-			return err
-		}
+	bindings, err := c.bindUpsertPayload(table, payload, storedLocal, tableInfo, pkColumn)
+	if err != nil {
+		return err
 	}
+	columns, values, updateAssignments := bindings.columns, bindings.values, bindings.updateAssignments
 
-	columnByLower := make(map[string]ColumnInfo, len(tableInfo.Columns))
-	for _, col := range tableInfo.Columns {
-		columnByLower[strings.ToLower(col.Name)] = col
-	}
-	if len(payload) != len(columnByLower) {
-		return fmt.Errorf("payload for %s must contain every table column", table)
-	}
-
-	columns := make([]string, 0, len(tableInfo.Columns))
-	values := make([]interface{}, 0, len(tableInfo.Columns))
-	updateAssignments := make([]string, 0, len(tableInfo.Columns))
-
-	for _, col := range tableInfo.Columns {
-		key := strings.ToLower(col.Name)
-		val, ok := payload[key]
-		if !ok {
-			return fmt.Errorf("payload for %s is missing column %s", table, col.Name)
-		}
-
-		if storedLocal {
-			codec, declared, ok := c.declaredColumn(table, col.Name)
-			if !ok {
-				return fmt.Errorf("payload for %s column %s is absent from the local generation contract", table, col.Name)
-			}
-			if val == nil && !declared.Nullable {
-				return fmt.Errorf("payload for %s column %s is unexpectedly null", table, col.Name)
-			}
-			val, err = sqliteValueFromLocalCodec(codec, val)
-		} else {
-			val, err = c.sqliteValueWithDeclaredCodec(table, col, val)
-		}
-		if err != nil {
-			return fmt.Errorf("payload for %s column %s: %w", table, col.Name, err)
-		}
-
-		columns = append(columns, quoteIdent(col.Name))
-		values = append(values, val)
-		if !strings.EqualFold(col.Name, pkColumn) {
-			updateAssignments = append(updateAssignments, fmt.Sprintf("%s = excluded.%s", quoteIdent(col.Name), quoteIdent(col.Name)))
-		}
+	if handled, err := c.reusePreparedUniqueUpsert(ctx, tx, table, tableInfo, pkColumn, values); err != nil || handled {
+		return err
 	}
 
 	if _, ok := payload[strings.ToLower(pkColumn)]; !ok {
 		return fmt.Errorf("payload for %s is missing primary key column %s", table, pkColumn)
+	}
+	if rowid, ok := ctx.Value(applyRowIDKey{}).(sql.NullInt64); ok && rowid.Valid {
+		alias, err := c.observableRowIDColumn(ctx, tx, table)
+		if err != nil {
+			return err
+		}
+		if alias != "" {
+			columns = append(columns, quoteIdent(alias))
+			values = append(values, rowid.Int64)
+		}
 	}
 
 	placeholders := make([]string, len(columns))
@@ -116,11 +88,11 @@ func (c *Client) syncKeyJSONForPKInTx(tx tableInfoQueryer, tableName, pk string)
 	if len(keyColumns) != 1 {
 		return "", fmt.Errorf("table %s must declare exactly one sync key column in the current client runtime", tableName)
 	}
-	keyJSONBytes, err := json.Marshal(map[string]any{strings.ToLower(keyColumns[0]): pk})
+	keyJSON, err := localKeyJSON(tx, strings.ToLower(keyColumns[0]), pk)
 	if err != nil {
 		return "", fmt.Errorf("failed to encode sync key for table %s column %s: %w", tableName, keyColumns[0], err)
 	}
-	return string(keyJSONBytes), nil
+	return keyJSON, nil
 }
 
 // GetTableRowCount returns the number of rows in a business table
@@ -177,4 +149,65 @@ func (c *Client) GetTableRows(tableName string) ([]map[string]interface{}, error
 	}
 
 	return results, nil
+}
+
+type upsertBindings struct {
+	columns           []string
+	values            []interface{}
+	updateAssignments []string
+}
+
+// Validate the complete image and decode physical bindings before attempting
+// either a prepared final-image reuse or the original upsert statement.
+func (c *Client) bindUpsertPayload(table string, payload map[string]interface{}, storedLocal bool, tableInfo *TableInfo, pkColumn string) (upsertBindings, error) {
+	var err error
+	if storedLocal {
+		if err := c.validateAndUnwrapCapturedPayload(table, payload); err != nil {
+			return upsertBindings{}, err
+		}
+	}
+
+	columnByLower := make(map[string]ColumnInfo, len(tableInfo.Columns))
+	for _, col := range tableInfo.Columns {
+		columnByLower[strings.ToLower(col.Name)] = col
+	}
+	if len(payload) != len(columnByLower) {
+		return upsertBindings{}, fmt.Errorf("payload for %s must contain every table column", table)
+	}
+
+	columns := make([]string, 0, len(tableInfo.Columns))
+	values := make([]interface{}, 0, len(tableInfo.Columns))
+	updateAssignments := make([]string, 0, len(tableInfo.Columns))
+
+	for _, col := range tableInfo.Columns {
+		key := strings.ToLower(col.Name)
+		val, ok := payload[key]
+		if !ok {
+			return upsertBindings{}, fmt.Errorf("payload for %s is missing column %s", table, col.Name)
+		}
+
+		if storedLocal {
+			codec, declared, ok := c.declaredColumn(table, col.Name)
+			if !ok {
+				return upsertBindings{}, fmt.Errorf("payload for %s column %s is absent from the local generation contract", table, col.Name)
+			}
+			if val == nil && !declared.Nullable {
+				return upsertBindings{}, fmt.Errorf("payload for %s column %s is unexpectedly null", table, col.Name)
+			}
+			val, err = sqliteValueFromLocalCodec(codec, val)
+		} else {
+			val, err = c.sqliteValueWithDeclaredCodec(table, col, val)
+		}
+		if err != nil {
+			return upsertBindings{}, fmt.Errorf("payload for %s column %s: %w", table, col.Name, err)
+		}
+
+		columns = append(columns, quoteIdent(col.Name))
+		values = append(values, val)
+		if !strings.EqualFold(col.Name, pkColumn) {
+			updateAssignments = append(updateAssignments, fmt.Sprintf("%s = excluded.%s", quoteIdent(col.Name), quoteIdent(col.Name)))
+		}
+	}
+
+	return upsertBindings{columns, values, updateAssignments}, nil
 }

@@ -90,6 +90,9 @@ func (s *SyncService) admitSourceGenerationBindingWithState(ctx context.Context,
 	if _, err := tx.Exec(ctx, `INSERT INTO sync.source_generation_bindings (user_pk,source_id,schema_generation_id,schema_generation_fingerprint) VALUES ($1,$2,$3,$4)`, userPK, sourceID, proof.ID, proof.Fingerprint); err != nil {
 		return fmt.Errorf("insert source generation binding: %w", err)
 	}
+	if _, err := tx.Exec(ctx, `INSERT INTO sync.push_source_progress(user_pk,source_id) VALUES($1,$2)`, userPK, sourceID); err != nil {
+		return fmt.Errorf("retain client source ownership: %w", err)
+	}
 	return nil
 }
 
@@ -111,8 +114,18 @@ func (s *SyncService) createOrConfirmSourceGenerationBinding(ctx context.Context
 		}
 		return sourceGenerationError(SourceGenerationStateCorrupt, proof.ID, binding.generationID, "source_state", "source generation state is corrupt")
 	}
+	progress, err := loadPushProgress(ctx, tx, userPK, actor.SourceID)
+	if err != nil {
+		return err
+	}
 	if binding == nil {
+		if !progress.present {
+			return sourceGenerationError(SourceGenerationConflict, proof.ID, 0, "source_id", "source_id belongs to a trusted server writer")
+		}
 		return sourceGenerationError(SourceGenerationStateCorrupt, proof.ID, 0, "source_generation_binding", "source generation state is corrupt")
+	}
+	if !progress.present {
+		return sourceGenerationError(SourceGenerationStateCorrupt, proof.ID, 0, "source_id", "client source ownership is missing")
 	}
 	if err := requireBindingPair(binding, proof); err != nil {
 		return err

@@ -451,6 +451,14 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.snapshot_sessions.expires_at", Attribute: "ordinal", Value: "9"},
 		{Kind: "column", Identity: "sync.snapshot_sessions.expires_at", Attribute: "type", Value: "pg_catalog.timestamptz"},
 		{Kind: "column", Identity: "sync.snapshot_sessions.expires_at", Attribute: "typmod", Value: "-1"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.recovery_minimum_bundle_seq", Attribute: "collation", Value: ""},
+		{Kind: "column", Identity: "sync.snapshot_sessions.recovery_minimum_bundle_seq", Attribute: "default", Value: ""},
+		{Kind: "column", Identity: "sync.snapshot_sessions.recovery_minimum_bundle_seq", Attribute: "generated", Value: ""},
+		{Kind: "column", Identity: "sync.snapshot_sessions.recovery_minimum_bundle_seq", Attribute: "identity", Value: ""},
+		{Kind: "column", Identity: "sync.snapshot_sessions.recovery_minimum_bundle_seq", Attribute: "not_null", Value: "false"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.recovery_minimum_bundle_seq", Attribute: "ordinal", Value: "11"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.recovery_minimum_bundle_seq", Attribute: "type", Value: "pg_catalog.int8"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.recovery_minimum_bundle_seq", Attribute: "typmod", Value: "-1"},
 		{Kind: "column", Identity: "sync.snapshot_sessions.row_count", Attribute: "collation", Value: ""},
 		{Kind: "column", Identity: "sync.snapshot_sessions.row_count", Attribute: "default", Value: "0"},
 		{Kind: "column", Identity: "sync.snapshot_sessions.row_count", Attribute: "generated", Value: ""},
@@ -483,6 +491,14 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_bundle_seq", Attribute: "ordinal", Value: "6"},
 		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_bundle_seq", Attribute: "type", Value: "pg_catalog.int8"},
 		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_bundle_seq", Attribute: "typmod", Value: "-1"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_hash", Attribute: "collation", Value: "pg_catalog.C"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_hash", Attribute: "default", Value: "repeat('0'::text, 64)"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_hash", Attribute: "generated", Value: ""},
+		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_hash", Attribute: "identity", Value: ""},
+		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_hash", Attribute: "not_null", Value: "true"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_hash", Attribute: "ordinal", Value: "10"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_hash", Attribute: "type", Value: "pg_catalog.text"},
+		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_hash", Attribute: "typmod", Value: "-1"},
 		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_id", Attribute: "collation", Value: ""},
 		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_id", Attribute: "default", Value: ""},
 		{Kind: "column", Identity: "sync.snapshot_sessions.snapshot_id", Attribute: "generated", Value: ""},
@@ -1046,6 +1062,17 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "constraint", Identity: "sync.snapshot_session_rows.snapshot_session_rows_table_id_fkey", Attribute: "type", Value: "f"},
 		{Kind: "constraint", Identity: "sync.snapshot_session_rows.snapshot_session_rows_table_id_fkey", Attribute: "update_action", Value: "a"},
 		{Kind: "constraint", Identity: "sync.snapshot_session_rows.snapshot_session_rows_table_id_fkey", Attribute: "validated", Value: "true"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "columns", Value: "[\"recovery_minimum_bundle_seq\",\"snapshot_bundle_seq\"]"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "deferrable", Value: "false"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "delete_action", Value: " "},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "expression", Value: "((recovery_minimum_bundle_seq >= 0) AND (recovery_minimum_bundle_seq <= snapshot_bundle_seq))"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "initially_deferred", Value: "false"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "match_type", Value: " "},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "referenced_columns", Value: "[]"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "referenced_table", Value: ""},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "type", Value: "c"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "update_action", Value: " "},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_check", Attribute: "validated", Value: "true"},
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_generation_fingerprint_chk", Attribute: "columns", Value: "[\"schema_generation_fingerprint\"]"},
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_generation_fingerprint_chk", Attribute: "deferrable", Value: "false"},
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_generation_fingerprint_chk", Attribute: "delete_action", Value: " "},
@@ -1079,6 +1106,17 @@ var expectedManagedLayoutFactsByName = map[string][]managedLayoutFact{
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_pkey", Attribute: "type", Value: "p"},
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_pkey", Attribute: "update_action", Value: " "},
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_pkey", Attribute: "validated", Value: "true"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "columns", Value: "[\"snapshot_hash\"]"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "deferrable", Value: "false"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "delete_action", Value: " "},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "expression", Value: "(snapshot_hash ~ '^[0-9a-f]{64}$'::text)"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "initially_deferred", Value: "false"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "match_type", Value: " "},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "referenced_columns", Value: "[]"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "referenced_table", Value: ""},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "type", Value: "c"},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "update_action", Value: " "},
+		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_snapshot_hash_check", Attribute: "validated", Value: "true"},
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_source_generation_fk", Attribute: "columns", Value: "[\"user_pk\",\"source_id\",\"schema_generation_id\",\"schema_generation_fingerprint\"]"},
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_source_generation_fk", Attribute: "deferrable", Value: "false"},
 		{Kind: "constraint", Identity: "sync.snapshot_sessions.snapshot_sessions_source_generation_fk", Attribute: "delete_action", Value: "c"},
@@ -1975,8 +2013,7 @@ func (s *SyncService) expectedManagedLayoutFacts(
 	if !ok {
 		return nil, fmt.Errorf("no compiled managed layout manifest for %q", syncSchemaLayoutName)
 	}
-	facts := append([]managedLayoutFact(nil), compiled...)
-	facts = append(facts, retryableWriteManagedLayoutFacts...)
+	facts := managedLayoutBaseFacts(compiled)
 	activeTables := s.activeRegisteredTableDeclarations()
 	targets, err := loadRegisteredTableTriggerTargetInventory(ctx, q, activeTables)
 	if err != nil {
@@ -2061,7 +2098,7 @@ func validateStaticManagedLayout(ctx context.Context, q syncCatalogQuerier) erro
 	if !ok {
 		return fmt.Errorf("no compiled managed layout manifest for %q", syncSchemaLayoutName)
 	}
-	expected, err := normalizeManagedLayoutFacts(append(append([]managedLayoutFact(nil), compiled...), retryableWriteManagedLayoutFacts...))
+	expected, err := normalizeManagedLayoutFacts(managedLayoutBaseFacts(compiled))
 	if err != nil {
 		return err
 	}
@@ -2751,4 +2788,10 @@ ORDER BY 1, 2, 3, 4`,
 		}
 	}
 	return normalizeManagedLayoutFacts(facts)
+}
+
+func managedLayoutBaseFacts(compiled []managedLayoutFact) []managedLayoutFact {
+	facts := append([]managedLayoutFact(nil), compiled...)
+	facts = append(facts, retryableWriteManagedLayoutFacts...)
+	return append(facts, pushOutcomeManagedLayoutFacts...)
 }

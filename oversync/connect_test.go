@@ -351,6 +351,7 @@ func TestHandleConnect_InvalidRequestMappings(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/sync/connect", strings.NewReader(`{"source_id":`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	setTestSchemaGenerationHeaders(req, svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: "connect-handler-badjson-" + uuid.NewString(), SourceID: "device-a"}))
 	rec := httptest.NewRecorder()
@@ -367,6 +368,7 @@ func TestHandleConnect_RejectsBodySourceIDInsteadOfAliasingLegacyInput(t *testin
 	userID := "connect-source-truth-" + uuid.NewString()
 	req := httptest.NewRequest(http.MethodPost, "/sync/connect", strings.NewReader(`{"source_id":"wrong-source","has_local_pending_rows":true}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	setTestSchemaGenerationHeaders(req, svc)
 	req = req.WithContext(ContextWithActor(req.Context(), Actor{UserID: userID, SourceID: "device-a"}))
 	rec := httptest.NewRecorder()

@@ -160,7 +160,7 @@ func TestUniformNumericWire_NonFiniteManagedWriteRollsBack(t *testing.T) {
 
 	userID := "uniform-nonfinite-user-" + suffix
 	actor := Actor{UserID: userID, SourceID: "server-app"}
-	mustInitializeEmptyScope(t, ctx, service, userID, actor.SourceID)
+	mustInitializeEmptyScope(t, ctx, service, userID, "client-reader")
 	for _, test := range []struct {
 		name   string
 		amount string

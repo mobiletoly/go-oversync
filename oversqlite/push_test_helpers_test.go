@@ -4,10 +4,13 @@
 package oversqlite
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -400,13 +403,20 @@ type mockPushServer struct {
 	committedBySource map[int64]*mockCommittedBundle
 	committedBySeq    map[int64]*mockCommittedBundle
 	pushHook          func(session *mockDirectPush) *http.Response
+	terminalBodies    map[int64][]byte
+	terminalOutcomes  map[int64]oversync.PushOutcome
+	initializations   map[int64]*string
+	resolveRequests   []oversync.PushOutcomeResolveRequest
+	ackRequests       []oversync.PushOutcomeAckRequest
+	latestAck         int64
 }
 
 func newMockPushServer(t *testing.T) *mockPushServer {
 	t.Helper()
 	return &mockPushServer{
-		t:                 t,
-		nextBundleSeq:     1,
+		t:              t,
+		nextBundleSeq:  1,
+		terminalBodies: make(map[int64][]byte), terminalOutcomes: make(map[int64]oversync.PushOutcome), initializations: make(map[int64]*string),
 		committedBySource: make(map[int64]*mockCommittedBundle),
 		committedBySeq:    make(map[int64]*mockCommittedBundle),
 	}
@@ -414,7 +424,15 @@ func newMockPushServer(t *testing.T) *mockPushServer {
 
 func (s *mockPushServer) RoundTrip(r *http.Request) (*http.Response, error) {
 	s.t.Helper()
-
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		reader, err := gzip.NewReader(r.Body)
+		require.NoError(s.t, err)
+		defer reader.Close()
+		r.Body = io.NopCloser(reader)
+	}
+	if r.URL.Path == "/sync/push-outcomes/resolve" || r.URL.Path == "/sync/push-outcomes/ack" {
+		return s.outcomeControl(r)
+	}
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/sync/push":
 		requireAuthenticatedSyncHeaders(s.t, r, "")
@@ -424,10 +442,22 @@ func (s *mockPushServer) RoundTrip(r *http.Request) (*http.Response, error) {
 		var req oversync.CompactPushRequest
 		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
 		s.pushRequests = append(s.pushRequests, req)
-		if committed := s.committedBySource[req.SourceBundleID]; committed != nil {
-			require.Equal(s.t, committed.CanonicalRequestHash, req.CanonicalRequestHash)
-			return s.compactResponse(committed), nil
+		if req.SourceBundleID <= s.latestAck {
+			return errorJSONResponse(http.StatusGone, oversync.ErrorResponse{Error: "push_outcome_acknowledged"}), nil
 		}
+		if raw, ok := s.terminalBodies[req.SourceBundleID]; ok {
+			o := s.terminalOutcomes[req.SourceBundleID]
+			if o.CanonicalRequestHash != req.CanonicalRequestHash {
+				return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{Error: "push_outcome_mismatch"}), nil
+			}
+			return rawMockOutcome(raw), nil
+		}
+		var initialization *string
+		if req.InitializationID != "" {
+			value := req.InitializationID
+			initialization = &value
+		}
+		s.initializations[req.SourceBundleID] = initialization
 		rows, err := oversync.ExpandCompactPushRows(contract, req.Rows)
 		require.NoError(s.t, err)
 		session := &mockDirectPush{
@@ -439,7 +469,7 @@ func (s *mockPushServer) RoundTrip(r *http.Request) (*http.Response, error) {
 			Generation:           contract,
 		}
 		if s.pushHook != nil {
-			return s.pushHook(session), nil
+			return s.captureBusinessRejection(session, s.pushHook(session)), nil
 		}
 		return s.defaultPushResponse(session), nil
 	}
@@ -482,7 +512,8 @@ func (s *mockPushServer) compactResponse(committed *mockCommittedBundle) *http.R
 func (s *mockPushServer) compactResponseWithGeneration(generation oversync.SchemaGenerationCapabilities, committed *mockCommittedBundle) *http.Response {
 	groups, err := oversync.CompactGroupsForBundleRows(generation, committed.Rows)
 	require.NoError(s.t, err)
-	return jsonResponse(oversync.CompactPushResponse{BundleSeq: committed.BundleSeq, BundleHash: committed.BundleHash, Rows: groups})
+	o := oversync.PushOutcome{SourceID: committed.SourceID, GenerationID: generation.ID, GenerationFingerprint: generation.Fingerprint, SourceBundleID: committed.SourceBundleID, CanonicalRequestHash: committed.CanonicalRequestHash, InitializationID: s.initializations[committed.SourceBundleID], Status: "committed", Committed: &oversync.CommittedPushEffect{BundleSeq: committed.BundleSeq, BundleHash: committed.BundleHash, RowCount: int64(len(committed.Rows)), Rows: groups}}
+	return s.retainOutcome(o, generation)
 }
 
 func expandCapturedPushRequest(t *testing.T, client *Client, request oversync.CompactPushRequest) []oversync.PushRequestRow {
@@ -555,4 +586,74 @@ func (c *Client) seedFixtureRowStateInTx(ctx context.Context, tx sqliteTransacti
 		}
 	}
 	return c.installAuthoritativeBaseline(ctx, tx, schema, table, key, kind, version, wire, baselineObservation{Origin: "pull"})
+}
+
+func rawMockOutcome(raw []byte) *http.Response {
+	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}
+}
+func (s *mockPushServer) retainOutcome(o oversync.PushOutcome, g oversync.SchemaGenerationCapabilities) *http.Response {
+	hash, err := oversync.HashPushOutcome(o, g)
+	require.NoError(s.t, err)
+	o.OutcomeHash = hash
+	raw, err := json.Marshal(o)
+	require.NoError(s.t, err)
+	s.terminalOutcomes[o.SourceBundleID] = o
+	s.terminalBodies[o.SourceBundleID] = raw
+	return rawMockOutcome(raw)
+}
+func (s *mockPushServer) outcomeControl(r *http.Request) (*http.Response, error) {
+	requireAuthenticatedSyncHeaders(s.t, r, "")
+	if r.URL.Path == "/sync/push-outcomes/ack" {
+		var req oversync.PushOutcomeAckRequest
+		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
+		s.ackRequests = append(s.ackRequests, req)
+		o, found := s.terminalOutcomes[req.SourceBundleID]
+		if !found || o.CanonicalRequestHash != req.CanonicalRequestHash || o.OutcomeHash != req.OutcomeHash {
+			return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{Error: "push_outcome_mismatch"}), nil
+		}
+		delete(s.terminalBodies, req.SourceBundleID)
+		s.latestAck = req.SourceBundleID
+		return &http.Response{StatusCode: 204, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	var req oversync.PushOutcomeResolveRequest
+	require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
+	s.resolveRequests = append(s.resolveRequests, req)
+	if req.SourceBundleID <= s.latestAck {
+		return errorJSONResponse(http.StatusGone, oversync.ErrorResponse{Error: "push_outcome_acknowledged"}), nil
+	}
+	if raw, ok := s.terminalBodies[req.SourceBundleID]; ok {
+		return rawMockOutcome(raw), nil
+	}
+	generation, found := mockGenerationByFingerprint.Load(r.Header.Get(oversync.SchemaGenerationFingerprintHeader))
+	require.True(s.t, found)
+	return s.retainOutcome(oversync.PushOutcome{SourceID: r.Header.Get(oversync.SourceIDHeader), GenerationID: r.Header.Get(oversync.SchemaGenerationIDHeader), GenerationFingerprint: r.Header.Get(oversync.SchemaGenerationFingerprintHeader), SourceBundleID: req.SourceBundleID, CanonicalRequestHash: req.CanonicalRequestHash, InitializationID: req.InitializationID, Status: "cancelled"}, generation.(oversync.SchemaGenerationCapabilities)), nil
+}
+
+// The private business hook still returns its application-layer error. Like the
+// real server, this fixture publishes declared terminal decisions as v1 C;
+// malformed/transport responses remain nonterminal negative fixture input.
+func (s *mockPushServer) captureBusinessRejection(p *mockDirectPush, response *http.Response) *http.Response {
+	if response.StatusCode != http.StatusConflict && response.StatusCode != http.StatusUnprocessableEntity {
+		return response
+	}
+	raw, err := io.ReadAll(response.Body)
+	require.NoError(s.t, err)
+	response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(raw))
+	var rejection *oversync.PushOutcomeRejection
+	if response.StatusCode == http.StatusConflict {
+		conflict, err := completeConflictResponse(raw)
+		if err != nil {
+			return response
+		}
+		conflict.Conflict.Op = map[string]string{oversync.OpInsert: "i", oversync.OpUpdate: "u", oversync.OpDelete: "d"}[conflict.Conflict.Op]
+		rejection = &oversync.PushOutcomeRejection{Code: "push_conflict", Conflict: conflict.Conflict}
+	} else {
+		application, ok := decodeServerErrorResponse(raw)
+		if !ok || application.Error == "" {
+			return response
+		}
+		rejection = &oversync.PushOutcomeRejection{Code: application.Error}
+	}
+	return s.retainOutcome(oversync.PushOutcome{SourceID: p.SourceID, GenerationID: p.Generation.ID, GenerationFingerprint: p.Generation.Fingerprint, SourceBundleID: p.SourceBundleID, CanonicalRequestHash: p.CanonicalRequestHash, InitializationID: s.initializations[p.SourceBundleID], Status: "rejected", Rejection: rejection}, p.Generation)
 }

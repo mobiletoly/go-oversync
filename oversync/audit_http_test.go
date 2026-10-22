@@ -52,6 +52,7 @@ func runAuditPushRequest(
 	t.Helper()
 
 	request := httptest.NewRequest(http.MethodPost, "/sync/push", strings.NewReader(body))
+	request.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
 	request.Header.Set("Content-Type", "application/json")
 	request = request.WithContext(ContextWithActor(request.Context(), fixture.writer))
 	proof := testSchemaGenerationProofForService(fixture.svc)

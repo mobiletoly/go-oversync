@@ -798,6 +798,8 @@ func TestPushPending_VerifiesEveryAuthoritativeEffectAfterCrossRowTriggers(t *te
 	originalSource := client.sourceID
 	originalHash := baselineText(t, db, `SELECT canonical_request_hash FROM _sync_outbox_bundle`)
 	require.Equal(t, expectedHash, originalHash)
+	_, err = client.commitPushOutboundSnapshot(ctx, frozen)
+	require.NoError(t, err)
 	_, err = client.PushPending(ctx)
 	require.NoError(t, err)
 	for key, payload := range map[string]string{
@@ -1033,7 +1035,9 @@ func TestPushPending_RebasesSameKeyLocalIntentAfterRestartBeforeReplay(t *testin
 			require.NoError(t, err)
 			require.Equal(t, AttachStatusConnected, result.Status)
 			mustPushPending(t, restarted, ctx)
-			require.Len(t, server.pushRequests, 2, "restart replays the direct request before applying its authoritative response")
+			require.Len(t, server.pushRequests, 1, "durable C settles after restart without another push")
+			require.Empty(t, server.resolveRequests)
+			require.Len(t, server.ackRequests, 1)
 
 			name, _, exists := loadUserForKey(t, db, rowID)
 			require.Equal(t, tc.expectedVisible, exists)

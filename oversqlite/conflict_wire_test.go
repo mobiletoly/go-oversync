@@ -10,13 +10,14 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
 
 func TestConflictEvidence_RejectsIncompleteOrMismatchedWithoutLosingIntent(t *testing.T) {
 	type mutation func(map[string]any, map[string]any)
 	cases := map[string]mutation{}
-	for _, field := range []string{"error", "message", "conflict"} {
+	for _, field := range []string{"source_id", "schema_generation_id", "schema_generation_fingerprint", "source_bundle_id", "canonical_request_hash", "status", "outcome_hash", "rejection"} {
 		cases["missing_outer_"+field] = func(e, c map[string]any) { delete(e, field) }
 		cases["null_outer_"+field] = func(e, c map[string]any) { e[field] = nil }
 	}
@@ -26,7 +27,7 @@ func TestConflictEvidence_RejectsIncompleteOrMismatchedWithoutLosingIntent(t *te
 			cases["null_"+field] = func(e, c map[string]any) { c[field] = nil }
 		}
 	}
-	cases["operation"] = func(e, c map[string]any) { c["op"] = "DELETE" }
+	cases["operation"] = func(e, c map[string]any) { c["op"] = "d" }
 	cases["base"] = func(e, c map[string]any) { c["base_row_version"] = 99 }
 	cases["live_without_payload"] = func(e, c map[string]any) { c["server_row"] = nil }
 	cases["tombstone_with_payload"] = func(e, c map[string]any) { c["server_row_deleted"] = true }
@@ -49,10 +50,10 @@ func TestConflictEvidence_RejectsIncompleteOrMismatchedWithoutLosingIntent(t *te
 			seedSyncedUserRow(t, c, db, id, "Original", 1)
 			_, err := db.Exec(`UPDATE users SET name='Offline' WHERE id=?`, id)
 			require.NoError(t, err)
-			_, err = c.ensurePushOutboundSnapshot(ctx)
-			require.NoError(t, err)
 			resolver := &capturingResolver{result: KeepLocal{}}
 			c.Resolver = resolver
+			_, err = c.ensurePushOutboundSnapshot(ctx)
+			require.NoError(t, err)
 			before := vectorState(t, c)
 			server := newMockPushServer(t)
 			var beforeResponse *outboxBundleRecord
@@ -60,18 +61,27 @@ func TestConflictEvidence_RejectsIncompleteOrMismatchedWithoutLosingIntent(t *te
 				var e error
 				beforeResponse, e = loadOutboxBundle(ctx, db)
 				require.NoError(t, e)
-				response := structuredConflictResponse(s.Rows[0], 2, false, map[string]any{"id": id, "name": "Server", "email": "ada@example.com"})
+				response := server.retainOutcome(oversync.PushOutcome{SourceID: s.SourceID, GenerationID: s.Generation.ID, GenerationFingerprint: s.Generation.Fingerprint, SourceBundleID: s.SourceBundleID, CanonicalRequestHash: s.CanonicalRequestHash, Status: "rejected", Rejection: &oversync.PushOutcomeRejection{Code: "push_conflict", Conflict: &oversync.PushConflictDetails{Schema: "main", Table: "users", Key: mustBundleKey(id), Op: "u", BaseRowVersion: 1, ServerRowVersion: 2, ServerRow: mustJSONPayload(t, map[string]any{"id": id, "name": "Server", "email": "ada@example.com"})}}}, s.Generation)
 				raw, err := io.ReadAll(response.Body)
 				require.NoError(t, err)
 				require.NoError(t, response.Body.Close())
 				var envelope map[string]any
 				require.NoError(t, json.Unmarshal(raw, &envelope))
-				mutate(envelope, envelope["conflict"].(map[string]any))
-				return errorJSONResponse(http.StatusConflict, envelope)
+				conflict := envelope["rejection"].(map[string]any)["conflict"].(map[string]any)
+				mutate(envelope, conflict)
+				raw, err = json.Marshal(envelope)
+				require.NoError(t, err)
+				return rawMockOutcome(raw)
 			}
-			c.HTTP = &http.Client{Transport: server}
+			c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				require.Equal(t, "/sync/push-outcomes/resolve", r.URL.Path)
+				frozen, loadErr := loadOutboxBundle(ctx, db)
+				require.NoError(t, loadErr)
+				return server.pushHook(&mockDirectPush{SourceID: c.sourceID, SourceBundleID: frozen.SourceBundleID, CanonicalRequestHash: frozen.CanonicalRequestHash, Generation: c.discovery.SchemaGeneration}), nil
+			})}
 			_, err = c.PushPending(ctx)
 			require.Error(t, err)
+			require.NotNil(t, beforeResponse, "negative wire body must be reached after public freeze")
 			require.False(t, resolver.called)
 			pending, pErr := c.PendingConflict(ctx)
 			require.NoError(t, pErr)

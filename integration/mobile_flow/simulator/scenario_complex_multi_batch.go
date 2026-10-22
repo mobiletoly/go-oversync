@@ -1190,38 +1190,13 @@ func (s *ComplexMultiBatchScenario) stage2UploadNewDataFromLaptop(ctx context.Co
 }
 
 func (s *ComplexMultiBatchScenario) verifyWholeRequestPushRestartRecovery(ctx context.Context, logger *slog.Logger, pendingBefore int) error {
-	const preCommitCrashMessage = "simulated crash before whole-request push"
 	const replayCrashMessage = "simulated crash after whole-request response before local apply"
 
-	client := s.laptopApp.currentClient()
-	if client == nil {
-		return fmt.Errorf("laptop client not initialized")
-	}
-	client.SetBeforePushCommitHook(func(context.Context) error {
-		return fmt.Errorf(preCommitCrashMessage)
-	})
-
-	_, err := client.PushPending(ctx)
-	if err == nil || !strings.Contains(err.Error(), preCommitCrashMessage) {
-		return fmt.Errorf("expected simulated pre-commit crash, got %v", err)
-	}
-
-	outboundCount, stagedCount, dirtyCount, err := s.getPushRecoveryStateCounts(ctx, s.laptopApp)
+	preCommitEvidence, err := s.interruptPushBeforeCommit(ctx, pendingBefore)
 	if err != nil {
 		return err
 	}
-	if outboundCount == 0 {
-		return fmt.Errorf("expected outbound push snapshot rows to remain after simulated pre-commit crash")
-	}
-	if dirtyCount == 0 {
-		return fmt.Errorf("expected later bounded requests to remain in the dirty queue after simulated pre-commit crash")
-	}
-	if stagedCount != 0 {
-		return fmt.Errorf("expected no staged committed bundle rows after simulated pre-commit crash, got %d", stagedCount)
-	}
-	if outboundCount+dirtyCount > pendingBefore {
-		return fmt.Errorf("push recovery state gained rows after simulated pre-commit crash: before=%d outbound=%d dirty=%d", pendingBefore, outboundCount, dirtyCount)
-	}
+	outboundCount, stagedCount, dirtyCount := preCommitEvidence.outbound, preCommitEvidence.staged, preCommitEvidence.dirty
 	preCommitOutboundCount, preCommitDirtyCount := outboundCount, dirtyCount
 
 	if verboseLog {
@@ -1238,11 +1213,14 @@ func (s *ComplexMultiBatchScenario) verifyWholeRequestPushRestartRecovery(ctx co
 	}
 	s.laptopApp = restartedLaptop
 
-	client = s.laptopApp.currentClient()
+	client := s.laptopApp.currentClient()
 	if client == nil {
 		return fmt.Errorf("restarted laptop client not initialized")
 	}
 	client.ResumeUploads()
+	if err := s.verifyCancelledPushAfterRestart(ctx, preCommitEvidence, preCommitOutboundCount+preCommitDirtyCount); err != nil {
+		return err
+	}
 	client.SetBeforePushReplayHook(func(context.Context) error {
 		return fmt.Errorf(replayCrashMessage)
 	})
@@ -1261,8 +1239,18 @@ func (s *ComplexMultiBatchScenario) verifyWholeRequestPushRestartRecovery(ctx co
 	if stagedCount == 0 {
 		return fmt.Errorf("expected staged committed bundle rows to remain after simulated pre-replay crash")
 	}
-	if outboundCount != preCommitOutboundCount || dirtyCount != preCommitDirtyCount {
-		return fmt.Errorf("expected the committed request to preserve the frozen and still-dirty rows before replay, got outbound=%d dirty=%d (before commit: outbound=%d dirty=%d)", outboundCount, dirtyCount, preCommitOutboundCount, preCommitDirtyCount)
+	if outboundCount+dirtyCount != preCommitOutboundCount+preCommitDirtyCount {
+		return fmt.Errorf("successor request changed the complete intent count before replay: outbound=%d dirty=%d original=%d", outboundCount, dirtyCount, preCommitOutboundCount+preCommitDirtyCount)
+	}
+	committedEvidence, err := s.readPushRestartEvidence(ctx)
+	if err != nil {
+		return err
+	}
+	if committedEvidence.sourceID != preCommitEvidence.sourceID || committedEvidence.sourceBundleID != preCommitEvidence.sourceBundleID+1 {
+		return fmt.Errorf("expected the committed successor to retain the source and consume the next sequence after cancellation")
+	}
+	if committedEvidence.allIntent != preCommitEvidence.allIntent {
+		return fmt.Errorf("successor preparation changed original captured bases/payloads or later intent")
 	}
 
 	if verboseLog {
@@ -1277,6 +1265,13 @@ func (s *ComplexMultiBatchScenario) verifyWholeRequestPushRestartRecovery(ctx co
 		return err
 	}
 	s.laptopApp = restartedLaptop
+	reopenedEvidence, err := s.readPushRestartEvidence(ctx)
+	if err != nil {
+		return err
+	}
+	if reopenedEvidence != committedEvidence {
+		return fmt.Errorf("committed F/C, captures or remaining intent changed across physical restart")
+	}
 	if client = s.laptopApp.currentClient(); client != nil {
 		client.ResumeUploads()
 	}
@@ -1292,6 +1287,37 @@ func (s *ComplexMultiBatchScenario) verifyWholeRequestPushRestartRecovery(ctx co
 		return fmt.Errorf("expected restart replay to clear outbound=%d staged=%d dirty=%d", outboundCount, stagedCount, dirtyCount)
 	}
 
+	return s.verifyCommittedPushAfterRestart(ctx)
+}
+
+// Establish and inspect the complete frozen owner before its first restart.
+func (s *ComplexMultiBatchScenario) interruptPushBeforeCommit(ctx context.Context, pendingBefore int) (pushRestartEvidence, error) {
+	const message = "simulated crash before whole-request push"
+	var empty pushRestartEvidence
+	client := s.laptopApp.currentClient()
+	if client == nil {
+		return empty, fmt.Errorf("laptop client not initialized")
+	}
+	client.SetBeforePushCommitHook(func(context.Context) error { return fmt.Errorf(message) })
+	_, err := client.PushPending(ctx)
+	if err == nil || !strings.Contains(err.Error(), message) {
+		return empty, fmt.Errorf("expected simulated pre-commit crash, got %v", err)
+	}
+	v, err := s.readPushRestartEvidence(ctx)
+	if err != nil {
+		return empty, err
+	}
+	if v.outbound == 0 || v.dirty == 0 || v.staged != 0 {
+		return empty, fmt.Errorf("expected frozen plus later dirty rows and no committed stage after pre-commit crash, got outbound=%d dirty=%d staged=%d", v.outbound, v.dirty, v.staged)
+	}
+	if v.outbound+v.dirty > pendingBefore {
+		return empty, fmt.Errorf("push recovery state gained rows after pre-commit crash: before=%d outbound=%d dirty=%d", pendingBefore, v.outbound, v.dirty)
+	}
+	return v, nil
+}
+
+// Verify durable completion independently of the two interrupted upload phases.
+func (s *ComplexMultiBatchScenario) verifyCommittedPushAfterRestart(ctx context.Context) error {
 	postCommitRestart, err := s.restartApp(ctx, s.laptopApp, "laptop")
 	if err != nil {
 		return err
@@ -1306,6 +1332,96 @@ func (s *ComplexMultiBatchScenario) verifyWholeRequestPushRestartRecovery(ctx co
 	}
 	if _, _, err := s.laptopApp.pullToStable(ctx); err != nil {
 		return fmt.Errorf("post-commit restart pull failed: %w", err)
+	}
+	return nil
+}
+
+type pushRestartEvidence struct {
+	outbound, staged, dirty      int
+	sourceID                     string
+	sourceBundleID, checkpoint   int64
+	journal, captures, allIntent string
+}
+
+// Keep complete frozen wire bytes, C and all original capture/base fields. The
+// intent union permits only the owner transfer from frozen rows back to dirty
+// rows on cancellation; queue timestamps and ordinals are derived anew there.
+func (s *ComplexMultiBatchScenario) readPushRestartEvidence(ctx context.Context) (pushRestartEvidence, error) {
+	db := s.laptopApp.database()
+	var v pushRestartEvidence
+	var err error
+	v.outbound, v.staged, v.dirty, err = s.getPushRecoveryStateCounts(ctx, s.laptopApp)
+	if err != nil {
+		return v, err
+	}
+	err = db.QueryRowContext(ctx, `SELECT b.source_id,b.source_bundle_id,a.last_bundle_seq_seen,
+ json_array(j.binding,hex(j.request_body),j.request_digest,hex(j.outcome_body),j.outcome_hash,j.phase)
+ FROM _sync_outbox_bundle b CROSS JOIN _sync_attachment_state a CROSS JOIN _sync_upload_journal j
+ WHERE b.singleton_key=1 AND a.singleton_key=1 AND j.singleton_key=1`).Scan(&v.sourceID, &v.sourceBundleID, &v.checkpoint, &v.journal)
+	if err != nil {
+		return v, fmt.Errorf("read interrupted push F/C identity: %w", err)
+	}
+	err = db.QueryRowContext(ctx, `SELECT json_group_array(json_array(source_bundle_id,row_ordinal,schema_name,table_name,key_json,wire_key_json,op,base_row_version,base_kind,base_payload,base_provenance,local_payload,wire_payload))
+ FROM (SELECT * FROM _sync_outbox_rows ORDER BY source_bundle_id,row_ordinal)`).Scan(&v.captures)
+	if err != nil {
+		return v, fmt.Errorf("read complete frozen push captures: %w", err)
+	}
+	v.allIntent, err = s.pushRestartIntent(ctx)
+	return v, err
+}
+
+func (s *ComplexMultiBatchScenario) pushRestartIntent(ctx context.Context) (string, error) {
+	var intent string
+	err := s.laptopApp.database().QueryRowContext(ctx, `SELECT json_group_array(json_array(schema_name,table_name,key_json,op,base_row_version,base_kind,base_payload,base_provenance,payload)) FROM (
+ SELECT schema_name,table_name,key_json,op,base_row_version,base_kind,base_payload,base_provenance,local_payload AS payload FROM _sync_outbox_rows
+ UNION ALL SELECT schema_name,table_name,key_json,op,base_row_version,base_kind,base_payload,base_provenance,payload FROM _sync_dirty_rows
+ ORDER BY schema_name,table_name,key_json)`).Scan(&intent)
+	if err != nil {
+		return "", fmt.Errorf("read complete frozen and dirty intent: %w", err)
+	}
+	return intent, nil
+}
+
+// v1 resolve fences the never-dispatched F as cancelled. Verify its public
+// disposition and ack before allowing a new request to reach the replay cut.
+func (s *ComplexMultiBatchScenario) verifyCancelledPushAfterRestart(ctx context.Context, expected pushRestartEvidence, pending int) error {
+	reopened, err := s.readPushRestartEvidence(ctx)
+	if err != nil {
+		return err
+	}
+	if reopened != expected {
+		return fmt.Errorf("original frozen F/captures/intent changed across pre-commit restart")
+	}
+	report, err := s.laptopApp.currentClient().PushPending(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve original pre-commit request: %w", err)
+	}
+	if report.Outcome != oversqlite.PushOutcomeNoChange {
+		return fmt.Errorf("expected cancelled pre-commit request disposition, got %s", report.Outcome)
+	}
+	outbound, staged, dirty, err := s.getPushRecoveryStateCounts(ctx, s.laptopApp)
+	if err != nil {
+		return err
+	}
+	if outbound != 0 || staged != 0 || dirty != pending {
+		return fmt.Errorf("cancelled request did not return all intent: outbound=%d staged=%d dirty=%d expected=%d", outbound, staged, dirty, pending)
+	}
+	var sourceID string
+	var nextID, checkpoint, journals int64
+	err = s.laptopApp.database().QueryRowContext(ctx, `SELECT s.source_id,s.next_source_bundle_id,a.last_bundle_seq_seen,(SELECT count(*) FROM _sync_upload_journal)
+ FROM _sync_source_state s CROSS JOIN _sync_attachment_state a WHERE a.singleton_key=1 AND s.source_id=a.current_source_id`).Scan(&sourceID, &nextID, &checkpoint, &journals)
+	if err != nil {
+		return fmt.Errorf("inspect cancelled upload sequence/checkpoint/ack cleanup: %w", err)
+	}
+	if sourceID != expected.sourceID || nextID != expected.sourceBundleID+1 || checkpoint != expected.checkpoint || journals != 0 {
+		return fmt.Errorf("cancelled request changed source/checkpoint or retained an ack obligation")
+	}
+	intent, err := s.pushRestartIntent(ctx)
+	if err != nil {
+		return err
+	}
+	if intent != expected.allIntent {
+		return fmt.Errorf("cancelled request changed original captured bases/payloads or later intent")
 	}
 	return nil
 }

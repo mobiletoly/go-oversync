@@ -48,7 +48,8 @@ func TestA3Replay_PhysicalRestart(t *testing.T) {
 	require.NoError(t, err)
 	requireA1Survivors(t, reopened)
 	requireA1ControlState(t, reopened, 3)
-	require.Len(t, server.pushRequests, 2)
-	require.Equal(t, server.pushRequests[0], server.pushRequests[1])
+	require.Len(t, server.pushRequests, 1)
+	require.Empty(t, server.resolveRequests)
+	require.Len(t, server.ackRequests, 1)
 	require.Zero(t, countA3(t, reopened, `SELECT push_stage_entries+push_stage_bytes FROM _sync_operation_state`))
 }

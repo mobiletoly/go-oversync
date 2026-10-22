@@ -41,6 +41,13 @@ func ActorMiddleware(cfg ActorMiddlewareConfig) func(http.Handler) http.Handler 
 				return
 			}
 
+			if strings.Contains(r.URL.Path, "/sync/") {
+				if err := ValidateProtocolHeader(r.Header); err != nil {
+					writeMiddlewareError(w, http.StatusUpgradeRequired, "protocol_version_mismatch", "Require exactly Oversync-Protocol-Version: v1")
+					return
+				}
+			}
+
 			sourceValues := exactHeaderValues(r.Header, SourceIDHeader)
 			if len(sourceValues) != 1 {
 				writeMiddlewareError(w, http.StatusBadRequest, "invalid_request", SourceIDHeader+" header must appear exactly once")

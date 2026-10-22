@@ -6,7 +6,6 @@ package oversqlite
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -113,8 +112,9 @@ func (c *Client) pullIncrementalToStableLocked(ctx context.Context, afterBundleS
 		}
 
 		for _, bundle := range resp.Bundles {
-			if err := c.applyPulledBundleLocked(ctx, &bundle); err != nil {
-				return RemoteSyncReport{}, err
+			recovered, handled, applyErr := c.applyPullUnitOrRecover(ctx, &bundle)
+			if handled || applyErr != nil {
+				return recovered, applyErr
 			}
 			appliedBundles = true
 			afterBundleSeq = bundle.BundleSeq
@@ -144,25 +144,22 @@ func (c *Client) pullIncrementalToStableLocked(ctx context.Context, afterBundleS
 }
 
 func (c *Client) recoverIncrementalPullHistoryGapLocked(ctx context.Context, pullErr error) (RemoteSyncReport, bool, error) {
-	var prunedErr *HistoryPrunedError
-	if errors.As(pullErr, &prunedErr) {
-		c.logger.Info("pull history pruned; rebuilding from chunked snapshot")
-		if err := c.markCheckpointRecoveryRequiredLocked(ctx, "history_pruned"); err != nil {
-			return RemoteSyncReport{}, true, err
-		}
-		report, err := c.resumeCheckpointRecoveryLocked(ctx)
-		return report, true, err
+	reason := historicalRecoveryReason(pullErr)
+	if reason == "" {
+		return RemoteSyncReport{}, false, nil
 	}
-	var aheadErr *CheckpointAheadError
-	if errors.As(pullErr, &aheadErr) {
-		c.logger.Info("pull checkpoint ahead; rebuilding from chunked snapshot")
-		if err := c.markCheckpointRecoveryRequiredLocked(ctx, "checkpoint_ahead"); err != nil {
-			return RemoteSyncReport{}, true, err
-		}
-		report, err := c.resumeCheckpointRecoveryLocked(ctx)
-		return report, true, err
+	enabled, err := c.automaticRecoveryEnabled(ctx)
+	if err != nil {
+		return RemoteSyncReport{}, true, err
 	}
-	return RemoteSyncReport{}, false, nil
+	if !enabled {
+		return RemoteSyncReport{}, false, nil
+	}
+	if err := c.captureAutomaticRecovery(ctx, reason, 0, reason); err != nil {
+		return RemoteSyncReport{}, true, err
+	}
+	report, err := c.runAutomaticRecovery(ctx)
+	return report, true, err
 }
 
 func (c *Client) sendPullRequest(ctx context.Context, afterBundleSeq int64, maxBundles int, targetBundleSeq int64) (*oversync.PullResponse, error) {
@@ -268,6 +265,7 @@ func (c *Client) applyPulledBundleLocked(ctx context.Context, bundle *oversync.B
 }
 
 func (c *Client) applyPulledBundleLockedSlice(ctx context.Context, bundle *oversync.Bundle) (resultErr error) {
+	ctx = withUniqueApplyContext(ctx)
 	ctx = context.WithValue(ctx, applyInputSequenceKey{}, bundle.BundleSeq)
 	tx, err := beginImmediateTx(ctx, c.db)
 	if err != nil {
@@ -292,6 +290,10 @@ func (c *Client) applyPulledBundleLockedSlice(ctx context.Context, bundle *overs
 		return c.pulledApplySurvivor(ctx, tx, bundle.Rows[index])
 	}); err != nil {
 		return commitApplyProgress(ctx, tx, err)
+	}
+
+	if err := c.installUniqueFinalState(ctx, tx, stmtCache); err != nil {
+		return err
 	}
 
 	if err := c.applyPulledRows(ctx, tx, stmtCache, bundle.Rows, bundle.BundleSeq); err != nil {
@@ -437,4 +439,29 @@ func (c *Client) applyPulledRows(ctx context.Context, tx sqliteTransaction, stmt
 		}
 	}
 	return nil
+}
+
+// Eligibility is derived only from a concrete authoritative pull unit. Upload
+// settlement and static/integrity/capacity failures never enter this path.
+func (c *Client) applyPullUnitOrRecover(ctx context.Context, bundle *oversync.Bundle) (RemoteSyncReport, bool, error) {
+	err := c.applyPulledBundleLocked(ctx, bundle)
+	if err == nil {
+		return RemoteSyncReport{}, false, nil
+	}
+	reason := historicalRecoveryReason(err)
+	if reason == "" {
+		return RemoteSyncReport{}, false, err
+	}
+	enabled, modeErr := c.automaticRecoveryEnabled(ctx)
+	if modeErr != nil {
+		return RemoteSyncReport{}, false, modeErr
+	}
+	if !enabled {
+		return RemoteSyncReport{}, false, err
+	}
+	if captureErr := c.captureAutomaticRecovery(ctx, reason, bundle.BundleSeq, bundle.BundleHash); captureErr != nil {
+		return RemoteSyncReport{}, true, captureErr
+	}
+	report, recoveryErr := c.runAutomaticRecovery(ctx)
+	return report, true, recoveryErr
 }

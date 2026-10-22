@@ -46,10 +46,14 @@ func TestEvolution_GenerationUploadPolicyAndCapture(t *testing.T) {
 	committed, err = fixtureUpload(t, pool, service, oldProof, key, oversync.OpUpdate, map[string]any{"legacy_name": "C|D"})
 	require.NoError(t, err)
 	require.Positive(t, committed.Bundle.RowCount)
-	_, err = fixtureUpload(t, pool, service, oldProof, key, oversync.OpUpdate, map[string]any{"legacy_name": "invalid"})
-	var rejected *oversync.ApplicationWriteRejectedError
-	require.ErrorAs(t, err, &rejected)
-	require.Equal(t, "transition_input_invalid", rejected.Category)
+	beforeRejected := fixtureUploadBusinessState(t, pool)
+	rejected, err := fixtureUpload(t, pool, service, oldProof, key, oversync.OpUpdate, map[string]any{"legacy_name": "invalid"})
+	require.NoError(t, err)
+	require.Nil(t, rejected.Bundle)
+	require.Equal(t, "rejected", rejected.Outcome.Status)
+	require.NotNil(t, rejected.Outcome.Rejection)
+	require.Equal(t, "transition_input_invalid", rejected.Outcome.Rejection.Code)
+	require.Equal(t, beforeRejected, fixtureUploadBusinessState(t, pool), "terminal rejection rolls back business data and history")
 	cfg, err = Configuration(4, 3, true)
 	require.NoError(t, err)
 	newProof := cfg.Readiness.Generations[1].Proof
@@ -58,11 +62,27 @@ func TestEvolution_GenerationUploadPolicyAndCapture(t *testing.T) {
 		require.NoError(t, err)
 	}
 	for _, payload := range []map[string]any{{"name": nil}, {"name": ""}} {
-		_, err := fixtureUpload(t, pool, service, newProof, key, oversync.OpUpdate, payload)
-		require.Error(t, err)
+		before := fixtureUploadBusinessState(t, pool)
+		response, err := fixtureUpload(t, pool, service, newProof, key, oversync.OpUpdate, payload)
+		if payload["name"] == nil {
+			require.Error(t, err) // null nonnullable wire value is rejected before SQL
+		} else {
+			require.NoError(t, err)
+			require.Nil(t, response.Bundle)
+			require.Equal(t, "rejected", response.Outcome.Status)
+			require.NotNil(t, response.Outcome.Rejection)
+			require.Equal(t, "transition_input_invalid", response.Outcome.Rejection.Code)
+		}
+		require.Equal(t, before, fixtureUploadBusinessState(t, pool))
 	}
-	_, err = fixtureUpload(t, pool, service, newProof, uuid.New(), oversync.OpInsert, map[string]any{"name": "Partial"})
-	require.Error(t, err)
+	beforePartial := fixtureUploadBusinessState(t, pool)
+	partial, err := fixtureUpload(t, pool, service, newProof, uuid.New(), oversync.OpInsert, map[string]any{"name": "Partial"})
+	require.NoError(t, err)
+	require.Nil(t, partial.Bundle)
+	require.Equal(t, "rejected", partial.Outcome.Status)
+	require.NotNil(t, partial.Outcome.Rejection)
+	require.Equal(t, "transition_input_invalid", partial.Outcome.Rejection.Code)
+	require.Equal(t, beforePartial, fixtureUploadBusinessState(t, pool))
 	newKey := uuid.New()
 	committed, err = fixtureUpload(t, pool, service, newProof, newKey, oversync.OpInsert, map[string]any{"name": "Whole", "new_label": "Pair"})
 	require.NoError(t, err)
@@ -96,4 +116,17 @@ func TestEvolution_GenerationUploadPolicyAndCapture(t *testing.T) {
 	unchanged, err := fixtureUpload(t, pool, service, newProof, newKey, oversync.OpUpdate, map[string]any{"name": "Whole", "new_label": "Pair"})
 	require.NoError(t, err)
 	require.EqualValues(t, 1, unchanged.Bundle.RowCount)
+}
+
+// Source progress and retained outcome rows legitimately change on rejection;
+// business data and authoritative captured history must remain byte-identical.
+func fixtureUploadBusinessState(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	var state string
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT jsonb_build_object(
+ 'people',(SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY to_jsonb(p)::text),'[]') FROM main.upgrade_people p),
+ 'row_state',(SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY to_jsonb(r)::text),'[]') FROM sync.row_state r),
+ 'bundle_log',(SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY to_jsonb(b)::text),'[]') FROM sync.bundle_log b),
+ 'bundle_rows',(SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY to_jsonb(b)::text),'[]') FROM sync.bundle_rows b))::text`).Scan(&state))
+	return state
 }

@@ -35,7 +35,7 @@ func TestA1ServerNormalizesDeleteBeforeSurvivingReparent(t *testing.T) {
 		SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, tables, nil),
 	}, integrationTestLogger(slog.LevelWarn))
 	owner := "a1-owner"
-	mustInitializeEmptyScope(t, ctx, svc, owner, "server-app")
+	mustInitializeEmptyScope(t, ctx, svc, owner, "initializing-client")
 	p, q, c, d := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	require.NoError(t, svc.WithinSyncBundle(ctx, Actor{UserID: owner},
 		BundleSource{SourceID: "server-app", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(),

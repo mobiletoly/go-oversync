@@ -1,0 +1,2840 @@
+[
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.created_at",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.created_at",
+    "Attribute": "default",
+    "Value": "clock_timestamp()"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.created_at",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.created_at",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.created_at",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.created_at",
+    "Attribute": "ordinal",
+    "Value": "10"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.created_at",
+    "Attribute": "type",
+    "Value": "pg_catalog.timestamptz"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.created_at",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.envelope",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.envelope",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.envelope",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.envelope",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.envelope",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.envelope",
+    "Attribute": "ordinal",
+    "Value": "9"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.envelope",
+    "Attribute": "type",
+    "Value": "pg_catalog.bytea"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.envelope",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_fingerprint",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_fingerprint",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_fingerprint",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_fingerprint",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_fingerprint",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_fingerprint",
+    "Attribute": "ordinal",
+    "Value": "5"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_fingerprint",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_fingerprint",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_id",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_id",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_id",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_id",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_id",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_id",
+    "Attribute": "ordinal",
+    "Value": "4"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_id",
+    "Attribute": "type",
+    "Value": "pg_catalog.int4"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.generation_id",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.initialization_id",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.initialization_id",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.initialization_id",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.initialization_id",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.initialization_id",
+    "Attribute": "not_null",
+    "Value": "false"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.initialization_id",
+    "Attribute": "ordinal",
+    "Value": "7"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.initialization_id",
+    "Attribute": "type",
+    "Value": "pg_catalog.uuid"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.initialization_id",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.outcome_hash",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.outcome_hash",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.outcome_hash",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.outcome_hash",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.outcome_hash",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.outcome_hash",
+    "Attribute": "ordinal",
+    "Value": "8"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.outcome_hash",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.outcome_hash",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.request_hash",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.request_hash",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.request_hash",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.request_hash",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.request_hash",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.request_hash",
+    "Attribute": "ordinal",
+    "Value": "6"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.request_hash",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.request_hash",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_bundle_id",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_bundle_id",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_bundle_id",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_bundle_id",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_bundle_id",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_bundle_id",
+    "Attribute": "ordinal",
+    "Value": "3"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_bundle_id",
+    "Attribute": "type",
+    "Value": "pg_catalog.int8"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_bundle_id",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_id",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_id",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_id",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_id",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_id",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_id",
+    "Attribute": "ordinal",
+    "Value": "2"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_id",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.source_id",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.user_pk",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.user_pk",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.user_pk",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.user_pk",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.user_pk",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.user_pk",
+    "Attribute": "ordinal",
+    "Value": "1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.user_pk",
+    "Attribute": "type",
+    "Value": "pg_catalog.int8"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_outcomes.user_pk",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.format",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.format",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.format",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.format",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.format",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.format",
+    "Attribute": "ordinal",
+    "Value": "2"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.format",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.format",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.max_outcome_bytes",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.max_outcome_bytes",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.max_outcome_bytes",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.max_outcome_bytes",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.max_outcome_bytes",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.max_outcome_bytes",
+    "Attribute": "ordinal",
+    "Value": "3"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.max_outcome_bytes",
+    "Attribute": "type",
+    "Value": "pg_catalog.int8"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.max_outcome_bytes",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.singleton",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.singleton",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.singleton",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.singleton",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.singleton",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.singleton",
+    "Attribute": "ordinal",
+    "Value": "1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.singleton",
+    "Attribute": "type",
+    "Value": "pg_catalog.bool"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_protocol_store.singleton",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_fingerprint",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_fingerprint",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_fingerprint",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_fingerprint",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_fingerprint",
+    "Attribute": "not_null",
+    "Value": "false"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_fingerprint",
+    "Attribute": "ordinal",
+    "Value": "5"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_fingerprint",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_fingerprint",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_id",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_id",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_id",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_id",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_id",
+    "Attribute": "not_null",
+    "Value": "false"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_id",
+    "Attribute": "ordinal",
+    "Value": "4"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_id",
+    "Attribute": "type",
+    "Value": "pg_catalog.int4"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_generation_id",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_outcome_hash",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_outcome_hash",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_outcome_hash",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_outcome_hash",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_outcome_hash",
+    "Attribute": "not_null",
+    "Value": "false"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_outcome_hash",
+    "Attribute": "ordinal",
+    "Value": "7"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_outcome_hash",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_outcome_hash",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_request_hash",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_request_hash",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_request_hash",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_request_hash",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_request_hash",
+    "Attribute": "not_null",
+    "Value": "false"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_request_hash",
+    "Attribute": "ordinal",
+    "Value": "6"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_request_hash",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_request_hash",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_sequence",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_sequence",
+    "Attribute": "default",
+    "Value": "0"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_sequence",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_sequence",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_sequence",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_sequence",
+    "Attribute": "ordinal",
+    "Value": "3"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_sequence",
+    "Attribute": "type",
+    "Value": "pg_catalog.int8"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.acknowledged_sequence",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.source_id",
+    "Attribute": "collation",
+    "Value": "pg_catalog.C"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.source_id",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.source_id",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.source_id",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.source_id",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.source_id",
+    "Attribute": "ordinal",
+    "Value": "2"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.source_id",
+    "Attribute": "type",
+    "Value": "pg_catalog.text"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.source_id",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.user_pk",
+    "Attribute": "collation",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.user_pk",
+    "Attribute": "default",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.user_pk",
+    "Attribute": "generated",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.user_pk",
+    "Attribute": "identity",
+    "Value": ""
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.user_pk",
+    "Attribute": "not_null",
+    "Value": "true"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.user_pk",
+    "Attribute": "ordinal",
+    "Value": "1"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.user_pk",
+    "Attribute": "type",
+    "Value": "pg_catalog.int8"
+  },
+  {
+    "Kind": "column",
+    "Identity": "sync.push_source_progress.user_pk",
+    "Attribute": "typmod",
+    "Value": "-1"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "columns",
+    "Value": "[\"generation_fingerprint\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "expression",
+    "Value": "(generation_fingerprint ~ '^[0-9a-f]{64}$'::text)"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_fingerprint_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "columns",
+    "Value": "[\"generation_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "expression",
+    "Value": "(generation_id \u003e 0)"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_generation_id_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "columns",
+    "Value": "[\"outcome_hash\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "expression",
+    "Value": "(outcome_hash ~ '^[0-9a-f]{64}$'::text)"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_outcome_hash_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "columns",
+    "Value": "[\"user_pk\",\"source_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "expression",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "type",
+    "Value": "p"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_pkey",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "columns",
+    "Value": "[\"request_hash\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "expression",
+    "Value": "(request_hash ~ '^[0-9a-f]{64}$'::text)"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_request_hash_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "columns",
+    "Value": "[\"source_bundle_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "expression",
+    "Value": "(source_bundle_id \u003e 0)"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_source_bundle_id_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "columns",
+    "Value": "[\"user_pk\",\"source_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "delete_action",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "expression",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "match_type",
+    "Value": "s"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "referenced_columns",
+    "Value": "[\"user_pk\",\"source_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "referenced_table",
+    "Value": "sync.push_source_progress"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "type",
+    "Value": "f"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "update_action",
+    "Value": "a"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_outcomes.push_outcomes_user_pk_source_id_fkey",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "columns",
+    "Value": "[\"format\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "expression",
+    "Value": "(format = 'durable_outcomes'::text)"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_format_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "columns",
+    "Value": "[\"max_outcome_bytes\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "expression",
+    "Value": "((max_outcome_bytes \u003e= 8194) AND (max_outcome_bytes \u003c= 67117056))"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_max_outcome_bytes_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "columns",
+    "Value": "[\"singleton\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "expression",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "type",
+    "Value": "p"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_pkey",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "columns",
+    "Value": "[\"singleton\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "expression",
+    "Value": "singleton"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_protocol_store.push_protocol_store_singleton_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "columns",
+    "Value": "[\"acknowledged_sequence\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "expression",
+    "Value": "(acknowledged_sequence \u003e= 0)"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_acknowledged_sequence_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "columns",
+    "Value": "[\"acknowledged_sequence\",\"acknowledged_generation_id\",\"acknowledged_generation_fingerprint\",\"acknowledged_request_hash\",\"acknowledged_outcome_hash\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "expression",
+    "Value": "(((acknowledged_sequence = 0) AND (acknowledged_generation_id IS NULL) AND (acknowledged_generation_fingerprint IS NULL) AND (acknowledged_request_hash IS NULL) AND (acknowledged_outcome_hash IS NULL)) OR ((acknowledged_sequence \u003e 0) AND (acknowledged_generation_id IS NOT NULL) AND (acknowledged_generation_fingerprint IS NOT NULL) AND (acknowledged_request_hash IS NOT NULL) AND (acknowledged_outcome_hash IS NOT NULL) AND ((acknowledged_generation_id \u003e= 1) AND (acknowledged_generation_id \u003c= 2147483647)) AND (acknowledged_generation_fingerprint ~ '^[0-9a-f]{64}$'::text) AND (acknowledged_request_hash ~ '^[0-9a-f]{64}$'::text) AND (acknowledged_outcome_hash ~ '^[0-9a-f]{64}$'::text)))"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "columns",
+    "Value": "[\"user_pk\",\"source_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "expression",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "type",
+    "Value": "p"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_pkey",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "columns",
+    "Value": "[\"source_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "delete_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "expression",
+    "Value": "((octet_length(source_id) \u003e= 1) AND (octet_length(source_id) \u003c= 256))"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "match_type",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "referenced_columns",
+    "Value": "[]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "referenced_table",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "type",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "update_action",
+    "Value": " "
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_source_id_check",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "columns",
+    "Value": "[\"user_pk\",\"source_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "deferrable",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "delete_action",
+    "Value": "c"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "expression",
+    "Value": ""
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "initially_deferred",
+    "Value": "false"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "match_type",
+    "Value": "s"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "referenced_columns",
+    "Value": "[\"user_pk\",\"source_id\"]"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "referenced_table",
+    "Value": "sync.source_state"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "type",
+    "Value": "f"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "update_action",
+    "Value": "a"
+  },
+  {
+    "Kind": "constraint",
+    "Identity": "sync.push_source_progress.push_source_progress_user_pk_source_id_fkey",
+    "Attribute": "validated",
+    "Value": "true"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "configuration",
+    "Value": "[]"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "language",
+    "Value": "plpgsql"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "leakproof",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "parallel",
+    "Value": "u"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "return_type",
+    "Value": "pg_catalog.trigger"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "security_definer",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "source.sha256",
+    "Value": "b8ff7291da6710391c30ef4101e618fa1a14289f556877788ef8831b169b7b37"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "strict",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_insert_guard()",
+    "Attribute": "volatility",
+    "Value": "v"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "configuration",
+    "Value": "[]"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "language",
+    "Value": "plpgsql"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "leakproof",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "parallel",
+    "Value": "u"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "return_type",
+    "Value": "pg_catalog.trigger"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "security_definer",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "source.sha256",
+    "Value": "496da9acd9f847a99db30a5a40a5623169eab999ee1ff17bd37fe7c48f1e7bb0"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "strict",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_lifecycle_guard()",
+    "Attribute": "volatility",
+    "Value": "v"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "configuration",
+    "Value": "[]"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "language",
+    "Value": "plpgsql"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "leakproof",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "parallel",
+    "Value": "u"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "return_type",
+    "Value": "pg_catalog.trigger"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "security_definer",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "source.sha256",
+    "Value": "f4bd380fa7b2c5db4de2e73116ff7d16bff2c384f8fc912fe36059b181efa490"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "strict",
+    "Value": "false"
+  },
+  {
+    "Kind": "function",
+    "Identity": "sync.push_outcome_store_guard()",
+    "Attribute": "volatility",
+    "Value": "v"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "access_method",
+    "Value": "btree"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "attribute.1",
+    "Value": "{\"role\": \"key\", \"column\": \"user_pk\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "attribute.2",
+    "Value": "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.C\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "attribute_count",
+    "Value": "2"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "exclusion",
+    "Value": "false"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "key_count",
+    "Value": "2"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "live",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "predicate",
+    "Value": ""
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "primary",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "ready",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "table",
+    "Value": "sync.push_outcomes"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "unique",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_outcomes_pkey",
+    "Attribute": "valid",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "access_method",
+    "Value": "btree"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "attribute.1",
+    "Value": "{\"role\": \"key\", \"column\": \"singleton\", \"opclass\": \"pg_catalog.bool_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "attribute_count",
+    "Value": "1"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "exclusion",
+    "Value": "false"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "key_count",
+    "Value": "1"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "live",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "predicate",
+    "Value": ""
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "primary",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "ready",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "table",
+    "Value": "sync.push_protocol_store"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "unique",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_protocol_store_pkey",
+    "Attribute": "valid",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "access_method",
+    "Value": "btree"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "attribute.1",
+    "Value": "{\"role\": \"key\", \"column\": \"user_pk\", \"opclass\": \"pg_catalog.int8_ops\", \"collation\": \"\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "attribute.2",
+    "Value": "{\"role\": \"key\", \"column\": \"source_id\", \"opclass\": \"pg_catalog.text_ops\", \"collation\": \"pg_catalog.C\", \"descending\": false, \"expression\": \"\", \"nulls_first\": false}"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "attribute_count",
+    "Value": "2"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "exclusion",
+    "Value": "false"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "key_count",
+    "Value": "2"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "live",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "predicate",
+    "Value": ""
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "primary",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "ready",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "table",
+    "Value": "sync.push_source_progress"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "unique",
+    "Value": "true"
+  },
+  {
+    "Kind": "index",
+    "Identity": "sync.push_source_progress_pkey",
+    "Attribute": "valid",
+    "Value": "true"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_outcomes",
+    "Attribute": "force_row_security",
+    "Value": "false"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_outcomes",
+    "Attribute": "is_partition",
+    "Value": "false"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_outcomes",
+    "Attribute": "kind",
+    "Value": "r"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_outcomes",
+    "Attribute": "persistence",
+    "Value": "p"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_outcomes",
+    "Attribute": "replica_identity",
+    "Value": "d"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_outcomes",
+    "Attribute": "row_security",
+    "Value": "false"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_protocol_store",
+    "Attribute": "force_row_security",
+    "Value": "false"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_protocol_store",
+    "Attribute": "is_partition",
+    "Value": "false"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_protocol_store",
+    "Attribute": "kind",
+    "Value": "r"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_protocol_store",
+    "Attribute": "persistence",
+    "Value": "p"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_protocol_store",
+    "Attribute": "replica_identity",
+    "Value": "d"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_protocol_store",
+    "Attribute": "row_security",
+    "Value": "false"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_source_progress",
+    "Attribute": "force_row_security",
+    "Value": "false"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_source_progress",
+    "Attribute": "is_partition",
+    "Value": "false"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_source_progress",
+    "Attribute": "kind",
+    "Value": "r"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_source_progress",
+    "Attribute": "persistence",
+    "Value": "p"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_source_progress",
+    "Attribute": "replica_identity",
+    "Value": "d"
+  },
+  {
+    "Kind": "relation",
+    "Identity": "sync.push_source_progress",
+    "Attribute": "row_security",
+    "Value": "false"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "arguments",
+    "Value": "[]"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "constraint",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "enabled",
+    "Value": "O"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "events",
+    "Value": "update"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "function",
+    "Value": "sync.push_outcome_store_guard()"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "level",
+    "Value": "row"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "new_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "old_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_immutable_guard",
+    "Attribute": "timing",
+    "Value": "before"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "arguments",
+    "Value": "[]"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "constraint",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "enabled",
+    "Value": "O"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "events",
+    "Value": "insert"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "function",
+    "Value": "sync.push_outcome_insert_guard()"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "level",
+    "Value": "row"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "new_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "old_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_outcomes.push_outcome_insert_guard",
+    "Attribute": "timing",
+    "Value": "before"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "arguments",
+    "Value": "[]"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "constraint",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "enabled",
+    "Value": "O"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "events",
+    "Value": "update,delete"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "function",
+    "Value": "sync.push_outcome_store_guard()"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "level",
+    "Value": "row"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "new_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "old_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_protocol_store.push_outcome_store_guard",
+    "Attribute": "timing",
+    "Value": "before"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "arguments",
+    "Value": "[]"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "constraint",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "enabled",
+    "Value": "O"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "events",
+    "Value": "delete"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "function",
+    "Value": "sync.push_outcome_lifecycle_guard()"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "level",
+    "Value": "row"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "new_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "old_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.push_source_progress.push_outcome_lifecycle_guard",
+    "Attribute": "timing",
+    "Value": "before"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "arguments",
+    "Value": "[]"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "constraint",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "enabled",
+    "Value": "O"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "events",
+    "Value": "delete"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "function",
+    "Value": "sync.push_outcome_lifecycle_guard()"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "level",
+    "Value": "row"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "new_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "old_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_generation_bindings.push_outcome_lifecycle_guard",
+    "Attribute": "timing",
+    "Value": "before"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "arguments",
+    "Value": "[]"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "constraint",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "enabled",
+    "Value": "O"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "events",
+    "Value": "update,delete"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "function",
+    "Value": "sync.push_outcome_lifecycle_guard()"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "level",
+    "Value": "row"
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "new_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "old_transition",
+    "Value": ""
+  },
+  {
+    "Kind": "trigger",
+    "Identity": "sync.source_state.push_outcome_lifecycle_guard",
+    "Attribute": "timing",
+    "Value": "before"
+  }
+]

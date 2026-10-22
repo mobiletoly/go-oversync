@@ -295,15 +295,17 @@ func TestDirectPush_ConflictRejectsWholeBundle(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushUsersFixture(t, ctx, "push_conflict_", "push-conflict-test", "push-conflict-user-")
 	rowID := uuid.New()
-
 	_, err := fixture.push(t, fixture.actor, 1, fixture.userInsert(rowID, "Alice", "alice@example.com"))
 	require.NoError(t, err)
-
-	_, err = fixture.push(t, fixture.actor, 2, fixture.userUpdate(rowID, 999, "Alice 2", "alice2@example.com"))
-	var conflictErr *PushConflictError
-	require.ErrorAs(t, err, &conflictErr)
-	require.NotNil(t, conflictErr.Conflict)
-	require.NotContains(t, string(conflictErr.Conflict.ServerRow), `"_sync_scope_id"`)
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	acknowledgeRetainedOutcomeForTest(t, ctx, fixture.svc, fixture.actor, proof)
+	rows := []PushRequestRow{fixture.userUpdate(rowID, 999, "Alice 2", "alice2@example.com")}
+	rejected, err := fixture.svc.PushOneShot(ctx, fixture.actor, proof, &OneShotPushRequest{SourceBundleID: 2, CanonicalRequestHash: mustCanonicalPushRequestHash(t, fixture.svc, rows), Rows: rows})
+	require.NoError(t, err)
+	require.Equal(t, "rejected", rejected.Outcome.Status)
+	conflict := rejected.Outcome.Rejection.Conflict
+	require.NotNil(t, conflict)
+	require.NotContains(t, string(conflict.ServerRow), `"_sync_scope_id"`)
 	require.Equal(t, 1, fixture.bundleLogCount(t, fixture.actor.UserID))
 	require.Equal(t, "Alice", fixture.userName(t, rowID))
 }
@@ -336,15 +338,16 @@ func TestDirectPush_WrongOwnerUpdateDeleteDoNotAffectAnotherUsersRow(t *testing.
 	_, err := fixture.push(t, actorA, 1, fixture.userInsert(rowID, "Owner A", "owner-a@example.com"))
 	require.NoError(t, err)
 
-	_, err = fixture.push(t, actorB, 1, fixture.userUpdate(rowID, 1, "Intruder", "intruder@example.com"))
-	var updateConflict *PushConflictError
-	require.ErrorAs(t, err, &updateConflict)
-	require.Equal(t, SyncKey{"id": rowID.String()}, updateConflict.Conflict.Key)
-
-	_, err = fixture.push(t, actorB, 1, fixture.userDelete(rowID, 1))
-	var deleteConflict *PushConflictError
-	require.ErrorAs(t, err, &deleteConflict)
-	require.Equal(t, SyncKey{"id": rowID.String()}, deleteConflict.Conflict.Key)
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	resolveConnectForPush(t, ctx, fixture.svc, actorB, false)
+	for i, row := range []PushRequestRow{fixture.userUpdate(rowID, 1, "Intruder", "intruder@example.com"), fixture.userDelete(rowID, 1)} {
+		rows := []PushRequestRow{row}
+		rejected, err := fixture.svc.PushOneShot(ctx, actorB, proof, &OneShotPushRequest{SourceBundleID: int64(i + 1), CanonicalRequestHash: mustCanonicalPushRequestHash(t, fixture.svc, rows), Rows: rows})
+		require.NoError(t, err)
+		require.Equal(t, "rejected", rejected.Outcome.Status)
+		require.Equal(t, SyncKey{"id": rowID.String()}, rejected.Outcome.Rejection.Conflict.Key)
+		acknowledgeRetainedOutcomeForTest(t, ctx, fixture.svc, actorB, proof)
+	}
 
 	require.Equal(t, "Owner A", fixture.scopedUserName(t, actorA.UserID, rowID))
 	require.Equal(t, 1, fixture.userRowCount(t, rowID))
@@ -358,6 +361,8 @@ func TestDirectPush_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
 	firstBundle, err := fixture.push(t, fixture.actor, 1, fixture.userInsert(rowID, "Alice", "alice@example.com"))
 	require.NoError(t, err)
 	require.Equal(t, int64(1), firstBundle.BundleSeq)
+
+	acknowledgeRetainedOutcomeForTest(t, ctx, fixture.svc, fixture.actor, testSchemaGenerationProofForService(fixture.svc))
 
 	secondBundle, err := fixture.push(t, fixture.actor, 2, fixture.userUpdate(rowID, 1, "Alice Updated", "alice-updated@example.com"))
 	require.NoError(t, err)
@@ -413,6 +418,8 @@ func TestDirectPush_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t *t
 	require.NoError(t, err)
 	require.Equal(t, int64(1), insertBundle.BundleSeq)
 
+	acknowledgeRetainedOutcomeForTest(t, ctx, svc, actor, testSchemaGenerationProofForService(svc))
+
 	deleteBundle, err := pushRowsOneShot(t, ctx, svc, actor, 2, []PushRequestRow{{
 		Schema:         schemaName,
 		Table:          "users",
@@ -465,11 +472,15 @@ func TestDirectPush_AlreadyCommittedReturnsSameCommittedBundle(t *testing.T) {
 	rowID := uuid.New()
 	rows := []PushRequestRow{fixture.userInsert(rowID, "Replay", "replay@example.com")}
 
-	firstBundle, err := fixture.push(t, fixture.actor, 1, rows...)
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	initializationID := resolveConnectForPush(t, ctx, fixture.svc, fixture.actor, true)
+	req := &OneShotPushRequest{SourceBundleID: 1, CanonicalRequestHash: mustCanonicalPushRequestHash(t, fixture.svc, rows), InitializationID: initializationID, Rows: rows}
+	exact, err := fixture.svc.PushOneShot(ctx, fixture.actor, proof, req)
 	require.NoError(t, err)
-	replayBundle, err := fixture.push(t, fixture.actor, 1, rows...)
+	require.Equal(t, "committed", exact.Outcome.Status)
+	replay, err := fixture.svc.PushOneShot(ctx, fixture.actor, proof, req)
 	require.NoError(t, err)
-	requireBundlesSemanticallyEqual(t, firstBundle, replayBundle)
+	require.Equal(t, exact.encoded, replay.encoded)
 	require.Equal(t, 1, fixture.bundleLogCount(t, fixture.actor.UserID))
 }
 

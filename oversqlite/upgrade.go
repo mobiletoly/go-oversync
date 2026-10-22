@@ -1221,6 +1221,9 @@ func (c *Opening) startInstalled(ctx context.Context) (*upgradeJournalRecord, er
 	if plan.Mode == UpgradeModeGeneration && (admittedInstalled == nil || admittedInstalled.Proof != c.installedContract.Proof) {
 		return nil, &UpgradeError{Outcome: UpgradeOutcomePlanMismatch, Cause: fmt.Errorf("installed ordinary contract is not admitted for the directed generation")}
 	}
+	if err := c.finishPreAdmissionUpload(ctx); err != nil {
+		return nil, err
+	}
 	var expectedAttachment *attachmentStateRecord
 	var expectedOperation *operationStateRecord
 	if plan.Mode == UpgradeModeGeneration {

@@ -18,6 +18,8 @@ type ScopeTransactionKind string
 const (
 	ScopeTransactionConnect        ScopeTransactionKind = "connect"
 	ScopeTransactionClientPush     ScopeTransactionKind = "client_push"
+	ScopeTransactionPushResolve    ScopeTransactionKind = "push_resolve"
+	ScopeTransactionPushAck        ScopeTransactionKind = "push_ack"
 	ScopeTransactionServerWrite    ScopeTransactionKind = "server_write"
 	ScopeTransactionSnapshotCreate ScopeTransactionKind = "snapshot_create"
 	ScopeTransactionSnapshotRetire ScopeTransactionKind = "snapshot_retire"

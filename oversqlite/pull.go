@@ -16,7 +16,6 @@ type snapshotApplyOptions struct {
 	RotateSource              bool
 	NewSourceID               string
 	ReplacementReason         string
-	PreserveOutbox            bool
 	ClearSourceRecovery       bool
 	RequireFreshRotatedSource bool
 	FinalizeRemoteReplace     bool
@@ -30,6 +29,8 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 }
 
 func (c *Client) applyStagedSnapshotLockedSlice(ctx context.Context, session *oversync.SnapshotSession, options snapshotApplyOptions) (resultErr error) {
+	ctx = withUniqueApplyContext(ctx)
+	uniqueInvocation(ctx).snapshot = true
 	guard, err := c.resolveSnapshotApplyGuardLocked(ctx, options)
 	if err != nil {
 		return err
@@ -48,6 +49,19 @@ func (c *Client) applyStagedSnapshotLockedSlice(ctx context.Context, session *ov
 	if err := c.validateStagedSnapshotForApply(ctx, tx, session); err != nil {
 		return err
 	}
+	snapshotSource := c.sourceID
+	if options.RotateSource {
+		snapshotSource = options.NewSourceID
+	}
+	if !options.FinalizeRemoteReplace {
+		floor, err := c.snapshotFloor(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if session.SnapshotBundleSeq < floor {
+			return fmt.Errorf("snapshot boundary precedes installed observation floor")
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
 		return fmt.Errorf("failed to defer foreign keys for staged snapshot apply: %w", err)
 	}
@@ -58,32 +72,40 @@ func (c *Client) applyStagedSnapshotLockedSlice(ctx context.Context, session *ov
 	if !options.FinalizeRemoteReplace && (attachment.BindingState != attachmentBindingAttached || strings.TrimSpace(attachment.AttachedUserID) == "") {
 		return &AttachRequiredError{Operation: "Rebuild()"}
 	}
-	if err := c.prepareSnapshotApply(ctx, tx, session, options.PreserveOutbox); err != nil {
+	if err := c.prepareSnapshotApply(ctx, tx, session); err != nil {
 		return commitApplyProgress(ctx, tx, err)
+	}
+	// Preparation is auxiliary and may span slices. Rehash once the complete
+	// plan is ready, on this final writer, before any business DML.
+	if err := c.verifySnapshotStageHash(ctx, tx, session, snapshotSource); err != nil {
+		return commitApplyProgress(ctx, tx, err)
+	}
+	if err := c.validateSnapshotPreservation(ctx, tx); err != nil {
+		return commitApplyProgress(ctx, tx, err)
+	}
+	if err := c.readyAutomaticRecovery(ctx, tx); err != nil {
+		return err
 	}
 	if err := c.setBundleApplyModeInTx(ctx, tx, true); err != nil {
 		return err
 	}
-	if err := c.clearManagedTablesInTxWithOptions(ctx, tx, clearManagedTablesOptions{PreserveOutbox: options.PreserveOutbox}); err != nil {
+	if err := c.installUniqueFinalState(ctx, tx, stmtCache); err != nil {
 		return err
 	}
+
 	if err := c.installStagedSnapshotRowsInTx(ctx, stmtCache, tx, session); err != nil {
 		return err
 	}
 	if c.afterSnapshotRowsHook != nil {
 		c.afterSnapshotRowsHook()
 	}
-	if options.PreserveOutbox && guard.outbox.State == outboxStatePrepared {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _sync_row_state(schema_name,table_name,key_json,row_version,server_kind,server_payload,server_provenance,relationships_known)
- SELECT o.schema_name,o.table_name,o.key_json,0,'absent',NULL,`+baselineProvenanceSQL("'snapshot'", "0", "?")+`,1 FROM _sync_outbox_rows o WHERE NOT EXISTS(SELECT 1 FROM _sync_row_state a WHERE a.schema_name=o.schema_name AND a.table_name=o.table_name AND a.key_json=o.key_json)`, session.SnapshotBundleSeq); err != nil {
-			return err
-		}
-
-		if err := c.reapplyPreparedOutboxIntentLocallyInTx(ctx, stmtCache, tx); err != nil {
-			return err
-		}
+	if err := c.installSnapshotAbsenceBaselines(ctx, tx, session); err != nil {
+		return err
 	}
-	if err := c.completeSnapshotDesiredState(ctx, tx, stmtCache, session, options.PreserveOutbox); err != nil {
+	if err := c.completeSnapshotDesiredState(ctx, tx, stmtCache, session); err != nil {
+		return err
+	}
+	if err := c.completeAutomaticRecovery(ctx, tx, session.SnapshotBundleSeq); err != nil {
 		return err
 	}
 	targetSourceID, err := c.finalizeSnapshotApplyStateInTx(ctx, tx, attachment, guard, session, options)
@@ -231,12 +253,6 @@ func (c *Client) finalizeSnapshotApplyStateInTx(ctx context.Context, tx *immedia
 	if err := persistAttachmentState(ctx, tx, attachment); err != nil {
 		return "", fmt.Errorf("failed to persist snapshot bundle checkpoint: %w", err)
 	}
-	if options.PreserveOutbox && guard.outbox.State == outboxStatePrepared {
-
-		if err := c.retargetPreparedOutboxInTx(ctx, tx, targetSourceID, 1); err != nil {
-			return "", err
-		}
-	}
 	if options.FinalizeRemoteReplace {
 		if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
 			return "", err
@@ -250,7 +266,7 @@ func (c *Client) finalizeSnapshotApplyStateInTx(ctx context.Context, tx *immedia
 		if err != nil {
 			return "", err
 		}
-		if operation.Kind == operationKindNone && isCheckpointRecoveryReason(operation.Reason) {
+		if operation.Kind == operationKindNone {
 			if err := persistOperationState(ctx, tx, &operationStateRecord{Kind: operationKindNone}); err != nil {
 				return "", err
 			}

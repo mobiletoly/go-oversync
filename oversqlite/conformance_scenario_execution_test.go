@@ -814,7 +814,7 @@ func newPortablePrunedFixture(t *testing.T, suffix string) portablePrunedFixture
 	require.NoError(t, err)
 	require.NoError(t, client.markCheckpointRecoveryRequiredLocked(ctx, "history_pruned"))
 	require.NotZero(t, outbound.SourceBundleID)
-	options := snapshotApplyOptions{PreserveOutbox: true}
+	options := snapshotApplyOptions{}
 	options.PinnedGuard, err = client.pinSnapshotApplyGuard(ctx, options)
 	require.NoError(t, err)
 	session := stageUserSnapshotForGate(t, client, "portable-pruned-"+suffix, "remote", 8,

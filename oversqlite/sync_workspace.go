@@ -179,10 +179,11 @@ func (c *Client) releaseWorkspace(ctx context.Context, token string) error {
 type freshLifetimeAdmissionKey struct{}
 type workspaceBufferKey struct{}
 type workspaceBufferScope struct {
-	token, unit   string
-	client        *Client
-	base          workspaceCharge
-	statementWork int64
+	journalBodyBytes int64
+	token, unit      string
+	client           *Client
+	base             workspaceCharge
+	statementWork    int64
 }
 
 func (c *Client) resizeWorkspaceInTx(ctx context.Context, tx sqliteTransaction, token string, requested workspaceCharge) error {
@@ -280,7 +281,7 @@ func reconcileWorkspaceOwners(ctx context.Context, q upgradeQueryer, config *Con
 	for _, owner := range []struct{ table, charge, columns, counter string }{
 		{"_sync_snapshot_stage", "charge", "64+6*(length(CAST(snapshot_id AS BLOB))+length(CAST(schema_name AS BLOB))+length(CAST(table_name AS BLOB))+length(CAST(key_json AS BLOB)))+length(CAST(COALESCE(payload,'') AS BLOB))", "SELECT snapshot_stage_entries,snapshot_stage_bytes FROM _sync_operation_state WHERE singleton_key=1"},
 		{"_sync_push_stage", "charge", "64+6*(length(CAST(schema_name AS BLOB))+length(CAST(table_name AS BLOB))+length(CAST(key_json AS BLOB))+length(CAST(op AS BLOB)))+length(CAST(COALESCE(payload,'') AS BLOB))", "SELECT push_stage_entries,push_stage_bytes FROM _sync_operation_state WHERE singleton_key=1"},
-		{"_sync_apply_rows", "bytes", "64+6*(length(CAST(table_name AS BLOB))+length(CAST(local_pk AS BLOB)))+length(CAST(COALESCE(payload,'') AS BLOB))", "SELECT entries,bytes FROM _sync_apply_plan WHERE singleton_key=1"},
+		{"_sync_apply_rows", "bytes", "96+6*(length(CAST(table_name AS BLOB))+length(CAST(local_pk AS BLOB)))+length(CAST(COALESCE(payload,'') AS BLOB))", "SELECT entries,bytes FROM _sync_apply_plan WHERE singleton_key=1"},
 		{"_sync_apply_edges", "bytes", "64+6*(length(CAST(parent_table AS BLOB))+length(CAST(parent_pk AS BLOB))+length(CAST(child_table AS BLOB))+length(CAST(child_pk AS BLOB)))", "SELECT edge_entries,edge_bytes FROM _sync_apply_plan WHERE singleton_key=1"},
 	} {
 		cursor := int64(math.MinInt64)
@@ -672,7 +673,7 @@ func (c *Client) operationWorkspaceCharge(ctx context.Context, q queryRower, uni
 	err := scanTransactionRow(ctx, q, `SELECT reserved_entries,reserved_bytes,snapshot_stage_entries,snapshot_stage_bytes,
         push_stage_entries,push_stage_bytes,length(CAST(workspace_context AS BLOB))+
         length(CAST(kind AS BLOB))+length(CAST(target_user_id AS BLOB))+length(CAST(reason AS BLOB))+
-        length(CAST(replacement_source_id AS BLOB))+length(CAST(staged_snapshot_id AS BLOB))
+        length(CAST(replacement_source_id AS BLOB))+length(CAST(staged_snapshot_id AS BLOB))+length(CAST(snapshot_transfer AS BLOB))+length(CAST(recovery_state AS BLOB))
         FROM _sync_operation_state WHERE singleton_key=1`, nil, &reserved.entries, &reserved.bytes, &snapshot.entries, &snapshot.bytes, &stagedPush.entries, &stagedPush.bytes, &textBytes)
 	if err != nil {
 		return workspaceCharge{}, err
@@ -691,7 +692,11 @@ func (c *Client) operationWorkspaceCharge(ctx context.Context, q queryRower, uni
 	if err != nil {
 		return workspaceCharge{}, err
 	}
-	return c.sumWorkspaceCharges(unit, workspaceCharge{1, 512}, workspaceCharge{0, descriptor}, reserved, snapshot, stagedPush)
+	var journalEntries, journalBytes int64
+	if err := scanTransactionRow(ctx, q, `SELECT count(*),COALESCE(sum(512+6*length(CAST(binding AS BLOB))+length(request_body)+length(outcome_body)),0) FROM _sync_upload_journal`, nil, &journalEntries, &journalBytes); err != nil {
+		return workspaceCharge{}, err
+	}
+	return c.sumWorkspaceCharges(unit, workspaceCharge{1, 512}, workspaceCharge{0, descriptor}, reserved, snapshot, stagedPush, workspaceCharge{journalEntries, journalBytes})
 }
 
 func (c *Client) retainedApplyWorkspaceCharge(ctx context.Context, q queryRower, unit string) (workspaceCharge, error) {
