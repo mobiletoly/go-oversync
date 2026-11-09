@@ -62,6 +62,34 @@ result, retained rejection or acknowledgment obligation. A committed upload that
 cannot settle safely stays blocked. Rebuild cannot bypass it. A later local
 synchronized write survives and prevents snapshot installation.
 
+One state is exempt, because the strict gate would otherwise strand local edits
+forever. When source recovery is required (`source_retired`,
+`source_sequence_out_of_order` or `source_sequence_changed`) the explicit
+`Rebuild` keeps pending edits instead of refusing. It first lets the old source
+settle and acknowledge an unsettled upload in the ordinary way. Whatever the
+server refuses stays in place while the snapshot is staged under the
+replacement source. The server admits that replacement only when the old source
+holds no unacknowledged outcome, so the refused upload is known to be void. The
+final writer then requeues each pending edit on top of the installed snapshot,
+keeps the local value visible and releases the retired source's frozen request.
+The next ordinary push uploads those edits as the replacement source's first
+bundle.
+
+A pending edit never overwrites another device's change. An edit made from the
+row state the snapshot still holds is rebased onto the snapshot. An edit of a
+row that another device updated, deleted or created in the meantime keeps the
+version it was made from, so the server refuses its upload as an ordinary
+conflict and the configured resolver decides. Remote changes after the snapshot
+surface the same way.
+
+An edit that cannot apply to the snapshot, such as a child of a parent another
+device deleted, rolls the installation back and returns
+`PendingIntentUnsatisfiableError`. Nothing is dropped automatically.
+`DiscardPendingIntentForRecovery` is the explicit exit: it runs only on request,
+returns exactly the rows it dropped and leaves business rows for the next
+`Rebuild` to replace. Automatic recovery, checkpoint rebuild and coordinated
+upgrades keep the strict gate.
+
 The server seals source, generation, minimum requested observation, snapshot T,
 row/byte totals and a streaming hash over the immutable projection. Recovery
 creation rejects an outstanding unacknowledged server outcome and a floor above

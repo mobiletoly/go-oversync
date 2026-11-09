@@ -62,6 +62,12 @@ type PushOutcomeAckRequest struct {
 	CanonicalRequestHash string `json:"canonical_request_hash"`
 	OutcomeHash          string `json:"outcome_hash"`
 }
+
+// PushOutcomeRetainedRequest is the closed sequence-only lookup an owning source
+// sends after push_outcome_mismatch; the retained hash and token are discovered.
+type PushOutcomeRetainedRequest struct {
+	SourceBundleID int64 `json:"source_bundle_id"`
+}
 type SnapshotRecovery struct {
 	MinimumBundleSeq int64 `json:"minimum_bundle_seq"`
 }
@@ -122,6 +128,18 @@ func (v *PushOutcomeResolveRequest) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	*v = PushOutcomeResolveRequest(p)
+	return nil
+}
+func (v *PushOutcomeRetainedRequest) UnmarshalJSON(raw []byte) error {
+	type plain PushOutcomeRetainedRequest
+	var p plain
+	if err := decodeRecoveryObject(raw, []string{"source_bundle_id"}, nil, "", &p); err != nil {
+		return err
+	}
+	if p.SourceBundleID < 1 {
+		return fmt.Errorf("invalid operation sequence")
+	}
+	*v = PushOutcomeRetainedRequest(p)
 	return nil
 }
 func (v *PushOutcomeAckRequest) UnmarshalJSON(raw []byte) error {

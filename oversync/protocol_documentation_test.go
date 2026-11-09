@@ -218,7 +218,7 @@ func TestSchemaGenerationOpenAPIGolden(t *testing.T) {
 	errorAlternatives := schemas["ErrorResponse"].(map[string]any)["properties"].(map[string]any)["error"].(map[string]any)["anyOf"].([]any)
 	errorValues := errorAlternatives[0].(map[string]any)["enum"].([]any)
 	require.NotContains(t, errorValues, "push_replay_mismatch")
-	for _, code := range []string{"invalid_request", "push_invalid", "push_outcome_pending", "push_outcome_acknowledged", "push_outcome_mismatch", "push_outcome_too_large", "invalid_gzip", "encoded_body_too_large", "decoded_body_too_large", "bundle_projection_too_large", "committed_bundle_unrepresentable", "snapshot_chunk_too_small"} {
+	for _, code := range []string{"invalid_request", "push_invalid", "push_outcome_pending", "push_outcome_acknowledged", "push_outcome_mismatch", "push_outcome_too_large", "push_outcome_absent", "invalid_gzip", "encoded_body_too_large", "decoded_body_too_large", "bundle_projection_too_large", "committed_bundle_unrepresentable", "snapshot_chunk_too_small"} {
 		require.Contains(t, errorValues, code)
 	}
 }

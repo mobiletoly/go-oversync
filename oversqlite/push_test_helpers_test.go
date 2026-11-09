@@ -407,6 +407,7 @@ type mockPushServer struct {
 	terminalOutcomes  map[int64]oversync.PushOutcome
 	initializations   map[int64]*string
 	resolveRequests   []oversync.PushOutcomeResolveRequest
+	retainedRequests  []oversync.PushOutcomeRetainedRequest
 	ackRequests       []oversync.PushOutcomeAckRequest
 	latestAck         int64
 }
@@ -430,7 +431,7 @@ func (s *mockPushServer) RoundTrip(r *http.Request) (*http.Response, error) {
 		defer reader.Close()
 		r.Body = io.NopCloser(reader)
 	}
-	if r.URL.Path == "/sync/push-outcomes/resolve" || r.URL.Path == "/sync/push-outcomes/ack" {
+	if r.URL.Path == "/sync/push-outcomes/resolve" || r.URL.Path == "/sync/push-outcomes/retained" || r.URL.Path == "/sync/push-outcomes/ack" {
 		return s.outcomeControl(r)
 	}
 	switch {
@@ -614,6 +615,23 @@ func (s *mockPushServer) outcomeControl(r *http.Request) (*http.Response, error)
 		delete(s.terminalBodies, req.SourceBundleID)
 		s.latestAck = req.SourceBundleID
 		return &http.Response{StatusCode: 204, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	if r.URL.Path == "/sync/push-outcomes/retained" {
+		// Sequence-only, read-only lookup of the owning source's retained outcome.
+		var req oversync.PushOutcomeRetainedRequest
+		require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))
+		s.retainedRequests = append(s.retainedRequests, req)
+		if req.SourceBundleID <= s.latestAck {
+			return errorJSONResponse(http.StatusGone, oversync.ErrorResponse{Error: "push_outcome_acknowledged"}), nil
+		}
+		if raw, ok := s.terminalBodies[req.SourceBundleID]; ok {
+			return rawMockOutcome(raw), nil
+		}
+		code := "push_outcome_absent"
+		if req.SourceBundleID != s.latestAck+1 {
+			code = "source_sequence_out_of_order"
+		}
+		return errorJSONResponse(http.StatusConflict, oversync.ErrorResponse{Error: code}), nil
 	}
 	var req oversync.PushOutcomeResolveRequest
 	require.NoError(s.t, json.NewDecoder(r.Body).Decode(&req))

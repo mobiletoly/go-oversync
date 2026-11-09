@@ -400,6 +400,11 @@ func (c *Client) disposeCancelledUpload(ctx context.Context, snapshot *pushOutbo
 }
 
 func requireNoUnresolvedUpload(ctx context.Context, q queryRower) error {
+	// The explicit rotated source-recovery rebuild is the one owner that keeps pending intent in
+	// place: it carries that intent onto the installed snapshot under the replacement source.
+	if owns, err := sourceRecoveryOwnsPendingIntent(ctx, q); err != nil || owns {
+		return err
+	}
 	j, err := loadUploadJournal(ctx, q)
 	if err != nil {
 		return err
@@ -462,7 +467,12 @@ func (c *Client) frozenUploadMayResume(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if operation.Kind != operationKindNone && (operation.Kind != operationKindSourceRecovery || operation.StagedSnapshotID != "") {
+	if operation.Kind == operationKindSourceRecovery && operation.StagedSnapshotID != "" {
+		// Once the replacement snapshot is staged the server has retired this source, so the frozen
+		// request can no longer resume under it. The rotated rebuild carries its intent forward.
+		return false, nil
+	}
+	if operation.Kind != operationKindNone && operation.Kind != operationKindSourceRecovery {
 		return false, &DestructiveTransitionInProgressError{TransitionKind: operation.Kind}
 	}
 	return true, nil

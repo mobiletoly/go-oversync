@@ -48,6 +48,24 @@ func (h *HTTPSyncHandlers) HandlePushOutcomeResolve(w http.ResponseWriter, r *ht
 	defer releaseHistoryProjection(&result.historyProjectionRelease)
 	h.writeJSONBytes(w, r, http.StatusOK, result.encoded)
 }
+func (h *HTTPSyncHandlers) HandlePushOutcomeRetained(w http.ResponseWriter, r *http.Request) {
+	actor, proof, ok := h.requireOutcomeActor(w, r)
+	if !ok {
+		return
+	}
+	var req PushOutcomeRetainedRequest
+	if err := decodeBoundedJSONRequest(r, &req, OutcomeControlBodyLimit); err != nil {
+		h.writeBoundedRequestFailure(w, r, err, "Invalid retained outcome request")
+		return
+	}
+	result, err := h.service.FetchRetainedPushOutcome(retainHistoryProjectionForHTTP(r.Context()), actor, proof, req)
+	if err != nil {
+		h.writeCompactPushError(w, r, actor.SourceID, err)
+		return
+	}
+	defer releaseHistoryProjection(&result.historyProjectionRelease)
+	h.writeJSONBytes(w, r, http.StatusOK, result.encoded)
+}
 func (h *HTTPSyncHandlers) HandlePushOutcomeAck(w http.ResponseWriter, r *http.Request) {
 	actor, proof, ok := h.requireOutcomeActor(w, r)
 	if !ok {

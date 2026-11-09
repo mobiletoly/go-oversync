@@ -14,8 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These replace prepared-source-rebind/snapshot success expectations. A
-// nonterminal source error cannot dispose of F or authorize its retargeting.
+// A source error can neither dispose of F nor retarget it. Push keeps refusing,
+// and Rebuild gives the old source one more ordinary chance before it asks the
+// server to arbitrate through the replacement snapshot request. While that
+// request fails, F, its captures and the current source stay exactly as frozen.
 func TestPushPending_CreateHistoryPrunedRetainsOriginalAndBlocksSnapshot(t *testing.T) {
 	testFrozenSourceErrorPreservation(t, SourceRecoveryHistoryPruned, false)
 }
@@ -35,7 +37,7 @@ func testFrozenSourceErrorPreservation(t *testing.T, code SourceRecoveryCode, re
 			resolves++
 		case "/sync/snapshot-sessions":
 			snapshots++
-			return nil, fmt.Errorf("snapshot must not bypass F")
+			return nil, fmt.Errorf("replacement snapshot unavailable")
 		default:
 			return nil, fmt.Errorf("unexpected request %s", r.URL.Path)
 		}
@@ -69,8 +71,8 @@ func testFrozenSourceErrorPreservation(t *testing.T, code SourceRecoveryCode, re
 	require.Equal(t, originalSource, client.sourceID)
 	require.Equal(t, originalSource, requireOutboxBundle(t, db).SourceID)
 	require.Equal(t, 1, pushes)
-	require.Equal(t, 1, resolves)
-	require.Zero(t, snapshots)
+	require.Equal(t, 2, resolves, "PushPending and Rebuild each ask the old source once")
+	require.Equal(t, 1, snapshots, "only an accepted replacement may release F")
 }
 
 func TestPushPending_CommitSourceSequenceChangedRequiresSourceRecovery(t *testing.T) {

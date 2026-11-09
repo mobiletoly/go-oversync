@@ -75,6 +75,49 @@ func (s *SyncService) ResolvePushOutcome(ctx context.Context, actor Actor, proof
 	return result, nil
 }
 
+// FetchRetainedPushOutcome returns the owning source's retained terminal outcome
+// at one sequence after a lost local freeze produced push_outcome_mismatch. It
+// reads under the same source lock as push/resolve and never consumes a sequence.
+func (s *SyncService) FetchRetainedPushOutcome(ctx context.Context, actor Actor, proof SchemaGenerationProof, req PushOutcomeRetainedRequest) (_ *RetainedPushOutcome, err error) {
+	if err = s.validateOutcomeActor(ctx, actor, proof); err != nil {
+		return nil, err
+	}
+	if req.SourceBundleID < 1 {
+		return nil, &PushInvalidError{Message: "invalid operation sequence"}
+	}
+	done, err := s.beginOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	releaseOperation := done
+	defer releaseHistoryProjection(&releaseOperation)
+	releaseProjection, err := s.acquireHistoryProjection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHistoryProjection(&releaseProjection)
+	conn, release, err := s.acquireUserUploadConn(ctx, actor.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	var result *RetainedPushOutcome
+	err = runRetryableOwnedTransaction(ctx, conn, func(tx pgx.Tx) error {
+		result = nil
+		retained, err := s.admitRetainedLookup(ctx, tx, actor, proof, req)
+		if err != nil {
+			return err
+		}
+		result = retained
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	transferHistoryProjectionForHTTP(ctx, &result.historyProjectionRelease, &releaseProjection, &releaseOperation)
+	return result, nil
+}
+
 // AcknowledgePushOutcome preserves the original binding in a compact latest-ack
 // fence. Exact duplicate matching precedes mutable generation/source admission.
 func (s *SyncService) AcknowledgePushOutcome(ctx context.Context, actor Actor, proof SchemaGenerationProof, req PushOutcomeAckRequest) error {

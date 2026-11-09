@@ -325,6 +325,8 @@ paths:
       summary: Resolve exact upload or durably cancel it
       description: Serialized with push; returns retained exact outcome, or consumes the next sequence
         with cancelled. It never returns racy absence. Delayed push cannot commit after cancellation.
+        A retained outcome at the same sequence under a different request hash or token stays 409
+        push_outcome_mismatch; the owning source reads it through /sync/push-outcomes/retained.
         Request encoded/decoded body limit4096 bytes.
       security:
       - BearerAuth: []
@@ -336,6 +338,48 @@ paths:
       - $ref: '#/components/parameters/RequestContentEncoding'
       requestBody:
         $ref: '#/components/requestBodies/PushOutcomeResolveRequest'
+      responses:
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/ScopeAccessDenied'
+        '409':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
+        '413':
+          $ref: '#/components/responses/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedEncoding'
+        '426':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '200':
+          $ref: '#/components/responses/PushOK'
+  /sync/push-outcomes/retained:
+    post:
+      operationId: fetchRetainedPushOutcome
+      summary: Read the retained outcome for one source sequence
+      description: Sequence-only lookup for the owning source after push_outcome_mismatch following a lost
+        local freeze. Serialized with push, resolve and ack; it never consumes, cancels, overwrites or
+        acknowledges a sequence. Returns the exact retained envelope regardless of the request hash or
+        initialization token that produced it. Nothing retained at the next admitted sequence is 409
+        push_outcome_absent and is not noncommit proof. Request encoded/decoded body limit4096 bytes.
+      security:
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/ProtocolVersionHeader'
+      - $ref: '#/components/parameters/SourceIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationIDHeader'
+      - $ref: '#/components/parameters/SchemaGenerationFingerprintHeader'
+      - $ref: '#/components/parameters/RequestContentEncoding'
+      requestBody:
+        $ref: '#/components/requestBodies/PushOutcomeRetainedRequest'
       responses:
         '400':
           $ref: '#/components/responses/InvalidRequest'
@@ -547,6 +591,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/PushOutcomeAckRequest'
+    PushOutcomeRetainedRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PushOutcomeRetainedRequest'
   responses:
     StatusOK:
       description: Service status
@@ -775,6 +825,7 @@ components:
             - push_outcome_pending
             - push_outcome_acknowledged
             - push_outcome_too_large
+            - push_outcome_absent
             - recovery_floor_ahead
           - type: string
             pattern: ^[a-z][a-z0-9_]{0,63}$
@@ -821,9 +872,10 @@ components:
         conflict:
           $ref: '#/components/schemas/PushConflictDetails'
       additionalProperties: true
-      description: 'New status mapping: protocol_version_mismatch 426; outcome mismatch/pending and recovery_floor_ahead
-        409; push_outcome_acknowledged 410; push_outcome_too_large 413. Infrastructure/storage failures
-        remain nonterminal. No nonterminal error proves an earlier attempt did not commit.'
+      description: 'New status mapping: protocol_version_mismatch 426; outcome mismatch/pending/absent and
+        recovery_floor_ahead 409; push_outcome_acknowledged 410; push_outcome_too_large 413. Infrastructure/storage
+        failures remain nonterminal. No nonterminal error, including push_outcome_absent, proves an earlier
+        attempt did not commit.'
     PushConflictDetails:
       type: object
       additionalProperties: false
@@ -1639,6 +1691,21 @@ components:
       - source_bundle_id: 7
         canonical_request_hash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         outcome_hash: 5a376ce2a63930bf5f5233ec8200ebed6239ee289838555b575e10c7510b50af
+    PushOutcomeRetainedRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        source_bundle_id:
+          type: integer
+          format: int64
+          maximum: 9223372036854775807
+          minimum: 1
+      required:
+      - source_bundle_id
+      description: 'Closed sequence-only lookup for the owning source. The response is the exact retained
+        terminal envelope; its canonical_request_hash and initialization_id are discovered, not supplied.'
+      examples:
+      - source_bundle_id: 7
     SnapshotRecovery:
       type: object
       additionalProperties: false

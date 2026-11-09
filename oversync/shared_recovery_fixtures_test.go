@@ -52,8 +52,8 @@ func TestSharedRecoveryProtocolFixtures(t *testing.T) {
 			Values   []string
 			Accepted bool
 		}
-		Outcomes, OutcomeInvalid, ResolveRequests, AckRequests, SnapshotRequests, SnapshotMetadataInvalid []recoveryRawCase
-		BindingCases                                                                                      []struct {
+		Outcomes, OutcomeInvalid, ResolveRequests, AckRequests, RetainedRequests, SnapshotRequests, SnapshotMetadataInvalid []recoveryRawCase
+		BindingCases                                                                                                        []struct {
 			Name, Raw                     string
 			Binding                       PushOperationBinding
 			FrozenContext, CurrentContext map[string]string
@@ -79,7 +79,7 @@ func TestSharedRecoveryProtocolFixtures(t *testing.T) {
 	readContractFixture(t, root, "recovery/protocol.json", &fixture)
 	var fields map[string]json.RawMessage
 	readContractFixture(t, root, "recovery/protocol.json", &fields)
-	expected := strings.Fields("formatVersion contract hashProjection generation headers bindingCases outcomes outcomeInvalid resolveRequests ackRequests snapshotRequests snapshots snapshotInvalid snapshotMetadataInvalid workflows requestCounts errors")
+	expected := strings.Fields("formatVersion contract hashProjection generation headers bindingCases outcomes outcomeInvalid resolveRequests ackRequests retainedRequests snapshotRequests snapshots snapshotInvalid snapshotMetadataInvalid workflows requestCounts errors")
 	if len(fields) != len(expected) {
 		t.Fatal("undeclared recovery family")
 	}
@@ -148,7 +148,7 @@ func TestSharedRecoveryProtocolFixtures(t *testing.T) {
 			t.Logf("rejected at %s boundary: %v", c.Stage, err)
 		})
 	}
-	for family, cases := range map[string][]recoveryRawCase{"resolve": fixture.ResolveRequests, "ack": fixture.AckRequests, "snapshot-request": fixture.SnapshotRequests} {
+	for family, cases := range map[string][]recoveryRawCase{"resolve": fixture.ResolveRequests, "ack": fixture.AckRequests, "retained": fixture.RetainedRequests, "snapshot-request": fixture.SnapshotRequests} {
 		if len(cases) == 0 {
 			t.Fatal("empty family", family)
 		}
@@ -160,6 +160,8 @@ func TestSharedRecoveryProtocolFixtures(t *testing.T) {
 					target = &PushOutcomeResolveRequest{}
 				case "ack":
 					target = &PushOutcomeAckRequest{}
+				case "retained":
+					target = &PushOutcomeRetainedRequest{}
 				default:
 					target = &SnapshotSessionCreateRequest{}
 				}
@@ -215,6 +217,8 @@ func TestSharedRecoveryProtocolFixtures(t *testing.T) {
 					requests = append(requests, "POST /sync/push")
 				case "resolve":
 					requests = append(requests, "POST /sync/push-outcomes/resolve")
+				case "retained":
+					requests = append(requests, "POST /sync/push-outcomes/retained")
 				case "ack":
 					if !ready {
 						t.Fatal("ack before disposition")
@@ -232,7 +236,7 @@ func TestSharedRecoveryProtocolFixtures(t *testing.T) {
 			}
 		})
 	}
-	statuses := map[string]int{"protocol_version_mismatch": 426, "push_outcome_mismatch": 409, "push_outcome_pending": 409, "push_outcome_acknowledged": 410, "push_outcome_too_large": 413, "recovery_floor_ahead": 409, "source_generation_conflict": 409}
+	statuses := map[string]int{"protocol_version_mismatch": 426, "push_outcome_mismatch": 409, "push_outcome_pending": 409, "push_outcome_acknowledged": 410, "push_outcome_too_large": 413, "push_outcome_absent": 409, "recovery_floor_ahead": 409, "source_generation_conflict": 409}
 	if len(fixture.Errors) != len(statuses) {
 		t.Fatal("error family coverage")
 	}
@@ -243,7 +247,7 @@ func TestSharedRecoveryProtocolFixtures(t *testing.T) {
 			}
 		})
 	}
-	t.Logf("executed recovery cases: headers=%d outcomes=%d invalid=%d resolve=%d ack=%d snapshot-requests=%d snapshots=%d invalid-snapshots=%d workflows=%d errors=%d", len(fixture.Headers), len(fixture.Outcomes), len(fixture.OutcomeInvalid), len(fixture.ResolveRequests), len(fixture.AckRequests), len(fixture.SnapshotRequests), len(fixture.Snapshots), len(fixture.SnapshotInvalid), len(fixture.Workflows), len(fixture.Errors))
+	t.Logf("executed recovery cases: headers=%d outcomes=%d invalid=%d resolve=%d ack=%d retained=%d snapshot-requests=%d snapshots=%d invalid-snapshots=%d workflows=%d errors=%d", len(fixture.Headers), len(fixture.Outcomes), len(fixture.OutcomeInvalid), len(fixture.ResolveRequests), len(fixture.AckRequests), len(fixture.RetainedRequests), len(fixture.SnapshotRequests), len(fixture.Snapshots), len(fixture.SnapshotInvalid), len(fixture.Workflows), len(fixture.Errors))
 }
 func verifyRecoveryAuthorityPins(t *testing.T, root string) {
 	t.Helper()
@@ -329,6 +333,9 @@ func reduceRecoveryWorkflow(t *testing.T, events []string) recoveryWorkflowState
 	t.Helper()
 	state := recoveryWorkflowState{Next: 1}
 	serverAcked := false
+	// The server retains at most one unacknowledged terminal outcome; a lost
+	// local freeze leaves it without local evidence until the retained lookup.
+	serverRetained := false
 	for _, event := range events {
 		switch event {
 		case "freeze":
@@ -344,6 +351,23 @@ func reduceRecoveryWorkflow(t *testing.T, events []string) recoveryWorkflowState
 				t.Fatal("outcome without frozen identity")
 			}
 			state.Outcome = true
+			serverRetained = true
+		case "freeze_lost":
+			// Local F and any undurable C vanish; the server keeps its evidence.
+			if !state.Frozen {
+				t.Fatal("nothing frozen to lose")
+			}
+			state.Frozen = false
+			state.Outcome = false
+		case "mismatch":
+			if !state.Frozen || state.Outcome || !serverRetained {
+				t.Fatal("mismatch requires a fresh frozen request and a retained server outcome")
+			}
+		case "retained":
+			if !state.Frozen || state.Outcome || !serverRetained {
+				t.Fatal("retained lookup requires a frozen request and a retained server outcome")
+			}
+			state.Outcome = true
 		case "settle":
 			if !state.Outcome {
 				t.Fatal("settlement without outcome")
@@ -356,6 +380,7 @@ func reduceRecoveryWorkflow(t *testing.T, events []string) recoveryWorkflowState
 				t.Fatal("ack before disposition")
 			}
 			state.AckPending = false
+			serverRetained = false
 			state.Next++
 		case "ack_lost":
 			if !state.AckPending {
@@ -367,6 +392,7 @@ func reduceRecoveryWorkflow(t *testing.T, events []string) recoveryWorkflowState
 				t.Fatal("missing latest ack fence")
 			}
 			state.AckPending = false
+			serverRetained = false
 			state.Next++
 		case "snapshot":
 			if !state.Frozen && !state.Outcome && !state.AckPending {

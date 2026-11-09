@@ -192,6 +192,10 @@ func (c *Client) obtainCommittedPushBundleLocked(ctx context.Context, snapshot *
 }
 
 func (c *Client) handlePushCommitErrorLocked(ctx context.Context, snapshot *pushOutboundSnapshot, commitErr error, conflictRetryCount int, allowCheckpointRecovery bool) (PushReport, error) {
+	var mismatch *retainedOutcomeMismatchError
+	if errors.As(commitErr, &mismatch) {
+		return c.recoverRetainedOutcomeLocked(ctx, snapshot)
+	}
 	var cancelled *cancelledUploadOutcome
 	if errors.As(commitErr, &cancelled) {
 		if err := c.disposeCancelledUpload(ctx, snapshot); err != nil {
@@ -236,6 +240,78 @@ func (c *Client) handlePushCommitErrorLocked(ctx context.Context, snapshot *push
 		}
 	}
 	return c.pushPendingLockedWithRecovery(ctx, conflictRetryCount+1, allowCheckpointRecovery)
+}
+
+// recoverRetainedOutcomeLocked handles a lost local freeze. The frozen request was
+// never admitted: an earlier freeze at this sequence reached the server, but its
+// local commit was lost. The retained outcome is this source's own authoritative
+// evidence, so it settles through the shared final-state engine with no uploaded
+// rows, while every frozen row stays local intent for the next sequence.
+func (c *Client) recoverRetainedOutcomeLocked(ctx context.Context, snapshot *pushOutboundSnapshot) (PushReport, error) {
+	j, err := loadUploadJournal(ctx, c.db)
+	if err != nil {
+		return PushReport{}, err
+	}
+	if err = c.guardUploadJournal(ctx, c.db, j); err != nil {
+		return PushReport{}, err
+	}
+	outbox, err := loadOutboxBundle(ctx, c.db)
+	if err != nil {
+		return PushReport{}, err
+	}
+	if snapshot == nil || j.Phase != "frozen" || outbox.State != outboxStatePrepared || outbox.SourceBundleID != snapshot.SourceBundleID || outbox.RowCount != int64(len(snapshot.Rows)) || j.Binding.Operation.SourceBundleID != outbox.SourceBundleID {
+		return PushReport{}, &UploadJournalIntegrityError{"frozen outbox changed"}
+	}
+	var raw []byte
+	if j.OutcomeBytes > 0 {
+		// An interrupted attempt already rebound the journal; settle from the stored evidence.
+		if err = c.growPushHTTPBuffers(ctx, 2*j.OutcomeBytes+65536, 32); err != nil {
+			return PushReport{}, err
+		}
+		err = c.db.QueryRowContext(ctx, `SELECT outcome_body FROM _sync_upload_journal WHERE singleton_key=1`).Scan(&raw)
+	} else {
+		raw, err = c.fetchRetainedUploadOutcome(ctx, j)
+	}
+	if err != nil {
+		return PushReport{}, err
+	}
+	outcome, committed, rows, err := c.decodeRetainedJournalOutcome(ctx, raw, j, int64(len(snapshot.Rows)))
+	if err != nil {
+		return PushReport{}, err
+	}
+	if j.OutcomeBytes == 0 {
+		if err = c.rebindUploadJournalToRetainedOutcome(ctx, j, raw, outcome); err != nil {
+			return PushReport{}, err
+		}
+	}
+	if committed == nil {
+		// Rejected or cancelled evidence binds the lost request, not these rows: keep the
+		// frozen intent pending without invoking rejection policy for it.
+		if err = c.disposeCancelledUpload(ctx, snapshot); err != nil {
+			return PushReport{}, err
+		}
+		if err = c.acknowledgeUploadJournal(ctx); err != nil {
+			return PushReport{}, err
+		}
+		return c.pushReportWithOutcomeLocked(ctx, PushOutcomeNoChange)
+	}
+	if err = c.stageAuthoritativePushRows(ctx, committed, rows); err != nil {
+		return PushReport{}, err
+	}
+	if invocation := invocationFromContext(ctx); invocation != nil {
+		invocation.recordCommitted(committed.SourceID, committed.SourceBundleID)
+	}
+	if err = c.applyRetainedPushBundleLocked(ctx, snapshot, committed); err != nil {
+		return PushReport{}, err
+	}
+	c.pendingInitializationID = ""
+	if err = c.clearPushPlanForLifecycle(ctx, true); err != nil {
+		return PushReport{}, err
+	}
+	if err = c.acknowledgeUploadJournal(ctx); err != nil {
+		return PushReport{}, err
+	}
+	return c.pushReportWithOutcomeLocked(ctx, PushOutcomeCommitted)
 }
 
 func (c *Client) pushReportWithOutcomeLocked(ctx context.Context, outcome PushOutcome) (PushReport, error) {

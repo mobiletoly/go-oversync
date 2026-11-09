@@ -46,6 +46,9 @@ type snapshotApplyGuard struct {
 	remoteTargetUserID string
 	context            string
 	automatic          *automaticRecoveryPin
+	// carriesIntent is set only by the explicit rotated source-recovery rebuild. The pinned dirty
+	// count and outbox fingerprint then keep that intent immutable while the snapshot is staged.
+	carriesIntent bool
 }
 
 type SnapshotFinalApplyGateError struct {
@@ -101,7 +104,7 @@ func loadSnapshotGuardState(ctx context.Context, tx sqliteTransaction, mode snap
 }
 
 func validateSnapshotGuardMode(guard *snapshotApplyGuard) error {
-	if guard.dirtyRows != 0 {
+	if guard.dirtyRows != 0 && !guard.carriesIntent {
 		return &DirtyStateRejectedError{DirtyCount: int(guard.dirtyRows)}
 	}
 	switch guard.mode {
@@ -122,7 +125,7 @@ func validateSnapshotGuardMode(guard *snapshotApplyGuard) error {
 		if guard.lifecycle.BindingState != attachmentBindingAttached || !guard.lifecycle.RebuildRequired || guard.lifecycle.OperationKind != operationKindSourceRecovery {
 			return &SourceRecoveryRequiredError{Code: SourceRecoverySequenceChanged, Message: "source-recovery lifecycle guard is not active"}
 		}
-		if guard.outbox.State != outboxStateNone || guard.outbox.ActualRowCount != 0 {
+		if !guard.carriesIntent && (guard.outbox.State != outboxStateNone || guard.outbox.ActualRowCount != 0) {
 			return &PendingPushReplayError{OutboundCount: int(guard.outbox.ActualRowCount)}
 		}
 	default:
@@ -132,6 +135,9 @@ func validateSnapshotGuardMode(guard *snapshotApplyGuard) error {
 }
 
 func (c *Client) pinSnapshotApplyGuard(ctx context.Context, options snapshotApplyOptions) (*snapshotApplyGuard, error) {
+	if options.CarryPendingIntent {
+		ctx = withSourceRecoveryIntent(ctx)
+	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin snapshot guard read transaction: %w", err)
@@ -145,6 +151,7 @@ func (c *Client) pinSnapshotApplyGuard(ctx context.Context, options snapshotAppl
 		return nil, err
 	}
 	guard.remoteReplace, guard.remoteTargetUserID = options.FinalizeRemoteReplace, options.RemoteTargetUserID
+	guard.carriesIntent = options.CarryPendingIntent
 	if err := validateSnapshotGuardMode(guard); err != nil {
 		return nil, err
 	}
@@ -181,6 +188,10 @@ func (c *Client) validateFinalSnapshotApplyGate(ctx context.Context, tx sqliteTr
 		return err
 	}
 	current.remoteReplace, current.remoteTargetUserID = pinned.remoteReplace, pinned.remoteTargetUserID
+	current.carriesIntent = pinned.carriesIntent
+	if pinned.carriesIntent {
+		ctx = withSourceRecoveryIntent(ctx)
+	}
 	if current.dirtyRows != pinned.dirtyRows {
 		return &SnapshotFinalApplyGateError{Mode: string(pinned.mode), Reason: "dirty row count changed", Cause: &DirtyStateRejectedError{DirtyCount: int(current.dirtyRows)}}
 	}

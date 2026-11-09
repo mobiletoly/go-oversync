@@ -138,7 +138,7 @@ func isSnapshotSessionLimitDimension(dimension string) bool {
 func isSafeServerErrorCode(code string) bool {
 	switch code {
 	case "bundle_change_watch_forbidden", "checkpoint_ahead",
-		"recovery_floor_ahead", "push_outcome_pending",
+		"recovery_floor_ahead", "push_outcome_pending", "push_outcome_mismatch", "push_outcome_absent",
 		"history_pruned", "initialization_expired", "initialization_stale", "invalid_request",
 		"push_conflict", "push_invalid", "push_replay_mismatch", "bundle_projection_too_large", "committed_bundle_unrepresentable",
 		"scope_initializing", "scope_uninitialized", "service_unavailable", "snapshot_build_capacity",

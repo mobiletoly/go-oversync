@@ -120,13 +120,33 @@ func (c *Client) resumeCheckpointRecoveryLocked(ctx context.Context) (RemoteSync
 	return c.runAutomaticRecovery(ctx)
 }
 
+// rebuildSourceRecoveryLocked is the explicit Rebuild out of source recovery. It never strands local
+// intent: an unsettled upload first gets its ordinary chance under the old source, and whatever the
+// server refuses there is carried onto the snapshot installed under the replacement source.
 func (c *Client) rebuildSourceRecoveryLocked(ctx context.Context) (RemoteSyncReport, error) {
-	return c.rebuildSourceRecoveryWithFinalizerLocked(ctx, nil)
+	if err := c.ensureConnectedSessionLocked(ctx, "Rebuild()"); err != nil {
+		return RemoteSyncReport{}, err
+	}
+	if atomic.LoadInt32(&c.downloadPaused) != 1 {
+		if err := c.settleUploadUnderRetiringSourceLocked(ctx); err != nil {
+			return RemoteSyncReport{}, err
+		}
+	}
+	return c.rebuildSourceRecoveryRotatingLocked(ctx, nil, true)
 }
 
+// rebuildSourceRecoveryWithFinalizerLocked serves coordinated upgrades, which keep the strict clean gate.
 func (c *Client) rebuildSourceRecoveryWithFinalizerLocked(
 	ctx context.Context,
 	finalize func(context.Context, *immediateTx, string) error,
+) (RemoteSyncReport, error) {
+	return c.rebuildSourceRecoveryRotatingLocked(ctx, finalize, false)
+}
+
+func (c *Client) rebuildSourceRecoveryRotatingLocked(
+	ctx context.Context,
+	finalize func(context.Context, *immediateTx, string) error,
+	carryPendingIntent bool,
 ) (RemoteSyncReport, error) {
 	if err := c.ensureConnectedSessionLocked(ctx, "Rebuild()"); err != nil {
 		return RemoteSyncReport{}, err
@@ -135,7 +155,7 @@ func (c *Client) rebuildSourceRecoveryWithFinalizerLocked(
 	if err != nil {
 		return RemoteSyncReport{}, err
 	}
-	if pendingCount > 0 {
+	if pendingCount > 0 && !carryPendingIntent {
 		return RemoteSyncReport{}, &DirtyStateRejectedError{DirtyCount: pendingCount}
 	}
 	if atomic.LoadInt32(&c.downloadPaused) == 1 {
@@ -167,6 +187,7 @@ func (c *Client) rebuildSourceRecoveryWithFinalizerLocked(
 		NewSourceID:               newSourceID,
 		ReplacementReason:         strings.TrimSpace(operation.Reason),
 		ClearSourceRecovery:       true,
+		CarryPendingIntent:        carryPendingIntent,
 		RequireFreshRotatedSource: true,
 	}
 	if finalize != nil {
@@ -209,6 +230,9 @@ func (c *Client) ensureRebuildPreconditionsLocked(ctx context.Context) error {
 }
 
 func (c *Client) rebuildFromSnapshotWithOptionsLocked(ctx context.Context, options snapshotApplyOptions) (RemoteSyncReport, error) {
+	if options.CarryPendingIntent {
+		ctx = withSourceRecoveryIntent(ctx)
+	}
 	if err := requireNoUnresolvedUpload(ctx, c.db); err != nil {
 		return RemoteSyncReport{}, err
 	}

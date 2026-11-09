@@ -104,6 +104,7 @@ func TestEndToEnd_GettingStartedDDLAttachPushPull(t *testing.T) {
 	mux.Handle("POST /sync/connect", withActor(http.HandlerFunc(handlers.HandleConnect)))
 	mux.Handle("POST /sync/push", withActor(http.HandlerFunc(handlers.HandlePush)))
 	mux.Handle("POST /sync/push-outcomes/resolve", withActor(http.HandlerFunc(handlers.HandlePushOutcomeResolve)))
+	mux.Handle("POST /sync/push-outcomes/retained", withActor(http.HandlerFunc(handlers.HandlePushOutcomeRetained)))
 	mux.Handle("POST /sync/push-outcomes/ack", withActor(http.HandlerFunc(handlers.HandlePushOutcomeAck)))
 	mux.Handle("GET /sync/pull", withActor(http.HandlerFunc(handlers.HandlePull)))
 	mux.Handle("POST /sync/snapshot-sessions", withActor(http.HandlerFunc(handlers.HandleCreateSnapshotSession)))

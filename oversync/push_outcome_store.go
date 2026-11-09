@@ -222,7 +222,16 @@ type pushOperationAdmission struct {
 	retained *RetainedPushOutcome
 }
 
-func (s *SyncService) admitPushOperation(ctx context.Context, tx pgx.Tx, actor Actor, proof SchemaGenerationProof, req PushOutcomeResolveRequest, kind ScopeTransactionKind) (*pushOperationAdmission, error) {
+// pushSourceOperationState is the locked source view shared by push, resolve and
+// the retained lookup. Every caller follows the same lock order before classifying.
+type pushSourceOperationState struct {
+	userPK   int64
+	state    *sourceStateRow
+	progress *pushSourceProgress
+	retained *RetainedPushOutcome
+}
+
+func (s *SyncService) lockPushSourceOperation(ctx context.Context, tx pgx.Tx, actor Actor, proof SchemaGenerationProof, kind ScopeTransactionKind) (*pushSourceOperationState, error) {
 	if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, SourceID: actor.SourceID, Kind: kind}); err != nil {
 		return nil, err
 	}
@@ -248,6 +257,47 @@ func (s *SyncService) admitPushOperation(ctx context.Context, tx pgx.Tx, actor A
 	if err != nil {
 		return nil, err
 	}
+	return &pushSourceOperationState{userPK: userPK, state: state, progress: progress, retained: retained}, nil
+}
+
+// classifyRetainedLookup is read-only: it never consumes, cancels or overwrites a
+// sequence. Only the owning source under its bound generation reads its evidence.
+func classifyRetainedLookup(p *pushSourceProgress, retained *RetainedPushOutcome, proof SchemaGenerationProof, sequence int64) error {
+	if sequence <= p.acknowledged {
+		return outcomeError("push_outcome_acknowledged")
+	}
+	if retained != nil {
+		if sequence != retained.Outcome.SourceBundleID {
+			return outcomeError("push_outcome_pending")
+		}
+		if retained.Outcome.GenerationID != canonicalSchemaGenerationID(proof.ID) || retained.Outcome.GenerationFingerprint != proof.Fingerprint {
+			return outcomeError("push_outcome_mismatch")
+		}
+		return nil
+	}
+	if p.acknowledged == math.MaxInt64 || sequence != p.acknowledged+1 {
+		return outcomeError("source_sequence_out_of_order")
+	}
+	return outcomeError("push_outcome_absent")
+}
+
+func (s *SyncService) admitRetainedLookup(ctx context.Context, tx pgx.Tx, actor Actor, proof SchemaGenerationProof, req PushOutcomeRetainedRequest) (*RetainedPushOutcome, error) {
+	locked, err := s.lockPushSourceOperation(ctx, tx, actor, proof, ScopeTransactionPushResolve)
+	if err != nil {
+		return nil, err
+	}
+	if err := classifyRetainedLookup(locked.progress, locked.retained, proof, req.SourceBundleID); err != nil {
+		return nil, err
+	}
+	return locked.retained, nil
+}
+
+func (s *SyncService) admitPushOperation(ctx context.Context, tx pgx.Tx, actor Actor, proof SchemaGenerationProof, req PushOutcomeResolveRequest, kind ScopeTransactionKind) (*pushOperationAdmission, error) {
+	locked, err := s.lockPushSourceOperation(ctx, tx, actor, proof, kind)
+	if err != nil {
+		return nil, err
+	}
+	userPK, state, progress, retained := locked.userPK, locked.state, locked.progress, locked.retained
 	if err := classifyPushOperation(progress, retained, proof, req); err != nil {
 		return nil, err
 	}

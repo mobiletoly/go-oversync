@@ -338,7 +338,7 @@ func (c *Client) executeBoundedRequest(ctx context.Context, operation string, re
 	} else if err := oversync.ValidateProtocolHeader(req.Header); err != nil {
 		return boundedResponsePayload{}, err
 	}
-	if strings.HasPrefix(operation, "snapshot_") || operation == "push_resolve" || operation == "push_ack" {
+	if strings.HasPrefix(operation, "snapshot_") || operation == "push_resolve" || operation == "push_retained" || operation == "push_ack" {
 		if err := c.chargeRecoveryExchange(ctx); err != nil {
 			return boundedResponsePayload{}, err
 		}

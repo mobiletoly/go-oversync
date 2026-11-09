@@ -121,6 +121,8 @@ func (f *outcomeFixture) http(t *testing.T, ctx context.Context, path string, bo
 		h.HandlePush(w, r)
 	case "/sync/push-outcomes/resolve":
 		h.HandlePushOutcomeResolve(w, r)
+	case "/sync/push-outcomes/retained":
+		h.HandlePushOutcomeRetained(w, r)
 	case "/sync/push-outcomes/ack":
 		h.HandlePushOutcomeAck(w, r)
 	default:
@@ -138,7 +140,7 @@ func (f *outcomeFixture) checkControlBoundaries(t *testing.T, ctx context.Contex
 	for _, endpoint := range []struct {
 		name    string
 		handler http.HandlerFunc
-	}{{"resolve", h.HandlePushOutcomeResolve}, {"ack", h.HandlePushOutcomeAck}} {
+	}{{"resolve", h.HandlePushOutcomeResolve}, {"retained", h.HandlePushOutcomeRetained}, {"ack", h.HandlePushOutcomeAck}} {
 		for _, tc := range []struct {
 			name, body, encoding, protocol, media string
 			status                                int
@@ -398,6 +400,68 @@ func TestPushOutcome_ResolveSerializesWithPush(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, cancelled.encoded, delayed.encoded)
 		require.EqualValues(t, 1, f.count(t, ctx, fmt.Sprintf(`SELECT count(*) FROM %s.users`, f.schemaName)))
+	})
+}
+
+// A client whose freeze commit was lost re-freezes different content under the
+// same sequence. Push and resolve keep answering push_outcome_mismatch; only the
+// owning source reads its retained evidence, read-only, and then acknowledges it.
+func TestPushOutcome_RetainedLookupAfterLostFreeze(t *testing.T) {
+	outcomeImages(t, func(t *testing.T, ctx context.Context, f *outcomeFixture) {
+		proof := testSchemaGenerationProofForService(f.svc)
+		lookup := func(actor Actor, p SchemaGenerationProof, seq int64) (*RetainedPushOutcome, error) {
+			return f.svc.FetchRetainedPushOutcome(ctx, actor, p, PushOutcomeRetainedRequest{SourceBundleID: seq})
+		}
+		_, err := lookup(f.writer, proof, 1)
+		outcomeCode(t, err, "push_outcome_absent")
+		_, err = lookup(f.writer, proof, 2)
+		outcomeCode(t, err, "source_sequence_out_of_order")
+		first := f.request(t, 1, f.userRow(uuid.New(), "lost-freeze"))
+		committed, err := f.svc.PushOneShot(ctx, f.writer, proof, first)
+		require.NoError(t, err)
+		require.Equal(t, "committed", committed.Outcome.Status)
+		refrozen := f.request(t, 1, f.userRow(uuid.New(), "lost-freeze"), f.userRow(uuid.New(), "later-edit"))
+		require.NotEqual(t, first.CanonicalRequestHash, refrozen.CanonicalRequestHash)
+		_, err = f.svc.PushOneShot(ctx, f.writer, proof, refrozen)
+		outcomeCode(t, err, "push_outcome_mismatch")
+		_, err = f.svc.ResolvePushOutcome(ctx, f.writer, proof, pushOperationRequest(refrozen))
+		outcomeCode(t, err, "push_outcome_mismatch")
+		retained, err := lookup(f.writer, proof, 1)
+		require.NoError(t, err)
+		require.Equal(t, committed.encoded, retained.encoded)
+		require.Equal(t, first.CanonicalRequestHash, retained.Outcome.CanonicalRequestHash)
+		require.EqualValues(t, 1, f.count(t, ctx, `SELECT count(*) FROM sync.push_outcomes WHERE source_id='writer'`))
+		require.Zero(t, f.count(t, ctx, `SELECT acknowledged_sequence FROM sync.push_source_progress WHERE source_id='writer'`))
+		require.EqualValues(t, 1, f.count(t, ctx, fmt.Sprintf(`SELECT count(*) FROM %s.users`, f.schemaName)))
+		_, err = lookup(f.writer, proof, 2)
+		outcomeCode(t, err, "push_outcome_pending")
+		wrong := proof
+		wrong.Fingerprint = strings.Repeat("e", 64)
+		_, err = lookup(f.writer, wrong, 1)
+		outcomeCode(t, err, "push_outcome_mismatch")
+		// Another connected source of the same scope never receives this evidence.
+		_, err = lookup(f.reader, proof, 1)
+		outcomeCode(t, err, "push_outcome_absent")
+		f.ack(t, ctx, f.writer, retained.Outcome)
+		_, err = lookup(f.writer, proof, 1)
+		outcomeCode(t, err, "push_outcome_acknowledged")
+		second, err := f.svc.PushOneShot(ctx, f.writer, proof, f.request(t, 2, f.userRow(uuid.New(), "later-edit")))
+		require.NoError(t, err)
+		require.Equal(t, "committed", second.Outcome.Status)
+		w := f.http(t, ctx, "/sync/push-outcomes/retained", PushOutcomeRetainedRequest{SourceBundleID: 2})
+		require.Equal(t, http.StatusOK, w.Code)
+		require.Equal(t, string(second.encoded), w.Body.String())
+		w = f.http(t, ctx, "/sync/push-outcomes/retained", PushOutcomeRetainedRequest{SourceBundleID: 3})
+		require.Equal(t, http.StatusConflict, w.Code)
+		require.Contains(t, w.Body.String(), "push_outcome_pending")
+		f.ack(t, ctx, f.writer, second.Outcome)
+		w = f.http(t, ctx, "/sync/push-outcomes/retained", PushOutcomeRetainedRequest{SourceBundleID: 2})
+		require.Equal(t, http.StatusGone, w.Code)
+		w = f.http(t, ctx, "/sync/push-outcomes/retained", PushOutcomeRetainedRequest{SourceBundleID: 3})
+		require.Equal(t, http.StatusConflict, w.Code)
+		require.Contains(t, w.Body.String(), "push_outcome_absent")
+		require.EqualValues(t, 2, f.count(t, ctx, `SELECT acknowledged_sequence FROM sync.push_source_progress WHERE source_id='writer'`))
+		require.EqualValues(t, 2, f.count(t, ctx, fmt.Sprintf(`SELECT count(*) FROM %s.users`, f.schemaName)))
 	})
 }
 func TestPushOutcome_AckAndSequenceFence(t *testing.T) {

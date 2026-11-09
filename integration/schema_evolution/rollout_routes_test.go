@@ -70,7 +70,7 @@ func TestMemberSyncRoutes_DispatchDiscoveryBeforeServeMuxAndGuardOtherSyncTraffi
 func TestMemberSyncRoutes_RegisterDurableOutcomeHandlers(t *testing.T) {
 	mux := http.NewServeMux()
 	registerMemberSyncRoutes(mux, &oversync.SyncService{}, LocalMemberConfig{})
-	for _, path := range []string{"/sync/push-outcomes/resolve", "/sync/push-outcomes/ack"} {
+	for _, path := range []string{"/sync/push-outcomes/resolve", "/sync/push-outcomes/retained", "/sync/push-outcomes/ack"} {
 		request := httptest.NewRequest(http.MethodPost, path, nil)
 		_, pattern := mux.Handler(request)
 		require.Equal(t, "POST "+path, pattern)

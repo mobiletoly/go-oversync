@@ -26,6 +26,9 @@ type committedPushBundle struct {
 	BundleHash           string
 	CanonicalRequestHash string
 	AlreadyCommitted     bool
+	// Retained marks a terminal outcome read by sequence after a lost local freeze.
+	// The frozen outbox rows did not produce it, so its request hash is discovered.
+	Retained bool
 }
 
 const (
@@ -261,7 +264,7 @@ func (c *Client) validateAuthoritativePushAgainstOutbox(ctx context.Context, tx 
 	if current.RowCount != committed.PlannedRowCount || current.RowCount <= 0 {
 		return nil, fmt.Errorf("committed planned_row_count does not match frozen outbox")
 	}
-	if current.CanonicalRequestHash != committed.CanonicalRequestHash {
+	if !committed.Retained && current.CanonicalRequestHash != committed.CanonicalRequestHash {
 		return nil, fmt.Errorf("committed canonical_request_hash does not match frozen outbox")
 	}
 	if committed.BundleSeq <= 0 || committed.RowCount <= 0 || committed.ByteCount <= 2 || !protocolhash.IsCanonicalHash(committed.BundleHash) {

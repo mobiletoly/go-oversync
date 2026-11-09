@@ -1875,8 +1875,16 @@ func (c *Client) Rebuild(ctx context.Context) (report RemoteSyncReport, resultEr
 	defer c.writeMu.Unlock()
 	ctx = context.WithValue(ctx, syncInvocationKey{}, &syncInvocation{})
 	defer func() { resultErr = c.withSyncErrorProgress(ctx, resultErr) }()
-	if err := requireNoUnresolvedUpload(ctx, c.db); err != nil {
+	// Only the rebuild out of source recovery may start with pending intent, which it carries onto
+	// the installed snapshot. Every other rebuild keeps the strict clean entry.
+	recovering, err := c.sourceRecoveryRequiredErrorLocked(ctx)
+	if err != nil {
 		return RemoteSyncReport{}, err
+	}
+	if recovering == nil {
+		if err := requireNoUnresolvedUpload(ctx, c.db); err != nil {
+			return RemoteSyncReport{}, err
+		}
 	}
 	if err := c.inspectSnapshotCapabilities(ctx); err != nil {
 		return RemoteSyncReport{}, err

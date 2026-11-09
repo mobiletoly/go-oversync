@@ -13,10 +13,13 @@ import (
 )
 
 type snapshotApplyOptions struct {
-	RotateSource              bool
-	NewSourceID               string
-	ReplacementReason         string
-	ClearSourceRecovery       bool
+	RotateSource        bool
+	NewSourceID         string
+	ReplacementReason   string
+	ClearSourceRecovery bool
+	// CarryPendingIntent admits pending local intent to this rotated source-recovery rebuild and
+	// moves it onto the installed snapshot. Only the explicit Rebuild sets it.
+	CarryPendingIntent        bool
 	RequireFreshRotatedSource bool
 	FinalizeRemoteReplace     bool
 	RemoteTargetUserID        string
@@ -31,6 +34,9 @@ func (c *Client) applyStagedSnapshotLocked(ctx context.Context, session *oversyn
 func (c *Client) applyStagedSnapshotLockedSlice(ctx context.Context, session *oversync.SnapshotSession, options snapshotApplyOptions) (resultErr error) {
 	ctx = withUniqueApplyContext(ctx)
 	uniqueInvocation(ctx).snapshot = true
+	if options.CarryPendingIntent {
+		ctx = withSourceRecoveryIntent(ctx)
+	}
 	guard, err := c.resolveSnapshotApplyGuardLocked(ctx, options)
 	if err != nil {
 		return err
@@ -104,6 +110,13 @@ func (c *Client) applyStagedSnapshotLockedSlice(ctx context.Context, session *ov
 	}
 	if err := c.completeSnapshotDesiredState(ctx, tx, stmtCache, session); err != nil {
 		return err
+	}
+	if options.CarryPendingIntent {
+		// The server accepted the replacement source to produce this snapshot, so pending local
+		// intent now moves onto the verified authoritative state before that source is published.
+		if err := c.carryPendingIntentOntoInstalledSnapshot(ctx, tx, stmtCache); err != nil {
+			return err
+		}
 	}
 	if err := c.completeAutomaticRecovery(ctx, tx, session.SnapshotBundleSeq); err != nil {
 		return err

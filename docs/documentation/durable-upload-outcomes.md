@@ -149,6 +149,33 @@ and policy completion. Retry requeues unsatisfied current intent for a successor
 identity. Cancellation also requeues through the existing capture owner. Neither
 status invents dirty revisions or repeats sequence consumption.
 
+A lost local freeze is recoverable rather than fatal. If the freeze commit never
+reached disk after its request was dispatched, the client re-freezes its current
+intent under the same source sequence; when the content differs the server answers
+`push_outcome_mismatch` for an outcome the source already owns. The client then reads
+that outcome with the sequence-only `POST /sync/push-outcomes/retained` lookup,
+validates source, generation, sequence and the recomputed outcome hash, and in one
+writer rebinds the journal to the retained request hash and token and stores the
+outcome. The frozen rows did not produce it, so they are requeued as dirty intent on
+their original bases. A committed outcome settles through the same final-state engine
+with no uploaded rows: committed keys with local intent are preserved as newer edits
+on the committed version (intent already equal to the committed effect is consumed),
+other committed keys apply authoritatively, and rows outside the outcome keep their
+intent. A rejected or cancelled outcome is disposed like a cancellation without
+invoking rejection policy, because its evidence binds the lost request. Ack uses the
+retained binding and the next freeze takes the following sequence. A journal that was
+rebound but not yet settled resumes from the stored outcome without another lookup.
+`push_outcome_absent` and every other nonterminal lookup answer leave the frozen
+request intact as a blocker; none proves noncommit.
+
+Recovery preserves every intent the local database still records. It cannot recover
+intent that left no durable trace after the lost commit: a row uploaded by the lost
+freeze and then deleted before it was ever known as published, or an update reverted
+to its original base value, leaves no dirty row, so the committed effect for that key
+installs as ordinary authoritative state, exactly as a remote change would. Requiring
+`synchronous=FULL` on client databases keeps this window closed in practice; the
+lookup is the safety net when a commit is lost anyway.
+
 Ack uses the original proof even after server generation retirement or rebinding.
 After a lost response, reopening retries the same ack without reapplication or a
 new freeze. Existing Detach/Uninstall guards include this durable obligation.

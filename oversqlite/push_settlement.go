@@ -36,7 +36,27 @@ func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dir
 	})
 }
 
-func (c *Client) applyStagedPushBundleLockedSlice(ctx context.Context, uploaded []dirtyRowCapture, committed *committedPushBundle, reservationBase workspaceCharge) (resultErr error) {
+// applyRetainedPushBundleLocked settles a retained outcome after a lost local freeze.
+// No frozen row produced these effects, so the frozen rows are requeued as current
+// dirty intent inside the settlement writer and preserved like newer local edits.
+func (c *Client) applyRetainedPushBundleLocked(ctx context.Context, frozen *pushOutboundSnapshot, committed *committedPushBundle) error {
+	if frozen == nil || committed == nil || !committed.Retained {
+		return fmt.Errorf("retained settlement requires the frozen rows and a retained outcome")
+	}
+	reservationBase := workspaceCharge{}
+	if scope, _ := ctx.Value(workspaceBufferKey{}).(*workspaceBufferScope); scope != nil {
+		reservationBase = scope.base
+	}
+	return c.completeWork(ctx, "push settlement", func(ctx context.Context) error {
+		return c.settleStagedPushBundleSlice(ctx, nil, committed, reservationBase, frozen)
+	})
+}
+
+func (c *Client) applyStagedPushBundleLockedSlice(ctx context.Context, uploaded []dirtyRowCapture, committed *committedPushBundle, reservationBase workspaceCharge) error {
+	return c.settleStagedPushBundleSlice(ctx, uploaded, committed, reservationBase, nil)
+}
+
+func (c *Client) settleStagedPushBundleSlice(ctx context.Context, uploaded []dirtyRowCapture, committed *committedPushBundle, reservationBase workspaceCharge, requeue *pushOutboundSnapshot) (resultErr error) {
 	if committed == nil {
 		return fmt.Errorf("committed push bundle metadata is required")
 	}
@@ -68,7 +88,13 @@ func (c *Client) applyStagedPushBundleLockedSlice(ctx context.Context, uploaded 
 	if err != nil {
 		return err
 	}
-	decisions, err := c.buildPushSettlementPlanInTx(ctx, execution, uploaded, stagedRows, effects)
+	if requeue != nil {
+		// Idempotent across work slices: an existing dirty row keeps its newer op and payload.
+		if err := c.requeueSnapshotRowsInTx(ctx, execution, requeue, nil); err != nil {
+			return err
+		}
+	}
+	decisions, err := c.buildPushSettlementPlanInTx(ctx, execution, uploaded, stagedRows, effects, committed.Retained)
 	if err != nil {
 		return err
 	}
@@ -261,7 +287,9 @@ func (c *Client) loadValidatedStagedPushEffectsInTx(ctx context.Context, tx sqli
 	return stagedRows, effects, nil
 }
 
-func (c *Client) buildPushSettlementPlanInTx(ctx context.Context, tx sqliteTransaction, uploaded []dirtyRowCapture, stagedRows []stagedPushBundleRow, effects map[string]stagedPushBundleRow) (map[string]pushSettlementDecision, error) {
+// satisfiedIntentAccepts is set only for a retained outcome that no frozen row produced:
+// local intent whose live state already equals the committed effect is satisfied by it.
+func (c *Client) buildPushSettlementPlanInTx(ctx context.Context, tx sqliteTransaction, uploaded []dirtyRowCapture, stagedRows []stagedPushBundleRow, effects map[string]stagedPushBundleRow, satisfiedIntentAccepts bool) (map[string]pushSettlementDecision, error) {
 	decisions := make(map[string]pushSettlementDecision, len(uploaded))
 	held := workspaceCharge{}
 	for _, uploadedRow := range uploaded {
@@ -313,6 +341,16 @@ func (c *Client) buildPushSettlementPlanInTx(ctx context.Context, tx sqliteTrans
 		livePayload, liveExists, err := c.serializeExistingRowInTx(ctx, tx, effect.TableName, effect.LocalPK)
 		if err != nil {
 			return nil, err
+		}
+		if satisfiedIntentAccepts {
+			satisfied, err := c.liveStateEqualsEffect(effect, livePayload, liveExists)
+			if err != nil {
+				return nil, fmt.Errorf("failed to compare local intent with retained committed effect for %s.%s %s: %w", effect.SchemaName, effect.TableName, effect.KeyJSON, err)
+			}
+			if satisfied {
+				decisions[decisionKey] = pushSettlementDecision{}
+				continue
+			}
 		}
 		decision, err := c.settlementDecisionForNewerState(effect, livePayload, liveExists)
 		if err != nil {
@@ -621,6 +659,27 @@ func (c *Client) settlementDecisionForNewerState(effect stagedPushBundleRow, liv
 		decision.requeueOp = oversync.OpDelete
 	}
 	return decision, nil
+}
+
+// liveStateEqualsEffect compares the live local row with a committed effect using the
+// same wire normalization as final authoritative-state verification.
+func (c *Client) liveStateEqualsEffect(effect stagedPushBundleRow, livePayload json.RawMessage, liveExists bool) (bool, error) {
+	targetExists := effect.Op != oversync.OpDelete
+	if liveExists != targetExists {
+		return false, nil
+	}
+	if !targetExists {
+		return true, nil
+	}
+	wirePayload, err := c.processPayloadForUpload(effect.TableName, string(livePayload))
+	if err != nil {
+		return false, err
+	}
+	normalizedTarget, err := c.normalizeWirePayloadForSQLiteRoundTrip(effect.TableName, effect.Payload.String)
+	if err != nil {
+		return false, err
+	}
+	return canonicalPayloadEqual(sql.NullString{String: string(wirePayload), Valid: true}, sql.NullString{String: string(normalizedTarget), Valid: true})
 }
 
 func (c *Client) restorePushSettlementDesiredStateInTx(ctx context.Context, execer execContexter, tx tableInfoQueryer, effect stagedPushBundleRow, decision pushSettlementDecision) error {
