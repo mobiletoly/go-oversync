@@ -387,3 +387,107 @@ func TestLostFreeze_AbsentRetainedOutcomeKeepsFrozenRequest(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT name FROM users WHERE id='item'`).Scan(&name))
 	require.Equal(t, "frozen", name)
 }
+
+// A lost freeze can leave no dirty row behind: when the application deletes the row the lost freeze
+// inserted, the next push prunes that no-op without consuming the sequence, so pull is admitted. Pull then
+// installs the source's own lost bundle C and a peer's later version of the same key. The next
+// freeze reuses C's sequence and recovers C through the retained lookup. C's effect for that key
+// is history the pulled version already superseded: settlement must neither lower the row nor
+// refuse, and the new intent must upload under the next sequence.
+func TestLostFreeze_RetainedEffectSupersededByPulledVersionSettles(t *testing.T) {
+	ctx := context.Background()
+	c, db, s := recoveryJournalClient(t)
+	exec := func(statement string) {
+		t.Helper()
+		_, err := db.Exec(statement)
+		require.NoError(t, err)
+	}
+	_, err := c.PushPending(ctx)
+	require.NoError(t, err)
+	exec(`INSERT INTO users(id,name,email) VALUES('ada','Ada','ada@example.invalid')`)
+	durableTables := captureDurableSyncState(t, db)
+	lose := true
+	c.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		response, err := s.RoundTrip(r)
+		if err == nil && lose {
+			lose = false
+			response.Body.Close()
+			return nil, errors.New("committed answer lost")
+		}
+		return response, err
+	})}
+	_, err = c.PushPending(ctx)
+	require.Error(t, err)
+	lost := s.committedBySource[2]
+	require.NotNil(t, lost)
+	require.Equal(t, "committed", s.terminalOutcomes[2].Status)
+	require.NoError(t, c.Close())
+	loseSyncCommitsSince(t, db, durableTables)
+	require.EqualValues(t, 2, countA3(t, db, `SELECT next_source_bundle_id FROM _sync_source_state`))
+
+	// The application deletes the never-published row; the pruned no-op leaves nothing dirty and the
+	// sequence unused.
+	exec(`DELETE FROM users WHERE id='ada'`)
+	peerRow := oversync.BundleRow{Schema: "main", Table: "users", Key: mustBundleKey("ada"), Op: oversync.OpUpdate, RowVersion: 3, Payload: mustBundlePayload(t, "ada", "peer edit", "ada@example.invalid")}
+	peer := pullBundle(3, "peer-source", 1, peerRow)
+	s.nextBundleSeq = 4
+	own := pullBundle(lost.BundleSeq, lost.SourceID, lost.SourceBundleID, lost.Rows...)
+	var pulls []string
+	reopened, err := newAdmittedFixtureClient(db, c.BaseURL, c.Token, c.config)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	attachTestClient(t, reopened, c.UserID, "bundle-device")
+	reopened.HTTP = &http.Client{Transport: rawRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/sync/pull" {
+			return s.RoundTrip(r)
+		}
+		after := r.URL.Query().Get("after_bundle_seq")
+		pulls = append(pulls, after)
+		if after == "1" {
+			return jsonResponse(oversync.PullResponse{StableBundleSeq: 3, Bundles: []oversync.Bundle{own, peer}}), nil
+		}
+		return jsonResponse(oversync.PullResponse{StableBundleSeq: 3}), nil
+	})}
+	pushes := len(s.pushRequests)
+	report, err := reopened.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, PushOutcomeNoChange, report.Outcome)
+	require.Len(t, s.pushRequests, pushes, "a pruned no-op dispatches nothing")
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`))
+	_, err = reopened.PullToStable(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"1"}, pulls[:1])
+	require.EqualValues(t, 3, countA3(t, db, `SELECT row_version FROM _sync_row_state WHERE key_json='{"id":"ada"}'`))
+	require.Equal(t, "peer edit", baselineText(t, db, `SELECT name FROM users WHERE id='ada'`))
+
+	// New intent reuses the lost sequence, so the server answers with a mismatch.
+	exec(`INSERT INTO users(id,name,email) VALUES('bob','Bob','bob@example.invalid')`)
+	// A higher version is history only once pull has passed C; before that it is an integrity failure.
+	exec(`UPDATE _sync_attachment_state SET last_bundle_seq_seen=1`)
+	_, err = reopened.PushPending(ctx)
+	require.ErrorContains(t, err, "would lower row version from 3 to 2")
+	require.EqualValues(t, 3, countA3(t, db, `SELECT row_version FROM _sync_row_state WHERE key_json='{"id":"ada"}'`))
+	exec(`UPDATE _sync_attachment_state SET last_bundle_seq_seen=3`)
+	report, err = reopened.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, PushOutcomeCommitted, report.Outcome)
+	require.Equal(t, []oversync.PushOutcomeRetainedRequest{{SourceBundleID: 2}}, s.retainedRequests)
+	require.EqualValues(t, 2, s.ackRequests[len(s.ackRequests)-1].SourceBundleID)
+	require.Equal(t, s.terminalOutcomes[2].CanonicalRequestHash, s.ackRequests[len(s.ackRequests)-1].CanonicalRequestHash)
+	require.EqualValues(t, 3, countA3(t, db, `SELECT next_source_bundle_id FROM _sync_source_state`))
+	// The superseded effect changed nothing: the pulled version and value stay authoritative.
+	require.EqualValues(t, 3, countA3(t, db, `SELECT row_version FROM _sync_row_state WHERE key_json='{"id":"ada"}'`))
+	require.Equal(t, "peer edit", baselineText(t, db, `SELECT name FROM users WHERE id='ada'`))
+	require.Equal(t, []string{"users/bob/INSERT/0"}, pendingIntentForTest(t, db))
+
+	_, err = reopened.PushPending(ctx)
+	require.NoError(t, err)
+	require.Len(t, s.pushRequests, pushes+2)
+	require.EqualValues(t, 3, s.pushRequests[pushes+1].SourceBundleID)
+	require.Equal(t, []string{"users:INSERT:bob:0"}, pushedRowIdentities(t, reopened, s.pushRequests[pushes+1]))
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`))
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_outbox_rows`))
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_upload_journal`))
+	require.EqualValues(t, 4, countA3(t, db, `SELECT next_source_bundle_id FROM _sync_source_state`))
+	require.Equal(t, "peer edit", baselineText(t, db, `SELECT name FROM users WHERE id='ada'`))
+}

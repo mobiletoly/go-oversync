@@ -242,11 +242,31 @@ func (c *Client) requireCarriedIntentForeignKeys(ctx context.Context, tx sqliteT
 	return &PendingIntentUnsatisfiableError{Tables: violating}
 }
 
-// releaseRetiredSourceUploadInTx releases the frozen request, its journal and any acknowledgment
-// obligation bound to a source the server has replaced. Replacement is admitted only while that source
-// holds no unacknowledged outcome, so none of them can be needed again.
+// requireNoRebuildBlockingDecision refuses a rebuild while an explicit decision is pending. The rebuild
+// out of source recovery admits a retained application rejection: the rejected request's intent is
+// pending intent that the carry requeues, and the carry releases the rejection with that request. A
+// deferred row conflict still blocks every rebuild before any network request.
+func (c *Client) requireNoRebuildBlockingDecision(ctx context.Context, q queryRower, carriesIntent bool) error {
+	if !carriesIntent {
+		return c.requireNoPendingConflict(ctx, q)
+	}
+	pending, err := readPendingConflict(ctx, q)
+	if err != nil {
+		return err
+	}
+	if pending != nil {
+		return &ConflictNeedsResolutionError{Pending: *pending}
+	}
+	return nil
+}
+
+// releaseRetiredSourceUploadInTx releases the frozen request, its journal, any acknowledgment
+// obligation and any retained application rejection bound to a source the server has replaced.
+// Replacement is admitted only while that source holds no unacknowledged outcome, so none of them can
+// be needed again. The rejection selected only that request: its intent is requeued or discarded by the
+// caller, and a stale edit is refused again under the replacement source as an ordinary conflict.
 func releaseRetiredSourceUploadInTx(ctx context.Context, tx sqliteTransaction) error {
-	for _, statement := range []string{`DELETE FROM _sync_upload_journal WHERE singleton_key=1`, `DELETE FROM _sync_outbox_rows`, `DELETE FROM _sync_push_stage`} {
+	for _, statement := range []string{`DELETE FROM _sync_upload_journal WHERE singleton_key=1`, `DELETE FROM _sync_outbox_rows`, `DELETE FROM _sync_push_stage`, `UPDATE _sync_push_rejection_state SET pending='' WHERE singleton_key=1`} {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("failed to release retired source upload: %w", err)
 		}
@@ -350,11 +370,8 @@ func (c *Client) DiscardPendingIntentForRecovery(ctx context.Context) (result Di
 	if err := releaseRetiredSourceUploadInTx(ctx, tx); err != nil {
 		return DiscardedPendingIntent{}, err
 	}
-	// The dropped request was the subject of any retained conflict or rejection observation.
+	// The dropped request was the subject of any retained conflict observation.
 	if _, err := tx.ExecContext(ctx, `UPDATE _sync_conflict_state SET pending='' WHERE singleton_key=1`); err != nil {
-		return DiscardedPendingIntent{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE _sync_push_rejection_state SET pending='' WHERE singleton_key=1`); err != nil {
 		return DiscardedPendingIntent{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

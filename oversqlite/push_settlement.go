@@ -274,17 +274,49 @@ func (c *Client) loadValidatedStagedPushEffectsInTx(ctx context.Context, tx sqli
 		return nil, nil, err
 	}
 	effects := make(map[string]stagedPushBundleRow, len(stagedRows))
+	current := make([]stagedPushBundleRow, 0, len(stagedRows))
+	supersessionAllowed := (*bool)(nil)
 	for _, effect := range stagedRows {
-		effects[pushSettlementKey(effect.SchemaName, effect.TableName, effect.KeyJSON)] = effect
 		currentState, err := c.loadStructuredRowStateInTx(ctx, tx, effect.SchemaName, effect.TableName, effect.KeyJSON)
 		if err != nil {
 			return nil, nil, err
 		}
 		if currentState.Exists && currentState.RowVersion > effect.RowVersion {
-			return nil, nil, fmt.Errorf("committed effect for %s.%s would lower row version from %d to %d", effect.SchemaName, effect.TableName, currentState.RowVersion, effect.RowVersion)
+			if supersessionAllowed == nil {
+				allowed, err := retainedEffectsMayBeSuperseded(ctx, tx, committed)
+				if err != nil {
+					return nil, nil, err
+				}
+				supersessionAllowed = &allowed
+			}
+			if !*supersessionAllowed {
+				return nil, nil, fmt.Errorf("committed effect for %s.%s would lower row version from %d to %d", effect.SchemaName, effect.TableName, currentState.RowVersion, effect.RowVersion)
+			}
+			// Already replaced by a later authoritative version: nothing of it remains to apply.
+			continue
 		}
+		effects[pushSettlementKey(effect.SchemaName, effect.TableName, effect.KeyJSON)] = effect
+		current = append(current, effect)
 	}
-	return stagedRows, effects, nil
+	return current, effects, nil
+}
+
+// retainedEffectsMayBeSuperseded reports whether a committed effect older than the key's current
+// authoritative version is history rather than corruption. Only a retained outcome recovered after
+// a lost local freeze qualifies, and only once the pull checkpoint has passed its bundle: pull then
+// installed C itself and every later committed version, so a higher version for one of C's keys is
+// a later server state that replaced C's effect. Any local intent for that key was written after
+// that pull and is already based on the higher version. An ordinary settlement never pulls between
+// freeze and settle, so a higher version there stays an integrity failure.
+func retainedEffectsMayBeSuperseded(ctx context.Context, tx sqliteTransaction, committed *committedPushBundle) (bool, error) {
+	if !committed.Retained {
+		return false, nil
+	}
+	attachment, err := loadAttachmentState(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	return attachment.LastBundleSeqSeen >= committed.BundleSeq, nil
 }
 
 // satisfiedIntentAccepts is set only for a retained outcome that no frozen row produced:

@@ -155,6 +155,66 @@ func TestSourceRecoveryIntent_FrozenUnsentUploadAndLaterEditsCarryToReplacementS
 	require.Equal(t, map[string]string{"synced": oversync.OpUpdate, "created": oversync.OpInsert, "later": oversync.OpInsert}, uploaded)
 }
 
+// A retained application rejection describes the retired source's request, which the carry releases
+// after requeueing its intent. The rejection goes with it, so the carried edit uploads under the
+// replacement source instead of waiting on a resolution that can no longer select anything.
+func TestSourceRecoveryIntent_RetainedRejectionIsReleasedWithTheCarriedRequest(t *testing.T) {
+	ctx := context.Background()
+	c, db := newUsersBundleClient(t)
+	c.config.RetryPolicy = &RetryPolicy{MaxAttempts: 1}
+	server := newMockPushServer(t)
+	c.HTTP = &http.Client{Transport: server}
+	_, err := db.Exec(`INSERT INTO users VALUES('synced','Synced','synced@example.com')`)
+	require.NoError(t, err)
+	_, err = c.PushPending(ctx)
+	require.NoError(t, err)
+	oldSource := c.sourceID
+
+	// The server rejects the next upload; the rejection is retained for an explicit decision.
+	_, err = db.Exec(`UPDATE users SET name='Rejected offline' WHERE id='synced'`)
+	require.NoError(t, err)
+	server.pushHook = func(*mockDirectPush) *http.Response {
+		return errorJSONResponse(http.StatusUnprocessableEntity, map[string]string{
+			"error": "transition_input_invalid", "message": "input cannot be converted",
+		})
+	}
+	var needsResolution *PushRejectionNeedsResolutionError
+	_, err = c.PushPending(ctx)
+	require.ErrorAs(t, err, &needsResolution)
+	pending, err := c.PendingPushRejection(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+
+	// The server then retires the source, and rebuild carries the rejected request's intent.
+	markSourceRecoveryForTest(t, db, SourceRecoveryRetired, "replacement-source")
+	replacement := newMockPushServer(t)
+	replacement.nextBundleSeq = 3
+	transport := &recoveryExitTransport{
+		t: t, client: c, oldSource: oldSource, newSource: "replacement-source", boundary: 1, replacement: replacement,
+		rows: []oversync.SnapshotRow{{Schema: "main", Table: "users", Key: oversync.SyncKey{"id": "synced"}, RowVersion: 1,
+			Payload: mustJSONPayload(t, map[string]any{"id": "synced", "name": "Synced", "email": "synced@example.com"})}},
+	}
+	c.HTTP = &http.Client{Transport: roundTripFunc(transport.roundTrip)}
+	_, err = c.Rebuild(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "replacement-source", c.sourceID)
+	require.Equal(t, []string{"users/synced/UPDATE/1"}, pendingIntentForTest(t, db))
+	require.Equal(t, "Rejected offline", baselineText(t, db, `SELECT name FROM users WHERE id='synced'`))
+	released, err := c.PendingPushRejection(ctx)
+	require.NoError(t, err)
+	require.Nil(t, released, "the carry releases the rejection together with the request it described")
+	var stale *StalePushRejectionResolutionError
+	require.ErrorAs(t, c.RetryPushRejection(ctx, *pending), &stale)
+
+	_, err = c.PushPending(ctx)
+	require.NoError(t, err)
+	require.Len(t, replacement.pushRequests, 1)
+	require.EqualValues(t, 1, replacement.pushRequests[0].SourceBundleID)
+	require.Equal(t, []string{"users:UPDATE:synced:1"}, pushedRowIdentities(t, c, replacement.pushRequests[0]))
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_dirty_rows`))
+	require.Zero(t, countA3(t, db, `SELECT count(*) FROM _sync_outbox_rows`))
+}
+
 func TestSourceRecoveryIntent_UnsatisfiableEditBlocksRebuildUntilExplicitDiscard(t *testing.T) {
 	ctx := context.Background()
 	c, db := newBundleClient(t, "main", []SyncTable{{TableName: "nodes", SyncKeyColumnName: "id"}},

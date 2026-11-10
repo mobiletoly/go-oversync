@@ -1889,7 +1889,7 @@ func (c *Client) Rebuild(ctx context.Context) (report RemoteSyncReport, resultEr
 	if err := c.inspectSnapshotCapabilities(ctx); err != nil {
 		return RemoteSyncReport{}, err
 	}
-	if err := c.requireNoPendingConflict(ctx, c.db); err != nil {
+	if err := c.requireNoRebuildBlockingDecision(ctx, c.db, recovering != nil); err != nil {
 		return RemoteSyncReport{}, err
 	}
 	if err := c.ensureConnectedSessionLocked(ctx, "Rebuild()"); err != nil {
