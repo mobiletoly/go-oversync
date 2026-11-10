@@ -374,14 +374,13 @@ func TestBootstrap_FreshLayoutSelfValidates(t *testing.T) {
 	require.Equal(t, 1, catalogCount)
 }
 
-func TestBootstrap_ManagedLayoutSupportedPostgresVersions(t *testing.T) {
+func TestBootstrap_ManagedLayoutPostgres17(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		image string
 		major int
 	}{
-		{image: managedIntegrationPostgresImage, major: 16},
-		{image: "postgres:17.10", major: 17},
+		{image: managedIntegrationPostgresImage, major: 17},
 	}
 	for _, test := range tests {
 		t.Run(strings.ReplaceAll(test.image, ":", "_"), func(t *testing.T) {

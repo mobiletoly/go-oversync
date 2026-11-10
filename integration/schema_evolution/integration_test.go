@@ -47,9 +47,9 @@ func fixtureDSN(t *testing.T) string {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		out, err := exec.CommandContext(ctx, "docker", "run", "--detach", "--rm", "--publish", "127.0.0.1::5432", "--env", "POSTGRES_PASSWORD=postgres", "postgres:"+fixturePostgresMajor(t)).CombinedOutput()
+		out, err := exec.CommandContext(ctx, "docker", "run", "--detach", "--rm", "--publish", "127.0.0.1::5432", "--env", "POSTGRES_PASSWORD=postgres", "postgres:17.11").CombinedOutput()
 		if err != nil {
-			fixtureServer.err = fmt.Errorf("postgres16: %w: %s", err, out)
+			fixtureServer.err = fmt.Errorf("postgres17: %w: %s", err, out)
 			return
 		}
 		fixtureServer.container = strings.TrimSpace(string(out))
@@ -307,10 +307,5 @@ func fixturePrepareNext(t *testing.T, w *Worker) *BatchDescriptor {
 
 func fixturePostgresMajor(t *testing.T) string {
 	t.Helper()
-	major := os.Getenv("ROLLOUT_PG_MAJOR")
-	if major == "" {
-		return "16"
-	}
-	require.Contains(t, []string{"16", "17"}, major)
-	return major
+	return "17"
 }

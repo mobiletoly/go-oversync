@@ -479,11 +479,7 @@ func TestMobileFlow_RolloutRetiredRestartHelper(t *testing.T) {
 
 func mobileQualificationMajor(t *testing.T) int {
 	t.Helper()
-	if os.Getenv("ROLLOUT_PG_MAJOR") == "17" {
-		return 17
-	}
-	require.True(t, os.Getenv("ROLLOUT_PG_MAJOR") == "" || os.Getenv("ROLLOUT_PG_MAJOR") == "16")
-	return 16
+	return 17
 }
 
 func mobileEmptyRetirementDevice(t *testing.T, s mobileRolloutState) (*versionedApplication, error) {

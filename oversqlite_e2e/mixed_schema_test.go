@@ -209,7 +209,7 @@ func newMixedFixture(t *testing.T, seed bool) *mixedFixture {
 	opCtx, cancel := mixedOperationContext(ctx)
 	require.NoError(t, s.Pool.QueryRow(opCtx, `SELECT current_setting('server_version_num')::int/10000,current_setting('fsync'),current_setting('synchronous_commit'),current_setting('full_page_writes')`).Scan(&major, &fsync, &syncCommit, &full))
 	cancel()
-	require.Equal(t, os.Getenv("MIXED_GENERATION_PG_MAJOR"), fmt.Sprint(major))
+	require.Equal(t, 17, major)
 	require.Equal(t, "on", fsync)
 	require.Equal(t, "on", syncCommit)
 	require.Equal(t, "on", full)

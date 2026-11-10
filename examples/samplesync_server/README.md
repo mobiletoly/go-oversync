@@ -39,7 +39,7 @@ scope-inclusive foreign keys. The synced table set is FK-closed.
 Run locally
 
 1. Start PostgreSQL:
-   `docker run --rm -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=samplesync -p 5432:5432 postgres:16`
+   `docker run --rm -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=samplesync -p 5432:5432 postgres:17.11`
 2. Set environment variables and start the server:
    `DATABASE_URL="postgres://postgres:postgres@localhost:5432/samplesync?sslmode=disable" JWT_SECRET="dev-secret" go run ./examples/samplesync_server`
 

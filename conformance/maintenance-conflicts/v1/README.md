@@ -20,7 +20,7 @@ triggers leave the transaction unchanged. Do not map a maintenance response to
 success or automatically reset, replace a source, migrate, or overwrite a file.
 
 Run `python3 scripts/check-maintenance-conformance.py --execute` from the Go
-repository. Go 1.25.12 and PostgreSQL 16 are required; use isolated database
+repository. Go 1.25.12 and PostgreSQL 17 are required; use isolated database
 fixtures. The runner checks artifact hashes and requires an actual PASS event
 for every mapped test. The two parameterized client tests consume this corpus.
 Other mapped tests exercise process death, real HTTP, PostgreSQL, same-file

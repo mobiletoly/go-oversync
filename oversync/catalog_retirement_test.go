@@ -7,7 +7,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -33,19 +32,9 @@ func (a testCatalogRetirementAuthority) AuthorizeCatalogRetirement(ctx context.C
 func TestCatalogRetirement_MultipleTablesPartitionsAndAtomicFailure(t *testing.T) {
 	ctx := context.Background()
 	pool := newIntegrationTestPool(t, ctx)
-	if os.Getenv("ROLLOUT_PG_MAJOR") == "17" {
-		server, err := startManagedIntegrationPostgres("postgres:17")
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, server.close()) })
-		pool = newIntegrationTestPoolForServer(t, ctx, server)
-	}
 	var major int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT current_setting('server_version_num')::int/10000`).Scan(&major))
-	expectedMajor := 16
-	if os.Getenv("ROLLOUT_PG_MAJOR") == "17" {
-		expectedMajor = 17
-	}
-	require.Equal(t, expectedMajor, major)
+	require.Equal(t, 17, major)
 	schema := "retire_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	ident := pgx.Identifier{schema}.Sanitize()
 	_, err := pool.Exec(ctx, `CREATE SCHEMA `+ident+`;CREATE TABLE `+ident+`.users(_sync_scope_id text NOT NULL,id uuid NOT NULL,name text NOT NULL,email text NOT NULL,PRIMARY KEY(_sync_scope_id,id));

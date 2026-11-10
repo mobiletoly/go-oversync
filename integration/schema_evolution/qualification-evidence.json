@@ -1,7 +1,7 @@
 {
   "status": "revision 9 seven review corrections; focused proof complete; full frozen qualification tracked in .artifacts/transition/revision9/validation-ledger.md; independent review and owner acceptance pending",
   "toolchain": "go1.25.12",
-  "database": "PostgreSQL 16; isolated databases",
+  "database": "PostgreSQL 17; isolated databases",
   "executions": [
     {
       "lane": "focused-final",

@@ -109,7 +109,7 @@ retention and lifecycle admission. It does not introduce a parallel application
 engine. Nine `TestPushOutcome_` families exercise atomic publication, rejection
 rollback, both race orders, sequence/ack fences, pruning/restart, lifecycle
 binding, bounded retention/storage failure, killed independent service processes
-and unrelated-scope progress on PostgreSQL 16 and 17.10. Native reports and the
+and unrelated-scope progress on PostgreSQL 17.11. Native reports and the
 current C02 ledger determine which lanes actually ran; test existence alone does
 not establish qualification. Snapshot installation, mapped synthetic activity runtime
 acceptance and the full platform/final matrix remain later phases.

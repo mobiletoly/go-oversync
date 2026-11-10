@@ -49,16 +49,14 @@ This repository currently requires:
 - language and consumer minimum: Go 1.25.0;
 - reproducible development, validation, benchmark, and memory-evidence
   toolchain: Go 1.25.12;
-- PostgreSQL 17.10 for the pinned normative database-backed assurance lanes;
-- PostgreSQL 16.x for the managed-layout compatibility lane; and
+- PostgreSQL 17.11 for every database-backed assurance lane; and
 - Docker for testcontainers and restart/crash tests.
 
 Go 1.26 results in the historical audit remain historical only. They are not a
 substitute for the normative Go 1.25.12 lane.
 
-The public server supports PostgreSQL 16.x and 17.x. The focused managed-layout
-matrix validates the current `postgres:16` image and pinned PostgreSQL 17.10;
-the broader database-backed assurance suite remains pinned to PostgreSQL 17.10.
+The public server requires PostgreSQL 17. All database-backed assurance lanes,
+including managed-layout validation, are pinned to PostgreSQL 17.11.
 
 ## Durable invariants
 

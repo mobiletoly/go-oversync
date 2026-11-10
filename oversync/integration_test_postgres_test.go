@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	managedIntegrationPostgresImage        = "postgres:16"
+	managedIntegrationPostgresImage        = "postgres:17.11"
 	managedIntegrationPostgresPassword     = "oversync_test_password"
 	managedIntegrationPostgresTestLabel    = "com.mobiletoly.go-oversync.test=true"
 	managedIntegrationPostgresTestRunLabel = "com.mobiletoly.go-oversync.test-run"

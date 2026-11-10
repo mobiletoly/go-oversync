@@ -230,9 +230,8 @@ there is no runtime reset endpoint or TRUNCATE-based reset.
 
 ## Managed `sync` layout validation
 
-Oversync supports PostgreSQL 16.x and 17.x. The maintained compatibility lane uses the current
-`postgres:16` image, while PostgreSQL 17.10 remains the pinned normative database-backed assurance
-lane.
+Oversync requires PostgreSQL 17. The database-backed test and assurance lanes are pinned to
+`postgres:17.11`.
 
 The entire PostgreSQL `sync` schema is reserved and server-managed. Do not add operator tables,
 views, sequences, functions, rules, indexes, constraints, columns, or non-internal triggers there.

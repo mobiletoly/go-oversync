@@ -34,6 +34,6 @@ python3 -m unittest discover -s scripts -p 'test_check_rollout_retirement_confor
 python3 scripts/check-rollout-retirement-conformance.py --execute
 ```
 
-Execution requires PostgreSQL 16 through `TEST_DATABASE_URL` for the nested mobile
-module. PostgreSQL 17 equivalence is a separate explicitly selected lane. See the
+Execution requires PostgreSQL 17 through `TEST_DATABASE_URL` for the nested mobile
+module. See the
 application rollout documentation and qualification ledger for commands and limits.

@@ -16,7 +16,7 @@ func TestReadiness_ConcurrentIndexSnapshotOverlap(t *testing.T) {
 	pool := newIntegrationTestPool(t, ctx)
 	var major int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT current_setting('server_version_num')::integer/10000`).Scan(&major))
-	require.Equal(t, 16, major, "transition lock qualification requires PostgreSQL 16")
+	require.Equal(t, 17, major, "transition lock qualification requires PostgreSQL 17")
 	_, err := pool.Exec(ctx, `CREATE SCHEMA readiness_index; CREATE TABLE readiness_index.people(_sync_scope_id text NOT NULL,id uuid NOT NULL,name text NOT NULL,PRIMARY KEY(_sync_scope_id,id))`)
 	require.NoError(t, err)
 	tables := []RegisteredTable{{Schema: "readiness_index", Table: "people", SyncKeyColumns: []string{"id"}}}

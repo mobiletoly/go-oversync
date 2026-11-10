@@ -35,7 +35,7 @@ cleanup tests preserve source/history/receipt evidence across expiry, rollback a
 `manifest.json` maps every case to named executable Go tests and binds the artifacts.
 Run `python3 scripts/check-table-evolution-conformance.py` to check the manifest; add
 `--execute` to run each mapped test once. Execution uses Go 1.25.12 and requires Docker
-for the application lane and an isolated PostgreSQL 16 `TEST_DATABASE_URL` for mobile.
+for the application lane and an isolated PostgreSQL 17 `TEST_DATABASE_URL` for mobile.
 This corpus defines runtime-neutral outcomes; SQLiteNow execution is pending,
 and cross-runtime parity qualification is pending.
 

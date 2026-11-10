@@ -129,8 +129,8 @@ def identity():
 
 def run(extra):
     m = manifest()
-    if not os.environ.get('TEST_DATABASE_URL') or os.environ.get('M0011_PG_MAJOR') not in ('16', '17'):
-        raise ValueError('explicit run-owned TEST_DATABASE_URL and M0011_PG_MAJOR=16/17 required')
+    if not os.environ.get('TEST_DATABASE_URL') or os.environ.get('M0011_PG_MAJOR') != '17':
+        raise ValueError('explicit run-owned TEST_DATABASE_URL and M0011_PG_MAJOR=17 required')
     started = time.monotonic()
     output = Path(os.environ.get('M0011_REPORT_DIR', '/tmp/m0011-' + str(time.time_ns())))
     output.mkdir(parents=True, exist_ok=False)

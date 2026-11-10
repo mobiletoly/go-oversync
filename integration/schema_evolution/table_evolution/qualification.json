@@ -1,7 +1,7 @@
 {
   "status": "bounded validation qualification passed; final frozen lanes recorded in revision4; owner requested no further independent reviews",
   "toolchain": "go1.25.12",
-  "database": "PostgreSQL 16, isolated databases",
+  "database": "PostgreSQL 17, isolated databases",
   "executions": [
     {
       "log": ".artifacts/table_evolution/revision4/focused-example-final.log",

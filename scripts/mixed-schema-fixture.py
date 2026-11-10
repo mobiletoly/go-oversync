@@ -19,8 +19,8 @@ def docker(*args, timeout=30):
 
 
 def run(major, lane, extra_args=()):
-    if major not in ('16', '17') or lane not in ('coexistence', 'fast', 'package', 'full', 'audit', 'mobile', 'vet'):
-        raise ValueError('usage: mixed-schema-fixture.py {16|17} {coexistence|fast|package|full|audit|mobile|vet}')
+    if major != '17' or lane not in ('coexistence', 'fast', 'package', 'full', 'audit', 'mobile', 'vet'):
+        raise ValueError('usage: mixed-schema-fixture.py 17 {coexistence|fast|package|full|audit|mobile|vet}')
     root = Path(__file__).resolve().parents[1]
     run_id = 'm0011-' + secrets.token_hex(8)
     volume = run_id + '-data'
@@ -40,7 +40,7 @@ def run(major, lane, extra_args=()):
         docker('volume', 'create', '--label', 'com.mobiletoly.go-oversync.test-run=' + run_id, volume)
         created_volume = True
         docker('run', '-d', '--name', run_id, '--label', 'com.mobiletoly.go-oversync.test-run=' + run_id,
-               '-e', 'POSTGRES_PASSWORD=' + password, '-p', '127.0.0.1::5432', '-v', volume + ':/var/lib/postgresql/data', 'postgres:' + major)
+               '-e', 'POSTGRES_PASSWORD=' + password, '-p', '127.0.0.1::5432', '-v', volume + ':/var/lib/postgresql/data', 'postgres:17.11')
         created_container = True
         deadline = time.monotonic() + 30
         while True:
@@ -58,7 +58,7 @@ def run(major, lane, extra_args=()):
         metadata['settings'] = settings
         env = dict(os.environ, TEST_DATABASE_URL=f'postgres://postgres:{password}@127.0.0.1:{port}/postgres?sslmode=disable',
                    GOTOOLCHAIN='go1.25.12', OVERSYNC_TEST_DOCKER_VOLUME='1', OVERSYNC_TEST_ISOLATE_DATABASES='1', OVERSYNC_TEST_RUN_ID=run_id,
-                   M0011_PG_MAJOR=major, ROLLOUT_PG_MAJOR=major, M0011_REPORT_DIR=str(report))
+                   M0011_PG_MAJOR=major, M0011_REPORT_DIR=str(report))
         command = ['scripts/test-lane.sh', lane]
         if lane not in ('coexistence', 'vet'):
             command.append('-json')

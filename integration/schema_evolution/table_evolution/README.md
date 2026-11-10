@@ -117,7 +117,7 @@ GOTOOLCHAIN=go1.25.12 go test ./oversqlite -run '^TestTableEvolution_' -count=1
 ```
 
 The nested `integration/mobile_flow` module's `TestMobileFlow_TableEvolutionAddRemoveFKSameFile`
-uses a real PostgreSQL 16 instance selected by `TEST_DATABASE_URL`, isolated databases,
+uses a real PostgreSQL 17 instance selected by `TEST_DATABASE_URL`, isolated databases,
 HTTP, two Go clients, disconnected staging, conflict resolution, and child processes
 killed during local migration and snapshot staging. It also covers a dirty delete and
 newer intent on the removed table. The portable cases live in

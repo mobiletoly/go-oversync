@@ -50,8 +50,8 @@ scenarios. The [runner](../../scripts/mixed-schema.py) enforces completeness.
 
 ## CI
 
-The [workflow](../../.github/workflows/mixed-schema.yml) runs PostgreSQL 16 and 17,
-the separate regression lanes, and checker tests on pull requests and main pushes.
+The [workflow](../../.github/workflows/mixed-schema.yml) runs the coexistence and
+regression lanes on PostgreSQL 17.11, and checker tests on pull requests and main pushes.
 It retains diagnostic artifacts for 14 days.
 
 Configure branch protection to require **mixed-schema-required**. This aggregate

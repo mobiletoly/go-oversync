@@ -47,7 +47,7 @@ func outcomeService(t *testing.T, ctx context.Context, pool *pgxpool.Pool, cfg *
 }
 func outcomeImages(t *testing.T, run func(*testing.T, context.Context, *outcomeFixture)) {
 	t.Helper()
-	for _, image := range []struct{ name, tag string }{{"pg16", "postgres:16"}, {"pg17_10", "postgres:17.10"}} {
+	for _, image := range []struct{ name, tag string }{{"pg17", managedIntegrationPostgresImage}} {
 		t.Run(image.name, func(t *testing.T) {
 			server, err := startManagedIntegrationPostgres(image.tag)
 			require.NoError(t, err)

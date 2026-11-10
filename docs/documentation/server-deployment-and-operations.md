@@ -440,7 +440,7 @@ reserved `sync` schema while any server or client uses the database.
 
 ## Pre-Production Checklist
 
-- [ ] PostgreSQL runs a supported 16.x or 17.x release and has a tested backup and restore path.
+- [ ] PostgreSQL runs a 17.x release and has a tested backup and restore path.
 - [ ] Every registered table passes bootstrap validation on a staging copy of the production
   schema.
 - [ ] All instances use the same registered tables, one-or-two-generation registry, catalog

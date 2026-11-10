@@ -88,7 +88,7 @@ func expectedMechanisms(through int64, phase string) []oversync.MechanismIdentit
 		oversync.MechanismIdentity{Kind: "trigger", Identity: "main.upgrade_people.zz_app_person_transition", Definition: "23|O|app_evolution.transition_person()|" + hex.EncodeToString(append([]byte(phase), 0)) + "|0||"},
 	)
 	if through == 4 {
-		// pg_get_constraintdef's exact PostgreSQL 16 rendering is checked below.
+		// pg_get_constraintdef's exact PostgreSQL 17 rendering is checked below.
 		result = append(result, oversync.MechanismIdentity{Kind: "constraint", Identity: "main.upgrade_people.person_encoding", Definition: encodingConstraintDefinition + "|true"})
 	}
 	return result

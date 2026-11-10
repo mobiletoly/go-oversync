@@ -78,8 +78,7 @@ production latency or memory SLA.
 
 Run the nine expensive rollout application scenarios explicitly with
 `ROLLOUT_QUALIFY=1 go test ./integration/schema_evolution -run '^TestRollout(Ledger_|Report_|Policy_|Cleanup_|Controller_|Fleet_|Column_|Tables_|Recovery_)' -v -count=1 -timeout 570s`
-under the 600-second wrapper and `GOTOOLCHAIN=go1.25.12`. Set `ROLLOUT_PG_MAJOR=17`
-for the declared equivalence subset. Ordinary aggregates report these cases as skipped;
+under the 600-second wrapper and `GOTOOLCHAIN=go1.25.12` on PostgreSQL 17. Ordinary aggregates report these cases as skipped;
 the qualification lane must show PASS for all nine, with zero skipped selected cases.
 The separate scale selector is `ROLLOUT_SCALE=1` and keeps its own 600-second budget.
 

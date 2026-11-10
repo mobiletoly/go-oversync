@@ -209,8 +209,8 @@ func TestGenerationWire_HTTPRejectsMalformedCompactKeysBeforePush(t *testing.T) 
 	}
 }
 
-func TestGenerationWire_WideJSONTablesAcrossSupportedPostgresVersions(t *testing.T) {
-	for _, image := range []string{"postgres:16", "postgres:17.10"} {
+func TestGenerationWire_WideJSONTablesOnPostgres17(t *testing.T) {
+	for _, image := range []string{managedIntegrationPostgresImage} {
 		t.Run(image, func(t *testing.T) {
 			server, err := startManagedIntegrationPostgres(image)
 			require.NoError(t, err)

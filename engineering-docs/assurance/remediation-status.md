@@ -112,9 +112,8 @@ the replacement; they do not expose a partially applied snapshot.
    strong permanent regression before changing status.
 4. Review wire, persisted-state, generated-client, and operator compatibility
    explicitly for every closeout.
-5. Use Go 1.25.12 for normative Go validation, PostgreSQL 17.10 for the pinned
-   database-backed assurance lane, and the current PostgreSQL 16 image for
-   managed-layout compatibility evidence.
+5. Use Go 1.25.12 for normative Go validation, and PostgreSQL 17.11 for every
+   database-backed assurance lane.
 6. Keep heavy memory, scale, concurrency, and real-server matrices local-only;
    keep deterministic fail-closed guards in normal CI.
 7. Update this register only after the focused implementation, validation,
