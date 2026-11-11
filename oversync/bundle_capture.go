@@ -552,6 +552,13 @@ func (s *SyncService) finalizeCapturedBundleWithLimit(ctx context.Context, tx pg
 // capturedFinalStateSQL uses capture only to identify touched keys and their
 // stable first-touch order. AFTER-trigger callbacks may arrive out of mutation
 // order, so the business row, not the last callback's NEW image, is authority.
+//
+// sync.user_state.user_id is COLLATE "C". The scope subquery returns it under
+// the default collation so the comparison adopts the business column's own
+// collation and can use the (_sync_scope_id, key) primary key. Without that,
+// the "C" collation wins, the scope predicate becomes a per-row filter, and
+// each touched row walks the whole index. Registered scope columns must use a
+// deterministic collation, under which equality is byte equality either way.
 func (s *SyncService) capturedFinalStateSQL() string {
 	tableIDs := make([]int, 0, len(s.registeredTableByID))
 	for tableID := range s.registeredTableByID {
@@ -574,7 +581,7 @@ func (s *SyncService) capturedFinalStateSQL() string {
    COALESCE(rs.deleted=FALSE,FALSE) OR %s IS NOT NULL AS has_effect
    FROM touched t
    LEFT JOIN sync.row_state rs ON rs.user_pk=$2 AND rs.table_id=t.table_id AND rs.key_bytes=t.key_bytes
-   LEFT JOIN %s src ON src._sync_scope_id=(SELECT user_id FROM sync.user_state WHERE user_pk=$2) AND %s=%s
+   LEFT JOIN %s src ON src._sync_scope_id=(SELECT user_id COLLATE "default" FROM sync.user_state WHERE user_pk=$2) AND %s=%s
    WHERE t.table_id=%d`, key, key, payload, key, table, key, decodedKey, id))
 	}
 	if len(parts) == 0 {
