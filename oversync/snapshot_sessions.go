@@ -1,6 +1,7 @@
 package oversync
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -586,15 +587,65 @@ func snapshotMaterializationPageSQL(info registeredTableRuntimeInfo, payloadExpr
 			`, cursorPredicate, limitPlaceholder, payloadExpression, tableIdent, ownerIdent, keyJoin)
 }
 
-// addStagedSnapshotRowToHash adds one staged row to the session's snapshot hash, with its sync key
-// values in the generation's key-column order.
-func addStagedSnapshotRowToHash(hash *SnapshotHashWriter, generation SchemaGenerationCapabilities, tableIndex int, key SyncKey, version int64, payload json.RawMessage) error {
-	keyColumns := generation.Tables[tableIndex].SyncKeyColumns
-	keyValues := make([]any, len(keyColumns))
-	for i, name := range keyColumns {
-		keyValues[i] = key[name]
+// stagedSnapshotTable is the per-table context for encoding staged rows. index is the table's position
+// in the wire generation, or -1 when the generation does not list it. keyName is the canonical JSON
+// string of the single sync key column; keyNameErr is kept so a row reports it where the expanded-size
+// check would have.
+type stagedSnapshotTable struct {
+	index      int
+	keyName    []byte
+	keyNameErr error
+}
+
+func newStagedSnapshotTable(generation SchemaGenerationCapabilities, info registeredTableRuntimeInfo, contract GenerationTableContract) stagedSnapshotTable {
+	table := stagedSnapshotTable{index: -1}
+	for index, candidate := range generation.Tables {
+		if candidate.Schema == info.schemaName && candidate.Table == info.tableName {
+			table.index = index
+			break
+		}
 	}
-	return hash.Add(tableIndex, keyValues, version, payload)
+	if len(contract.SyncKeyColumns) == 1 {
+		table.keyName, table.keyNameErr = jcs.Marshal(contract.SyncKeyColumns[0])
+	} else {
+		table.keyNameErr = fmt.Errorf("snapshot key contract is invalid")
+	}
+	return table
+}
+
+// stagedSnapshotRowEncoding is one validated staged row's hash parts and its expanded decoded size,
+// len(jcs.Marshal(key)) + len(jcs.Marshal(payload)) as ExpandedRowDecodedBytes measures it.
+type stagedSnapshotRowEncoding struct {
+	parts         snapshotRowCanonicalParts
+	expandedBytes int64
+}
+
+// encodeStagedSnapshotRow canonicalizes the decoded payload once. keyCanonical is the canonical single
+// key value, already checked equal to the payload's key column.
+func encodeStagedSnapshotRow(table stagedSnapshotTable, keyCanonical []byte, version int64, payloadObject map[string]any) (stagedSnapshotRowEncoding, error) {
+	if table.keyNameErr != nil {
+		return stagedSnapshotRowEncoding{}, table.keyNameErr
+	}
+	payload, err := jcs.Marshal(payloadObject)
+	if err != nil {
+		return stagedSnapshotRowEncoding{}, fmt.Errorf("encode canonical snapshot payload: %w", err)
+	}
+	keyValues := make([]byte, 0, len(keyCanonical)+2)
+	keyValues = append(append(append(keyValues, '['), keyCanonical...), ']')
+	// The canonical key object is `{` + name + `:` + value + `}`.
+	expandedKey := int64(len(table.keyName) + len(keyCanonical) + 3)
+	return stagedSnapshotRowEncoding{
+		parts:         snapshotRowCanonicalParts{tableIndex: table.index, keyValues: keyValues, version: version, payload: payload},
+		expandedBytes: expandedKey + int64(len(payload)),
+	}, nil
+}
+
+// snapshotRowGroup is the one-row compact group CompactGroupsForSnapshotRowsAt builds for a snapshot
+// row at its row ordinal; keyValues are in the generation's key-column order.
+func snapshotRowGroup(tableIndex int, rowOrdinal int64, keyValues []any, version int64, payload json.RawMessage) CompactRowGroup {
+	return CompactRowGroup{TableIndex: tableIndex, FirstRowOrdinal: rowOrdinal, Rows: []CompactRowTuple{{
+		Op: "i", KeyValues: keyValues, Version: version, Payload: payload,
+	}}}
 }
 
 func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, view *schemaGenerationView, snapshotID, userID string, userPK, snapshotBundleSeq int64, hash *SnapshotHashWriter) (int64, int64, snapshotBatchHighWater, error) {
@@ -628,6 +679,7 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 		if err != nil {
 			return 0, 0, highWater, fmt.Errorf("derive snapshot payload transfer limit for %s.%s: %w", info.schemaName, info.tableName, err)
 		}
+		stagedTable := newStagedSnapshotTable(wireGeneration, info, contract)
 		var lastKey []byte
 		for {
 			queryArgs := []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, s.config.SnapshotMaterializationBatchRows}
@@ -720,23 +772,21 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot row version is outside the pinned checkpoint")
 				}
 				nextRows := rowCount + int64(len(batch)) + 1
-				snapshotRow := SnapshotRow{Schema: info.schemaName, Table: info.tableName, Key: key, RowVersion: bundleSeq, Payload: payloadWire}
-				expandedBytes, err := ExpandedRowDecodedBytes(PushRequestRow{
-					Schema: snapshotRow.Schema, Table: snapshotRow.Table, Key: snapshotRow.Key,
-					Op: OpInsert, BaseRowVersion: snapshotRow.RowVersion, Payload: snapshotRow.Payload,
-				})
-				if err != nil || expandedBytes > s.maxBytesPerSnapshotRow() {
+				// One canonical payload serves the expanded size, the logical size and the hash frame.
+				encoding, err := encodeStagedSnapshotRow(stagedTable, keyCanonical, bundleSeq, payloadObject)
+				if err != nil || encoding.expandedBytes > s.maxBytesPerSnapshotRow() {
 					liveRows.Close()
-					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "row_decoded_body_bytes", Actual: expandedBytes, Limit: s.maxBytesPerSnapshotRow()}
+					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "row_decoded_body_bytes", Actual: encoding.expandedBytes, Limit: s.maxBytesPerSnapshotRow()}
 				}
-				groups, logicalBytes, err := CompactGroupsForSnapshotRowsAt(wireGeneration, []SnapshotRow{snapshotRow}, nextRows)
-				if err != nil {
+				if stagedTable.index < 0 || !bytes.HasPrefix(payloadWire, []byte("{")) {
 					liveRows.Close()
 					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot row cannot be compact encoded")
 				}
+				logicalBytes := encoding.parts.logicalByteCount()
+				group := snapshotRowGroup(stagedTable.index, nextRows, []any{keyValue}, bundleSeq, payloadWire)
 				// false is the longer JSON literal, so this proves that the row can fit
 				// even when it is the final row in the snapshot.
-				body, err := json.Marshal(CompactSnapshotChunkResponse{Rows: groups, NextRowOrdinal: nextRows, LogicalByteCount: logicalBytes, HasMore: false})
+				body, err := json.Marshal(CompactSnapshotChunkResponse{Rows: []CompactRowGroup{group}, NextRowOrdinal: nextRows, LogicalByteCount: logicalBytes, HasMore: false})
 				if err != nil {
 					liveRows.Close()
 					return 0, 0, highWater, fmt.Errorf("encode compact snapshot body: %w", err)
@@ -759,7 +809,7 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 				}
 				// Only a row committed to the batch is hashed; one read past the batch byte limit above
 				// is read again, and hashed then, on the next page.
-				if err := addStagedSnapshotRowToHash(hash, wireGeneration, groups[0].TableIndex, key, bundleSeq, payloadWire); err != nil {
+				if err := hash.addCanonical(encoding.parts); err != nil {
 					liveRows.Close()
 					return 0, 0, highWater, fmt.Errorf("hash snapshot row: %w", err)
 				}

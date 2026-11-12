@@ -361,10 +361,68 @@ func (h *SnapshotHashWriter) frame(value any) error {
 	if err != nil {
 		return err
 	}
+	h.writeFrame(body)
+	return nil
+}
+
+func (h *SnapshotHashWriter) writeFrame(body []byte) {
 	var length [8]byte
 	binary.BigEndian.PutUint64(length[:], uint64(len(body)))
 	_, _ = h.digest.Write(length[:])
 	_, _ = h.digest.Write(body)
+}
+
+// snapshotRowCanonicalParts is one already validated snapshot row as RFC 8785 parts: keyValues is the
+// canonical array of sync key values in the generation's key-column order and payload the canonical
+// payload object. Canonical JSON is compositional (a canonical array is its canonical elements joined
+// by commas inside brackets), so the hash frame and the logical row are assembled from these bytes
+// with the same result as Add, which serializes the whole row again.
+type snapshotRowCanonicalParts struct {
+	tableIndex int
+	keyValues  []byte
+	version    int64
+	payload    []byte
+}
+
+// logicalByteCount is len(jcs.Marshal(["i",tableIndex,keyValues,version,payload])).
+func (p snapshotRowCanonicalParts) logicalByteCount() int64 {
+	var digits [20]byte
+	tableDigits := len(strconv.AppendInt(digits[:0], int64(p.tableIndex), 10))
+	versionDigits := len(strconv.AppendInt(digits[:0], p.version, 10))
+	// `["i",` + table + `,` + keyValues + `,` + version + `,` + payload + `]`
+	return int64(5 + tableDigits + 1 + len(p.keyValues) + 1 + versionDigits + 1 + len(p.payload) + 1)
+}
+
+// frameBody is jcs.Marshal(["i","<tableIndex>",keyValues,"<version>",payload]), the row frame Add hashes.
+func (p snapshotRowCanonicalParts) frameBody() []byte {
+	body := make([]byte, 0, p.logicalByteCount()+4)
+	body = append(body, `["i","`...)
+	body = strconv.AppendInt(body, int64(p.tableIndex), 10)
+	body = append(body, `",`...)
+	body = append(body, p.keyValues...)
+	body = append(body, `,"`...)
+	body = strconv.AppendInt(body, p.version, 10)
+	body = append(body, `",`...)
+	body = append(body, p.payload...)
+	return append(body, ']')
+}
+
+// addCanonical hashes a row whose key and payload the caller has already validated against the
+// generation and canonicalized; Add is the validating form of the same frame.
+func (h *SnapshotHashWriter) addCanonical(parts snapshotRowCanonicalParts) error {
+	if h.finished {
+		return fmt.Errorf("snapshot hash already finalized")
+	}
+	if parts.tableIndex < 0 || parts.tableIndex >= len(h.generation.Tables) || parts.version < 1 {
+		return fmt.Errorf("invalid snapshot row")
+	}
+	logical := parts.logicalByteCount()
+	if h.rows == math.MaxInt64 || h.logicalBytes > math.MaxInt64-logical {
+		return fmt.Errorf("snapshot totals overflow")
+	}
+	h.writeFrame(parts.frameBody())
+	h.rows++
+	h.logicalBytes += logical
 	return nil
 }
 func (h *SnapshotHashWriter) Add(tableIndex int, key []any, version int64, payload json.RawMessage) error {

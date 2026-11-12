@@ -235,6 +235,10 @@ type SnapshotChunkResponse struct {
 	NextRowOrdinal    int64         `json:"next_row_ordinal"`
 	HasMore           bool          `json:"has_more"`
 	ByteCount         int64         `json:"byte_count"`
+
+	// compactGroups are Rows as compact groups, built while the rows are selected so the HTTP
+	// handler does not encode them a second time.
+	compactGroups []CompactRowGroup
 }
 
 type CompactSnapshotSessionResponse struct {

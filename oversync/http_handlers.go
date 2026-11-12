@@ -1150,21 +1150,25 @@ func (h *HTTPSyncHandlers) HandleGetSnapshotChunk(w http.ResponseWriter, r *http
 		return
 	}
 	defer release()
-	view, err := h.service.resolveRequestGeneration(r.Context(), actor, proof)
-	if err != nil {
+	if _, err := h.service.resolveRequestGeneration(r.Context(), actor, proof); err != nil {
 		h.writeGenerationError(w, r, err)
 		return
 	}
-	groups, logicalByteCount, err := CompactGroupsForSnapshotRowsAt(generationDescriptor(view.contract), response.Rows, afterRowOrdinal+1)
-	if err != nil || logicalByteCount != response.ByteCount {
-		h.logger.Error("Failed to project compact snapshot chunk", "error_type", fmt.Sprintf("%T", err))
+	// The groups were built from the selected rows in the session's generation, starting at
+	// afterRowOrdinal+1; ByteCount is the sum of the rows' logical sizes recorded at staging.
+	groups := response.compactGroups
+	if groups == nil {
+		groups = []CompactRowGroup{}
+	}
+	if len(groups) == 0 && len(response.Rows) != 0 || len(groups) != 0 && groups[0].FirstRowOrdinal != afterRowOrdinal+1 {
+		h.logger.Error("Failed to project compact snapshot chunk", "error_type", "compact_groups_mismatch")
 		h.writeError(w, http.StatusInternalServerError, "snapshot_chunk_failed", "Failed to project compact snapshot chunk", r)
 		return
 	}
 	h.writeBoundedJSON(w, r, http.StatusOK, CompactSnapshotChunkResponse{
 		Rows:             groups,
 		NextRowOrdinal:   response.NextRowOrdinal,
-		LogicalByteCount: logicalByteCount,
+		LogicalByteCount: response.ByteCount,
 		HasMore:          response.HasMore,
 	}, h.service.maxBytesPerSnapshotChunk(), "Failed to encode compact snapshot chunk response")
 }
