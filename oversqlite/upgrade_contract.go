@@ -113,6 +113,9 @@ type compiledLocalContract struct {
 	contract    oversync.SchemaGenerationContract
 	localTables []oversync.GenerationTableContract
 	codecs      map[string]map[string]LocalColumnCodec
+	declared    map[declaredColumnKey]declaredColumnEntry
+	// schemaByTable resolves a local table's schema without scanning localTables.
+	schemaByTable map[string]string
 }
 
 func requireCompleteLocalContract(local LocalGenerationContract, compiled *compiledLocalContract) error {
@@ -127,7 +130,9 @@ func compileLocalContract(local LocalGenerationContract) (*compiledLocalContract
 	if err != nil {
 		return nil, err
 	}
-	configuredTables, err := compileConfiguredSyncTables(local.Tables, len(contract.Tables()))
+	// Tables() copies the whole contract; take one copy for compilation.
+	tables := contract.Tables()
+	configuredTables, err := compileConfiguredSyncTables(local.Tables, len(tables))
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +143,7 @@ func compileLocalContract(local LocalGenerationContract) (*compiledLocalContract
 	if len(codecs) != len(configuredTables) {
 		return nil, fmt.Errorf("local codec table set does not match local sync tables")
 	}
-	contractByTable := generationTablesByName(contract.Tables())
+	contractByTable := generationTablesByName(tables)
 	localTables, err := validateConfiguredLocalTables(local.Tables, contractByTable, codecs)
 	if err != nil {
 		return nil, err
@@ -146,7 +151,45 @@ func compileLocalContract(local LocalGenerationContract) (*compiledLocalContract
 	if err := validateLocalForeignKeyClosure(localTables, codecs); err != nil {
 		return nil, err
 	}
-	return &compiledLocalContract{proof: proof, contract: contract, localTables: localTables, codecs: codecs}, nil
+	return &compiledLocalContract{proof: proof, contract: contract, localTables: localTables, codecs: codecs,
+		declared: indexDeclaredColumns(tables, codecs), schemaByTable: indexLocalTableSchemas(localTables)}, nil
+}
+
+// indexLocalTableSchemas maps each local table name to the schema of its first local table entry,
+// the same choice schemaForTable makes by scanning localTables.
+func indexLocalTableSchemas(localTables []oversync.GenerationTableContract) map[string]string {
+	schemas := make(map[string]string, len(localTables))
+	for _, table := range localTables {
+		if _, seen := schemas[table.Table]; !seen {
+			schemas[table.Table] = table.Schema
+		}
+	}
+	return schemas
+}
+
+// declaredColumnKey names one column of one generation table, as the contract spells them.
+type declaredColumnKey struct{ schema, table, column string }
+
+type declaredColumnEntry struct {
+	codec    LocalColumnCodec
+	declared oversync.GenerationColumn
+}
+
+// indexDeclaredColumns resolves, once per compiled contract, every generation column that also has a
+// local codec. Lookups then neither copy the contract nor search it.
+func indexDeclaredColumns(tables []oversync.GenerationTableContract, codecs map[string]map[string]LocalColumnCodec) map[declaredColumnKey]declaredColumnEntry {
+	index := make(map[declaredColumnKey]declaredColumnEntry)
+	for _, table := range tables {
+		byColumn := codecs[table.Schema+"."+table.Table]
+		for _, declared := range table.Columns {
+			codec, ok := byColumn[declared.Name]
+			key := declaredColumnKey{schema: table.Schema, table: table.Table, column: declared.Name}
+			if _, seen := index[key]; ok && !seen {
+				index[key] = declaredColumnEntry{codec: codec, declared: declared}
+			}
+		}
+	}
+	return index
 }
 
 func compileDeclaredGeneration(local LocalGenerationContract) (oversync.SchemaGenerationContract, oversync.SchemaGenerationProof, error) {

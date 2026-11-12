@@ -22,21 +22,16 @@ func (c *Client) declaredColumn(table, column string) (LocalColumnCodec, oversyn
 	}
 	table = strings.ToLower(table)
 	column = strings.ToLower(column)
-	codec, ok := c.localGeneration.codecs[c.schemaForTable(table)+"."+table][column]
+	// Same schema as schemaForTable, in one map lookup: this runs for every column of every row.
+	schema, local := c.localGeneration.schemaByTable[table]
+	if !local {
+		schema = c.config.schema
+	}
+	entry, ok := c.localGeneration.declared[declaredColumnKey{schema: schema, table: table, column: column}]
 	if !ok {
 		return "", oversync.GenerationColumn{}, false
 	}
-	for _, tableContract := range c.localGeneration.contract.Tables() {
-		if tableContract.Schema != c.schemaForTable(table) || tableContract.Table != table {
-			continue
-		}
-		for _, declared := range tableContract.Columns {
-			if declared.Name == column {
-				return codec, declared, true
-			}
-		}
-	}
-	return "", oversync.GenerationColumn{}, false
+	return entry.codec, entry.declared, true
 }
 
 func (c *Client) processPayloadWithDeclaredCodecs(table string, payload map[string]any) error {

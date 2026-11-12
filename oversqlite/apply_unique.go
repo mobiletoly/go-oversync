@@ -517,8 +517,13 @@ func (c *Client) preflightUniqueApply(ctx context.Context, tx sqliteTransaction,
 	// Recursive reachability is SQLite-owned but still charged, including its
 	// worst-case pair set, query workspace and atomic statement visits.
 	pairs := saturatingWorkAdd(p.entries, saturatingWorkMultiply(p.visit, max(p.visit, 1)))
-	if err := c.checkApplyWorkspace(p, saturatingWorkMultiply(pairs, 4), saturatingWorkAdd(4096, saturatingWorkMultiply(pairs, 128))); err != nil {
-		return err
+	// The cycle working set is built only from unique transfer edges: without one, no component is
+	// vacated and preservation has no unresolved rows to close over. A snapshot still reserves the
+	// work of its unique-ordered install loop below.
+	if n != 0 {
+		if err := c.checkApplyWorkspace(p, saturatingWorkMultiply(pairs, 4), saturatingWorkAdd(4096, saturatingWorkMultiply(pairs, 128))); err != nil {
+			return err
+		}
 	}
 	return c.reserveReadySyncWork(ctx, p.unit, saturatingWorkAdd(saturatingWorkMultiply(pairs, 8), saturatingWorkMultiply(p.entries, 256)))
 }

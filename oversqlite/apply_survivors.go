@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/mobiletoly/go-oversync/internal/jcs"
@@ -400,8 +401,13 @@ func (c *Client) prepareApplySurvivors(ctx context.Context, tx sqliteTransaction
 	if err := saveApplyPlan(ctx, tx, p); err != nil {
 		return err
 	}
+	// Only a caller that names the pull kind gets the bounded index; the default kind keeps the full one.
+	var scope *pullIndexScope
+	if len(operationKind) == 1 && operationKind[0] == "pull" {
+		scope = &pullIndexScope{}
+	}
 	for p.phase != "ready" && p.phase != "installed" {
-		if err := c.prepareApplySurvivorStep(ctx, tx, p, roots, seed); err != nil {
+		if err := c.prepareApplySurvivorStep(ctx, tx, p, roots, seed, scope); err != nil {
 			return err
 		}
 	}
@@ -424,14 +430,14 @@ func (c *Client) prepareApplySurvivors(ctx context.Context, tx sqliteTransaction
 
 // Every mutating transition owns a complete checkpoint before it starts.
 // A work refusal can publish only staging whose counters/cursor were saved.
-func (c *Client) prepareApplySurvivorStep(ctx context.Context, tx sqliteTransaction, p *applyPlan, roots int, seed func(int) (applySurvivor, error)) error {
+func (c *Client) prepareApplySurvivorStep(ctx context.Context, tx sqliteTransaction, p *applyPlan, roots int, seed func(int) (applySurvivor, error), scope *pullIndexScope) error {
 	if err := c.reserveSyncWork(ctx, p.unit, 16); err != nil {
 		return err
 	}
 	if err := admitApplyPlanCheckpoint(ctx, tx); err != nil {
 		return err
 	}
-	err := c.advanceApplySurvivors(ctx, tx, p, roots, seed)
+	err := c.advanceApplySurvivors(ctx, tx, p, roots, seed, scope)
 	if err == nil {
 		err = c.checkApplyWorkspace(p, 0, 0)
 	}
@@ -454,7 +460,7 @@ func finishApplyPreparationStep(ctx context.Context, tx sqliteTransaction, p *ap
 }
 
 // One durable preparation transition, under the caller's guarded writer.
-func (c *Client) advanceApplySurvivors(ctx context.Context, tx sqliteTransaction, p *applyPlan, roots int, seed func(int) (applySurvivor, error)) error {
+func (c *Client) advanceApplySurvivors(ctx context.Context, tx sqliteTransaction, p *applyPlan, roots int, seed func(int) (applySurvivor, error), scope *pullIndexScope) error {
 	switch p.phase {
 	case "clear":
 		return c.clearApplyStep(ctx, tx, p)
@@ -470,10 +476,15 @@ func (c *Client) advanceApplySurvivors(ctx context.Context, tx sqliteTransaction
 		if err = c.putApplySurvivor(ctx, tx, p, row); err != nil {
 			return err
 		}
+		scope.recordRoot(p.root, row.table)
 		p.root++
 		return nil
 	case "index":
-		return c.indexApplyStep(ctx, tx, p)
+		walkable, err := c.resolvePullIndexScope(tx, scope)
+		if err != nil {
+			return err
+		}
+		return c.indexApplyStep(ctx, tx, p, walkable)
 	case "walk":
 		return c.walkApplyStep(ctx, tx, p)
 	case "unique":
@@ -544,9 +555,80 @@ func (c *Client) clearApplyStep(ctx context.Context, tx sqliteTransaction, p *ap
 	return nil
 }
 
+// pullIndexScope bounds a pull's dependency index to the relationships its walk can read. The walk
+// looks a relationship up only by a parent row already in the plan, and a plan row is either a pulled
+// row or a child found through such a lookup, so parents outside the tables reachable from the pulled
+// rows' tables are never read. The pulled tables are known only to the invocation that seeds every
+// root; a plan resumed later, and every other plan kind, index all relationships.
+type pullIndexScope struct {
+	seededTables map[string]bool
+	walkable     map[string]bool
+	resolved     bool
+}
+
+func (s *pullIndexScope) recordRoot(root int64, table string) {
+	if s == nil {
+		return
+	}
+	if root == 0 {
+		s.seededTables = map[string]bool{}
+	}
+	if s.seededTables != nil {
+		s.seededTables[strings.ToLower(table)] = true
+	}
+}
+
+// resolvePullIndexScope returns the parent tables whose relationships the walk can read, or nil to
+// index every relationship.
+func (c *Client) resolvePullIndexScope(tx sqliteTransaction, s *pullIndexScope) (map[string]bool, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if !s.resolved {
+		s.resolved = true
+		if s.seededTables != nil {
+			walkable, err := c.walkableParentTables(tx, s.seededTables)
+			if err != nil {
+				return nil, err
+			}
+			s.walkable = walkable
+		}
+	}
+	return s.walkable, nil
+}
+
+// walkableParentTables is the closure of the root tables under "holds a foreign key to a reached table".
+func (c *Client) walkableParentTables(tx sqliteTransaction, rootTables map[string]bool) (map[string]bool, error) {
+	reached := make(map[string]bool, len(c.config.Tables))
+	for table := range rootTables {
+		reached[table] = true
+	}
+	for grew := true; grew; {
+		grew = false
+		for _, configured := range c.config.Tables {
+			name := strings.ToLower(configured.TableName)
+			if reached[name] {
+				continue
+			}
+			info, err := c.getTableInfoTx(tx, name)
+			if err != nil {
+				return nil, err
+			}
+			for _, fk := range info.ForeignKeys {
+				if reached[strings.ToLower(fk.RefTable)] {
+					reached[name], grew = true, true
+					break
+				}
+			}
+		}
+	}
+	return reached, nil
+}
+
 // Each business key is visited once during index construction. FK columns for
-// that key are handled by bounded steps before advancing to the next key.
-func (c *Client) indexApplyStep(ctx context.Context, tx sqliteTransaction, p *applyPlan) error {
+// that key are handled by bounded steps before advancing to the next key. A nil
+// walkable set indexes every relationship.
+func (c *Client) indexApplyStep(ctx context.Context, tx sqliteTransaction, p *applyPlan, walkable map[string]bool) error {
 	if p.table >= int64(len(c.config.Tables)) {
 		p.phase, p.table, p.fk, p.cursor = "walk", 0, 0, sql.NullString{}
 		return nil
@@ -556,7 +638,9 @@ func (c *Client) indexApplyStep(ctx context.Context, tx sqliteTransaction, p *ap
 	if err != nil {
 		return err
 	}
-	if len(info.ForeignKeys) == 0 {
+	readable := func(fk ForeignKeyInfo) bool { return walkable == nil || walkable[strings.ToLower(fk.RefTable)] }
+	if !slices.ContainsFunc(info.ForeignKeys, readable) {
+		// No relationship of this table can be read by the walk: do not visit its rows at all.
 		p.table++
 		p.fk = -1
 		p.cursor = sql.NullString{}
@@ -569,7 +653,9 @@ func (c *Client) indexApplyStep(ctx context.Context, tx sqliteTransaction, p *ap
 		p.fk = -1
 		return nil
 	}
-	err = c.indexApplyForeignKey(ctx, tx, p, table, info, info.ForeignKeys[p.fk])
+	if fk := info.ForeignKeys[p.fk]; readable(fk) {
+		err = c.indexApplyForeignKey(ctx, tx, p, table, info, fk)
+	}
 	if err == nil {
 		p.fk++
 	}

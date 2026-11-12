@@ -288,7 +288,7 @@ func (c *Client) applyPulledBundleLockedSlice(ctx context.Context, bundle *overs
 	unit := applyUnit("pull", bundle.BundleSeq, bundle.BundleHash)
 	if err := c.prepareApplySurvivors(ctx, tx, unit, len(bundle.Rows), func(index int) (applySurvivor, error) {
 		return c.pulledApplySurvivor(ctx, tx, bundle.Rows[index])
-	}); err != nil {
+	}, "pull"); err != nil {
 		return commitApplyProgress(ctx, tx, err)
 	}
 
