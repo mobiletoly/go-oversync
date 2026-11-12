@@ -591,7 +591,9 @@ func DefaultConfig(generationID oversync.SchemaGenerationID, tables []SyncTable)
 		MaxSyncWorkspaceBytes:         defaultSyncWorkspaceBytes,
 		MaxSyncWorkUnitsPerInvocation: defaultSyncWorkUnits,
 		GenerationID:                  generationID, Tables: tables,
-		UploadLimit: 1000, UploadByteLimit: 1 << 20, DownloadLimit: 1000,
+		// 200 rows matches the Kotlin client. With 1,000 rows of about 450 bytes the
+		// frozen bundle's charged copies exceed the default 256 MiB workspace.
+		UploadLimit: 200, UploadByteLimit: 1 << 20, DownloadLimit: 1000,
 		SnapshotChunkRows: 1000, SnapshotChunkBytes: 4 << 20,
 		BackoffMin: time.Second, BackoffMax: 60 * time.Second,
 		BundleChangeWatchMode: BundleChangeWatchOff,

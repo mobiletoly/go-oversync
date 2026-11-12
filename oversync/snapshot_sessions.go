@@ -529,6 +529,57 @@ type snapshotBatchHighWater struct {
 	batches int
 }
 
+// snapshotMaterializationPageSQL reads one page of a user's live rows of one
+// registered table: up to the batch limit of row_state keys after the cursor,
+// each joined to its business row for the payload.
+//
+// Parameters: $1 user id, $2 user_pk, $3 table id, $4 row byte limit, $5 payload
+// byte limit, then the cursor key bytes (only when afterCursor) and the page size.
+func snapshotMaterializationPageSQL(info registeredTableRuntimeInfo, payloadExpression string, afterCursor bool) string {
+	tableIdent := pgx.Identifier{info.schemaName, info.tableName}.Sanitize()
+	keyIdent := pgx.Identifier{info.syncKeyColumn}.Sanitize()
+	ownerIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
+	// Compare in the key column's own type so the join is a lookup on the
+	// (_sync_scope_id, key) primary key. A UUID is exactly its 16 bytes, so the
+	// CASE keeps any other length unmatched, as uuid_send equality did. Text keys
+	// look up by text equality and then recheck the exact UTF-8 bytes, so a
+	// nondeterministic key collation cannot widen the match. convert_from's
+	// result takes collation "C" from its name-typed encoding argument; the
+	// explicit default collation lets the comparison use the key's index.
+	keyJoin := fmt.Sprintf(`src.%[1]s=(convert_from(page.key_bytes, 'UTF8') COLLATE "default") AND convert_to(CAST(src.%[1]s AS text), 'UTF8')=page.key_bytes`, keyIdent)
+	if info.syncKeyType == syncKeyTypeUUID {
+		keyJoin = fmt.Sprintf("src.%s=CASE WHEN octet_length(page.key_bytes)=16 THEN encode(page.key_bytes, 'hex')::uuid END", keyIdent)
+	}
+	cursorPredicate := ""
+	limitPlaceholder := "$6"
+	if afterCursor {
+		cursorPredicate = " AND rs.key_bytes > $6"
+		limitPlaceholder = "$7"
+	}
+	return fmt.Sprintf(`
+				WITH page AS MATERIALIZED (
+					SELECT rs.key_bytes, rs.bundle_seq
+					FROM sync.row_state AS rs
+					WHERE rs.user_pk=$2 AND rs.table_id=$3 AND rs.deleted=FALSE%s
+					ORDER BY rs.key_bytes
+					LIMIT %s
+				), projected AS MATERIALIZED (
+					SELECT page.key_bytes, page.bundle_seq, %s AS payload_db
+					FROM page
+					JOIN %s AS src
+					  ON src.%s=$1 AND %s
+				)
+				SELECT
+					octet_length(key_bytes),
+					CASE WHEN octet_length(key_bytes) <= $4 THEN key_bytes END,
+					bundle_seq,
+					octet_length(payload_db::text),
+					CASE WHEN octet_length(payload_db::text) <= $5 THEN payload_db END
+				FROM projected
+				ORDER BY key_bytes
+			`, cursorPredicate, limitPlaceholder, payloadExpression, tableIdent, ownerIdent, keyJoin)
+}
+
 func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, view *schemaGenerationView, snapshotID, userID string, userPK, snapshotBundleSeq int64) (int64, int64, snapshotBatchHighWater, error) {
 	if view == nil {
 		return 0, 0, snapshotBatchHighWater{}, projectionError(GenerationProjectionIntegrityError, "snapshot", "generation view is unavailable")
@@ -553,9 +604,6 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 	var rowCount, byteCount int64
 	highWater := snapshotBatchHighWater{}
 	for _, info := range tableInfos {
-		tableIdent := pgx.Identifier{info.schemaName, info.tableName}.Sanitize()
-		keyIdent := pgx.Identifier{info.syncKeyColumn}.Sanitize()
-		ownerIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
 		contract := contracts[info.tableID]
 		columnTypes := s.columnTypesForTable(info.schemaName, info.tableName)
 		payloadExpression := databaseVisibleWirePayloadExpression("src", contract.Columns, columnTypes)
@@ -563,42 +611,13 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 		if err != nil {
 			return 0, 0, highWater, fmt.Errorf("derive snapshot payload transfer limit for %s.%s: %w", info.schemaName, info.tableName, err)
 		}
-		businessKeyBytesExpr := fmt.Sprintf("convert_to(CAST(src.%s AS text), 'UTF8')", keyIdent)
-		if info.syncKeyType == syncKeyTypeUUID {
-			businessKeyBytesExpr = fmt.Sprintf("uuid_send(src.%s)", keyIdent)
-		}
 		var lastKey []byte
 		for {
-			cursorPredicate := ""
-			limitPlaceholder := "$6"
 			queryArgs := []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, s.config.SnapshotMaterializationBatchRows}
 			if lastKey != nil {
-				cursorPredicate = " AND rs.key_bytes > $6"
-				limitPlaceholder = "$7"
 				queryArgs = []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, lastKey, s.config.SnapshotMaterializationBatchRows}
 			}
-			query := fmt.Sprintf(`
-				WITH page AS MATERIALIZED (
-					SELECT rs.key_bytes, rs.bundle_seq
-					FROM sync.row_state AS rs
-					WHERE rs.user_pk=$2 AND rs.table_id=$3 AND rs.deleted=FALSE%s
-					ORDER BY rs.key_bytes
-					LIMIT %s
-				), projected AS MATERIALIZED (
-					SELECT page.key_bytes, page.bundle_seq, %s AS payload_db
-					FROM page
-					JOIN %s AS src
-					  ON src.%s=$1 AND %s=page.key_bytes
-				)
-				SELECT
-					octet_length(key_bytes),
-					CASE WHEN octet_length(key_bytes) <= $4 THEN key_bytes END,
-					bundle_seq,
-					octet_length(payload_db::text),
-					CASE WHEN octet_length(payload_db::text) <= $5 THEN payload_db END
-				FROM projected
-				ORDER BY key_bytes
-			`, cursorPredicate, limitPlaceholder, payloadExpression, tableIdent, ownerIdent, businessKeyBytesExpr)
+			query := snapshotMaterializationPageSQL(info, payloadExpression, lastKey != nil)
 			liveRows, err := tx.Query(ctx, query, queryArgs...)
 			if err != nil {
 				return 0, 0, highWater, fmt.Errorf("query snapshot page for %s.%s: %w", info.schemaName, info.tableName, err)

@@ -92,7 +92,7 @@ func TestEndToEnd_GettingStartedDDLAttachPushPull(t *testing.T) {
 	clientConfig := &oversqlite.Config{
 		GenerationID: 1, DatabaseID: "app-db", ServiceID: "my-service", LocalVersion: 1,
 		Tables:      []oversqlite.SyncTable{{TableName: "users", SyncKeyColumnName: "id"}, {TableName: "posts", SyncKeyColumnName: "id"}},
-		UploadLimit: 1000, DownloadLimit: 1000,
+		UploadLimit: 200, DownloadLimit: 1000,
 	}
 
 	const userID = "getting-started-user"

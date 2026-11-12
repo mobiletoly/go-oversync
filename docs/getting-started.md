@@ -430,7 +430,7 @@ func main() {
             {TableName: "users", SyncKeyColumnName: "id"},
             {TableName: "posts", SyncKeyColumnName: "id"},
         },
-        UploadLimit: 1000,
+        UploadLimit: 200,
         DownloadLimit: 1000,
         BundleChangeWatchMode: oversqlite.BundleChangeWatchAuto,
     }

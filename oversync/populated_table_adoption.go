@@ -794,12 +794,15 @@ func (s *SyncService) loadAdoptionUserIDs(
 		}
 		tableIdent := pgx.Identifier{info.schemaName, info.tableName}.Sanitize()
 		ownerIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
-		fmt.Fprintf(&query, "SELECT DISTINCT CAST(src.%s AS text) AS scope_id, %d::integer AS source_ordinal FROM %s AS src", ownerIdent, i, tableIdent)
+		// Scope columns may use any deterministic collation and user_id is "C".
+		// Mixing two implicit collations makes the ordering undefined, so every
+		// branch states "C"; the result is collected into a set and sorted in Go.
+		fmt.Fprintf(&query, `SELECT DISTINCT CAST(src.%s AS text) COLLATE "C" AS scope_id, %d::integer AS source_ordinal FROM %s AS src`, ownerIdent, i, tableIdent)
 	}
 	if len(infos) > 0 {
 		query.WriteString(" UNION ALL ")
 	}
-	query.WriteString("SELECT user_id AS scope_id, -1::integer AS source_ordinal FROM sync.user_state")
+	query.WriteString(`SELECT user_id COLLATE "C" AS scope_id, -1::integer AS source_ordinal FROM sync.user_state`)
 	query.WriteString(") AS discovered ORDER BY scope_id, source_ordinal")
 
 	rows, err := tx.Query(ctx, query.String())
