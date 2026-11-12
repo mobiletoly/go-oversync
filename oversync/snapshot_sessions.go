@@ -201,7 +201,18 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 				return err
 			}
 		}
-		rowCount, byteCount, materializationHighWater, err := s.materializeSnapshotRowsForGeneration(ctx, tx, selection, snapshotID, actor.UserID, retainedState.UserPK, snapshotBundleSeq)
+		var recovery *SnapshotRecovery
+		if req != nil && req.Recovery != nil {
+			value := *req.Recovery
+			recovery = &value
+		}
+		// The seal is accumulated while staging, in row-ordinal order, from the same values the rows
+		// are stored and served with; serving still validates every stored row it returns.
+		hash, err := NewSnapshotHashWriter(effectiveSourceID, generationDescriptor(selection.view.contract), snapshotID, snapshotBundleSeq, recovery)
+		if err != nil {
+			return err
+		}
+		rowCount, byteCount, materializationHighWater, err := s.materializeSnapshotRowsForGeneration(ctx, tx, selection, snapshotID, actor.UserID, retainedState.UserPK, snapshotBundleSeq, hash)
 		batchHighWater = materializationHighWater
 		observeAtomicHighWater(&s.snapshotMetrics.materializationBatchRowsHighWater, int64(batchHighWater.rows))
 		observeAtomicHighWater(&s.snapshotMetrics.materializationBatchBytesHighWater, batchHighWater.bytes)
@@ -213,12 +224,7 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 				return err
 			}
 		}
-		var recovery *SnapshotRecovery
-		if req != nil && req.Recovery != nil {
-			value := *req.Recovery
-			recovery = &value
-		}
-		snapshotHash, err := s.sealSnapshotRows(ctx, tx, selection, effectiveSourceID, snapshotID, snapshotBundleSeq, recovery, rowCount, byteCount)
+		snapshotHash, err := hash.Sum(rowCount, byteCount)
 		if err != nil {
 			return err
 		}
@@ -580,7 +586,18 @@ func snapshotMaterializationPageSQL(info registeredTableRuntimeInfo, payloadExpr
 			`, cursorPredicate, limitPlaceholder, payloadExpression, tableIdent, ownerIdent, keyJoin)
 }
 
-func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, view *schemaGenerationView, snapshotID, userID string, userPK, snapshotBundleSeq int64) (int64, int64, snapshotBatchHighWater, error) {
+// addStagedSnapshotRowToHash adds one staged row to the session's snapshot hash, with its sync key
+// values in the generation's key-column order.
+func addStagedSnapshotRowToHash(hash *SnapshotHashWriter, generation SchemaGenerationCapabilities, tableIndex int, key SyncKey, version int64, payload json.RawMessage) error {
+	keyColumns := generation.Tables[tableIndex].SyncKeyColumns
+	keyValues := make([]any, len(keyColumns))
+	for i, name := range keyColumns {
+		keyValues[i] = key[name]
+	}
+	return hash.Add(tableIndex, keyValues, version, payload)
+}
+
+func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, view *schemaGenerationView, snapshotID, userID string, userPK, snapshotBundleSeq int64, hash *SnapshotHashWriter) (int64, int64, snapshotBatchHighWater, error) {
 	if view == nil {
 		return 0, 0, snapshotBatchHighWater{}, projectionError(GenerationProjectionIntegrityError, "snapshot", "generation view is unavailable")
 	}
@@ -739,6 +756,12 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 				if limit := s.maxBytesPerSnapshotSession(); limit > 0 && nextBytes > limit {
 					liveRows.Close()
 					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "logical_byte_count", Actual: nextBytes, Limit: limit}
+				}
+				// Only a row committed to the batch is hashed; one read past the batch byte limit above
+				// is read again, and hashed then, on the next page.
+				if err := addStagedSnapshotRowToHash(hash, wireGeneration, groups[0].TableIndex, key, bundleSeq, payloadWire); err != nil {
+					liveRows.Close()
+					return 0, 0, highWater, fmt.Errorf("hash snapshot row: %w", err)
 				}
 				batch = append(batch, snapshotMaterializedRow{rowOrdinal: nextRows, tableID: info.tableID, keyBytes: append([]byte(nil), keyBytes...), bundleSeq: bundleSeq, payloadWire: append([]byte(nil), payloadWire...), wireByteCount: logicalBytes})
 				batchBytes += logicalBytes

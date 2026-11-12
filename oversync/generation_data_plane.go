@@ -287,11 +287,11 @@ func (s *SyncService) projectPullPageForGeneration(ctx context.Context, tx pgx.T
 	return &PullResponse{StableBundleSeq: stableBundleSeq, Bundles: projected, HasMore: hasMore}, nil
 }
 
-func (s *SyncService) materializeSnapshotRowsForGeneration(ctx context.Context, tx pgx.Tx, selection generationSelection, snapshotID, userID string, userPK, snapshotBundleSeq int64) (int64, int64, snapshotBatchHighWater, error) {
+func (s *SyncService) materializeSnapshotRowsForGeneration(ctx context.Context, tx pgx.Tx, selection generationSelection, snapshotID, userID string, userPK, snapshotBundleSeq int64, hash *SnapshotHashWriter) (int64, int64, snapshotBatchHighWater, error) {
 	if err := validateGenerationSelection(selection); err != nil {
 		return 0, 0, snapshotBatchHighWater{}, err
 	}
-	return s.materializeSnapshotRows(ctx, tx, selection.view, snapshotID, userID, userPK, snapshotBundleSeq)
+	return s.materializeSnapshotRows(ctx, tx, selection.view, snapshotID, userID, userPK, snapshotBundleSeq, hash)
 }
 
 func watchGenerationBoundary(selection generationSelection) error {
