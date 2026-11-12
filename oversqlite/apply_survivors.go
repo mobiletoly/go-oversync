@@ -401,6 +401,9 @@ func (c *Client) prepareApplySurvivors(ctx context.Context, tx sqliteTransaction
 	if err := saveApplyPlan(ctx, tx, p); err != nil {
 		return err
 	}
+	if rootOnlyApply(ctx) && kind != "settlement" {
+		return fmt.Errorf("only an unchanged push acknowledgement may omit dependency discovery")
+	}
 	// Only a caller that names the pull kind gets the bounded index; the default kind keeps the full one.
 	var scope *pullIndexScope
 	if len(operationKind) == 1 && operationKind[0] == "pull" {
@@ -466,6 +469,10 @@ func (c *Client) advanceApplySurvivors(ctx context.Context, tx sqliteTransaction
 		return c.clearApplyStep(ctx, tx, p)
 	case "roots":
 		if p.root == int64(roots) {
+			if rootOnlyApply(ctx) {
+				finishDependencyDiscovery(ctx, p)
+				return nil
+			}
 			p.phase, p.fk = "index", -1
 			return nil
 		}
@@ -788,17 +795,35 @@ func (c *Client) putApplySurvivor(ctx context.Context, tx sqliteTransaction, p *
 	return err
 }
 
+type rootOnlyApplyContextKey struct{}
+
+// withRootOnlyApplyContext marks a settlement that only acknowledges unchanged rows: its plan holds the
+// roots alone, with no dependency index or walk.
+func withRootOnlyApplyContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, rootOnlyApplyContextKey{}, true)
+}
+
+func rootOnlyApply(ctx context.Context) bool {
+	rootOnly, _ := ctx.Value(rootOnlyApplyContextKey{}).(bool)
+	return rootOnly
+}
+
+// finishDependencyDiscovery moves a plan whose dependents are all known to its next phase.
+func finishDependencyDiscovery(ctx context.Context, p *applyPlan) {
+	p.phase = "ready"
+	if v := uniqueInvocation(ctx); v != nil && v.required {
+		p.phase = "unique"
+		p.fk = 0
+		p.root = 0
+		p.cursor = sql.NullString{}
+	}
+}
+
 func (c *Client) walkApplyStep(ctx context.Context, tx sqliteTransaction, p *applyPlan) error {
 	if p.visit == 0 {
 		err := scanTransactionRow(ctx, tx, `SELECT ordinal FROM _sync_apply_rows WHERE pending=1 ORDER BY ordinal LIMIT 1`, nil, &p.visit)
 		if errors.Is(err, sql.ErrNoRows) {
-			p.phase = "ready"
-			if v := uniqueInvocation(ctx); v != nil && v.required {
-				p.phase = "unique"
-				p.fk = 0
-				p.root = 0
-				p.cursor = sql.NullString{}
-			}
+			finishDependencyDiscovery(ctx, p)
 			return nil
 		}
 		if err != nil {

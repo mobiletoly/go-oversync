@@ -404,24 +404,34 @@ func (c *Client) validateUniqueVacate(ctx context.Context, tx sqliteTransaction,
 		return err
 	}
 
-	names := []any{row.table}
-	marks := make([]string, 0, 6)
-	for _, suffix := range []string{"bi_guard", "bu_guard", "bd_guard", "ai", "au", "ad"} {
-		names = append(names, "trg_"+row.table+"_"+suffix)
-		marks = append(marks, "?")
-	}
-	var trigger string
-	query := `SELECT name FROM (SELECT name,tbl_name FROM sqlite_schema WHERE type='trigger' UNION ALL SELECT name,tbl_name FROM sqlite_temp_schema WHERE type='trigger') WHERE tbl_name=? AND name NOT IN (` + strings.Join(marks, ",") + `) LIMIT 1`
-	err = scanTransactionRow(ctx, tx, query, names, &trigger)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
+	trigger, found, err := applicationTriggerOnTable(ctx, tx, row.table)
+	if err != nil || !found {
 		return err
 	}
 	e := uniqueBlocked(p, row, "unsafe_trigger_or_dependency")
 	e.Trigger = trigger
 	return e
+}
+
+// applicationTriggerOnTable returns a main or TEMP trigger on the table other than the six the client
+// installs for change capture, if one exists.
+func applicationTriggerOnTable(ctx context.Context, tx sqliteTransaction, table string) (string, bool, error) {
+	names := []any{table}
+	marks := make([]string, 0, 6)
+	for _, suffix := range []string{"bi_guard", "bu_guard", "bd_guard", "ai", "au", "ad"} {
+		names = append(names, "trg_"+table+"_"+suffix)
+		marks = append(marks, "?")
+	}
+	var trigger string
+	query := `SELECT name FROM (SELECT name,tbl_name FROM sqlite_schema WHERE type='trigger' UNION ALL SELECT name,tbl_name FROM sqlite_temp_schema WHERE type='trigger') WHERE tbl_name=? AND name NOT IN (` + strings.Join(marks, ",") + `) LIMIT 1`
+	err := scanTransactionRow(ctx, tx, query, names, &trigger)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return trigger, true, nil
 }
 
 // Suppress a second execution of already installed business effects while the

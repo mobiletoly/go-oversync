@@ -22,6 +22,9 @@ type pushSettlementDecision struct {
 	desiredExists  bool
 	desiredPayload sql.NullString
 	desiredWire    sql.NullString
+	// liveEqualsEffect: an accepted row's live state already equals the committed effect, so applying
+	// the effect would rewrite the business row with the same values.
+	liveEqualsEffect bool
 }
 
 func (c *Client) applyStagedPushBundleLocked(ctx context.Context, uploaded []dirtyRowCapture, committed *committedPushBundle) error {
@@ -99,7 +102,17 @@ func (c *Client) settleStagedPushBundleSlice(ctx context.Context, uploaded []dir
 		return err
 	}
 	ctx = withUniqueApplyContext(ctx)
-	unit := applyUnit("push", committed.BundleSeq, committed.BundleHash)
+	acknowledgementOnly, err := c.canAcknowledgeWithoutBusinessWrites(ctx, execution, stagedRows, decisions)
+	if err != nil {
+		return err
+	}
+	// The strategy is part of the unit: a resumed plan of the other strategy is cleared, not reused.
+	strategy := "push"
+	if acknowledgementOnly {
+		strategy = "push-ack"
+		ctx = withRootOnlyApplyContext(ctx)
+	}
+	unit := applyUnit(strategy, committed.BundleSeq, committed.BundleHash)
 	if err := c.prepareApplySurvivors(ctx, execution, unit, len(stagedRows), func(index int) (applySurvivor, error) {
 		row := stagedRows[index]
 		decision := decisions[pushSettlementKey(row.SchemaName, row.TableName, row.KeyJSON)]
@@ -117,7 +130,7 @@ func (c *Client) settleStagedPushBundleSlice(ctx context.Context, uploaded []dir
 		return err
 	}
 
-	if err := c.applyPushSettlementEffectsInTx(ctx, stmtCache, execution, stagedRows, decisions, committed.BundleSeq); err != nil {
+	if err := c.applyPushSettlementEffectsInTx(ctx, stmtCache, execution, stagedRows, decisions, committed.BundleSeq, acknowledgementOnly); err != nil {
 		return err
 	}
 	if err := c.restorePushSettlementIntentInTx(ctx, stmtCache, execution, stagedRows, decisions, committed.BundleSeq); err != nil {
@@ -346,7 +359,10 @@ func (c *Client) buildPushSettlementPlanInTx(ctx context.Context, tx sqliteTrans
 			return nil, err
 		}
 		if !currentDirty.Exists && liveMatches {
-			decisions[decisionKey] = pushSettlementDecision{}
+			// A comparison that cannot be made only rules out acknowledgement-only settlement; the
+			// ordinary path applies and verifies the effect.
+			equal, compareErr := c.liveStateEqualsEffect(effect, livePayload, liveExists)
+			decisions[decisionKey] = pushSettlementDecision{liveEqualsEffect: compareErr == nil && equal}
 			continue
 		}
 		decision, err := c.settlementDecisionForNewerState(effect, livePayload, liveExists)
@@ -380,7 +396,7 @@ func (c *Client) buildPushSettlementPlanInTx(ctx context.Context, tx sqliteTrans
 				return nil, fmt.Errorf("failed to compare local intent with retained committed effect for %s.%s %s: %w", effect.SchemaName, effect.TableName, effect.KeyJSON, err)
 			}
 			if satisfied {
-				decisions[decisionKey] = pushSettlementDecision{}
+				decisions[decisionKey] = pushSettlementDecision{liveEqualsEffect: true}
 				continue
 			}
 		}
@@ -393,7 +409,34 @@ func (c *Client) buildPushSettlementPlanInTx(ctx context.Context, tx sqliteTrans
 	return decisions, nil
 }
 
-func (c *Client) applyPushSettlementEffectsInTx(ctx context.Context, stmtCache *txStmtCache, tx sqliteTransaction, stagedRows []stagedPushBundleRow, decisions map[string]pushSettlementDecision, bundleSeq int64) error {
+// canAcknowledgeWithoutBusinessWrites reports whether every committed effect is an unchanged accepted
+// row: an INSERT/UPDATE with an accept decision whose live row already equals the effect, on a table
+// without application or TEMP triggers. Such a settlement only records authoritative baselines, so its
+// plan needs no dependency index. Root preflight, unique handling and final verification still run.
+func (c *Client) canAcknowledgeWithoutBusinessWrites(ctx context.Context, tx sqliteTransaction, stagedRows []stagedPushBundleRow, decisions map[string]pushSettlementDecision) (bool, error) {
+	tables := map[string]bool{}
+	for _, row := range stagedRows {
+		if row.Op != oversync.OpInsert && row.Op != oversync.OpUpdate {
+			return false, nil
+		}
+		decision, ok := decisions[pushSettlementKey(row.SchemaName, row.TableName, row.KeyJSON)]
+		if !ok || decision.skipApply || !decision.liveEqualsEffect {
+			return false, nil
+		}
+		tables[row.TableName] = true
+	}
+	for table := range tables {
+		if err := c.reserveSyncWork(ctx, "push-ack", 16); err != nil {
+			return false, err
+		}
+		if _, found, err := applicationTriggerOnTable(ctx, tx, table); err != nil || found {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (c *Client) applyPushSettlementEffectsInTx(ctx context.Context, stmtCache *txStmtCache, tx sqliteTransaction, stagedRows []stagedPushBundleRow, decisions map[string]pushSettlementDecision, bundleSeq int64, acknowledgementOnly bool) error {
 	for _, row := range stagedRows {
 		bundleRow := oversync.BundleRow{
 			Schema:     row.SchemaName,
@@ -407,7 +450,13 @@ func (c *Client) applyPushSettlementEffectsInTx(ctx context.Context, stmtCache *
 		}
 		rowDecision, hasDecision := decisions[pushSettlementKey(row.SchemaName, row.TableName, row.KeyJSON)]
 		if !hasDecision || !rowDecision.skipApply {
-			if err := c.applyBundleRowAuthoritativelyInTxUsing(ctx, stmtCache, tx, &bundleRow, row.LocalPK, baselineObservation{Origin: "settlement", BundleSeq: &bundleSeq}); err != nil {
+			observation := baselineObservation{Origin: "settlement", BundleSeq: &bundleSeq}
+			if acknowledgementOnly {
+				// The live row already equals the effect: record its baseline without rewriting it.
+				if err := c.installAuthoritativeBaseline(ctx, tx, row.SchemaName, row.TableName, row.KeyJSON, "live", row.RowVersion, bundleRow.Payload, observation); err != nil {
+					return err
+				}
+			} else if err := c.applyBundleRowAuthoritativelyInTxUsing(ctx, stmtCache, tx, &bundleRow, row.LocalPK, observation); err != nil {
 				return err
 			}
 			if hasDecision {
