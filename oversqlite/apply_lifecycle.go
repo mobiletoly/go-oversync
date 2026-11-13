@@ -178,7 +178,7 @@ func (c *Client) snapshotStageSurvivor(ctx context.Context, tx sqliteTransaction
 	if err != nil {
 		return applySurvivor{}, err
 	}
-	if err := c.checkApplyWorkspace(p, 8, 8*size); err != nil {
+	if err := c.checkApplyWorkspace(p, snapshotRowAdmissionEntries, 8*size); err != nil {
 		return applySurvivor{}, err
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT table_name,key_json,payload FROM _sync_snapshot_stage WHERE snapshot_id=? AND row_ordinal=?`, id, ordinal).Scan(&table, &key, &payload); err != nil {

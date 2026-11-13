@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/mobiletoly/go-oversync/oversync"
@@ -548,6 +549,12 @@ func (c *Client) createOperationSnapshot(ctx context.Context, options snapshotAp
 	if session.SnapshotBundleSeq < floor {
 		return nil, &snapshotEvidenceError{"snapshot boundary precedes installed observations"}
 	}
+	if err := c.requireSnapshotWithinEntryQuota(session); err != nil {
+		// The session belongs to the source it was created for, which after a
+		// rotation is the new one.
+		c.retireSnapshotSession(ctx, session.SnapshotID, source)
+		return nil, err
+	}
 	state := &snapshotTransfer{Session: *session, Source: source, Guard: guard.context}
 	err = c.completeWork(ctx, "snapshot publish", func(ctx context.Context) (resultErr error) {
 		tx, err := beginImmediateTx(ctx, c.db)
@@ -801,4 +808,35 @@ func (c *Client) snapshotHashKeyValues(tx tableInfoQueryer, table, key string, c
 		local = fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
 	}
 	return []any{local}, nil
+}
+
+// snapshotRowAdmissionEntries is what snapshotStageSurvivor reserves to admit
+// one snapshot row into the apply plan.
+const snapshotRowAdmissionEntries int64 = 8
+
+// snapshotRetainedEntriesLowerBound is the number of workspace entries a
+// snapshot of rowCount rows certainly holds when its last row is admitted:
+// two owners, every stage row and the apply rows of all rows but the last.
+// Local rows and dependency edges only add to it. It saturates instead of
+// overflowing.
+func snapshotRetainedEntriesLowerBound(rowCount int64) int64 {
+	const ownersLessTheLastApplyRow = 2 - 1
+	if rowCount < 0 || rowCount > (math.MaxInt64-ownersLessTheLastApplyRow)/2 {
+		return math.MaxInt64
+	}
+	return ownersLessTheLastApplyRow + 2*rowCount
+}
+
+// requireSnapshotWithinEntryQuota refuses a snapshot that can never be applied
+// under the configured entry quota. It runs before any chunk is requested and
+// before anything is staged, and returns the error the apply would return
+// after the whole download.
+func (c *Client) requireSnapshotWithinEntryQuota(session *oversync.SnapshotSession) error {
+	limit := c.config.MaxSyncWorkspaceEntries
+	retained := snapshotRetainedEntriesLowerBound(session.RowCount)
+	if retained > limit || snapshotRowAdmissionEntries > limit-retained {
+		unit := applyUnit("snapshot", session.SnapshotBundleSeq, fmt.Sprintf("%s/%d/%d", session.SnapshotID, session.RowCount, session.ByteCount))
+		return &SyncWorkspaceLimitError{Unit: unit, Dimension: "entries", Limit: limit, Used: retained, Reserved: snapshotRowAdmissionEntries}
+	}
+	return nil
 }
