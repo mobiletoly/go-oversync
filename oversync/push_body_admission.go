@@ -82,17 +82,16 @@ func (a *pushBodyAdmission) tryAcquireDecode() (func(), bool) {
 }
 
 // readEncoded buffers at most limit+1 bytes of an encoded body and charges the
-// buffer's capacity to the byte budget before each allocation. sizeHint is the
-// declared length, or negative when unknown; it sizes the first buffer and is
-// not trusted beyond that. The returned charge stays held until the caller
-// refunds it, also when an error is returned.
+// buffer's capacity to the byte budget before each allocation. The buffer
+// starts small and grows only as bytes arrive, so a body that has been
+// announced but not sent holds almost nothing. sizeHint is the declared
+// length, or negative when unknown; it only keeps the buffer from growing past
+// what the request announced and is not trusted beyond that. The returned
+// charge stays held until the caller refunds it, also when an error is
+// returned.
 func (a *pushBodyAdmission) readEncoded(body io.Reader, sizeHint, limit int64) (encoded []byte, charged int64, err error) {
 	maxBuffer := limit + 1
-	capacity := pushBodyInitialBufferBytes
-	if sizeHint >= 0 {
-		capacity = sizeHint + 1
-	}
-	capacity = min(capacity, maxBuffer)
+	capacity := pushBodyBufferCapacity(0, sizeHint, maxBuffer)
 	for {
 		if grow := capacity - int64(cap(encoded)); grow > 0 {
 			if !a.tryCharge(grow) {
@@ -113,16 +112,28 @@ func (a *pushBodyAdmission) readEncoded(body io.Reader, sizeHint, limit int64) (
 		case int64(len(encoded)) >= maxBuffer:
 			return encoded, charged, nil
 		case len(encoded) == cap(encoded):
-			capacity = min(2*int64(cap(encoded)), maxBuffer)
+			capacity = pushBodyBufferCapacity(int64(cap(encoded)), sizeHint, maxBuffer)
 		}
 	}
+}
+
+// pushBodyBufferCapacity is the next capacity of a full receive buffer: the
+// initial size, then double, never past the declared length while the body is
+// within it, and never past maxBuffer.
+func pushBodyBufferCapacity(current, sizeHint, maxBuffer int64) int64 {
+	next := max(pushBodyInitialBufferBytes, 2*current)
+	if declared := sizeHint + 1; sizeHint >= 0 && current < declared {
+		next = min(next, declared)
+	}
+	return min(next, maxBuffer)
 }
 
 // admitPushBody reads and decodes one push request body under admission. On
 // success the caller owns the decoded bytes and must call release when the
 // request no longer needs them. Header and declared-length failures are
 // reported before any capacity is consumed; capacity refusal is reported
-// before any decompression or parsing.
+// before any decompression or parsing, and therefore before the body's shape
+// can be checked.
 func (s *SyncService) admitPushBody(r *http.Request, decodedLimit int64) (decoded []byte, release func(), err error) {
 	if decodedLimit < 1 {
 		return nil, nil, &boundedBodyError{code: "decoded_body_too_large", err: errors.New("decoded body limit is invalid")}
@@ -132,6 +143,10 @@ func (s *SyncService) admitPushBody(r *http.Request, decodedLimit int64) (decode
 		return nil, nil, err
 	}
 	if r.ContentLength > decodedLimit {
+		// Receive what a body of undeclared length would have been read up
+		// to, without retaining it, so that the refusal reaches a client that
+		// is still writing.
+		_, _ = io.CopyN(io.Discard, r.Body, decodedLimit+1)
 		return nil, nil, encodedBodyTooLargeError()
 	}
 	admission := s.pushBodies

@@ -14,8 +14,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -75,7 +77,8 @@ func TestPushBodyAdmission_RefusesBeyondDecodePermitsWithoutDecoding(t *testing.
 	require.Nil(t, decoded)
 	require.Nil(t, release)
 	// A refused body must cost about its encoded size, not its decoded size.
-	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(1<<20))
+	// The bound is half the decoded size because the counter is process-wide.
+	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(decodedBytes/2))
 	require.Zero(t, service.pushBodies.chargedBytes.Load())
 	require.EqualValues(t, 1, service.historyProjectionMetrics.capacityFailures.Load())
 
@@ -139,49 +142,105 @@ func TestPushBodyAdmission_AdmitsOnlyPermittedConcurrentBodies(t *testing.T) {
 	require.Zero(t, service.pushBodies.chargedBytes.Load())
 }
 
-func TestPushBodyAdmission_ChargesBodiesWhileTheyAreReceived(t *testing.T) {
-	const limit = int64(1024)
-	service := &SyncService{pushBodies: newPushBodyAdmission(1, limit)}
-	body := bytes.Repeat([]byte{'c'}, 600)
+type admittedPushBody struct {
+	decoded []byte
+	release func()
+	err     error
+}
 
-	// The first upload has declared its length and delivered only part of it.
-	slowReader, slowWriter := io.Pipe()
-	slow := httptest.NewRequest(http.MethodPost, "/sync/push", slowReader)
-	slow.ContentLength = int64(len(body))
-	type admittedBody struct {
-		decoded []byte
-		release func()
-		err     error
-	}
-	slowDone := make(chan admittedBody, 1)
-	go func() {
-		decoded, release, err := service.admitPushBody(slow, limit)
-		slowDone <- admittedBody{decoded: decoded, release: release, err: err}
-	}()
-	_, err := slowWriter.Write(body[:100])
-	require.NoError(t, err)
-	require.EqualValues(t, len(body)+1, service.pushBodies.chargedBytes.Load())
-
-	// A second upload that does not fit beside it is refused and received
-	// without being retained.
-	second := &countingReader{reader: bytes.NewReader(body)}
-	request := httptest.NewRequest(http.MethodPost, "/sync/push", second)
+// startStalledPushBody starts admitting a body that declares its full length
+// and has delivered only the given prefix. finish delivers the rest.
+func startStalledPushBody(t *testing.T, service *SyncService, limit int64, body []byte, prefix int) (finish func() admittedPushBody) {
+	t.Helper()
+	reader, writer := io.Pipe()
+	request := httptest.NewRequest(http.MethodPost, "/sync/push", reader)
 	request.ContentLength = int64(len(body))
+	done := make(chan admittedPushBody, 1)
+	go func() {
+		decoded, release, err := service.admitPushBody(request, limit)
+		done <- admittedPushBody{decoded: decoded, release: release, err: err}
+	}()
+	_, err := writer.Write(body[:prefix])
+	require.NoError(t, err)
+	return func() admittedPushBody {
+		_, err := writer.Write(body[prefix:])
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		return <-done
+	}
+}
+
+func TestPushBodyAdmission_AnAnnouncedBodyHoldsOnlyWhatHasArrived(t *testing.T) {
+	const limit = int64(1 << 20)
+	service := &SyncService{pushBodies: newPushBodyAdmission(1, limit)}
+	announced := bytes.Repeat([]byte{'c'}, int(limit))
+
+	// A body announces the largest length and stalls after 100 bytes.
+	finishStalled := startStalledPushBody(t, service, limit, announced, 100)
+	require.Equal(t, pushBodyInitialBufferBytes, service.pushBodies.chargedBytes.Load())
+
+	// Another body of more than half the budget is still received and admitted.
+	other := bytes.Repeat([]byte{'d'}, 600<<10)
+	request := httptest.NewRequest(http.MethodPost, "/sync/push", bytes.NewReader(other))
+	decoded, release, err := service.admitPushBody(request, limit)
+	require.NoError(t, err)
+	require.Equal(t, other, decoded)
+	require.Equal(t, pushBodyInitialBufferBytes, service.pushBodies.chargedBytes.Load())
+	release()
+
+	stalled := finishStalled()
+	require.NoError(t, stalled.err)
+	require.Equal(t, announced, stalled.decoded)
+	require.Zero(t, service.pushBodies.chargedBytes.Load())
+	stalled.release()
+	require.Empty(t, service.pushBodies.decodePermits)
+}
+
+func TestPushBodyAdmission_BodiesThatHaveArrivedAreChargedAndBoundOthers(t *testing.T) {
+	const limit = int64(1 << 20)
+	service := &SyncService{pushBodies: newPushBodyAdmission(1, limit)}
+	first := bytes.Repeat([]byte{'c'}, int(limit))
+
+	// 700 kB of the first body has arrived; its buffer has doubled to 1 MiB,
+	// one byte short of the whole budget.
+	finishFirst := startStalledPushBody(t, service, limit, first, 700<<10)
+	require.Eventually(t, func() bool { return service.pushBodies.chargedBytes.Load() == limit }, time.Second, time.Millisecond)
+
+	// A second body that does not fit beside it is refused and received
+	// without being retained.
+	second := &countingReader{reader: bytes.NewReader(bytes.Repeat([]byte{'d'}, 600<<10))}
+	request := httptest.NewRequest(http.MethodPost, "/sync/push", second)
+	request.ContentLength = 600 << 10
 	decoded, release, err := service.admitPushBody(request, limit)
 	requirePushBodyCapacityError(t, err)
 	require.Nil(t, decoded)
 	require.Nil(t, release)
-	require.Equal(t, len(body), second.read)
-	require.EqualValues(t, len(body)+1, service.pushBodies.chargedBytes.Load())
+	require.Equal(t, 600<<10, second.read)
+	require.Equal(t, limit, service.pushBodies.chargedBytes.Load())
 
-	_, err = slowWriter.Write(body[100:])
-	require.NoError(t, err)
-	require.NoError(t, slowWriter.Close())
-	first := <-slowDone
-	require.NoError(t, first.err)
-	require.Equal(t, body, first.decoded)
+	admitted := finishFirst()
+	require.NoError(t, admitted.err)
+	require.Equal(t, first, admitted.decoded)
 	require.Zero(t, service.pushBodies.chargedBytes.Load())
-	first.release()
+	admitted.release()
+}
+
+func TestPushBodyAdmission_RefundsAfterABodyReadFailure(t *testing.T) {
+	const limit = int64(1 << 20)
+	service := &SyncService{pushBodies: newPushBodyAdmission(1, limit)}
+	failure := errors.New("connection lost")
+	body := io.MultiReader(bytes.NewReader(make([]byte, 100<<10)), errorReader{err: failure})
+	request := httptest.NewRequest(http.MethodPost, "/sync/push", body)
+	request.ContentLength = -1
+
+	decoded, release, err := service.admitPushBody(request, limit)
+
+	require.ErrorIs(t, err, failure)
+	require.Nil(t, decoded)
+	require.Nil(t, release)
+	require.Zero(t, service.pushBodies.chargedBytes.Load())
+	require.Empty(t, service.pushBodies.decodePermits)
+	require.Zero(t, service.historyProjectionMetrics.capacityFailures.Load())
 }
 
 func TestPushBodyAdmission_RejectsOversizedBodiesBeforeCapacity(t *testing.T) {
@@ -196,13 +255,17 @@ func TestPushBodyAdmission_RejectsOversizedBodiesBeforeCapacity(t *testing.T) {
 		require.Empty(t, service.pushBodies.decodePermits)
 	}
 
-	t.Run("declared length is not read", func(t *testing.T) {
-		body := &countingReader{reader: bytes.NewReader(make([]byte, limit+1))}
+	t.Run("declared length is received up to the limit and not retained", func(t *testing.T) {
+		body := &countingReader{reader: bytes.NewReader(make([]byte, 4*limit))}
 		request := httptest.NewRequest(http.MethodPost, "/sync/push", body)
-		request.ContentLength = limit + 1
+		request.ContentLength = 4 * limit
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
 		_, _, err := service.admitPushBody(request, limit)
+		runtime.ReadMemStats(&after)
 		requireTooLarge(t, err, "encoded_body_too_large")
-		require.Zero(t, body.read)
+		require.EqualValues(t, limit+1, body.read)
+		require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(256<<10))
 	})
 	t.Run("undeclared length stops at the limit", func(t *testing.T) {
 		body := &countingReader{reader: bytes.NewReader(make([]byte, 4*limit))}
@@ -331,6 +394,19 @@ func TestPushBodyAdmission_HTTPRefusalIsRetryableAndTheSamePushThenCommits(t *te
 	for _, release := range held {
 		release()
 	}
+	// A body that is admitted and then fails to parse gives its admission back.
+	malformed := httptest.NewRequest(http.MethodPost, "/sync/push", strings.NewReader(`{"source_bundle_id":`))
+	malformed.Header.Set(ProtocolVersionHeader, SyncProtocolVersion)
+	malformed.Header.Set("Content-Type", "application/json")
+	malformed.Header.Set(SchemaGenerationIDHeader, canonicalSchemaGenerationID(proof.ID))
+	malformed.Header.Set(SchemaGenerationFingerprintHeader, proof.Fingerprint)
+	malformed = malformed.WithContext(ContextWithActor(malformed.Context(), fixture.writer))
+	malformedRecorder := httptest.NewRecorder()
+	handlers.HandlePush(malformedRecorder, malformed)
+	require.Equal(t, http.StatusBadRequest, malformedRecorder.Code, malformedRecorder.Body.String())
+	require.Empty(t, fixture.svc.pushBodies.decodePermits)
+	require.Zero(t, fixture.svc.pushBodies.chargedBytes.Load())
+
 	committed := push()
 	require.Equal(t, http.StatusOK, committed.Code, committed.Body.String())
 	replayed := push()
