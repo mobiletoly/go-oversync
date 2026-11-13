@@ -68,8 +68,18 @@ func readBoundedRequestBody(r *http.Request, decodedLimit int64) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	return decodeBoundedBody(encoding, encoded, decodedLimit)
+}
+
+func encodedBodyTooLargeError() error {
+	return &boundedBodyError{code: "encoded_body_too_large", err: errors.New("encoded request body exceeds limit")}
+}
+
+// decodeBoundedBody applies the encoded and decoded size limits to a body that
+// has already been read and removes its content encoding.
+func decodeBoundedBody(encoding string, encoded []byte, decodedLimit int64) ([]byte, error) {
 	if int64(len(encoded)) > decodedLimit {
-		return nil, &boundedBodyError{code: "encoded_body_too_large", err: errors.New("encoded request body exceeds limit")}
+		return nil, encodedBodyTooLargeError()
 	}
 	decoded := encoded
 	if encoding == "gzip" {
@@ -79,6 +89,7 @@ func readBoundedRequestBody(r *http.Request, decodedLimit int64) ([]byte, error)
 			return nil, &boundedBodyError{code: "invalid_gzip", err: gzipErr}
 		}
 		zipped.Multistream(false)
+		var err error
 		decoded, err = io.ReadAll(io.LimitReader(zipped, decodedLimit+1))
 		closeErr := zipped.Close()
 		if err != nil || closeErr != nil {
@@ -557,8 +568,18 @@ func (h *HTTPSyncHandlers) HandlePush(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", err.Error(), r)
 		return
 	}
+	// The body is admitted before it is decompressed or parsed, and its
+	// admission is held until this handler returns.
+	body, releaseBody, err := h.service.admitPushBody(r, int64(h.service.config.MaxBytesPerBundle)+historyEnvelopeAllowance)
+	if err != nil {
+		if !h.writeGenerationError(w, r, err) {
+			h.writeBoundedRequestFailure(w, r, err, "Failed to parse push envelope")
+		}
+		return
+	}
+	defer releaseBody()
 	var request CompactPushRequest
-	if err := decodeBoundedJSONRequest(r, &request, int64(h.service.config.MaxBytesPerBundle)+historyEnvelopeAllowance); err != nil {
+	if err := decodeStrictJSONRequest(bytes.NewReader(body), &request, true); err != nil {
 		h.writeBoundedRequestFailure(w, r, err, "Failed to parse push envelope")
 		return
 	}

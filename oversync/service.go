@@ -189,6 +189,7 @@ type SyncService struct {
 	snapshotBuildPermits       chan struct{}
 	snapshotChunkPermits       chan struct{}
 	historyProjectionPermits   chan struct{}
+	pushBodies                 *pushBodyAdmission
 	snapshotCleanupMu          sync.Mutex
 	snapshotCleanupCancel      context.CancelFunc
 	snapshotCleanupDone        chan struct{}
@@ -578,6 +579,7 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 		snapshotBuildPermits:       make(chan struct{}, config.MaxConcurrentSnapshotBuilds),
 		snapshotChunkPermits:       make(chan struct{}, config.MaxConcurrentSnapshotChunkRequests),
 		historyProjectionPermits:   make(chan struct{}, config.MaxConcurrentHistoryProjections),
+		pushBodies:                 newPushBodyAdmission(config.MaxConcurrentHistoryProjections, int64(config.MaxBytesPerBundle)+historyEnvelopeAllowance),
 		snapshotCleanupTrigger:     make(chan string, 1),
 		scopeReceiptCleanupTrigger: make(chan string, 1),
 	}
