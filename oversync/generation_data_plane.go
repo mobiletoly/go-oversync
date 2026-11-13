@@ -246,45 +246,46 @@ func (s *SyncService) projectPullPageForGeneration(ctx context.Context, tx pgx.T
 	if err := validateGenerationSelection(selection); err != nil {
 		return nil, err
 	}
-	projected := make([]Bundle, 0, len(bundleSeqs))
+	page, err := newPullPageAssembly(generationDescriptor(selection.view.contract), stableBundleSeq, hasMore, len(bundleSeqs))
+	if err != nil {
+		return nil, err
+	}
 	var admittedRows int64
 	stageStart := s.stageStart()
 	for _, bundleSeq := range bundleSeqs {
 		canonical, err := s.loadCommittedBundle(ctx, tx, userID, bundleSeq)
 		if err != nil {
-			s.observeStageErr(ctx, "pull", "load_bundles", stageStart, len(projected), 0, err)
+			s.observeStageErr(ctx, "pull", "load_bundles", stageStart, len(page.bundles), 0, err)
 			return nil, err
 		}
 		bundle, err := s.projectCommittedBundle(selection, canonical)
 		if err != nil {
-			s.observeStageErr(ctx, "pull", "load_bundles", stageStart, len(projected), 0, err)
+			s.observeStageErr(ctx, "pull", "load_bundles", stageStart, len(page.bundles), 0, err)
 			return nil, err
 		}
 		bundle.CanonicalRequestHash = ""
 		s.observeHistoryProjectionRetention(
-			int64(len(projected))+2,
+			int64(len(page.bundles))+2,
 			admittedRows+canonical.RowCount+bundle.RowCount,
 			canonical.ByteCount+bundle.ByteCount,
 		)
-		ownedBuffers, ownedBytes := retainedPullAllocations(projected, canonical, bundle)
-		s.observeHistoryProjectionOwnedRetention(ownedBuffers, ownedBytes)
-		candidate := append(append([]Bundle(nil), projected...), *bundle)
-		responseBytes, sizeErr := compactPullResponseDecodedBytes(generationDescriptor(selection.view.contract), stableBundleSeq, candidate, hasMore)
+		s.observeHistoryProjectionOwnedRetention(page.retainedWith(canonical, bundle))
+		responseBytes, sizeErr := page.responseBytesWith(bundle)
 		if sizeErr != nil {
 			return nil, &CommittedBundleUnrepresentableError{BundleSeq: bundle.BundleSeq}
 		}
 		if responseBytes > s.config.MaxBytesPerPullResponse {
-			if len(projected) == 0 {
+			if len(page.bundles) == 0 {
 				return nil, &CommittedBundleUnrepresentableError{BundleSeq: bundle.BundleSeq}
 			}
 			hasMore = true
 			break
 		}
 		admittedRows += bundle.RowCount
-		projected = append(projected, *bundle)
+		page.admit(bundle, responseBytes)
 	}
-	s.observeStage(ctx, "pull", "load_bundles", stageStart, len(projected), 0, false)
-	return &PullResponse{StableBundleSeq: stableBundleSeq, Bundles: projected, HasMore: hasMore}, nil
+	s.observeStage(ctx, "pull", "load_bundles", stageStart, len(page.bundles), 0, false)
+	return &PullResponse{StableBundleSeq: stableBundleSeq, Bundles: page.bundles, HasMore: hasMore}, nil
 }
 
 func (s *SyncService) materializeSnapshotRowsForGeneration(ctx context.Context, tx pgx.Tx, selection generationSelection, snapshotID, userID string, userPK, snapshotBundleSeq int64, hash *SnapshotHashWriter) (int64, int64, snapshotBatchHighWater, error) {

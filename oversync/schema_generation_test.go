@@ -2134,7 +2134,12 @@ func schemaGenerationAnonymousTuple(tuple *types.Tuple) *types.Tuple {
 // C01-C04 add v1 protocol admission, durable push outcomes/resolve/ack and
 // sealed snapshots/recovery/source replacement. Declarations remain declarative.
 // Prior pre-durable-recovery surface: a8ed6636c04ef884eae95b4517bcc5ac31bc9d7938344cc4cda249dae0612a37.
-const schemaGenerationAllowedPackageSurfaceHash = "601db16632ecdb5da11bda0e83bd07d74e890d819e455eb46c8713ed39f1b6fd"
+// Lost-freeze outcome recovery adds the owning source's retained-outcome read:
+// PushOutcomeRetainedRequest with its one field and strict UnmarshalJSON,
+// SyncService.FetchRetainedPushOutcome and HTTPSyncHandlers.HandlePushOutcomeRetained.
+// Generation declaration types and fingerprints remain unchanged.
+// Prior pre-retained-outcome surface: 601db16632ecdb5da11bda0e83bd07d74e890d819e455eb46c8713ed39f1b6fd.
+const schemaGenerationAllowedPackageSurfaceHash = "32d85f94d339d5467b45c9b67b2be3785eec552a1dfd6931b2950bfb4a026b80"
 
 func schemaGenerationPackageSurfaceHash(surface []string) string {
 	digest := sha256.Sum256([]byte(strings.Join(surface, "\n")))

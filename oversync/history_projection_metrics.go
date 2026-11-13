@@ -129,21 +129,6 @@ func retainedBundleAllocations(bundles ...*Bundle) (int64, int64) {
 	return buffers, bytes
 }
 
-func retainedPullAllocations(admitted []Bundle, current ...*Bundle) (int64, int64) {
-	var buffers, bytes int64
-	if admitted != nil {
-		buffers++
-		bytes += int64(cap(admitted)) * int64(unsafe.Sizeof(Bundle{}))
-	}
-	for i := range admitted {
-		rowBuffers, rowBytes := retainedBundleAllocations(&admitted[i])
-		buffers += rowBuffers
-		bytes += rowBytes
-	}
-	currentBuffers, currentBytes := retainedBundleAllocations(current...)
-	return buffers + currentBuffers, bytes + currentBytes
-}
-
 func (s *SyncService) observeHistoryProjectionOwnedRetention(buffers, bytes int64) {
 	m := &s.historyProjectionMetrics
 	observeAtomicHighWater(&m.ownedBuffersHigh, buffers)

@@ -249,17 +249,35 @@ func compactPushResponseDecodedBytes(generation SchemaGenerationCapabilities, bu
 
 func compactPullResponseDecodedBytes(generation SchemaGenerationCapabilities, stableBundleSeq int64, bundles []Bundle, hasMore bool) (int64, error) {
 	response := CompactPullResponse{StableBundleSeq: stableBundleSeq, Bundles: make([]CompactBundle, 0, len(bundles)), HasMore: hasMore}
-	for _, bundle := range bundles {
-		groups, err := CompactGroupsForBundleRows(generation, bundle.Rows)
+	for i := range bundles {
+		compact, err := compactPullBundle(generation, &bundles[i])
 		if err != nil {
 			return 0, err
 		}
-		response.Bundles = append(response.Bundles, CompactBundle{
-			BundleSeq: bundle.BundleSeq, SourceID: bundle.SourceID, SourceBundleID: bundle.SourceBundleID,
-			BundleHash: bundle.BundleHash, Rows: groups,
-		})
+		response.Bundles = append(response.Bundles, compact)
 	}
 	return decodedJSONBytes(response)
+}
+
+func compactPullBundle(generation SchemaGenerationCapabilities, bundle *Bundle) (CompactBundle, error) {
+	groups, err := CompactGroupsForBundleRows(generation, bundle.Rows)
+	if err != nil {
+		return CompactBundle{}, err
+	}
+	return CompactBundle{
+		BundleSeq: bundle.BundleSeq, SourceID: bundle.SourceID, SourceBundleID: bundle.SourceBundleID,
+		BundleHash: bundle.BundleHash, Rows: groups,
+	}, nil
+}
+
+// compactPullBundleDecodedBytes is the exact size of one bundle as an element
+// of a compact pull response, without the separator that joins elements.
+func compactPullBundleDecodedBytes(generation SchemaGenerationCapabilities, bundle *Bundle) (int64, error) {
+	compact, err := compactPullBundle(generation, bundle)
+	if err != nil {
+		return 0, err
+	}
+	return decodedJSONBytes(compact)
 }
 
 // validateFutureBundleRepresentations proves the publication invariants shared
