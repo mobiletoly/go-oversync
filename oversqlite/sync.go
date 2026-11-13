@@ -184,11 +184,9 @@ func (c *Client) probeRetiredGenerationWhileDownloadBlocked(ctx context.Context,
 	if !errors.As(pullErr, &dirty) {
 		return false
 	}
-	maxBundles := c.config.DownloadLimit
-	if maxBundles <= 0 {
-		maxBundles = 1000
-	}
-	_, err := c.sendPullRequest(ctx, afterBundleSeq, maxBundles, 0)
+	// The response is discarded, so one bundle is asked for: the retirement
+	// signal does not depend on the page size.
+	_, err := c.sendPullRequest(ctx, afterBundleSeq, 1, 0)
 	return c.stopForRetiredGeneration(err)
 }
 

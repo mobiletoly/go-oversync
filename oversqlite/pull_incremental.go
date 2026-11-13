@@ -6,6 +6,7 @@ package oversqlite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -95,16 +96,39 @@ func (c *Client) pullToStableLocked(ctx context.Context) (RemoteSyncReport, erro
 }
 
 func (c *Client) pullIncrementalToStableLocked(ctx context.Context, afterBundleSeq int64, maxBundles int) (RemoteSyncReport, error) {
+	return c.pullIncrementalPagesLocked(ctx, afterBundleSeq, maxBundles, pullPageTargetDecodedBytes)
+}
+
+// pullIncrementalPagesLocked pulls to the stable bundle sequence in pages of
+// about pageTargetDecodedBytes.
+func (c *Client) pullIncrementalPagesLocked(ctx context.Context, afterBundleSeq int64, maxBundles int, pageTargetDecodedBytes int64) (RemoteSyncReport, error) {
+	if c.discovery == nil || c.discovery.Limits.MaxPullDecodedBytes < 1 {
+		return RemoteSyncReport{}, &InvalidAdmittedContractError{Message: "pull response limit is unavailable"}
+	}
+	if maxBundles < 1 {
+		return RemoteSyncReport{}, &InvalidAdmittedContractError{Message: "pull limits are unavailable"}
+	}
+	admittedDecodedBytes := c.discovery.Limits.MaxPullDecodedBytes
+	pages := newPullPageSizing(maxBundles, pageTargetDecodedBytes)
 	targetBundleSeq := int64(0)
 	appliedBundles := false
 	for {
-		resp, err := c.sendPullRequest(ctx, afterBundleSeq, maxBundles, targetBundleSeq)
+		decodedByteLimit := pages.responseDecodedByteLimit(admittedDecodedBytes)
+		resp, decodedBytes, err := c.sendPullPageRequest(ctx, afterBundleSeq, pages.requestBundles, targetBundleSeq, decodedByteLimit)
 		if err != nil {
+			// Only a page refused at this client's own byte target is asked
+			// for again with fewer bundles. A response above what the server
+			// advertised stays a failure, and so does an oversized error body,
+			// which is refused at a different limit.
+			if decodedByteLimit < admittedDecodedBytes && pullPageRefusedAtLimit(err, decodedByteLimit) && pages.shrinkAfterOversizedPage() {
+				continue
+			}
 			if report, recovered, recoveryErr := c.recoverIncrementalPullHistoryGapLocked(ctx, err); recovered {
 				return report, recoveryErr
 			}
 			return RemoteSyncReport{}, err
 		}
+		pages.pageDecoded(len(resp.Bundles), decodedBytes)
 		if targetBundleSeq == 0 {
 			targetBundleSeq = resp.StableBundleSeq
 		} else if resp.StableBundleSeq != targetBundleSeq {
@@ -162,10 +186,37 @@ func (c *Client) recoverIncrementalPullHistoryGapLocked(ctx context.Context, pul
 	return report, true, err
 }
 
+// pullPageRefusedAtLimit reports whether a pull failed because its successful
+// response body, encoded or decoded, exceeded exactly the given limit. An
+// error body is refused at snapshotControlBodyLimit, so that limit cannot
+// identify a page and never counts as one.
+func pullPageRefusedAtLimit(err error, limit int64) bool {
+	if limit == snapshotControlBodyLimit {
+		return false
+	}
+	var decoded *SnapshotResponseBodyTooLargeError
+	if errors.As(err, &decoded) {
+		return decoded.Limit == limit
+	}
+	var encoded *EncodedResponseBodyTooLargeError
+	if errors.As(err, &encoded) {
+		return encoded.Limit == limit
+	}
+	return false
+}
+
 func (c *Client) sendPullRequest(ctx context.Context, afterBundleSeq int64, maxBundles int, targetBundleSeq int64) (*oversync.PullResponse, error) {
 	if c.discovery == nil || c.discovery.Limits.MaxPullDecodedBytes < 1 {
 		return nil, &InvalidAdmittedContractError{Message: "pull response limit is unavailable"}
 	}
+	resp, _, err := c.sendPullPageRequest(ctx, afterBundleSeq, maxBundles, targetBundleSeq, c.discovery.Limits.MaxPullDecodedBytes)
+	return resp, err
+}
+
+// sendPullPageRequest sends one pull request whose successful response body
+// may hold at most decodedByteLimit bytes, and returns the validated response
+// with the decoded size of its body.
+func (c *Client) sendPullPageRequest(ctx context.Context, afterBundleSeq int64, maxBundles int, targetBundleSeq, decodedByteLimit int64) (*oversync.PullResponse, int64, error) {
 	endpoint := fmt.Sprintf("%s/sync/pull?after_bundle_seq=%d&max_bundles=%d", c.BaseURL, afterBundleSeq, maxBundles)
 	if targetBundleSeq > 0 {
 		endpoint += "&target_bundle_seq=" + strconv.FormatInt(targetBundleSeq, 10)
@@ -173,26 +224,26 @@ func (c *Client) sendPullRequest(ctx context.Context, afterBundleSeq int64, maxB
 
 	result, err := c.doAuthenticatedBoundedRequestWithRetry(
 		ctx, "pull_request", http.MethodGet, endpoint, nil, "",
-		c.discovery.Limits.MaxPullDecodedBytes, snapshotControlBodyLimit, nil, nil,
+		decodedByteLimit, snapshotControlBodyLimit, nil, nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send pull request: %w", err)
+		return nil, 0, fmt.Errorf("failed to send pull request: %w", err)
 	}
 	body, statusCode := result.body, result.statusCode
 	if statusCode != http.StatusOK {
 		if generationErr := decodeSchemaGenerationRequestError(statusCode, body, c.schemaGenerationProof); generationErr != nil {
-			return nil, generationErr
+			return nil, 0, generationErr
 		}
 		if statusCode == http.StatusConflict {
 			var errorResp oversync.ErrorResponse
 			if json.Unmarshal(body, &errorResp) == nil {
 				switch errorResp.Error {
 				case "history_pruned":
-					return nil, &HistoryPrunedError{
+					return nil, 0, &HistoryPrunedError{
 						Status: statusCode,
 					}
 				case "checkpoint_ahead":
-					return nil, &CheckpointAheadError{
+					return nil, 0, &CheckpointAheadError{
 						Status: statusCode,
 					}
 				}
@@ -200,27 +251,27 @@ func (c *Client) sendPullRequest(ctx context.Context, afterBundleSeq int64, maxB
 		}
 		if statusCode == http.StatusInternalServerError {
 			if response, ok := decodeServerErrorResponse(body); ok && response.Error == "committed_bundle_unrepresentable" {
-				return nil, &CommittedBundleUnrepresentableError{}
+				return nil, 0, &CommittedBundleUnrepresentableError{}
 			}
 		}
-		return nil, fmt.Errorf("pull request returned status %d: %s", statusCode, decodeServerErrorBody(body))
+		return nil, 0, fmt.Errorf("pull request returned status %d: %s", statusCode, decodeServerErrorBody(body))
 	}
 
 	if err := validatePullResponseFieldPresence(body); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var compact oversync.CompactPullResponse
 	if err := json.Unmarshal(body, &compact); err != nil {
-		return nil, fmt.Errorf("failed to decode pull response: %w", err)
+		return nil, 0, fmt.Errorf("failed to decode pull response: %w", err)
 	}
 	pullResp, err := c.expandCompactPullResponse(compact)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := c.validatePullResponse(pullResp, afterBundleSeq); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return pullResp, nil
+	return pullResp, int64(len(body)), nil
 }
 
 func (c *Client) expandCompactPullResponse(compact oversync.CompactPullResponse) (*oversync.PullResponse, error) {
