@@ -456,16 +456,25 @@ func (c *Client) doAuthenticatedBoundedRequestWithRetryAsSource(
 ) (boundedResponsePayload, error) {
 	capacityPolicy := c.normalizedSnapshotCapacityRetryPolicy()
 	var capacityStarted time.Time
+	// The pull window lives outside the generic attempt loop and its refusals are
+	// waited out inside one generic attempt, so neither resets the other's budget.
+	history := pullCapacityWindow{policy: c.normalizedPullCapacityRetryPolicy(), enabled: operation == "pull_request"}
 	for {
 		result, err := withRetryValue(ctx, c.normalizedRetryPolicy(), operation, func() (boundedResponsePayload, error) {
-			result, err := c.doAuthenticatedBoundedRequestAsSource(ctx, operation, method, endpoint, requestBody, contentType, successLimit, errorLimit, sourceID, onDecodedBodyRead)
-			if err != nil {
-				return boundedResponsePayload{}, err
+			for {
+				history.dispatches++
+				result, err := c.doAuthenticatedBoundedRequestAsSource(ctx, operation, method, endpoint, requestBody, contentType, successLimit, errorLimit, sourceID, onDecodedBodyRead)
+				if err != nil {
+					return boundedResponsePayload{}, err
+				}
+				err = classifyBoundedRetryResponse(result, operation, transientErrorCodes)
+				if err == nil {
+					return result, nil
+				}
+				if retry, err := history.wait(ctx, operation, result, err); !retry {
+					return boundedResponsePayload{}, err
+				}
 			}
-			if err := classifyBoundedRetryResponse(result, operation, transientErrorCodes); err != nil {
-				return boundedResponsePayload{}, err
-			}
-			return result, nil
 		})
 		if err == nil {
 			return result, nil
@@ -503,8 +512,49 @@ func (c *Client) doAuthenticatedBoundedRequestWithRetryAsSource(
 	}
 }
 
+// pullCapacityWindow re-sends a pull refused with HTTP 503
+// history_projection_capacity_exceeded within its elapsed-time window instead of
+// the generic attempt limit. Exhaustion surfaces the generic RetryExhaustedError,
+// which the generic attempt loop does not retry.
+type pullCapacityWindow struct {
+	policy       normalizedPushCapacityRetryPolicy
+	enabled      bool
+	firstRefusal time.Time
+	dispatches   int
+}
+
+// wait reports whether the classified failure err of result was a history
+// capacity refusal that has been waited out, so the request is sent again.
+// Otherwise it returns the error that ends this attempt: err itself, the
+// exhausted window, or the caller's cancellation.
+func (w *pullCapacityWindow) wait(ctx context.Context, operation string, result boundedResponsePayload, err error) (bool, error) {
+	if !w.enabled || !w.policy.enabled || !isHistoryProjectionCapacityResponse(result) {
+		return false, err
+	}
+	var httpErr *retryHTTPError
+	if !errors.As(err, &httpErr) {
+		return false, err
+	}
+	if w.firstRefusal.IsZero() {
+		w.firstRefusal = time.Now()
+	}
+	delay, ok := nextCapacityRetryDelay(w.policy, w.firstRefusal, httpErr.retryAfter)
+	if !ok {
+		return false, &RetryExhaustedError{
+			Operation:   operation,
+			Attempts:    w.dispatches,
+			LastFailure: RetryFailureClass{Kind: "http_status", Operation: operation, HTTPStatus: http.StatusServiceUnavailable},
+		}
+	}
+	if err := waitRetryBackoff(ctx, delay); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Classify a decoded HTTP failure before retry scheduling. Snapshot capacity keeps
-// its separate elapsed budget; ordinary history capacity retains transport attempts.
+// its separate elapsed budget; pullCapacityWindow waits out a pull's history
+// capacity refusal inside one generic attempt, which elsewhere it would consume.
 func classifyBoundedRetryResponse(result boundedResponsePayload, operation string, transientErrorCodes map[string]struct{}) error {
 	retryable := result.statusCode == http.StatusBadGateway || result.statusCode == http.StatusServiceUnavailable || result.statusCode == http.StatusGatewayTimeout
 	if result.statusCode == http.StatusTooManyRequests {

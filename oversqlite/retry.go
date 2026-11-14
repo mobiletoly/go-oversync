@@ -45,6 +45,17 @@ type PushCapacityRetryPolicy struct {
 	JitterFraction float64
 }
 
+// PullCapacityRetryPolicy configures elapsed-time retry for server history
+// projection admission during pull requests. It is independent of RetryPolicy
+// so a busy server does not consume the generic transport-attempt budget; an
+// exhausted window surfaces RetryExhaustedError for the pull request.
+type PullCapacityRetryPolicy struct {
+	Enabled        bool
+	MaxWait        time.Duration
+	FallbackDelay  time.Duration
+	JitterFraction float64
+}
+
 // PushCapacityRetryExhaustedError reports that push admission remained
 // unavailable for the configured capacity-wait budget.
 type PushCapacityRetryExhaustedError struct {
@@ -143,6 +154,13 @@ var defaultSnapshotCapacityRetryPolicy = SnapshotCapacityRetryPolicy{
 }
 
 var defaultPushCapacityRetryPolicy = PushCapacityRetryPolicy{
+	Enabled:        true,
+	MaxWait:        30 * time.Second,
+	FallbackDelay:  time.Second,
+	JitterFraction: 1,
+}
+
+var defaultPullCapacityRetryPolicy = PullCapacityRetryPolicy{
 	Enabled:        true,
 	MaxWait:        30 * time.Second,
 	FallbackDelay:  time.Second,
@@ -290,6 +308,35 @@ func normalizePushCapacityRetryPolicy(policy *PushCapacityRetryPolicy) normalize
 	return normalizedPushCapacityRetryPolicy{
 		enabled: true, maxWait: maxWait, fallbackDelay: fallbackDelay, jitterFraction: jitter,
 	}
+}
+
+// The pull window has the push window's shape and normalization; only its
+// defaults and the exhaustion error differ.
+func (c *Client) normalizedPullCapacityRetryPolicy() normalizedPushCapacityRetryPolicy {
+	policy := defaultPullCapacityRetryPolicy
+	if c != nil && c.config != nil && c.config.PullCapacityRetryPolicy != nil {
+		policy = *c.config.PullCapacityRetryPolicy
+	}
+	normalized := PushCapacityRetryPolicy(policy)
+	return normalizePushCapacityRetryPolicy(&normalized)
+}
+
+// nextCapacityRetryDelay returns the wait before the next dispatch after a
+// capacity refusal, or false when the elapsed window cannot hold that wait.
+// The window runs from the first refusal of the request.
+func nextCapacityRetryDelay(policy normalizedPushCapacityRetryPolicy, firstRefusal time.Time, retryAfter time.Duration) (time.Duration, bool) {
+	if !policy.enabled {
+		return 0, false
+	}
+	waited, delay := time.Since(firstRefusal), retryAfter
+	if delay <= 0 {
+		delay = policy.fallbackDelay
+	}
+	delay = positiveJitterDuration(delay, policy.jitterFraction)
+	if delay <= 0 || waited >= policy.maxWait || delay > policy.maxWait-waited {
+		return 0, false
+	}
+	return delay, true
 }
 
 func withRetryValue[T any](ctx context.Context, policy normalizedRetryPolicy, operation string, fn func() (T, error)) (T, error) {

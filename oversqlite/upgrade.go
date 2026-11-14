@@ -1886,6 +1886,10 @@ func cloneCoordinatorClientConfig(config *Config) *Config {
 		policy := *config.PushCapacityRetryPolicy
 		clone.PushCapacityRetryPolicy = &policy
 	}
+	if config.PullCapacityRetryPolicy != nil {
+		policy := *config.PullCapacityRetryPolicy
+		clone.PullCapacityRetryPolicy = &policy
+	}
 	return &clone
 }
 

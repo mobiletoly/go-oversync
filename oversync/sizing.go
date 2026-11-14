@@ -182,8 +182,9 @@ type ConnectionBudget struct {
 	// BackgroundWorkers covers snapshot cleanup and scope-receipt cleanup.
 	BackgroundWorkers int
 	// ShortRequests is a reserve for requests that take a connection without a
-	// permit: pull planning, push-outcome acknowledgment, source binding,
-	// snapshot deletion, watch subscription and status.
+	// permit: push-outcome acknowledgment, source binding, snapshot deletion,
+	// watch subscription and status. A pull takes its history-projection permit
+	// before its first pooled query.
 	ShortRequests int
 	// PoolMaxConns is the sum above: the minimum pgxpool MaxConns.
 	PoolMaxConns int32

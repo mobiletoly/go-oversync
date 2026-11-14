@@ -321,20 +321,19 @@ func (c *Client) doAuthenticatedPushRequestForBinding(ctx context.Context, opera
 		return boundedResponsePayload{}, err
 	}
 	policy := c.normalizedPushCapacityRetryPolicy()
-	started := time.Now()
+	var firstRefusal time.Time
 	for {
 		result, err := c.doAuthenticatedBoundedRequestForBinding(ctx, operation, method, endpoint, requestBody, contentType, successLimit, errorLimit, binding.SourceID, oversync.SchemaGenerationProof{ID: oversync.SchemaGenerationID(generationID), Fingerprint: binding.GenerationFingerprint}, onDecodedBodyRead)
 		if err != nil || !isHistoryProjectionCapacityResponse(result) {
 			return result, err
 		}
 		atomic.AddInt64(&c.pushStats.capacityResponses, 1)
-		waited, delay := time.Since(started), parseRetryAfterDeltaSeconds(result.retryAfter)
-		if delay <= 0 {
-			delay = policy.fallbackDelay
+		if firstRefusal.IsZero() {
+			firstRefusal = time.Now()
 		}
-		delay = positiveJitterDuration(delay, policy.jitterFraction)
-		if !policy.enabled || delay <= 0 || waited >= policy.maxWait || delay > policy.maxWait-waited {
-			return boundedResponsePayload{}, &PushCapacityRetryExhaustedError{Operation: operation, ErrorCode: "history_projection_capacity_exceeded", Waited: waited}
+		delay, ok := nextCapacityRetryDelay(policy, firstRefusal, parseRetryAfterDeltaSeconds(result.retryAfter))
+		if !ok {
+			return boundedResponsePayload{}, &PushCapacityRetryExhaustedError{Operation: operation, ErrorCode: "history_projection_capacity_exceeded", Waited: time.Since(firstRefusal)}
 		}
 		atomic.AddInt64(&c.pushStats.capacityRetries, 1)
 		waitStarted := time.Now()

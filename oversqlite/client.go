@@ -575,9 +575,10 @@ type Config struct {
 	SnapshotChunkBytes            int64                                 // e.g., 4 MiB
 	BackoffMin                    time.Duration                         // 1s
 	BackoffMax                    time.Duration                         // 60s
-	RetryPolicy                   *RetryPolicy                          // nil => conservative built-in retry policy; explicit disabled policy turns retries off
+	RetryPolicy                   *RetryPolicy                          // nil => conservative built-in retry policy; explicit disabled policy turns generic retries off (capacity windows have their own policies)
 	SnapshotCapacityRetryPolicy   *SnapshotCapacityRetryPolicy          // nil => enabled with a 30-second elapsed-time budget
 	PushCapacityRetryPolicy       *PushCapacityRetryPolicy              // nil => enabled with a 30-second elapsed-time budget
+	PullCapacityRetryPolicy       *PullCapacityRetryPolicy              // nil => enabled with a 30-second elapsed-time budget
 	BundleChangeWatchMode         BundleChangeWatchMode                 // off by default; auto uses /sync/watch only when advertised by server
 	WatchFallbackInterval         time.Duration                         // 0 => BackoffMax, or 60s when BackoffMax is unset
 	testAfterOwnership            func()                                // tests may pause construction after exclusive ownership

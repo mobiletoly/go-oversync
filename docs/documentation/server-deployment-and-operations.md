@@ -301,8 +301,9 @@ The integration server also accepts `OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS
 machine sizing or the service's bounded default of four applies. Projection permits can remain held until the HTTP response is
 written, so raise this only from measurements and size it with the PostgreSQL pool, request
 duration, and server memory. Admission overload returns retryable HTTP `503` with `Retry-After: 1`.
-The Go client's `PushCapacityRetryPolicy` handles this signal independently of the generic
-three-attempt transport retry budget; a nil policy uses a 30-second elapsed-time budget.
+The Go client's `PushCapacityRetryPolicy` and `PullCapacityRetryPolicy` handle this signal
+independently of the generic three-attempt transport retry budget; a nil policy uses a 30-second
+elapsed-time budget. The Kotlin client applies the same 30-second window to push and pull.
 
 Place TLS and public request controls in your application or trusted proxy. Keep
 `/syncx/health` and `/syncx/status` on an internal network or protect them with an access policy.

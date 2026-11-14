@@ -231,7 +231,7 @@ type ServiceConfig struct {
 	ScopeTransactionAdmission      ScopeTransactionAdmission
 	Readiness                      *ReadinessConfig   // Required application-owned deployment evidence
 	SchemaGenerations              []SchemaGeneration // Required immutable client generation contracts
-	AppName                        string             // Application name for connection tracking
+	AppName                        string             // Application name reported by the status endpoint
 	RegisteredTables               []RegisteredTable  // Schema.table combinations allowed for sync (required)
 	RegisteredTableCatalogRevision int64              // Required target revision for the durable table catalog
 	MaxClientSourcesPerUser        int                // Zero selects 64; explicit values must be in 1..4096
@@ -270,8 +270,8 @@ type ServiceConfig struct {
 	// Per-process admission. Each permit holds at most one PostgreSQL
 	// connection; see ConnectionBudget and ApplySizing. Zero selects the default.
 
-	// MaxConcurrentHistoryProjections bounds pushes, pull projections and
-	// push-outcome reads in flight. Excess requests get 503 with Retry-After.
+	// MaxConcurrentHistoryProjections bounds pushes, pulls and push-outcome
+	// reads in flight. Excess requests get 503 with Retry-After.
 	// Zero selects 4; maximum 32.
 	MaxConcurrentHistoryProjections int
 	// MaxConcurrentSnapshotBuilds bounds snapshot session builds in flight.

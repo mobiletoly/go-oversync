@@ -216,18 +216,22 @@ the request:
 
 | Refused request | Go client (`oversqlite`) | Kotlin client (SQLiteNow) |
 | --- | --- | --- |
-| Push, push-outcome read (503) | `PushCapacityRetryPolicy`: up to 30 seconds; each wait is `Retry-After` plus up to 100% random jitter | Transient retry: 3 attempts per sync call, each wait at least `Retry-After` |
-| Pull (503) | `RetryPolicy`: 3 attempts, each wait at least `Retry-After` (about 2 seconds in all) | Transient retry: 3 attempts per sync call, each wait at least `Retry-After` |
+| Push, push-outcome read (503) | `PushCapacityRetryPolicy`: up to 30 seconds; each wait is `Retry-After` plus up to 100% random jitter | Capacity window: up to 30 seconds per request, each wait `Retry-After` plus up to 100% random jitter; refusals do not use the 3 transient attempts |
+| Pull (503) | `PullCapacityRetryPolicy`: the same as push | Capacity window: the same as push |
 | Snapshot creation or chunk (429) | `SnapshotCapacityRetryPolicy`: up to 30 seconds; each wait is `Retry-After` plus up to 100% random jitter | `snapshotCapacityRetryPolicy`: the same |
+
+The 30-second windows are counted from the first refusal of a request; a retry whose wait would end
+past the window is not sent. In recovery work (push-outcome resolve and retained reads, snapshot
+requests) every retry is also one of the 64 recovery requests a sync call may send.
 
 When the retries run out, the sync call fails with a retryable error (Go `RetryExhaustedError` or
 `PushCapacityRetryExhaustedError`; Kotlin reports an `OversqliteCategorizedException` in the
 `NETWORK` category). Local changes stay
 pending and the next sync sends them. Many devices pulling at once, for example all catching up
-after the same burst of pushes, is therefore the case to plan for: on one 2 vCPU instance, 26 to 38
-of 50 devices that pulled together gave up after about 2 seconds and needed the app's next sync.
-Retry a failed sync from the app with a randomized delay, and add instances when this happens
-regularly.
+after the same burst of pushes, is therefore the case to plan for: on one 2 vCPU instance, before
+pulls had a capacity window, 26 to 38 of 50 devices that pulled together gave up after about
+2 seconds and needed the app's next sync. Retry a failed sync from the app with a randomized delay,
+and add instances when this happens regularly.
 
 Fleet-wide restore bursts need attention. A new schema generation rolled out to all devices, or a
 database restored from a backup, makes many clients build snapshot sessions at once. Each session
