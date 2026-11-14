@@ -4,16 +4,31 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	sc "github.com/mobiletoly/go-oversync/examples/samplesync_server/server"
+	"github.com/mobiletoly/go-oversync/internal/serverenv"
 )
 
+// shutdownTimeout bounds the drain on SIGTERM: readiness is withdrawn first,
+// then in-flight requests finish.
+const shutdownTimeout = 30 * time.Second
+
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Example-server variables (OVERSYNC_*) are read by the host, never by oversync.
+	envSettings, err := serverenv.Load(os.Getenv)
+	if err != nil {
+		slog.Error("invalid environment", "error", err)
+		os.Exit(1)
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: envSettings.LogLevel}))
 
 	cfg := &sc.ServerConfig{
 		DatabaseURL: os.Getenv("DATABASE_URL"),
@@ -48,11 +63,32 @@ func main() {
 	logger.Info("Sync source: send Oversync-Source-ID on authenticated /sync/* requests")
 
 	server := newHTTPServer(addr, comps.Handler)
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
 
-	if err := server.ListenAndServe(); err != nil {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-quit:
+	case err := <-serverErr:
 		logger.Error("http server failed", "error", err)
-		os.Exit(1)
 	}
+
+	logger.Info("Shutting down server")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	// Withdraw readiness and cancel watches before waiting for HTTP handlers.
+	if err := comps.SyncService.Close(shutdownCtx); err != nil {
+		logger.Error("sync service drain did not complete", "error", err)
+	}
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http server shutdown did not complete", "error", err)
+	}
+	logger.Info("Server exited")
 }
 
 func newHTTPServer(addr string, handler http.Handler) *http.Server {
@@ -60,8 +96,11 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    1 << 20,
+		// ReadTimeout bounds a slow upload of a maximum-size push, which would
+		// otherwise hold the shared push-body budget.
+		ReadTimeout:    120 * time.Second,
+		IdleTimeout:    2 * time.Minute,
+		MaxHeaderBytes: 1 << 20,
 		// WriteTimeout remains zero because /sync/watch is a long-lived SSE stream.
 	}
 }

@@ -49,15 +49,21 @@ source comments, formatting, and file location do not rotate the identity.
 
 Concurrency
 
-- Snapshot admission defaults to eight active builds and four active chunk requests.
-- Override the limits with positive integers in
-  `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS` and
-  `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS`.
+- Snapshot admission defaults to four active builds and four active chunk requests.
+- Set `OVERSYNC_MACHINE=small|medium|large|auto` (or `OVERSYNC_CPUS` with `OVERSYNC_MEMORY`) to
+  size the permits, pool, and Go memory limit for the machine. Positive integers in
+  `OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS`, `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS` and
+  `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS` override single permits. The full list is in
+  the "Sizing and Deployment" documentation page.
 - Requests above the active snapshot limit receive a retryable HTTP 429 response instead of
   entering an unbounded server queue. Supported clients honor `Retry-After` and retry within
   their configured capacity-wait budget.
-- The PostgreSQL pool allows 20 connections in this local sample. Snapshot concurrency limits
-  bound the memory-heavy work; they do not limit connected users or devices.
+- The PostgreSQL pool defaults to the service's connection budget (18 connections at the default
+  permits); `OVERSYNC_DB_POOL_MAX_CONNS` or `pool_max_conns` in `DATABASE_URL` override it.
+  Snapshot concurrency limits bound the memory-heavy work; they do not limit connected users or
+  devices.
+- `OVERSYNC_LOG_LEVEL` selects the log level (default `info`); `PORT` the listen port. The server
+  drains requests for up to 30 seconds on SIGTERM.
 
 Client settings
 

@@ -10,24 +10,25 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mobiletoly/go-oversync/internal/exampleauth"
+	"github.com/mobiletoly/go-oversync/internal/serverenv"
 	"github.com/mobiletoly/go-oversync/internal/syncroute"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
 type ServerConfig struct {
-	DatabaseURL                        string
-	JWTSecret                          string
-	Logger                             *slog.Logger
-	AppName                            string
-	ReservedServerSourceIDs            []string
-	MaxConcurrentSnapshotBuilds        int
-	MaxConcurrentSnapshotChunkRequests int
+	DatabaseURL             string
+	JWTSecret               string
+	Logger                  *slog.Logger
+	AppName                 string
+	ReservedServerSourceIDs []string
+	// ConfigureService optionally adjusts the service configuration after the
+	// environment sizing is applied and before the pool is sized from it.
+	ConfigureService func(*oversync.ServiceConfig)
 }
 
 const maxLoggedBodyBytes = 100_000
@@ -38,8 +39,10 @@ type ServerComponents struct {
 	Auth        *exampleauth.TokenAuth
 	Handler     http.Handler
 	Logger      *slog.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
+	// Sizing is the machine sizing applied from the environment; nil without one.
+	Sizing *oversync.Sizing
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func (sc *ServerComponents) Close() {
@@ -56,9 +59,15 @@ func (sc *ServerComponents) Close() {
 
 func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	// The environment variables are read here, by the host, never by oversync.
+	envSettings, err := serverenv.Load(os.Getenv)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	logger := config.Logger
 	if logger == nil {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: envSettings.LogLevel}))
 	}
 	dsn := config.DatabaseURL
 	if dsn == "" {
@@ -69,13 +78,43 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		appName = "samplesync-server"
 	}
 
+	svcCfg := &oversync.ServiceConfig{
+		SchemaGenerations: []oversync.SchemaGeneration{{ID: 1, Tables: []oversync.GenerationTable{
+			{Schema: "business", Table: "comment", Columns: []oversync.GenerationColumn{{Name: "comment", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "person_id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "tags", WireType: oversync.GenerationWireTypeText, Nullable: true}}, ForeignKeys: []oversync.GenerationForeignKey{{Columns: []string{"person_id"}, ReferencedSchema: "business", ReferencedTable: "person", ReferencedColumns: []string{"id"}, OnDelete: oversync.GenerationForeignKeyCascade, OnUpdate: oversync.GenerationForeignKeyNoAction}}},
+			{Schema: "business", Table: "person", Columns: []oversync.GenerationColumn{{Name: "birth_date", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "email", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "first_name", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "is_active", WireType: oversync.GenerationWireTypeBoolean, Nullable: false}, {Name: "last_name", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "notes", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "phone", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "score", WireType: oversync.GenerationWireTypeFloat64, Nullable: true}, {Name: "ssn", WireType: oversync.GenerationWireTypeInt64, Nullable: true}, {Name: "updated_at", WireType: oversync.GenerationWireTypeText, Nullable: false}}},
+			{Schema: "business", Table: "person_address", Columns: []oversync.GenerationColumn{{Name: "address_type", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "city", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "country", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "is_primary", WireType: oversync.GenerationWireTypeBoolean, Nullable: false}, {Name: "person_id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "postal_code", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "state", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "street", WireType: oversync.GenerationWireTypeText, Nullable: false}}, ForeignKeys: []oversync.GenerationForeignKey{{Columns: []string{"person_id"}, ReferencedSchema: "business", ReferencedTable: "person", ReferencedColumns: []string{"id"}, OnDelete: oversync.GenerationForeignKeyCascade, OnUpdate: oversync.GenerationForeignKeyNoAction}}},
+		}}},
+		AppName: appName,
+		BundleChangeWatch: oversync.BundleChangeWatchConfig{
+			Enabled: true,
+		},
+		RegisteredTables: []oversync.RegisteredTable{
+			{Schema: "business", Table: "person", SyncKeyColumns: []string{"id"}},
+			{Schema: "business", Table: "person_address", SyncKeyColumns: []string{"id"}},
+			{Schema: "business", Table: "comment", SyncKeyColumns: []string{"id"}},
+		},
+		ReservedServerSourceIDs:        append([]string(nil), config.ReservedServerSourceIDs...),
+		RegisteredTableCatalogRevision: 1,
+	}
+	sizing, err := envSettings.ApplyService(svcCfg)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if config.ConfigureService != nil {
+		config.ConfigureService(svcCfg)
+	}
+	// Set the Go memory limit before the service starts, so its startup checks see it.
+	if limit := serverenv.ApplyGoMemoryLimit(sizing, os.Getenv); limit > 0 {
+		logger.Info("Go memory limit", "bytes", limit)
+	}
+
 	poolCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	poolCfg.MaxConns = 20
-	poolCfg.MinConns = 2
+	envSettings.ApplyPool(poolCfg, dsn, *svcCfg)
 	poolCfg.MaxConnIdleTime = time.Minute * 30
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -92,41 +131,6 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		pool.Close()
 		cancel()
 		return nil, err
-	}
-
-	svcCfg := &oversync.ServiceConfig{
-		SchemaGenerations: []oversync.SchemaGeneration{{ID: 1, Tables: []oversync.GenerationTable{
-			{Schema: "business", Table: "comment", Columns: []oversync.GenerationColumn{{Name: "comment", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "person_id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "tags", WireType: oversync.GenerationWireTypeText, Nullable: true}}, ForeignKeys: []oversync.GenerationForeignKey{{Columns: []string{"person_id"}, ReferencedSchema: "business", ReferencedTable: "person", ReferencedColumns: []string{"id"}, OnDelete: oversync.GenerationForeignKeyCascade, OnUpdate: oversync.GenerationForeignKeyNoAction}}},
-			{Schema: "business", Table: "person", Columns: []oversync.GenerationColumn{{Name: "birth_date", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "email", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "first_name", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "is_active", WireType: oversync.GenerationWireTypeBoolean, Nullable: false}, {Name: "last_name", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "notes", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "phone", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "score", WireType: oversync.GenerationWireTypeFloat64, Nullable: true}, {Name: "ssn", WireType: oversync.GenerationWireTypeInt64, Nullable: true}, {Name: "updated_at", WireType: oversync.GenerationWireTypeText, Nullable: false}}},
-			{Schema: "business", Table: "person_address", Columns: []oversync.GenerationColumn{{Name: "address_type", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "city", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "country", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "is_primary", WireType: oversync.GenerationWireTypeBoolean, Nullable: false}, {Name: "person_id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "postal_code", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "state", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "street", WireType: oversync.GenerationWireTypeText, Nullable: false}}, ForeignKeys: []oversync.GenerationForeignKey{{Columns: []string{"person_id"}, ReferencedSchema: "business", ReferencedTable: "person", ReferencedColumns: []string{"id"}, OnDelete: oversync.GenerationForeignKeyCascade, OnUpdate: oversync.GenerationForeignKeyNoAction}}},
-		}}},
-		AppName:                            appName,
-		MaxConcurrentSnapshotBuilds:        config.MaxConcurrentSnapshotBuilds,
-		MaxConcurrentSnapshotChunkRequests: config.MaxConcurrentSnapshotChunkRequests,
-		BundleChangeWatch: oversync.BundleChangeWatchConfig{
-			Enabled: true,
-		},
-		RegisteredTables: []oversync.RegisteredTable{
-			{Schema: "business", Table: "person", SyncKeyColumns: []string{"id"}},
-			{Schema: "business", Table: "person_address", SyncKeyColumns: []string{"id"}},
-			{Schema: "business", Table: "comment", SyncKeyColumns: []string{"id"}},
-		},
-		ReservedServerSourceIDs:        append([]string(nil), config.ReservedServerSourceIDs...),
-		RegisteredTableCatalogRevision: 1,
-	}
-	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(
-		svcCfg.MaxConcurrentSnapshotBuilds,
-		svcCfg.MaxConcurrentSnapshotChunkRequests,
-	)
-	if err != nil {
-		pool.Close()
-		cancel()
-		return nil, err
-	}
-	svcCfg.MaxConcurrentSnapshotBuilds = builds
-	svcCfg.MaxConcurrentSnapshotChunkRequests = chunks
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
-		svcCfg.LogStageTimings = true
 	}
 
 	if err := prepareBaselineReadiness(ctx, pool, svcCfg); err != nil {
@@ -197,6 +201,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		Auth:        auth,
 		Handler:     BrowserTestCORSMiddleware(sampleReadinessGuard(syncService, mux, generationHandler)),
 		Logger:      logger,
+		Sizing:      sizing,
 		ctx:         ctx,
 		cancel:      cancel,
 	}, nil
@@ -235,31 +240,6 @@ func sampleSyncDummySigninHandler(auth *exampleauth.TokenAuth, logger *slog.Logg
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp{Token: token, ExpiresIn: tokenExpiresInSeconds, User: rr.User})
 	})
-}
-
-func configuredSnapshotConcurrencyFromEnv(builds, chunks int) (int, int, error) {
-	parse := func(name string, current int) (int, error) {
-		value := strings.TrimSpace(os.Getenv(name))
-		if value == "" {
-			return current, nil
-		}
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 {
-			return 0, fmt.Errorf("%s must be a positive integer", name)
-		}
-		return parsed, nil
-	}
-
-	var err error
-	builds, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", builds)
-	if err != nil {
-		return 0, 0, err
-	}
-	chunks, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS", chunks)
-	if err != nil {
-		return 0, 0, err
-	}
-	return builds, chunks, nil
 }
 
 // BrowserTestCORSMiddleware keeps the example server usable from browser-based demos.

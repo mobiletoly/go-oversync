@@ -99,8 +99,11 @@ JWT_SECRET="your-secret-key-change-in-production" \
 go run ./integration/nethttp_server
 ```
 
-Snapshot admission defaults to eight active builds and four active chunk
-requests. Override them with positive integers in
+Snapshot admission defaults to four active builds and four active chunk
+requests. `OVERSYNC_MACHINE=small|medium|large|auto` (or `OVERSYNC_CPUS` with
+`OVERSYNC_MEMORY`) sizes the permits, the PostgreSQL pool, and the Go memory
+limit for the machine; see the "Sizing and Deployment" documentation page for
+every variable. Override single limits with positive integers in
 `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS` and
 `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS`; excess requests receive an
 immediate retryable 429 rather than entering an unbounded server queue.
@@ -109,6 +112,10 @@ History projection admission defaults to four response-held permits. A positive
 `OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS` override is available for measured
 load tests. Size it together with `OVERSYNC_DB_POOL_MAX_CONNS`, request duration,
 and server memory; excess work receives retryable HTTP 503 with `Retry-After: 1`.
+The pool defaults to the service's connection budget (18 connections at the
+default permits) unless `OVERSYNC_DB_POOL_MAX_CONNS` or `pool_max_conns` in
+`DATABASE_URL` sets it. Logs default to `info`; set `OVERSYNC_LOG_LEVEL=debug`
+for more, and `PORT` to change the listen port.
 
 ## Demo auth
 

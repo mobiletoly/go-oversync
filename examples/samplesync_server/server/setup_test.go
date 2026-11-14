@@ -102,33 +102,6 @@ func TestBrowserTestCORSMiddlewareAllowsGenerationProofHeaders(t *testing.T) {
 	require.Contains(t, response.Header().Get("Access-Control-Allow-Headers"), oversync.SchemaGenerationFingerprintHeader)
 }
 
-func TestConfiguredSnapshotConcurrencyFromEnv(t *testing.T) {
-	t.Setenv("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", "12")
-	t.Setenv("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS", "6")
-
-	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(8, 4)
-	require.NoError(t, err)
-	require.Equal(t, 12, builds)
-	require.Equal(t, 6, chunks)
-}
-
-func TestConfiguredSnapshotConcurrencyFromEnv_PreservesConfigWithoutOverrides(t *testing.T) {
-	t.Setenv("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", "")
-	t.Setenv("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS", "")
-
-	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(11, 7)
-	require.NoError(t, err)
-	require.Equal(t, 11, builds)
-	require.Equal(t, 7, chunks)
-}
-
-func TestConfiguredSnapshotConcurrencyFromEnv_RejectsInvalidValues(t *testing.T) {
-	t.Setenv("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", "0")
-
-	_, _, err := configuredSnapshotConcurrencyFromEnv(8, 4)
-	require.ErrorContains(t, err, "OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS must be a positive integer")
-}
-
 func TestResponseCapture_BoundsBufferedBody(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	capture := &respCapture{

@@ -56,7 +56,7 @@ func NewA2DependencyTestServer() (*TestServer, error) {
 	}
 	authority, err := NewTestServer(&ServerConfig{
 		AppName: "nethttp-server-example", Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		MaxRowsPerBundle: 2, SchemaGenerations: []oversync.SchemaGeneration{generation},
+		ConfigureService: func(c *oversync.ServiceConfig) { c.MaxRowsPerBundle = 2 }, SchemaGenerations: []oversync.SchemaGeneration{generation},
 		BeforeBootstrap: func(ctx context.Context, pool *pgxpool.Pool, _ string) error {
 			_, err := pool.Exec(ctx, `ALTER TABLE business.categories DROP CONSTRAINT categories_parent_id_fkey;
     ALTER TABLE business.categories ADD CONSTRAINT categories_parent_id_fkey

@@ -50,7 +50,7 @@ func TestMobileFlow_DirectSyncDrainsSeveralAdmittedBatchesOnce(t *testing.T) {
 	server, err := serverpkg.NewTestServer(&serverpkg.ServerConfig{
 		JWTSecret:         "direct-sync-multi-batch-secret",
 		SchemaGenerations: []oversync.SchemaGeneration{generation},
-		MaxRowsPerBundle:  2,
+		ConfigureService:  func(c *oversync.ServiceConfig) { c.MaxRowsPerBundle = 2 },
 		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
@@ -132,7 +132,7 @@ func TestMobileFlow_DirectSyncRecoveryPreservesIntent(t *testing.T) {
 	}
 	server, err := serverpkg.NewTestServer(&serverpkg.ServerConfig{
 		JWTSecret: "direct-sync-cancellation-secret", SchemaGenerations: []oversync.SchemaGeneration{generation},
-		MaxRowsPerBundle: 2, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ConfigureService: func(c *oversync.ServiceConfig) { c.MaxRowsPerBundle = 2 }, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)

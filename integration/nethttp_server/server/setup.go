@@ -13,7 +13,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mobiletoly/go-oversync/internal/exampleauth"
+	"github.com/mobiletoly/go-oversync/internal/serverenv"
 	"github.com/mobiletoly/go-oversync/internal/syncroute"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
@@ -47,14 +47,14 @@ type ServerConfig struct {
 	RegisteredTableCatalogRevision int64
 	ReservedServerSourceIDs        []string
 	StageMetrics                   oversync.StageMetricsRecorder
-	// MaxRowsPerBundle optionally narrows the admitted push row limit in isolated tests.
-	MaxRowsPerBundle                   int
-	InitializationLeaseTTL             time.Duration
-	MaxConcurrentSnapshotBuilds        int
-	MaxConcurrentSnapshotChunkRequests int
-	MaxConcurrentHistoryProjections    int
-	EnableEmptyFirstDeferral           bool
-	EmptyFirstDeferralDuration         time.Duration
+	// ConfigureService optionally adjusts the service configuration after the
+	// environment sizing is applied and before the pool is sized from it. Tests
+	// use it to narrow limits; it is the last word on every field.
+	ConfigureService func(*oversync.ServiceConfig)
+	// InitializationLeaseTTL is passed to the service; zero selects its default.
+	InitializationLeaseTTL     time.Duration
+	EnableEmptyFirstDeferral   bool
+	EmptyFirstDeferralDuration time.Duration
 	// BeforeBootstrap is a test/conformance hook that runs after the application
 	// schema exists and before Oversync observes it. Production callers should
 	// leave it nil.
@@ -69,12 +69,14 @@ type ServerConfig struct {
 
 // ServerComponents holds the initialized server components
 type ServerComponents struct {
-	Pool            *pgxpool.Pool
-	ReadinessPools  *oversync.ReadinessPoolPair
-	SyncService     *oversync.SyncService
-	Auth            *exampleauth.TokenAuth
-	Handler         http.Handler
-	Logger          *slog.Logger
+	Pool           *pgxpool.Pool
+	ReadinessPools *oversync.ReadinessPoolPair
+	SyncService    *oversync.SyncService
+	Auth           *exampleauth.TokenAuth
+	Handler        http.Handler
+	Logger         *slog.Logger
+	// Sizing is the machine sizing applied from the environment; nil without one.
+	Sizing          *oversync.Sizing
 	BusinessSchema  string
 	FailureInjector *failureInjector
 	ctx             context.Context
@@ -178,12 +180,17 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	injector := &failureInjector{rules: make(map[string]*failureRule)}
 
+	// The environment variables are read here, by the host, never by oversync.
+	envSettings, err := serverenv.Load(os.Getenv)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	// Use default logger if not provided
 	logger := config.Logger
 	if logger == nil {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelDebug, // Enable DEBUG logging to see duplicate detection
-		}))
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: envSettings.LogLevel}))
 	}
 
 	// Use default database URL if not provided
@@ -203,22 +210,52 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		businessSchema = "business"
 	}
 
-	// Create database connection pool with configuration for parallel load
+	// Configure the sync service first: its permits decide the pool size.
+	schemaGenerations := config.SchemaGenerations
+	if len(schemaGenerations) == 0 {
+		schemaGenerations = SchemaGenerationsForBusinessSchema(businessSchema)
+	}
+	registeredTables := config.RegisteredTables
+	if len(registeredTables) == 0 {
+		registeredTables = RegisteredTablesForBusinessSchema(businessSchema)
+	}
+	serviceConfig := &oversync.ServiceConfig{
+		SchemaGenerations:      schemaGenerations,
+		AppName:                appName,
+		StageMetrics:           config.StageMetrics,
+		InitializationLeaseTTL: config.InitializationLeaseTTL,
+		BundleChangeWatch: oversync.BundleChangeWatchConfig{
+			Enabled: true,
+		},
+		RegisteredTables:               registeredTables,
+		ReservedServerSourceIDs:        append([]string(nil), config.ReservedServerSourceIDs...),
+		RegisteredTableCatalogRevision: 1,
+	}
+	if config.RegisteredTableCatalogRevision != 0 {
+		serviceConfig.RegisteredTableCatalogRevision = config.RegisteredTableCatalogRevision
+	}
+	sizing, err := envSettings.ApplyService(serviceConfig)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if config.ConfigureService != nil {
+		config.ConfigureService(serviceConfig)
+	}
+	if sizing != nil {
+		logger.Info("Sized sync service for machine", "cpus", sizing.Machine.CPUs, "memory_bytes", sizing.Machine.MemoryBytes, "recommended_go_memory_limit_bytes", sizing.GoMemoryLimitBytes)
+	}
+	// Set the Go memory limit before the service starts, so its startup checks see it.
+	if limit := serverenv.ApplyGoMemoryLimit(sizing, os.Getenv); limit > 0 {
+		logger.Info("Go memory limit", "bytes", limit)
+	}
+
 	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-
-	// Configure connection pool for parallel testing. Allow environment overrides so
-	// higher-parallelism mobile_flow runs can be profiled without code changes.
-	maxConns, minConns, err := configuredPoolSizeFromEnv()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	poolConfig.MaxConns = maxConns
-	poolConfig.MinConns = minConns
+	envSettings.ApplyPool(poolConfig, databaseURL, *serviceConfig)
 	poolConfig.MaxConnLifetime = time.Hour
 	poolConfig.MaxConnIdleTime = time.Minute * 30
 
@@ -265,56 +302,6 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 			cancel()
 			return nil, fmt.Errorf("before bootstrap: %w", err)
 		}
-	}
-
-	// Configure sync service with registered tables and handlers
-	schemaGenerations := config.SchemaGenerations
-	if len(schemaGenerations) == 0 {
-		schemaGenerations = SchemaGenerationsForBusinessSchema(businessSchema)
-	}
-	registeredTables := config.RegisteredTables
-	if len(registeredTables) == 0 {
-		registeredTables = RegisteredTablesForBusinessSchema(businessSchema)
-	}
-	serviceConfig := &oversync.ServiceConfig{
-		SchemaGenerations:                  schemaGenerations,
-		AppName:                            appName,
-		StageMetrics:                       config.StageMetrics,
-		MaxRowsPerBundle:                   config.MaxRowsPerBundle,
-		InitializationLeaseTTL:             config.InitializationLeaseTTL,
-		MaxConcurrentSnapshotBuilds:        config.MaxConcurrentSnapshotBuilds,
-		MaxConcurrentSnapshotChunkRequests: config.MaxConcurrentSnapshotChunkRequests,
-		MaxConcurrentHistoryProjections:    config.MaxConcurrentHistoryProjections,
-		BundleChangeWatch: oversync.BundleChangeWatchConfig{
-			Enabled: true,
-		},
-		RegisteredTables:               registeredTables,
-		ReservedServerSourceIDs:        append([]string(nil), config.ReservedServerSourceIDs...),
-		RegisteredTableCatalogRevision: 1,
-	}
-	if config.RegisteredTableCatalogRevision != 0 {
-		serviceConfig.RegisteredTableCatalogRevision = config.RegisteredTableCatalogRevision
-	}
-	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(
-		serviceConfig.MaxConcurrentSnapshotBuilds,
-		serviceConfig.MaxConcurrentSnapshotChunkRequests,
-	)
-	if err != nil {
-		pool.Close()
-		cancel()
-		return nil, err
-	}
-	serviceConfig.MaxConcurrentSnapshotBuilds = builds
-	serviceConfig.MaxConcurrentSnapshotChunkRequests = chunks
-	historyProjections, err := configuredHistoryProjectionConcurrencyFromEnv(serviceConfig.MaxConcurrentHistoryProjections)
-	if err != nil {
-		pool.Close()
-		cancel()
-		return nil, err
-	}
-	serviceConfig.MaxConcurrentHistoryProjections = historyProjections
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
-		serviceConfig.LogStageTimings = true
 	}
 
 	registeredKeys := make([]string, 0, len(serviceConfig.RegisteredTables))
@@ -515,6 +502,7 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		Auth:            auth,
 		Handler:         BrowserTestCORSMiddleware(guardSyncRoutes(syncService, mux, generationHandler, config.SyncAdmissionMiddleware)),
 		Logger:          logger,
+		Sizing:          sizing,
 		BusinessSchema:  businessSchema,
 		FailureInjector: injector,
 		ctx:             ctx,
@@ -664,66 +652,6 @@ func (c *emptyFirstDeferralController) decide(userID, sourceID string, now time.
 		expiresAt: expiresAt,
 	}
 	return true, expiresAt
-}
-
-func configuredPoolSizeFromEnv() (maxConns int32, minConns int32, err error) {
-	maxConns = 50
-	minConns = 5
-
-	if v := strings.TrimSpace(os.Getenv("OVERSYNC_DB_POOL_MAX_CONNS")); v != "" {
-		parsed, parseErr := strconv.Atoi(v)
-		if parseErr != nil || parsed < 1 {
-			return 0, 0, fmt.Errorf("OVERSYNC_DB_POOL_MAX_CONNS must be a positive integer")
-		}
-		maxConns = int32(parsed)
-	}
-	if v := strings.TrimSpace(os.Getenv("OVERSYNC_DB_POOL_MIN_CONNS")); v != "" {
-		parsed, parseErr := strconv.Atoi(v)
-		if parseErr != nil || parsed < 0 {
-			return 0, 0, fmt.Errorf("OVERSYNC_DB_POOL_MIN_CONNS must be a non-negative integer")
-		}
-		minConns = int32(parsed)
-	}
-	if minConns > maxConns {
-		return 0, 0, fmt.Errorf("OVERSYNC_DB_POOL_MIN_CONNS cannot exceed OVERSYNC_DB_POOL_MAX_CONNS")
-	}
-	return maxConns, minConns, nil
-}
-
-func configuredSnapshotConcurrencyFromEnv(builds, chunks int) (int, int, error) {
-	parse := func(name string, current int) (int, error) {
-		value := strings.TrimSpace(os.Getenv(name))
-		if value == "" {
-			return current, nil
-		}
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 {
-			return 0, fmt.Errorf("%s must be a positive integer", name)
-		}
-		return parsed, nil
-	}
-	var err error
-	builds, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", builds)
-	if err != nil {
-		return 0, 0, err
-	}
-	chunks, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS", chunks)
-	if err != nil {
-		return 0, 0, err
-	}
-	return builds, chunks, nil
-}
-
-func configuredHistoryProjectionConcurrencyFromEnv(current int) (int, error) {
-	value := strings.TrimSpace(os.Getenv("OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS"))
-	if value == "" {
-		return current, nil
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed < 1 {
-		return 0, fmt.Errorf("OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS must be a positive integer")
-	}
-	return parsed, nil
 }
 
 // Close shuts down the server components and cleans up resources

@@ -15,13 +15,16 @@ import (
 	"time"
 
 	"github.com/mobiletoly/go-oversync/integration/nethttp_server/server"
+	"github.com/mobiletoly/go-oversync/internal/serverenv"
 )
 
 func main() {
-	// Set up structured logging
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug, // Enable DEBUG logging to see duplicate detection
-	}))
+	// Example-server variables (OVERSYNC_*) are read by the host, never by oversync.
+	envSettings, err := serverenv.Load(os.Getenv)
+	if err != nil {
+		log.Fatalf("Invalid environment: %v", err)
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: envSettings.LogLevel}))
 
 	// Database connection string
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -50,14 +53,11 @@ func main() {
 	}
 	defer components.Close()
 
-	// Create HTTP server with timeouts suitable for large batch uploads
-	httpServer := &http.Server{
-		Addr:         ":8080",
-		Handler:      components.Handler,
-		ReadTimeout:  120 * time.Second, // Increased for large batch uploads
-		WriteTimeout: 120 * time.Second, // Increased for large batch processing
-		IdleTimeout:  60 * time.Second,
+	addr := ":8080"
+	if port := os.Getenv("PORT"); port != "" {
+		addr = ":" + port
 	}
+	httpServer := newHTTPServer(addr, components.Handler)
 
 	// Start server in a goroutine
 	serverErr := make(chan error, 1)
@@ -109,4 +109,18 @@ func main() {
 	}
 
 	components.Logger.Info("Server exited")
+}
+
+// newHTTPServer bounds slow uploads of a maximum-size push with ReadTimeout.
+// WriteTimeout stays zero because GET /sync/watch is a long-lived server-sent
+// event stream.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 }
