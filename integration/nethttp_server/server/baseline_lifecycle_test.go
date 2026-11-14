@@ -6,17 +6,21 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/mobiletoly/go-oversync/oversqlite"
 	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
@@ -331,12 +335,10 @@ type baselineProtocolRequest struct {
 }
 
 type baselineCommittedResponseLoss struct {
-	lose     atomic.Bool
-	requests atomic.Int64
+	lose atomic.Bool
 }
 
 func (transport *baselineCommittedResponseLoss) RoundTrip(request *http.Request) (*http.Response, error) {
-	transport.requests.Add(1)
 	response, err := http.DefaultTransport.RoundTrip(request)
 	if err == nil && request.URL.Path == "/sync/push" && transport.lose.Swap(false) {
 		if response.StatusCode != http.StatusOK {
@@ -352,8 +354,82 @@ func (transport *baselineCommittedResponseLoss) RoundTrip(request *http.Request)
 	return response, err
 }
 
-func TestBaselineLive_SourceRecoverySnapshotPreservesFrozenOwners(t *testing.T) {
-	ctx := context.Background()
+// baselineRecoveryRequest is one request a source-recovery rebuild sent, with the body of a snapshot
+// session request so the test can see which source it asked to replace.
+type baselineRecoveryRequest struct {
+	Method, Path string
+	Body         []byte
+}
+
+// baselineSourceRecoveryTransport loses one committed push response and, while refuseSettlement is set,
+// answers every upload operation of the old source the way a server answers a source it cannot sequence.
+type baselineSourceRecoveryTransport struct {
+	baselineCommittedResponseLoss
+	refuseSettlement atomic.Bool
+	mu               sync.Mutex
+	recorded         []baselineRecoveryRequest
+}
+
+func (transport *baselineSourceRecoveryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	var body []byte
+	if request.URL.Path == "/sync/snapshot-sessions" && request.Body != nil {
+		var err error
+		body, err = io.ReadAll(request.Body)
+		_ = request.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		request = request.Clone(request.Context())
+		request.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	transport.mu.Lock()
+	transport.recorded = append(transport.recorded, baselineRecoveryRequest{request.Method, request.URL.Path, body})
+	transport.mu.Unlock()
+	if transport.refuseSettlement.Load() && (request.URL.Path == "/sync/push" || strings.HasPrefix(request.URL.Path, "/sync/push-outcomes/")) {
+		if request.Body != nil {
+			_ = request.Body.Close()
+		}
+		refusal := `{"error":"source_sequence_changed","message":"source sequence cannot continue"}`
+		return &http.Response{
+			StatusCode: http.StatusConflict, Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(refusal)), ContentLength: int64(len(refusal)), Request: request,
+		}, nil
+	}
+	return transport.baselineCommittedResponseLoss.RoundTrip(request)
+}
+
+// take returns the requests recorded since the previous call and starts a new recording.
+func (transport *baselineSourceRecoveryTransport) take() []baselineRecoveryRequest {
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	taken := transport.recorded
+	transport.recorded = nil
+	return taken
+}
+
+func baselineRequestPaths(requests []baselineRecoveryRequest) []string {
+	paths := make([]string, 0, len(requests))
+	for _, request := range requests {
+		paths = append(paths, request.Method+" "+request.Path)
+	}
+	return paths
+}
+
+// baselineFrozenCommittedFixture is a client whose second upload F committed on the server while its
+// response was lost, so F stays frozen locally with no outcome, and whose old source then needs recovery.
+type baselineFrozenCommittedFixture struct {
+	authority   *TestServer
+	client      *oversqlite.Client
+	db          *sql.DB
+	transport   *baselineSourceRecoveryTransport
+	id          string
+	oldSource   string
+	replacement string
+	frozenHash  string
+}
+
+func newBaselineFrozenCommittedFixture(t *testing.T, ctx context.Context, beforeRecovery func(*sql.DB)) *baselineFrozenCommittedFixture {
+	t.Helper()
 	authority, err := NewA1SurvivorTestServer()
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, authority.CloseWithError()) })
@@ -364,95 +440,211 @@ func TestBaselineLive_SourceRecoverySnapshotPreservesFrozenOwners(t *testing.T) 
 	config.RetryPolicy = &oversqlite.RetryPolicy{Enabled: false}
 	client := newReadyOnlyTestClient(t, filepath.Join(t.TempDir(), "recovery.sqlite"), authority.URL(), func(context.Context) (string, error) { return token, nil }, config, `CREATE TABLE categories(id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,parent_id TEXT REFERENCES categories(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)`)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	transport := &baselineCommittedResponseLoss{}
+	transport := &baselineSourceRecoveryTransport{}
 	client.HTTP = &http.Client{Transport: transport}
 	_, err = client.Attach(ctx, user)
 	require.NoError(t, err)
-	id := uuid.NewString()
-	db := client.Database()
-	_, err = db.Exec(`INSERT INTO categories VALUES(?,'original',NULL)`, id)
+	f := &baselineFrozenCommittedFixture{authority: authority, client: client, db: client.Database(), transport: transport, id: uuid.NewString()}
+	_, err = f.db.Exec(`INSERT INTO categories VALUES(?,'original',NULL)`, f.id)
 	require.NoError(t, err)
 	_, err = client.PushPending(ctx)
 	require.NoError(t, err)
-	var aPayload, aProvenance string
-	require.NoError(t, db.QueryRow(`SELECT server_payload,server_provenance FROM _sync_row_state`).Scan(&aPayload, &aProvenance))
-	_, err = db.Exec(`UPDATE categories SET name='frozen' WHERE id=?`, id)
+	_, err = f.db.Exec(`UPDATE categories SET name='frozen' WHERE id=?`, f.id)
 	require.NoError(t, err)
 	transport.lose.Store(true)
 	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	require.False(t, transport.lose.Load())
-	var base, provenance, wire, local, hash string
-	require.NoError(t, db.QueryRow(`SELECT base_payload,base_provenance,wire_payload,local_payload FROM _sync_outbox_rows`).Scan(&base, &provenance, &wire, &local))
-	require.JSONEq(t, aPayload, base)
-	require.JSONEq(t, aProvenance, provenance)
-	require.NoError(t, db.QueryRow(`SELECT canonical_request_hash FROM _sync_outbox_bundle`).Scan(&hash))
-	require.Len(t, hash, 64)
-	var remote string
-	require.NoError(t, authority.Pool.QueryRow(ctx, `SELECT name FROM business.categories WHERE id=$1`, id).Scan(&remote))
-	require.Equal(t, "frozen", remote)
-	replacement := uuid.NewString()
-	tx, err := db.BeginTx(ctx, nil)
+	var bundleID int64
+	require.NoError(t, f.db.QueryRow(`SELECT source_id,source_bundle_id,canonical_request_hash FROM _sync_outbox_bundle`).Scan(&f.oldSource, &bundleID, &f.frozenHash))
+	require.EqualValues(t, 2, bundleID)
+	require.Len(t, f.frozenHash, 64)
+	require.Equal(t, "frozen", f.remoteName(t, ctx, f.id), "F committed on the server")
+	require.Equal(t, 1, f.retainedOutcomes(t, ctx, f.oldSource), "the server retains F's unacknowledged outcome")
+	if beforeRecovery != nil {
+		beforeRecovery(f.db)
+	}
+	// The client records that its source cannot continue (r0001 section 6.4 "client-recorded equivalent").
+	f.replacement = uuid.NewString()
+	tx, err := f.db.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	_, err = tx.Exec(`INSERT INTO _sync_source_state(source_id) VALUES(?)`, replacement)
+	_, err = tx.Exec(`INSERT INTO _sync_source_state(source_id) VALUES(?)`, f.replacement)
 	require.NoError(t, err)
 	_, err = tx.Exec(`UPDATE _sync_attachment_state SET rebuild_required=1`)
 	require.NoError(t, err)
-	_, err = tx.Exec(`UPDATE _sync_operation_state SET kind='source_recovery',reason='source_sequence_changed',replacement_source_id=?`, replacement)
+	_, err = tx.Exec(`UPDATE _sync_operation_state SET kind='source_recovery',reason='source_sequence_changed',replacement_source_id=?`, f.replacement)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
-	before := baselineLiveVector(t, db)
-	requestsBefore := transport.requests.Load()
-	_, err = client.Rebuild(ctx)
-	var unresolved *oversqlite.UploadJournalIntegrityError
-	require.ErrorAs(t, err, &unresolved)
-	require.Equal(t, before, baselineLiveVector(t, db), "snapshot must preserve every frozen owner byte")
-	require.Equal(t, requestsBefore, transport.requests.Load(), "unresolved F/C refuses before HTTP")
-	var newBase, newProvenance, newWire, newLocal, newHash, source, kind, name string
-	var version, next, checkpoint, bundleID int64
-	require.NoError(t, db.QueryRow(`SELECT base_payload,base_provenance,wire_payload,local_payload,source_bundle_id FROM _sync_outbox_rows`).Scan(&newBase, &newProvenance, &newWire, &newLocal, &bundleID))
-	require.Equal(t, base, newBase)
-	require.Equal(t, provenance, newProvenance)
-	require.Equal(t, wire, newWire)
-	require.Equal(t, local, newLocal)
-	require.Equal(t, int64(2), bundleID, "the original frozen operation is never rebound to replacement sequence1")
-	require.NoError(t, db.QueryRow(`SELECT canonical_request_hash,source_id FROM _sync_outbox_bundle`).Scan(&newHash, &source))
-	require.Equal(t, hash, newHash)
-	require.NotEqual(t, replacement, source)
-	settlement, err := client.PushPending(ctx)
-	require.NoError(t, err)
-	require.Equal(t, oversqlite.PushOutcomeCommitted, settlement.Outcome)
-	for _, table := range []string{"_sync_upload_journal", "_sync_outbox_rows", "_sync_dirty_rows"} {
-		var count int
-		require.NoError(t, db.QueryRow("SELECT count(*) FROM "+table).Scan(&count))
-		require.Zero(t, count)
+	transport.take()
+	return f
+}
+
+func (f *baselineFrozenCommittedFixture) remoteName(t *testing.T, ctx context.Context, id string) string {
+	t.Helper()
+	var name string
+	require.NoError(t, f.authority.Pool.QueryRow(ctx, `SELECT name FROM business.categories WHERE id=$1`, id).Scan(&name))
+	return name
+}
+
+func (f *baselineFrozenCommittedFixture) retainedOutcomes(t *testing.T, ctx context.Context, source string) int {
+	t.Helper()
+	var count int
+	require.NoError(t, f.authority.Pool.QueryRow(ctx, `SELECT count(*) FROM sync.push_outcomes WHERE source_id=$1`, source).Scan(&count))
+	return count
+}
+
+func (f *baselineFrozenCommittedFixture) serverSourceState(t *testing.T, ctx context.Context, source string) (state, replacedBy string) {
+	t.Helper()
+	err := f.authority.Pool.QueryRow(ctx, `SELECT state,replaced_by_source_id FROM sync.source_state WHERE source_id=$1`, source).Scan(&state, &replacedBy)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ""
 	}
-	_, err = client.Rebuild(ctx)
 	require.NoError(t, err)
-	require.NoError(t, db.QueryRow(`SELECT server_kind,row_version,json_extract(server_payload,'$.name.value') FROM _sync_row_state`).Scan(&kind, &version, &name))
-	require.Equal(t, "live", kind)
-	require.Equal(t, int64(2), version)
+	return state, replacedBy
+}
+
+func (f *baselineFrozenCommittedFixture) localInt(t *testing.T, query string, args ...any) int {
+	t.Helper()
+	var count int
+	require.NoError(t, f.db.QueryRow(query, args...).Scan(&count))
+	return count
+}
+
+// requireSnapshotReplacement checks that the request asks the server to replace the old source.
+func (f *baselineFrozenCommittedFixture) requireSnapshotReplacement(t *testing.T, request baselineRecoveryRequest) {
+	t.Helper()
+	var body struct {
+		SourceReplacement struct {
+			PreviousSourceID string `json:"previous_source_id"`
+			NewSourceID      string `json:"new_source_id"`
+			Reason           string `json:"reason"`
+		} `json:"source_replacement"`
+	}
+	require.NoError(t, json.Unmarshal(request.Body, &body))
+	require.Equal(t, f.oldSource, body.SourceReplacement.PreviousSourceID)
+	require.Equal(t, f.replacement, body.SourceReplacement.NewSourceID)
+	require.Equal(t, "source_sequence_changed", body.SourceReplacement.Reason)
+}
+
+// r0001 section 6.4 steps 2-4: an explicit Rebuild out of source recovery first gives the old source
+// ordinary settlement of its committed frozen upload, then installs the snapshot under the replacement
+// source and carries the edit made after the freeze, which the replacement then uploads.
+func TestBaselineLive_SourceRecoveryRebuildSettlesFrozenUploadBeforeReplacement(t *testing.T) {
+	ctx := context.Background()
+	carried := uuid.NewString()
+	f := newBaselineFrozenCommittedFixture(t, ctx, func(db *sql.DB) {
+		_, err := db.Exec(`INSERT INTO categories VALUES(?,'after-freeze',NULL)`, carried)
+		require.NoError(t, err)
+	})
+
+	report, err := f.client.Rebuild(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
+
+	requests := f.transport.take()
+	paths := baselineRequestPaths(requests)
+	resolve := slices.Index(paths, "POST /sync/push-outcomes/resolve")
+	ack := slices.Index(paths, "POST /sync/push-outcomes/ack")
+	snapshot := slices.Index(paths, "POST /sync/snapshot-sessions")
+	require.True(t, resolve >= 0 && ack > resolve && snapshot > ack, "settlement under the old source precedes the replacement snapshot: %v", paths)
+	require.NotContains(t, paths, "POST /sync/push", "the frozen request is resolved, never re-sent: %v", paths)
+	f.requireSnapshotReplacement(t, requests[snapshot])
+
+	// F settled by its real committed outcome; the server released the old source only after the ack.
+	require.Zero(t, f.retainedOutcomes(t, ctx, f.oldSource))
+	state, replacedBy := f.serverSourceState(t, ctx, f.oldSource)
+	require.Equal(t, "retired", state)
+	require.Equal(t, f.replacement, replacedBy)
+	require.Zero(t, f.localInt(t, `SELECT count(*) FROM _sync_upload_journal`))
+	require.Zero(t, f.localInt(t, `SELECT count(*) FROM _sync_outbox_rows`))
+	require.Equal(t, 1, f.localInt(t, `SELECT count(*) FROM _sync_outbox_bundle WHERE state='none'`))
+	var current, kind string
+	var rebuildRequired, checkpoint int
+	require.NoError(t, f.db.QueryRow(`SELECT current_source_id,rebuild_required,last_bundle_seq_seen FROM _sync_attachment_state`).Scan(&current, &rebuildRequired, &checkpoint))
+	require.Equal(t, f.replacement, current)
+	require.Zero(t, rebuildRequired)
+	require.Equal(t, 2, checkpoint, "the checkpoint moves to the snapshot boundary, F's commit")
+	require.NoError(t, f.db.QueryRow(`SELECT kind FROM _sync_operation_state`).Scan(&kind))
+	require.Equal(t, "none", kind)
+	var name, serverKind, serverName string
+	var version int64
+	require.NoError(t, f.db.QueryRow(`SELECT name FROM categories WHERE id=?`, f.id).Scan(&name))
 	require.Equal(t, "frozen", name)
-	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id=?`, replacement).Scan(&next))
-	require.Equal(t, int64(1), next)
-	require.NoError(t, db.QueryRow(`SELECT current_source_id,last_bundle_seq_seen FROM _sync_attachment_state`).Scan(&source, &checkpoint))
-	require.Equal(t, replacement, source)
-	require.Equal(t, int64(2), checkpoint)
-	for _, table := range []string{"_sync_dirty_rows", "_sync_relationships"} {
-		var count int
-		require.NoError(t, db.QueryRow("SELECT count(*) FROM "+table).Scan(&count))
-		require.Zero(t, count)
-	}
-	require.NoError(t, authority.Pool.QueryRow(ctx, `SELECT name FROM business.categories WHERE id=$1`, id).Scan(&remote))
-	require.Equal(t, "frozen", remote)
-	_, err = db.Exec(`UPDATE categories SET name='replacement-write' WHERE id=?`, id)
+	require.NoError(t, f.db.QueryRow(`SELECT server_kind,row_version,json_extract(server_payload,'$.name.value') FROM _sync_row_state WHERE json_extract(key_json,'$.id')=?`, f.id).Scan(&serverKind, &version, &serverName))
+	require.Equal(t, "live", serverKind)
+	require.EqualValues(t, 2, version, "the snapshot observes the row as written by F's commit, the scope's second bundle sequence")
+	require.Equal(t, "frozen", serverName)
+
+	// The edit made after the freeze is carried as ordinary dirty intent: the snapshot lacks the row and
+	// the edit's base was absent, so it is an INSERT with base 0.
+	var op string
+	var base int64
+	require.NoError(t, f.db.QueryRow(`SELECT op,base_row_version FROM _sync_dirty_rows WHERE json_extract(key_json,'$.id')=?`, carried).Scan(&op, &base))
+	require.Equal(t, "INSERT", op)
+	require.Zero(t, base)
+	require.Equal(t, 1, f.localInt(t, `SELECT count(*) FROM _sync_dirty_rows`))
+	require.Equal(t, 1, f.localInt(t, `SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id=?`, f.replacement))
+
+	pushed, err := f.client.PushPending(ctx)
 	require.NoError(t, err)
-	_, err = client.PushPending(ctx)
+	require.Equal(t, oversqlite.PushOutcomeCommitted, pushed.Outcome)
+	require.Equal(t, "after-freeze", f.remoteName(t, ctx, carried))
+	require.Equal(t, "frozen", f.remoteName(t, ctx, f.id))
+	var committedSourceBundle int64
+	require.NoError(t, f.authority.Pool.QueryRow(ctx, `SELECT max_committed_source_bundle_id FROM sync.source_state WHERE source_id=$1`, f.replacement).Scan(&committedSourceBundle))
+	require.EqualValues(t, 1, committedSourceBundle, "the carried intent is the replacement source's first bundle")
+	require.Zero(t, f.localInt(t, `SELECT count(*) FROM _sync_dirty_rows`))
+}
+
+// r0001 section 6.4 step 3: when settlement under the old source is refused, the server still retains
+// F's committed outcome and refuses the replacement with push_outcome_pending. The rebuild fails with
+// every local owner intact, and discard stays unavailable because nothing proves F has no outcome.
+func TestBaselineLive_SourceReplacementRefusedWhileOldSourceHoldsOutcome(t *testing.T) {
+	ctx := context.Background()
+	f := newBaselineFrozenCommittedFixture(t, ctx, nil)
+	before := baselineLiveVector(t, f.db)
+
+	f.transport.refuseSettlement.Store(true)
+	_, err := f.client.Rebuild(ctx)
+	require.ErrorContains(t, err, "push_outcome_pending")
+	requests := f.transport.take()
+	paths := baselineRequestPaths(requests)
+	require.Equal(t, []string{"POST /sync/push-outcomes/resolve", "POST /sync/snapshot-sessions"}, paths,
+		"one refused settlement attempt, then the replacement request the server refuses")
+	f.requireSnapshotReplacement(t, requests[1])
+	require.Equal(t, before, baselineLiveVector(t, f.db), "a refused replacement changes no local byte")
+	var source, hash string
+	var bundleID int64
+	require.NoError(t, f.db.QueryRow(`SELECT source_id,source_bundle_id,canonical_request_hash FROM _sync_outbox_bundle`).Scan(&source, &bundleID, &hash))
+	require.Equal(t, f.oldSource, source)
+	require.EqualValues(t, 2, bundleID)
+	require.Equal(t, f.frozenHash, hash)
+	require.Equal(t, 1, f.retainedOutcomes(t, ctx, f.oldSource), "the server still retains F's outcome")
+	state, _ := f.serverSourceState(t, ctx, f.oldSource)
+	require.Equal(t, "active", state)
+	state, _ = f.serverSourceState(t, ctx, f.replacement)
+	require.Empty(t, state, "the refused replacement creates no server source")
+
+	_, err = f.client.DiscardPendingIntentForRecovery(ctx)
+	var unavailable *oversqlite.PendingIntentDiscardUnavailableError
+	require.ErrorAs(t, err, &unavailable)
+	require.Empty(t, f.transport.take(), "a refused discard sends nothing")
+	require.Equal(t, before, baselineLiveVector(t, f.db), "a refused discard changes no local byte")
+
+	f.transport.refuseSettlement.Store(false)
+	report, err := f.client.Rebuild(ctx)
 	require.NoError(t, err)
-	require.NoError(t, authority.Pool.QueryRow(ctx, `SELECT name FROM business.categories WHERE id=$1`, id).Scan(&remote))
-	require.Equal(t, "replacement-write", remote)
-	require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id=?`, replacement).Scan(&next))
-	require.EqualValues(t, 2, next, "fresh replacement write consumes its own first sequence")
-	t.Log("baseline-live: original F/C preserved through refusal and settled before clean source replacement; fresh replacement write converged")
-	t.Log(baselineLiveVector(t, db))
+	require.Equal(t, oversqlite.RemoteSyncOutcomeAppliedSnapshot, report.Outcome)
+	paths = baselineRequestPaths(f.transport.take())
+	ack := slices.Index(paths, "POST /sync/push-outcomes/ack")
+	require.True(t, slices.Index(paths, "POST /sync/push-outcomes/resolve") >= 0 && ack > slices.Index(paths, "POST /sync/push-outcomes/resolve"), "%v", paths)
+	require.True(t, slices.Index(paths, "POST /sync/snapshot-sessions") > ack, "%v", paths)
+	require.NotContains(t, paths, "POST /sync/push", "the frozen request is resolved, never re-sent: %v", paths)
+	require.Zero(t, f.retainedOutcomes(t, ctx, f.oldSource))
+	require.Zero(t, f.localInt(t, `SELECT count(*) FROM _sync_upload_journal`))
+	require.Zero(t, f.localInt(t, `SELECT count(*) FROM _sync_dirty_rows`))
+	require.Equal(t, 1, f.localInt(t, `SELECT count(*) FROM _sync_attachment_state WHERE current_source_id=?`, f.replacement))
+	var name string
+	require.NoError(t, f.db.QueryRow(`SELECT name FROM categories WHERE id=?`, f.id).Scan(&name))
+	require.Equal(t, "frozen", name)
 }
