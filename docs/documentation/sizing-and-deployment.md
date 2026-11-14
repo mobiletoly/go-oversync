@@ -15,8 +15,11 @@ Oversync is a library. It never reads environment variables and never changes pr
 runtime settings such as `GOMEMLIMIT` or `GOMAXPROCS`. Your host program decides those values;
 Oversync computes recommendations, checks them at startup, and logs what it runs with.
 
-Memory and CPU figures on this page were measured on a laptop (Apple M2 Max) and are estimates for
-cloud vCPUs. Confirm them with a load test on your target machine.
+The 2 vCPU / 2 GiB row was checked against measurements in a Docker container limited to 2 CPUs and 2 GiB
+(`--cpus=2 --memory=2g`, `GOMEMLIMIT=1536MiB`) on an Apple M2 Max, against PostgreSQL 17 on the same
+host. The larger machines follow the same rules but were not measured. See
+[Measured on 2 vCPU / 2 GiB](#measured-on-2-vcpu--2-gib) for the numbers and their limits, and confirm
+them with a load test on your target machine.
 
 ## What you need before you start
 
@@ -56,7 +59,7 @@ It reads, but never changes, the bundle and chunk byte limits. The rule:
 
 - snapshot builds = CPUs (at most 16);
 - snapshot chunk requests = 2 × CPUs (2 to 32);
-- history projections (pushes, pull projections, push-outcome reads) = the smaller of 2 × CPUs and
+- history projections (pushes, pulls, push-outcome reads) = the smaller of 2 × CPUs and
   the number of maximum-size pushes that fit in 40% of the recommended Go memory limit (1 to 32).
   One admitted push needs about six times `MaxBytesPerBundle` (about 96 MiB at the default 16 MiB).
 
@@ -82,11 +85,11 @@ poolConfig.MinConns = 2
 
 | Part | Connections | Why |
 | --- | ---: | --- |
-| History projections | one per permit | An admitted push, pull projection, or push-outcome read holds one connection. A push pins its connection for the whole request. |
+| History projections | one per permit | An admitted push, pull, or push-outcome read holds one connection at a time. Each takes its permit before its first connection from this pool, so a refused request never waits for it. A push pins its connection for the whole request. |
 | Snapshot builds | one per permit | One transaction per build. |
 | Snapshot chunk requests | one per permit | One read transaction per chunk. |
 | Background workers | 2 | Snapshot cleanup and scope-receipt cleanup, each one batch at a time. |
-| Short requests | 4 | Requests that take a connection without a permit: pull planning (a pull takes its permit only after planning), push-outcome acknowledgment, source binding, snapshot deletion, watch subscription, and status. |
+| Short requests | 4 | Requests that take a connection without a permit: push-outcome acknowledgment, source binding, snapshot deletion, watch subscription, and status. |
 | **`PoolMaxConns`** | sum | The minimum `pgxpool` `MaxConns`. |
 | Listener | 1 when `BundleChangeWatch.Enabled` | The watch takes one connection out of the pool for `LISTEN`, so PostgreSQL sees it in addition to `MaxConns`. |
 | **`PerInstance`** | `PoolMaxConns` + listener | PostgreSQL connections per instance. Add the admission pool size when you use `NewReadinessPoolPair` (2 in the reference server). |
@@ -176,9 +179,13 @@ settings" line. Instances that should match must log the same fingerprint.
    `estimated_peak_bytes`, the advertised limits, and `shared_settings_fingerprint`.
 3. Confirm there is no warning about the pool, the Go memory limit, or the estimated peak.
 4. Start the other instances and compare their fingerprints.
-5. Under load, count connections per instance with
-   `SELECT count(*) FROM pg_stat_activity WHERE application_name = '<AppName>';` and compare with
-   `PerInstance`.
+5. Under load, count connections per instance and compare with `PerInstance`. Oversync does not
+   set the PostgreSQL `application_name`, so give each instance its own in the connection string,
+   for example `DATABASE_URL=postgres://…/app?application_name=sync-1`, and count with
+   `SELECT count(*) FROM pg_stat_activity WHERE application_name = 'sync-1';`.
+   Without it, count the whole fleet with
+   `SELECT count(*) FROM pg_stat_activity WHERE usename = '<role>' AND datname = '<database>';`
+   and compare with the sum of `PerInstance` plus the other users of that role.
 
 ## Step 8: Adjust from measurements
 
@@ -187,6 +194,7 @@ Change one setting at a time, on every instance of the same size, and record the
 | Signal | Action |
 | --- | --- |
 | Sustained 503 `history_projection_capacity_exceeded`, memory below 50% of the limit, CPU below 70% | Raise `MaxConcurrentHistoryProjections` by 2 and recompute the budget. |
+| Sustained 503 `history_projection_capacity_exceeded` with CPU above 70% | The instance is at its CPU limit (on 2 vCPU, catch-up pulls reach it at the default permits). Add instances; more permits would only add refusals later. |
 | Process memory above 80% of the limit | Lower `MaxConcurrentHistoryProjections`, or lower `MaxBytesPerBundle` (see the outcome ceiling rule below). |
 | Sustained 429 `snapshot_build_capacity`, PostgreSQL CPU below 60% | Raise `MaxConcurrentSnapshotBuilds` by 1. |
 | PostgreSQL CPU above 80% during restores | Lower `MaxConcurrentSnapshotBuilds`. |
@@ -198,22 +206,66 @@ Change one setting at a time, on every instance of the same size, and record the
 Oversync does not queue excess work. Over capacity it refuses immediately and the clients retry:
 
 - pushes, pulls, and push-outcome reads: HTTP 503 `history_projection_capacity_exceeded` with
-  `Retry-After: 1`;
+  `Retry-After: 1`, before the request takes a connection from the sync pool (with an
+  `OperationAdmissionAdapter`, `ReadinessGuard` still takes an admission-pool connection first);
 - snapshot session creation: HTTP 429 `snapshot_build_capacity` with `Retry-After: 1`;
 - snapshot chunk reads: HTTP 429 `snapshot_chunk_capacity` with `Retry-After: 1`.
 
-The Go client retries these within an elapsed-time budget (30 seconds by default); give other
-clients an equivalent retry budget. Nothing partial is applied when a request is refused.
+Nothing partial is applied when a request is refused. How long the clients keep retrying depends on
+the request:
+
+| Refused request | Go client (`oversqlite`) | Kotlin client (SQLiteNow) |
+| --- | --- | --- |
+| Push, push-outcome read (503) | `PushCapacityRetryPolicy`: up to 30 seconds; each wait is `Retry-After` plus up to 100% random jitter | Transient retry: 3 attempts per sync call, each wait at least `Retry-After` |
+| Pull (503) | `RetryPolicy`: 3 attempts, each wait at least `Retry-After` (about 2 seconds in all) | Transient retry: 3 attempts per sync call, each wait at least `Retry-After` |
+| Snapshot creation or chunk (429) | `SnapshotCapacityRetryPolicy`: up to 30 seconds; each wait is `Retry-After` plus up to 100% random jitter | `snapshotCapacityRetryPolicy`: the same |
+
+When the retries run out, the sync call fails with a retryable error (Go `RetryExhaustedError` or
+`PushCapacityRetryExhaustedError`; Kotlin reports an `OversqliteCategorizedException` in the
+`NETWORK` category). Local changes stay
+pending and the next sync sends them. Many devices pulling at once, for example all catching up
+after the same burst of pushes, is therefore the case to plan for: on one 2 vCPU instance, 26 to 38
+of 50 devices that pulled together gave up after about 2 seconds and needed the app's next sync.
+Retry a failed sync from the app with a randomized delay, and add instances when this happens
+regularly.
 
 Fleet-wide restore bursts need attention. A new schema generation rolled out to all devices, or a
 database restored from a backup, makes many clients build snapshot sessions at once. Each session
 stages the user's whole account in `sync.snapshot_session_rows` (about 1.5 KB per row including
-indexes, measured). The per-instance build permits bound concurrent builds, but nothing bounds the
+indexes; 1.57 KB measured on 2 vCPU / 2 GiB). The per-instance build permits bound concurrent builds, but nothing bounds the
 total staged rows across the fleet. Clients delete their session when they finish; cleanup then
 removes its rows promptly in batches of 5,000 rows, one transaction each, and keeps going until the
 expired work is gone. A session a client abandons stays until `SnapshotSessionTTL` (15 minutes by
 default) expires. Budget disk and WAL for the peak: concurrent restoring users × rows per account ×
 1.5 KB, and watch `pg_total_relation_size('sync.snapshot_session_rows')`.
+
+## Measured on 2 vCPU / 2 GiB
+
+One instance with `ApplySizing` for 2 CPUs / 2 GiB in a container limited to `--cpus=2 --memory=2g`,
+`GOMEMLIMIT=1536MiB`, and the pool from `ConnectionBudget`:
+
+| Quantity | Computed | Measured |
+| --- | --- | --- |
+| Permits, pool, connections per instance | 4 / 2 / 4, 16, 17 | as computed; no startup warning |
+| Memory, ordinary device load | — | 36–60 MiB container peak |
+| Memory, worst case: 50 concurrent maximum-size pushes (4 admitted and decoded, then refused at hash verification, so none committed), 2 builds and their chunks | 0.66 GiB estimated peak heap | 0.46 GiB container peak (0.39 GiB Go heap); no OOM |
+| Memory per admitted maximum-size push | about 96 MiB | about 100 MiB |
+| PostgreSQL connections | 17 per instance | 17 per instance; 34 for two instances on one database |
+| Catch-up pulls (4 bundles, about 110 rows each) | — | 180–250 admitted per second at 1.6–1.7 of the 2 CPUs: CPU, not the permits, is the limit |
+| Pulls at 16 times the permits | — | refused at once; admitted rate within about 20% of the peak; the pool stays at 4 connections |
+| Two instances, catch-up pulls | 2 × one instance | 1.7 × one instance |
+| One 100,000-row restore (Kotlin JVM client) | — | 22.8 s in all, 6.7 s of it in the server |
+
+What these numbers cannot tell you:
+
+- The 2 CPUs were a CPU quota on Apple M2 Max cores. A cloud vCPU is usually one hyperthread of a
+  slower core and may be burstable, so expect lower CPU-bound figures (pull rate, build time).
+  Memory figures should carry over.
+- PostgreSQL ran on the same host, not on its own machine or a managed service, with no network hop
+  between the server and the database.
+- Each scenario ran once, on a shared machine whose load varied.
+- A committing maximum-size push and four concurrent maximum-size snapshot chunks were not
+  exercised, so keep the computed peak heap as the budget.
 
 ## Every setting and what it bounds
 
@@ -221,7 +273,7 @@ Zero selects the default for every field.
 
 | Field | Default | Bounds | Scope |
 | --- | --- | --- | --- |
-| `MaxConcurrentHistoryProjections` | 4 (1–32) | Pushes, pull projections and push-outcome reads in flight; also the push-body decode budget. Memory and one connection each. | Per instance |
+| `MaxConcurrentHistoryProjections` | 4 (1–32) | Pushes, pulls and push-outcome reads in flight; also the push-body decode budget. Memory and one connection each. | Per instance |
 | `MaxConcurrentSnapshotBuilds` | 4 | Snapshot session builds in flight; CPU on both sides and one connection each. | Per instance |
 | `MaxConcurrentSnapshotChunkRequests` | 4 | Snapshot chunk reads in flight; one connection and up to one chunk of memory each. | Per instance |
 | `MaxRowsPerBundle` | 10,000 (max 100,000) | Rows per push. | Shared, advertised |
