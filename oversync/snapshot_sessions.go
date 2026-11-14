@@ -682,9 +682,9 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 		stagedTable := newStagedSnapshotTable(wireGeneration, info, contract)
 		var lastKey []byte
 		for {
-			queryArgs := []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, s.config.SnapshotMaterializationBatchRows}
+			queryArgs := []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, s.config.tuning.snapshotMaterializationBatchRows}
 			if lastKey != nil {
-				queryArgs = []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, lastKey, s.config.SnapshotMaterializationBatchRows}
+				queryArgs = []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, lastKey, s.config.tuning.snapshotMaterializationBatchRows}
 			}
 			query := snapshotMaterializationPageSQL(info, payloadExpression, lastKey != nil)
 			liveRows, err := tx.Query(ctx, query, queryArgs...)
@@ -693,7 +693,7 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 			}
 			s.snapshotMetrics.materializationPageQueries.Add(1)
 
-			batch := make([]snapshotMaterializedRow, 0, s.config.SnapshotMaterializationBatchRows)
+			batch := make([]snapshotMaterializedRow, 0, s.config.tuning.snapshotMaterializationBatchRows)
 			var batchBytes int64
 			for liveRows.Next() {
 				var keyBytes, payloadDB []byte
@@ -795,7 +795,7 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 					liveRows.Close()
 					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "row_decoded_body_bytes", Actual: int64(len(body)), Limit: s.maxBytesPerSnapshotChunk()}
 				}
-				if len(batch) > 0 && batchBytes+logicalBytes > s.config.SnapshotMaterializationBatchBytes {
+				if len(batch) > 0 && batchBytes+logicalBytes > s.config.tuning.snapshotMaterializationBatchBytes {
 					break
 				}
 				nextBytes := byteCount + batchBytes + logicalBytes
@@ -852,7 +852,7 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, vi
 			if batchBytes > highWater.bytes {
 				highWater.bytes = batchBytes
 			}
-			if len(batch) < s.config.SnapshotMaterializationBatchRows && batchBytes < s.config.SnapshotMaterializationBatchBytes {
+			if len(batch) < s.config.tuning.snapshotMaterializationBatchRows && batchBytes < s.config.tuning.snapshotMaterializationBatchBytes {
 				continue
 			}
 		}

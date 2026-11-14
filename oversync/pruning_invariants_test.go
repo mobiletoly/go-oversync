@@ -23,8 +23,8 @@ func TestRetentionPolicy_PrunesCommittedHistoryButPreservesCurrentStateAndSource
 	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
 		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 	}), AppName: "retention-prune-invariants-test",
-		RetainedBundlesPerUser:  1,
-		RetentionPruneBatchSize: 100,
+		RetainedBundlesPerUser: 1,
+		tuning:                 serviceTuning{retentionPruneBatchSize: 100},
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},

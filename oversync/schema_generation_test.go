@@ -2139,7 +2139,7 @@ func schemaGenerationAnonymousTuple(tuple *types.Tuple) *types.Tuple {
 // SyncService.FetchRetainedPushOutcome and HTTPSyncHandlers.HandlePushOutcomeRetained.
 // Generation declaration types and fingerprints remain unchanged.
 // Prior pre-retained-outcome surface: 601db16632ecdb5da11bda0e83bd07d74e890d819e455eb46c8713ed39f1b6fd.
-const schemaGenerationAllowedPackageSurfaceHash = "32d85f94d339d5467b45c9b67b2be3785eec552a1dfd6931b2950bfb4a026b80"
+const schemaGenerationAllowedPackageSurfaceHash = "1a479343a62610d2bf046f2816d7f72e79d3ec2e0d1d7f92c29dc272b0124825"
 
 func schemaGenerationPackageSurfaceHash(surface []string) string {
 	digest := sha256.Sum256([]byte(strings.Join(surface, "\n")))

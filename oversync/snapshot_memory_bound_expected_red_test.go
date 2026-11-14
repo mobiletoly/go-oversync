@@ -71,8 +71,8 @@ func TestSnapshotMaterializationHasNoFullSnapshotCollections(t *testing.T) {
 	}
 	text := string(source)
 	requiredBoundedSeams := []string{
-		"SnapshotMaterializationBatchRows",
-		"SnapshotMaterializationBatchBytes",
+		"snapshotMaterializationBatchRows",
+		"snapshotMaterializationBatchBytes",
 		`limitPlaceholder := "$4"`,
 		`limitPlaceholder = "$5"`,
 		"LIMIT %s",

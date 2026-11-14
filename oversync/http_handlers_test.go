@@ -55,7 +55,7 @@ func TestSyncService_GenerationDiscoveryModel(t *testing.T) {
 		MaxBytesPerSnapshotChunk:   5678,
 		MaxRowsPerSnapshotSession:  890,
 		MaxBytesPerSnapshotSession: 98765,
-		MaxBytesPerSnapshotRow:     1234,
+		tuning:                     serviceTuning{maxBytesPerSnapshotRow: 1234},
 	}, logger: slog.Default()}
 
 	response := svc.generationDiscoveryResponse(contract, true)
@@ -72,6 +72,8 @@ func TestSyncService_GenerationDiscoveryModel(t *testing.T) {
 		MaxSnapshotRows:                 890,
 		MaxSnapshotLogicalBytes:         98765,
 		MaxRowDecodedBytes:              1234,
+		// Without a database the service advertises the ceiling a new store would record.
+		MaxPushOutcomeDecodedBytes: 4096 + pushOutcomeEnvelopeAllowance,
 	}, response.Limits)
 }
 
@@ -81,9 +83,8 @@ func TestHTTPSyncHandlers_HandleGenerationRequiresAuthentication(t *testing.T) {
 			AppName:                            "handler-test",
 			MaxConcurrentSnapshotBuilds:        defaultMaxConcurrentSnapshotBuilds,
 			MaxConcurrentSnapshotChunkRequests: defaultMaxConcurrentSnapshotChunkRequests,
-			DefaultBytesPerSnapshotChunk:       defaultBytesPerSnapshotChunk,
 			MaxBytesPerSnapshotChunk:           defaultMaxBytesPerSnapshotChunk,
-			MaxBytesPerSnapshotRow:             defaultMaxBytesPerSnapshotRow,
+			tuning:                             serviceTuning{defaultBytesPerSnapshotChunk: defaultBytesPerSnapshotChunk, maxBytesPerSnapshotRow: defaultMaxBytesPerSnapshotRow},
 			RegisteredTableCatalogRevision:     1,
 		},
 		logger: slog.Default(),
@@ -105,9 +106,8 @@ func TestHTTPSyncHandlers_GenerationDiscoveryAppliesActorWatchPolicy(t *testing.
 			AppName:                            "handler-watch-policy-test",
 			MaxConcurrentSnapshotBuilds:        defaultMaxConcurrentSnapshotBuilds,
 			MaxConcurrentSnapshotChunkRequests: defaultMaxConcurrentSnapshotChunkRequests,
-			DefaultBytesPerSnapshotChunk:       defaultBytesPerSnapshotChunk,
 			MaxBytesPerSnapshotChunk:           defaultMaxBytesPerSnapshotChunk,
-			MaxBytesPerSnapshotRow:             defaultMaxBytesPerSnapshotRow,
+			tuning:                             serviceTuning{defaultBytesPerSnapshotChunk: defaultBytesPerSnapshotChunk, maxBytesPerSnapshotRow: defaultMaxBytesPerSnapshotRow},
 			BundleChangeWatch: BundleChangeWatchConfig{
 				Enabled: true,
 			},

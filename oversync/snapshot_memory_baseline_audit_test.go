@@ -378,7 +378,7 @@ func BenchmarkAuditDatabaseSnapshotBoundedCleanup(b *testing.B) {
 		tableBytesDuring int64
 		walBytesDuring   float64
 	}
-	expectedBatches := (rowCount + fixture.svc.config.SnapshotCleanupBatchRows - 1) / fixture.svc.config.SnapshotCleanupBatchRows
+	expectedBatches := (rowCount + fixture.svc.config.tuning.snapshotCleanupBatchRows - 1) / fixture.svc.config.tuning.snapshotCleanupBatchRows
 	midpointBatch := max(1, (expectedBatches+1)/2)
 	cleanupBegan := make(chan struct{})
 	cleanupDone := make(chan cleanupRunResult, 1)
@@ -388,7 +388,7 @@ func BenchmarkAuditDatabaseSnapshotBoundedCleanup(b *testing.B) {
 		result := cleanupRunResult{}
 		for {
 			batchStarted := time.Now()
-			cleanupCtx, cancelCleanup := context.WithTimeout(fixture.ctx, fixture.svc.config.SnapshotCleanupBatchTimeout)
+			cleanupCtx, cancelCleanup := context.WithTimeout(fixture.ctx, fixture.svc.config.tuning.snapshotCleanupBatchTimeout)
 			batch, cleanupErr := fixture.svc.cleanupSnapshotBatch(cleanupCtx)
 			cancelCleanup()
 			batchDuration := time.Since(batchStarted)

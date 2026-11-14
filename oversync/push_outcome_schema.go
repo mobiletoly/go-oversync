@@ -25,6 +25,41 @@ var pushOutcomeManagedLayoutFacts = func() []managedLayoutFact {
 	return facts
 }()
 
+// pushOutcomeEnvelopeAllowance is the room r0001 reserves above the push body
+// limit for the outcome envelope.
+const pushOutcomeEnvelopeAllowance int64 = 8192
+
+// maximumPushOutcomeCeiling is the largest ceiling the store accepts.
+const maximumPushOutcomeCeiling = int64(maxMaxBytesPerBundle) + pushOutcomeEnvelopeAllowance
+
+// minimumPushOutcomeCeiling is the smallest ceiling that can hold the outcome
+// of a maximum-size push.
+func minimumPushOutcomeCeiling(maxBytesPerBundle int) int64 {
+	return int64(maxBytesPerBundle) + pushOutcomeEnvelopeAllowance
+}
+
+// newStorePushOutcomeCeiling is the ceiling a new push outcome store records:
+// the explicit value, or the minimum for the configured bundle limit.
+func newStorePushOutcomeCeiling(cfg *ServiceConfig) int64 {
+	if cfg.MaxPushOutcomeDecodedBytes != 0 {
+		return cfg.MaxPushOutcomeDecodedBytes
+	}
+	return minimumPushOutcomeCeiling(cfg.MaxBytesPerBundle)
+}
+
+// pushOutcomeCeilingBytes returns the ceiling this instance enforces and
+// advertises. With a database it is known only after Bootstrap has created or
+// read the store; a service without a pool (unit tests) uses the new-store value.
+func (s *SyncService) pushOutcomeCeilingBytes() (int64, bool) {
+	if ceiling := s.pushOutcomeCeiling.Load(); ceiling > 0 {
+		return ceiling, true
+	}
+	if s.pool == nil {
+		return newStorePushOutcomeCeiling(s.config), true
+	}
+	return 0, false
+}
+
 func (s *SyncService) createPushOutcomeStore(ctx context.Context, tx pgx.Tx) error {
 	statements := []string{
 		`CREATE TABLE sync.push_protocol_store (
@@ -95,33 +130,52 @@ func (s *SyncService) createPushOutcomeStore(ctx context.Context, tx pgx.Tx) err
 			return fmt.Errorf("create fresh push outcome store: %w", err)
 		}
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO sync.push_protocol_store VALUES(TRUE,'durable_outcomes',$1)`, s.config.MaxPushOutcomeDecodedBytes)
+	_, err := tx.Exec(ctx, `INSERT INTO sync.push_protocol_store VALUES(TRUE,'durable_outcomes',$1)`, newStorePushOutcomeCeiling(s.config))
 	return err
 }
 
-func (s *SyncService) validatePushOutcomeStore(ctx context.Context, tx pgx.Tx) error {
+// validatePushOutcomeStore checks the existing store and returns its immutable
+// ceiling, which this instance then advertises and enforces.
+func (s *SyncService) validatePushOutcomeStore(ctx context.Context, tx pgx.Tx) (int64, error) {
 	var ceiling int64
 	if err := tx.QueryRow(ctx, `SELECT max_outcome_bytes FROM sync.push_protocol_store WHERE singleton AND format='durable_outcomes'`).Scan(&ceiling); err != nil {
-		return fmt.Errorf("incompatible push outcome store: %w", err)
+		return 0, fmt.Errorf("incompatible push outcome store: %w", err)
 	}
-	if ceiling != s.config.MaxPushOutcomeDecodedBytes {
-		return fmt.Errorf("immutable push outcome ceiling mismatch: stored=%d configured=%d", ceiling, s.config.MaxPushOutcomeDecodedBytes)
+	if err := checkStoredPushOutcomeCeiling(ceiling, s.config); err != nil {
+		return 0, err
 	}
 	rows, err := tx.Query(ctx, `SELECT DISTINCT generation_id,generation_fingerprint FROM sync.push_outcomes`)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id int32
 		var fingerprint string
 		if err := rows.Scan(&id, &fingerprint); err != nil {
-			return err
+			return 0, err
 		}
 		contract, ok := s.schemaGenerationRegistry.Generation(SchemaGenerationID(id))
 		if !ok || contract.Fingerprint() != fingerprint {
-			return &PushOutcomeError{Code: "push_outcome_pending"}
+			return 0, &PushOutcomeError{Code: "push_outcome_pending"}
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return ceiling, nil
+}
+
+// checkStoredPushOutcomeCeiling applies r0001's startup rule to an existing
+// store: an explicit configured ceiling must equal the stored one, and the
+// stored one must hold the outcome of a maximum-size push. The ceiling has no
+// in-place transition, so the error names the two ways out.
+func checkStoredPushOutcomeCeiling(stored int64, cfg *ServiceConfig) error {
+	if cfg.MaxPushOutcomeDecodedBytes != 0 && stored != cfg.MaxPushOutcomeDecodedBytes {
+		return fmt.Errorf("immutable push outcome ceiling mismatch: stored=%d configured=%d; set MaxPushOutcomeDecodedBytes to 0 to adopt the stored value", stored, cfg.MaxPushOutcomeDecodedBytes)
+	}
+	if required := minimumPushOutcomeCeiling(cfg.MaxBytesPerBundle); stored < required {
+		return fmt.Errorf("immutable push outcome ceiling too small: stored=%d, MaxBytesPerBundle=%d needs at least %d; keep MaxBytesPerBundle at or below %d, or recreate the sync store (the ceiling cannot change in place)", stored, cfg.MaxBytesPerBundle, required, stored-pushOutcomeEnvelopeAllowance)
+	}
+	return nil
 }

@@ -143,7 +143,6 @@ func openPrivateRolloutRuntime(ctx context.Context, pool *pgxpool.Pool, input Ro
 		cfg.Readiness.DisableBackgroundWorkers = true
 		if input.Plan.Action == "expire_history" {
 			cfg.RetainedBundlesPerUser = input.Plan.RetentionWindow
-			cfg.RetentionPruneBatchSize = int64(input.Plan.MaxRows)
 		}
 		if err = WithCatalogRetirement(cfg, input.Plan); err != nil {
 			return nil, func() {}, err

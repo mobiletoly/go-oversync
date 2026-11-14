@@ -76,8 +76,9 @@ type snapshotSessionFixtureOptions struct {
 	snapshotCleanupInterval            time.Duration
 	snapshotCleanupBatchRows           int
 	snapshotCleanupBatchSessions       int
-	snapshotCleanupMaxBatches          int
+	snapshotCleanupBatchesPerBurst     int
 	snapshotCleanupBatchTimeout        time.Duration
+	snapshotCleanupDrainPause          time.Duration
 	snapshotMaterializationBatchRows   int
 	snapshotMaterializationBatchBytes  int64
 	maxBytesPerSnapshotRow             int64
@@ -120,18 +121,21 @@ func newSnapshotSessionFixture(t *testing.T, scenario string, opts snapshotSessi
 		schemaGenerations = testSchemaGenerationsForRegisteredTables(registeredTables)
 	}
 	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: schemaGenerations, AppName: scenarioID + "-test",
-		DefaultRowsPerSnapshotChunk:        opts.defaultRowsPerSnapshotChunk,
-		MaxRowsPerSnapshotChunk:            opts.maxRowsPerSnapshotChunk,
-		MaxRowsPerSnapshotSession:          opts.maxRowsPerSnapshotSession,
-		MaxBytesPerSnapshotSession:         opts.maxBytesPerSnapshotSession,
-		SnapshotCleanupInterval:            opts.snapshotCleanupInterval,
-		SnapshotCleanupBatchRows:           opts.snapshotCleanupBatchRows,
-		SnapshotCleanupBatchSessions:       opts.snapshotCleanupBatchSessions,
-		SnapshotCleanupMaxBatchesPerRun:    opts.snapshotCleanupMaxBatches,
-		SnapshotCleanupBatchTimeout:        opts.snapshotCleanupBatchTimeout,
-		SnapshotMaterializationBatchRows:   opts.snapshotMaterializationBatchRows,
-		SnapshotMaterializationBatchBytes:  opts.snapshotMaterializationBatchBytes,
-		MaxBytesPerSnapshotRow:             opts.maxBytesPerSnapshotRow,
+		MaxRowsPerSnapshotChunk:    opts.maxRowsPerSnapshotChunk,
+		MaxRowsPerSnapshotSession:  opts.maxRowsPerSnapshotSession,
+		MaxBytesPerSnapshotSession: opts.maxBytesPerSnapshotSession,
+		tuning: serviceTuning{
+			defaultRowsPerSnapshotChunk:       opts.defaultRowsPerSnapshotChunk,
+			snapshotCleanupInterval:           opts.snapshotCleanupInterval,
+			snapshotCleanupBatchRows:          opts.snapshotCleanupBatchRows,
+			snapshotCleanupBatchSessions:      opts.snapshotCleanupBatchSessions,
+			snapshotCleanupBatchesPerBurst:    opts.snapshotCleanupBatchesPerBurst,
+			snapshotCleanupBatchTimeout:       opts.snapshotCleanupBatchTimeout,
+			snapshotCleanupDrainPause:         opts.snapshotCleanupDrainPause,
+			snapshotMaterializationBatchRows:  opts.snapshotMaterializationBatchRows,
+			snapshotMaterializationBatchBytes: opts.snapshotMaterializationBatchBytes,
+			maxBytesPerSnapshotRow:            opts.maxBytesPerSnapshotRow,
+		},
 		MaxConcurrentSnapshotBuilds:        opts.maxConcurrentSnapshotBuilds,
 		MaxConcurrentSnapshotChunkRequests: opts.maxConcurrentSnapshotChunkRequests,
 		RegisteredTables:                   registeredTables,
@@ -578,9 +582,8 @@ func TestSnapshotSessions_TextKeysUseCanonicalByteOrderAcrossPages(t *testing.T)
 	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, tables, map[string]GenerationWireType{
 		Key(schemaName, "docs") + ".doc_id": GenerationWireTypeText,
 	}), AppName: "snapshot-text-key-test",
-		SnapshotMaterializationBatchRows: 2,
-		DefaultRowsPerSnapshotChunk:      2,
-		MaxRowsPerSnapshotChunk:          2,
+		MaxRowsPerSnapshotChunk: 2,
+		tuning:                  serviceTuning{snapshotMaterializationBatchRows: 2, defaultRowsPerSnapshotChunk: 2},
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "docs", SyncKeyColumns: []string{"doc_id"}},
 		},
@@ -1429,8 +1432,8 @@ func TestSnapshotSessions_RowWireLimitRejectsAndRollsBack(t *testing.T) {
 	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "row_wire_limit", snapshotSessionFixtureOptions{})
 	fixture.pushUser(t, 1, uuid.New(), strings.Repeat("x", 512))
-	fixture.svc.config.MaxBytesPerSnapshotRow = 128
-	fixture.svc.config.SnapshotMaterializationBatchBytes = 128
+	fixture.svc.config.tuning.maxBytesPerSnapshotRow = 128
+	fixture.svc.config.tuning.snapshotMaterializationBatchBytes = 128
 	_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	var limit *SnapshotSessionLimitExceededError
 	require.ErrorAs(t, err, &limit)
@@ -1451,7 +1454,7 @@ func TestSnapshotSessions_ExpandedKeyPlusPayloadRowLimitRollsBack(t *testing.T) 
 	})
 	require.NoError(t, err)
 	require.Greater(t, expandedBytes, int64(len(row.Payload)))
-	fixture.svc.config.MaxBytesPerSnapshotRow = expandedBytes - 1
+	fixture.svc.config.tuning.maxBytesPerSnapshotRow = expandedBytes - 1
 
 	_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	var limit *SnapshotSessionLimitExceededError
@@ -1466,8 +1469,8 @@ func TestSnapshotSessions_ExpandedKeyPlusPayloadRowLimitRollsBack(t *testing.T) 
 func TestSnapshotSessions_OversizedRowsAreSuppressedBeforeMaterialization(t *testing.T) {
 	fixture := newSnapshotSessionFixture(t, "row_preflight", snapshotSessionFixtureOptions{})
 	fixture.pushUser(t, 1, uuid.New(), strings.Repeat("x", 512))
-	fixture.svc.config.MaxBytesPerSnapshotRow = 128
-	fixture.svc.config.SnapshotMaterializationBatchBytes = 128
+	fixture.svc.config.tuning.maxBytesPerSnapshotRow = 128
+	fixture.svc.config.tuning.snapshotMaterializationBatchBytes = 128
 	var observation snapshotPayloadScanObservation
 	fixture.svc.snapshotHooks = &snapshotTestHooks{afterSnapshotMaterializedRowScan: func(actual snapshotPayloadScanObservation) {
 		observation = actual
@@ -1484,7 +1487,7 @@ func TestSnapshotSessions_OversizedRowsAreSuppressedBeforeMaterialization(t *tes
 func TestSnapshotSessions_OversizedRetainedRowsAreSuppressedBeforeChunkDecode(t *testing.T) {
 	fixture := newSnapshotSessionFixture(t, "chunk_preflight", snapshotSessionFixtureOptions{})
 	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
-	fixture.svc.config.MaxBytesPerSnapshotRow = 128
+	fixture.svc.config.tuning.maxBytesPerSnapshotRow = 128
 	_, err := fixture.pool.Exec(fixture.ctx, `
 		UPDATE sync.snapshot_session_rows
 		SET payload_wire = $2::json, wire_byte_count = 100
@@ -1507,7 +1510,7 @@ func TestSnapshotSessions_OversizedRetainedRowsAreSuppressedBeforeChunkDecode(t 
 func TestSnapshotSessions_OversizedRetainedKeysAreSuppressedBeforeChunkDecode(t *testing.T) {
 	fixture := newSnapshotSessionFixture(t, "chunk_key_preflight", snapshotSessionFixtureOptions{})
 	session := fixture.createSessionWithUser(t, uuid.New(), "Alpha")
-	fixture.svc.config.MaxBytesPerSnapshotRow = 128
+	fixture.svc.config.tuning.maxBytesPerSnapshotRow = 128
 	_, err := fixture.pool.Exec(fixture.ctx, `
 		UPDATE sync.snapshot_session_rows
 		SET key_bytes = decode(repeat('61', 512), 'hex'), wire_byte_count = 100
@@ -1531,8 +1534,8 @@ func TestSnapshotSessions_RowDecodedLimitRejectsOversizePayload(t *testing.T) {
 	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "rowdecodedlimit", snapshotSessionFixtureOptions{})
 	fixture.pushUser(t, 1, uuid.New(), strings.Repeat("x", 512))
-	fixture.svc.config.MaxBytesPerSnapshotRow = 128
-	fixture.svc.config.SnapshotMaterializationBatchBytes = 128
+	fixture.svc.config.tuning.maxBytesPerSnapshotRow = 128
+	fixture.svc.config.tuning.snapshotMaterializationBatchBytes = 128
 	_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	var limit *SnapshotSessionLimitExceededError
 	require.ErrorAs(t, err, &limit)
@@ -1751,18 +1754,18 @@ func TestSnapshotConfig_DefaultsRelationshipsAndCapacityAreFailClosed(t *testing
 	t.Parallel()
 	service, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), RegisteredTables: runtimeServiceTestRegisteredTables(), RegisteredTableCatalogRevision: 1}, nil)
 	require.NoError(t, err)
-	require.Equal(t, defaultSnapshotMaterializationBatchRows, service.config.SnapshotMaterializationBatchRows)
-	require.Equal(t, defaultSnapshotMaterializationBatchBytes, service.config.SnapshotMaterializationBatchBytes)
+	require.Equal(t, defaultSnapshotMaterializationBatchRows, service.config.tuning.snapshotMaterializationBatchRows)
+	require.Equal(t, defaultSnapshotMaterializationBatchBytes, service.config.tuning.snapshotMaterializationBatchBytes)
 	require.Equal(t, defaultMaxConcurrentSnapshotBuilds, cap(service.snapshotBuildPermits))
 	require.Equal(t, defaultMaxConcurrentSnapshotChunkRequests, cap(service.snapshotChunkPermits))
 
 	invalid := []ServiceConfig{
-		{SnapshotMaterializationBatchBytes: 1, MaxBytesPerSnapshotRow: 2},
-		{DefaultBytesPerSnapshotChunk: 2, MaxBytesPerSnapshotChunk: 1, MaxBytesPerSnapshotRow: 1, SnapshotMaterializationBatchBytes: 2},
-		{MaxBytesPerSnapshotRow: 2, MaxBytesPerSnapshotChunk: 1, SnapshotMaterializationBatchBytes: 2},
-		{MaxBytesPerBundle: 4096, MaxBytesPerPullResponse: 8192, MaxBytesPerSnapshotRow: 4096, MaxBytesPerSnapshotChunk: 4096, SnapshotMaterializationBatchBytes: 8192},
-		{MaxBytesPerBundle: 4096, MaxBytesPerPullResponse: 4096, MaxBytesPerSnapshotRow: 4096, MaxBytesPerSnapshotChunk: 8192, SnapshotMaterializationBatchBytes: 8192},
-		{MaxBytesPerBundle: 4095, MaxBytesPerPullResponse: 8192, MaxBytesPerSnapshotRow: 4096, MaxBytesPerSnapshotChunk: 8192, SnapshotMaterializationBatchBytes: 8192},
+		{tuning: serviceTuning{snapshotMaterializationBatchBytes: 1, maxBytesPerSnapshotRow: 2}},
+		{MaxBytesPerSnapshotChunk: 1, tuning: serviceTuning{defaultBytesPerSnapshotChunk: 2, maxBytesPerSnapshotRow: 1, snapshotMaterializationBatchBytes: 2}},
+		{MaxBytesPerSnapshotChunk: 1, tuning: serviceTuning{maxBytesPerSnapshotRow: 2, snapshotMaterializationBatchBytes: 2}},
+		{MaxBytesPerBundle: 4096, MaxBytesPerPullResponse: 8192, MaxBytesPerSnapshotChunk: 4096, tuning: serviceTuning{maxBytesPerSnapshotRow: 4096, snapshotMaterializationBatchBytes: 8192}},
+		{MaxBytesPerBundle: 4096, MaxBytesPerPullResponse: 4096, MaxBytesPerSnapshotChunk: 8192, tuning: serviceTuning{maxBytesPerSnapshotRow: 4096, snapshotMaterializationBatchBytes: 8192}},
+		{MaxBytesPerBundle: 4095, MaxBytesPerPullResponse: 8192, MaxBytesPerSnapshotChunk: 8192, tuning: serviceTuning{maxBytesPerSnapshotRow: 4096, snapshotMaterializationBatchBytes: 8192}},
 		{MaxConcurrentSnapshotBuilds: -1},
 		{MaxRowsPerSnapshotSession: -1},
 	}
@@ -1978,7 +1981,7 @@ func TestSnapshotSessions_CleanupExpiredSessionsRemovesRows(t *testing.T) {
 func TestSnapshotCleanup_BatchesAreBoundedAndPreserveUnexpiredAndAuthoritativeState(t *testing.T) {
 	t.Parallel()
 	fixture := newSnapshotSessionFixture(t, "cleanup_bounds", snapshotSessionFixtureOptions{
-		snapshotCleanupInterval: time.Hour, snapshotCleanupBatchRows: 2, snapshotCleanupBatchSessions: 2, snapshotCleanupMaxBatches: 1,
+		snapshotCleanupInterval: time.Hour, snapshotCleanupBatchRows: 2, snapshotCleanupBatchSessions: 2, snapshotCleanupBatchesPerBurst: 1,
 	})
 	fixture.pushUser(t, 1, uuid.New(), "Alpha")
 	var expired []string
@@ -2003,6 +2006,35 @@ func TestSnapshotCleanup_BatchesAreBoundedAndPreserveUnexpiredAndAuthoritativeSt
 	var afterBusiness, afterState, afterBundles int64
 	require.NoError(t, fixture.pool.QueryRow(fixture.ctx, fmt.Sprintf(`SELECT (SELECT count(*) FROM %s.users),(SELECT count(*) FROM sync.row_state),(SELECT count(*) FROM sync.bundle_rows)`, pgx.Identifier{fixture.schemaName}.Sanitize())).Scan(&afterBusiness, &afterState, &afterBundles))
 	require.Equal(t, []int64{businessRows, rowStateRows, bundleRows}, []int64{afterBusiness, afterState, afterBundles})
+}
+
+// One trigger drains a session much larger than a burst: the worker keeps
+// running bounded batches after short pauses instead of waiting for a tick.
+func TestSnapshotCleanup_OneTriggerDrainsLargeExpiredSessionWithoutTicks(t *testing.T) {
+	t.Parallel()
+	const batchRows = 2
+	fixture := newSnapshotSessionFixture(t, "cleanup_drain", snapshotSessionFixtureOptions{
+		snapshotCleanupInterval: time.Hour, snapshotCleanupBatchRows: batchRows, snapshotCleanupBatchSessions: 1,
+		snapshotCleanupBatchesPerBurst: 1, snapshotCleanupDrainPause: 5 * time.Millisecond,
+	})
+	const rows = 12
+	for i := 1; i <= rows; i++ {
+		fixture.pushUser(t, int64(i), uuid.New(), fmt.Sprintf("user-%d", i))
+	}
+	session, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
+	require.NoError(t, err)
+	require.Equal(t, rows, fixture.snapshotSessionRowCount(t, session.SnapshotID))
+	before := fixture.svc.snapshotRuntimeMetricsSnapshot()
+
+	require.NoError(t, fixture.svc.DeleteSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID))
+	require.Eventually(t, func() bool {
+		return fixture.snapshotSessionCount(t, session.SnapshotID) == 0 && fixture.snapshotSessionRowCount(t, session.SnapshotID) == 0
+	}, 10*time.Second, 10*time.Millisecond)
+
+	metrics := fixture.svc.snapshotRuntimeMetricsSnapshot()
+	require.LessOrEqual(t, metrics.CleanupDeletedRowsHighWater, int64(batchRows), "each transaction keeps its batch size")
+	require.GreaterOrEqual(t, metrics.CleanupBatches-before.CleanupBatches, int64(rows/batchRows))
+	require.LessOrEqual(t, metrics.CleanupRuns-before.CleanupRuns, int64(2), "the delete trigger drains in one run; no tick is needed")
 }
 
 func TestSnapshotCleanup_PeriodicPostCreateAndPostBootstrapTriggers(t *testing.T) {

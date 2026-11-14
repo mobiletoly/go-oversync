@@ -912,7 +912,8 @@ func TestPushConflict_OversizedVisibleRowIsSuppressedBeforeGoMaterialization(t *
 	smallConfig := *largeConfig
 	smallConfig.MaxBytesPerBundle = 4096
 	smallConfig.MaxBytesPerPullResponse = 4096
-	smallConfig.MaxPushOutcomeDecodedBytes = 73728 // preserve immutable store ceiling across a projection-limit restart
+	// MaxPushOutcomeDecodedBytes stays zero: the restarted service adopts the
+	// stored ceiling, which still holds a maximum-size outcome at the lower limit.
 	restarted := newBootstrappedIntegrationService(t, ctx, pool, &smallConfig, integrationTestLogger(slog.LevelWarn))
 	var observation conflictRowScanObservation
 	restarted.uploadConnHooks = &userUploadConnTestHooks{afterConflictRowScan: func(actual conflictRowScanObservation) {

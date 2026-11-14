@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,7 +51,7 @@ const (
 	defaultSnapshotSessionTTL                 time.Duration = 15 * time.Minute
 	defaultSnapshotMaterializationBatchRows   int           = 512
 	defaultSnapshotMaterializationBatchBytes  int64         = 4 << 20
-	defaultMaxConcurrentSnapshotBuilds        int           = 8
+	defaultMaxConcurrentSnapshotBuilds        int           = 4
 	defaultMaxConcurrentSnapshotChunkRequests int           = 4
 	defaultBytesPerSnapshotChunk              int64         = 4 << 20
 	defaultMaxBytesPerSnapshotChunk           int64         = 16 << 20
@@ -58,7 +59,8 @@ const (
 	defaultSnapshotCleanupInterval            time.Duration = time.Minute
 	defaultSnapshotCleanupBatchRows           int           = 5000
 	defaultSnapshotCleanupBatchSessions       int           = 32
-	defaultSnapshotCleanupMaxBatchesPerRun    int           = 8
+	defaultSnapshotCleanupBatchesPerBurst     int           = 8
+	defaultSnapshotCleanupDrainPause          time.Duration = 100 * time.Millisecond
 	defaultSnapshotCleanupBatchTimeout        time.Duration = 5 * time.Second
 	defaultRetainedBundlesPerUser             int64         = 10000
 	defaultRetentionPruneBatchSize            int64         = 1000
@@ -202,6 +204,8 @@ type SyncService struct {
 	snapshotMetrics            snapshotRuntimeMetrics
 	historyProjectionMetrics   historyProjectionRuntimeMetrics
 	snapshotHooks              *snapshotTestHooks
+	// pushOutcomeCeiling is the stored push outcome ceiling, set by Bootstrap.
+	pushOutcomeCeiling atomic.Int64
 }
 
 type snapshotTestHooks struct {
@@ -235,32 +239,59 @@ type ServiceConfig struct {
 	// client boundaries and available to trusted ScopeManager writes.
 	ReservedServerSourceIDs []string
 
-	MaxRowsPerBundle                int   // Zero selects 10,000; hard maximum 100,000.
-	MaxBytesPerBundle               int   // Zero selects 16 MiB; hard maximum 64 MiB.
-	MaxPushOutcomeDecodedBytes      int64 // Zero selects MaxBytesPerBundle+8KiB; immutable per fresh store.
-	MaxBytesPerPullResponse         int64
+	// Wire limits. Clients read them from generation discovery, so they must be
+	// identical on every instance. Zero selects the default.
+
+	// MaxRowsPerBundle bounds rows per push. Zero selects 10,000; maximum 100,000.
+	MaxRowsPerBundle int
+	// MaxBytesPerBundle bounds the decoded push body and drives push memory
+	// (about six times this value per admitted push). Zero selects 16 MiB;
+	// maximum 64 MiB.
+	MaxBytesPerBundle int
+	// MaxPushOutcomeDecodedBytes bounds one retained push outcome. It is stored
+	// when the push outcome store is created and never changes afterwards. Zero
+	// adopts the stored value, or MaxBytesPerBundle+8 KiB for a new store. A
+	// non-zero value must equal the stored value. Startup fails when the stored
+	// value is below MaxBytesPerBundle+8 KiB.
+	MaxPushOutcomeDecodedBytes int64
+	// MaxBytesPerPullResponse bounds one pull page. Zero selects 32 MiB; it must
+	// be between MaxBytesPerBundle and 128 MiB.
+	MaxBytesPerPullResponse int64
+	// MaxRowsPerSnapshotChunk and MaxBytesPerSnapshotChunk cap what one snapshot
+	// chunk request may return. Zero selects 5,000 rows and 16 MiB.
+	MaxRowsPerSnapshotChunk  int
+	MaxBytesPerSnapshotChunk int64
+	// MaxRowsPerSnapshotSession and MaxBytesPerSnapshotSession bound one
+	// snapshot session. Zero means unbounded. An account above the bound can
+	// never build a snapshot, so these are product decisions.
+	MaxRowsPerSnapshotSession  int64
+	MaxBytesPerSnapshotSession int64
+
+	// Per-process admission. Each permit holds at most one PostgreSQL
+	// connection; see ConnectionBudget and ApplySizing. Zero selects the default.
+
+	// MaxConcurrentHistoryProjections bounds pushes, pull projections and
+	// push-outcome reads in flight. Excess requests get 503 with Retry-After.
+	// Zero selects 4; maximum 32.
 	MaxConcurrentHistoryProjections int
-	InitializationLeaseTTL          time.Duration
-	// Snapshot chunking limits. Zero uses the runtime defaults.
-	DefaultRowsPerSnapshotChunk        int
-	MaxRowsPerSnapshotChunk            int
-	SnapshotSessionTTL                 time.Duration
-	MaxRowsPerSnapshotSession          int64
-	MaxBytesPerSnapshotSession         int64
-	SnapshotMaterializationBatchRows   int
-	SnapshotMaterializationBatchBytes  int64
-	MaxConcurrentSnapshotBuilds        int
+	// MaxConcurrentSnapshotBuilds bounds snapshot session builds in flight.
+	// Excess requests get 429 with Retry-After. Zero selects 4.
+	MaxConcurrentSnapshotBuilds int
+	// MaxConcurrentSnapshotChunkRequests bounds snapshot chunk requests in
+	// flight. Excess requests get 429 with Retry-After. Zero selects 4.
 	MaxConcurrentSnapshotChunkRequests int
-	DefaultBytesPerSnapshotChunk       int64
-	MaxBytesPerSnapshotChunk           int64
-	MaxBytesPerSnapshotRow             int64
-	SnapshotCleanupInterval            time.Duration
-	SnapshotCleanupBatchRows           int
-	SnapshotCleanupBatchSessions       int
-	SnapshotCleanupMaxBatchesPerRun    int
-	SnapshotCleanupBatchTimeout        time.Duration
-	RetainedBundlesPerUser             int64
-	RetentionPruneBatchSize            int64
+
+	// Lifecycle policy. These act on shared database state, so keep them
+	// identical on every instance. Zero selects the default.
+
+	// InitializationLeaseTTL bounds a scope initialization lease. Zero selects 15 minutes.
+	InitializationLeaseTTL time.Duration
+	// SnapshotSessionTTL is how long a snapshot session and its staged rows live
+	// unless the client deletes it first. Zero selects 15 minutes.
+	SnapshotSessionTTL time.Duration
+	// RetainedBundlesPerUser is the per-user bundle history kept for pulls; a
+	// client behind it must rebuild from a snapshot. Zero selects 10,000.
+	RetainedBundlesPerUser int64
 	// UploadLockTimeout bounds lock waits inside upload transactions.
 	// Zero disables SET LOCAL lock_timeout so lock waits are governed only by the request context,
 	// which is the reliability-first default.
@@ -280,7 +311,30 @@ type ServiceConfig struct {
 	LogStageTimings bool
 
 	// BundleChangeWatch optionally enables metadata-only bundle change wakeups.
+	// When enabled, each instance holds one extra PostgreSQL connection outside
+	// its pool for LISTEN.
 	BundleChangeWatch BundleChangeWatchConfig
+
+	// tuning holds internal batch sizes and cleanup cadence. Only package tests
+	// set it; zero fields select the defaults.
+	tuning serviceTuning
+}
+
+// serviceTuning holds mechanism settings that are not part of the public
+// configuration: they do not size a deployment and only tests vary them.
+type serviceTuning struct {
+	defaultRowsPerSnapshotChunk       int
+	defaultBytesPerSnapshotChunk      int64
+	maxBytesPerSnapshotRow            int64
+	snapshotMaterializationBatchRows  int
+	snapshotMaterializationBatchBytes int64
+	snapshotCleanupInterval           time.Duration
+	snapshotCleanupBatchRows          int
+	snapshotCleanupBatchSessions      int
+	snapshotCleanupBatchesPerBurst    int
+	snapshotCleanupBatchTimeout       time.Duration
+	snapshotCleanupDrainPause         time.Duration
+	retentionPruneBatchSize           int64
 }
 
 func normalizeHistoryProjectionConfig(cfg *ServiceConfig) error {
@@ -290,11 +344,10 @@ func normalizeHistoryProjectionConfig(cfg *ServiceConfig) error {
 	if cfg.MaxBytesPerBundle == 0 {
 		cfg.MaxBytesPerBundle = defaultMaxBytesPerBundle
 	}
-	if cfg.MaxPushOutcomeDecodedBytes == 0 {
-		cfg.MaxPushOutcomeDecodedBytes = int64(cfg.MaxBytesPerBundle) + 8192
-	}
-	if cfg.MaxPushOutcomeDecodedBytes < int64(cfg.MaxBytesPerBundle)+8192 || cfg.MaxPushOutcomeDecodedBytes > int64(maxMaxBytesPerBundle)+8192 {
-		return fmt.Errorf("MaxPushOutcomeDecodedBytes must be between MaxBytesPerBundle+8192 and %d", int64(maxMaxBytesPerBundle)+8192)
+	// Zero adopts the stored ceiling at Bootstrap; only an explicit value is
+	// checked here.
+	if cfg.MaxPushOutcomeDecodedBytes != 0 && (cfg.MaxPushOutcomeDecodedBytes < minimumPushOutcomeCeiling(cfg.MaxBytesPerBundle) || cfg.MaxPushOutcomeDecodedBytes > maximumPushOutcomeCeiling) {
+		return fmt.Errorf("MaxPushOutcomeDecodedBytes must be zero or between MaxBytesPerBundle+%d and %d", pushOutcomeEnvelopeAllowance, maximumPushOutcomeCeiling)
 	}
 	if cfg.MaxBytesPerPullResponse == 0 {
 		cfg.MaxBytesPerPullResponse = defaultMaxBytesPerPullResponse
@@ -334,12 +387,9 @@ func normalizeBundleChangeWatchConfig(cfg BundleChangeWatchConfig) (BundleChange
 }
 
 func normalizeSnapshotConfig(cfg *ServiceConfig) error {
-	if cfg.DefaultRowsPerSnapshotChunk < 0 || cfg.MaxRowsPerSnapshotChunk < 0 ||
-		cfg.MaxRowsPerSnapshotSession < 0 || cfg.MaxBytesPerSnapshotSession < 0 || cfg.SnapshotSessionTTL < 0 {
+	if cfg.MaxRowsPerSnapshotChunk < 0 || cfg.MaxRowsPerSnapshotSession < 0 ||
+		cfg.MaxBytesPerSnapshotSession < 0 || cfg.SnapshotSessionTTL < 0 {
 		return fmt.Errorf("snapshot row and session limits must not be negative")
-	}
-	if cfg.DefaultRowsPerSnapshotChunk == 0 {
-		cfg.DefaultRowsPerSnapshotChunk = defaultRowsPerSnapshotChunk
 	}
 	if cfg.MaxRowsPerSnapshotChunk == 0 {
 		cfg.MaxRowsPerSnapshotChunk = defaultMaxRowsPerSnapshotChunk
@@ -347,84 +397,105 @@ func normalizeSnapshotConfig(cfg *ServiceConfig) error {
 	if cfg.SnapshotSessionTTL == 0 {
 		cfg.SnapshotSessionTTL = defaultSnapshotSessionTTL
 	}
-	if cfg.SnapshotMaterializationBatchRows == 0 {
-		cfg.SnapshotMaterializationBatchRows = defaultSnapshotMaterializationBatchRows
-	}
-	if cfg.SnapshotMaterializationBatchBytes == 0 {
-		cfg.SnapshotMaterializationBatchBytes = defaultSnapshotMaterializationBatchBytes
-	}
 	if cfg.MaxConcurrentSnapshotBuilds == 0 {
 		cfg.MaxConcurrentSnapshotBuilds = defaultMaxConcurrentSnapshotBuilds
 	}
 	if cfg.MaxConcurrentSnapshotChunkRequests == 0 {
 		cfg.MaxConcurrentSnapshotChunkRequests = defaultMaxConcurrentSnapshotChunkRequests
 	}
-	if cfg.DefaultBytesPerSnapshotChunk == 0 {
-		cfg.DefaultBytesPerSnapshotChunk = defaultBytesPerSnapshotChunk
-	}
 	if cfg.MaxBytesPerSnapshotChunk == 0 {
 		cfg.MaxBytesPerSnapshotChunk = defaultMaxBytesPerSnapshotChunk
 	}
-	if cfg.MaxBytesPerSnapshotRow == 0 {
+	if cfg.MaxConcurrentSnapshotBuilds <= 0 || cfg.MaxConcurrentSnapshotChunkRequests <= 0 ||
+		cfg.MaxBytesPerSnapshotChunk <= 0 {
+		return fmt.Errorf("snapshot admission and chunk limits must be positive")
+	}
+	return normalizeServiceTuning(cfg)
+}
+
+// normalizeServiceTuning fills internal defaults after the public limits are
+// normalized; the defaults are clamped to those limits so that any valid
+// public configuration has a valid internal one.
+func normalizeServiceTuning(cfg *ServiceConfig) error {
+	t := &cfg.tuning
+	if t.defaultRowsPerSnapshotChunk == 0 {
+		t.defaultRowsPerSnapshotChunk = min(defaultRowsPerSnapshotChunk, cfg.MaxRowsPerSnapshotChunk)
+	}
+	if t.defaultBytesPerSnapshotChunk == 0 {
+		t.defaultBytesPerSnapshotChunk = min(defaultBytesPerSnapshotChunk, cfg.MaxBytesPerSnapshotChunk)
+	}
+	if t.maxBytesPerSnapshotRow == 0 {
 		maximumAdvertisableRow := min(defaultMaxBytesPerSnapshotRow, int64(cfg.MaxBytesPerBundle))
 		maximumAdvertisableRow = min(maximumAdvertisableRow, cfg.MaxBytesPerPullResponse-maxCompactSingleRowEnvelopeBytes)
 		maximumAdvertisableRow = min(maximumAdvertisableRow, cfg.MaxBytesPerSnapshotChunk-maxCompactSingleRowEnvelopeBytes)
 		if maximumAdvertisableRow <= 0 {
 			return fmt.Errorf("wire response limits cannot represent one row plus its mandatory envelope")
 		}
-		cfg.MaxBytesPerSnapshotRow = maximumAdvertisableRow
+		t.maxBytesPerSnapshotRow = maximumAdvertisableRow
 	}
-	if cfg.SnapshotCleanupInterval == 0 {
-		cfg.SnapshotCleanupInterval = defaultSnapshotCleanupInterval
+	if t.snapshotMaterializationBatchRows == 0 {
+		t.snapshotMaterializationBatchRows = defaultSnapshotMaterializationBatchRows
 	}
-	if cfg.SnapshotCleanupBatchRows == 0 {
-		cfg.SnapshotCleanupBatchRows = defaultSnapshotCleanupBatchRows
+	if t.snapshotMaterializationBatchBytes == 0 {
+		t.snapshotMaterializationBatchBytes = max(defaultSnapshotMaterializationBatchBytes, t.maxBytesPerSnapshotRow)
 	}
-	if cfg.SnapshotCleanupBatchSessions == 0 {
-		cfg.SnapshotCleanupBatchSessions = defaultSnapshotCleanupBatchSessions
+	if t.snapshotCleanupInterval == 0 {
+		t.snapshotCleanupInterval = defaultSnapshotCleanupInterval
 	}
-	if cfg.SnapshotCleanupMaxBatchesPerRun == 0 {
-		cfg.SnapshotCleanupMaxBatchesPerRun = defaultSnapshotCleanupMaxBatchesPerRun
+	if t.snapshotCleanupBatchRows == 0 {
+		t.snapshotCleanupBatchRows = defaultSnapshotCleanupBatchRows
 	}
-	if cfg.SnapshotCleanupBatchTimeout == 0 {
-		cfg.SnapshotCleanupBatchTimeout = defaultSnapshotCleanupBatchTimeout
+	if t.snapshotCleanupBatchSessions == 0 {
+		t.snapshotCleanupBatchSessions = defaultSnapshotCleanupBatchSessions
 	}
-	if cfg.SnapshotMaterializationBatchRows <= 0 || cfg.SnapshotMaterializationBatchBytes <= 0 ||
-		cfg.MaxConcurrentSnapshotBuilds <= 0 || cfg.MaxConcurrentSnapshotChunkRequests <= 0 ||
-		cfg.DefaultBytesPerSnapshotChunk <= 0 || cfg.MaxBytesPerSnapshotChunk <= 0 ||
-		cfg.MaxBytesPerSnapshotRow <= 0 || cfg.SnapshotCleanupInterval <= 0 ||
-		cfg.SnapshotCleanupBatchRows <= 0 || cfg.SnapshotCleanupBatchSessions <= 0 ||
-		cfg.SnapshotCleanupMaxBatchesPerRun <= 0 || cfg.SnapshotCleanupBatchTimeout <= 0 {
+	if t.snapshotCleanupBatchesPerBurst == 0 {
+		t.snapshotCleanupBatchesPerBurst = defaultSnapshotCleanupBatchesPerBurst
+	}
+	if t.snapshotCleanupBatchTimeout == 0 {
+		t.snapshotCleanupBatchTimeout = defaultSnapshotCleanupBatchTimeout
+	}
+	if t.snapshotCleanupDrainPause == 0 {
+		t.snapshotCleanupDrainPause = defaultSnapshotCleanupDrainPause
+	}
+	if t.retentionPruneBatchSize == 0 {
+		t.retentionPruneBatchSize = defaultRetentionPruneBatchSize
+	}
+	if t.defaultRowsPerSnapshotChunk <= 0 || t.defaultBytesPerSnapshotChunk <= 0 || t.maxBytesPerSnapshotRow <= 0 ||
+		t.snapshotMaterializationBatchRows <= 0 || t.snapshotMaterializationBatchBytes <= 0 ||
+		t.snapshotCleanupInterval <= 0 || t.snapshotCleanupBatchRows <= 0 || t.snapshotCleanupBatchSessions <= 0 ||
+		t.snapshotCleanupBatchesPerBurst <= 0 || t.snapshotCleanupBatchTimeout <= 0 || t.snapshotCleanupDrainPause < 0 ||
+		t.retentionPruneBatchSize <= 0 {
 		return fmt.Errorf("snapshot bounded-work configuration values must be positive")
 	}
-	if cfg.DefaultRowsPerSnapshotChunk > cfg.MaxRowsPerSnapshotChunk {
+	if t.defaultRowsPerSnapshotChunk > cfg.MaxRowsPerSnapshotChunk {
 		return fmt.Errorf("default rows per snapshot chunk must be <= max rows per snapshot chunk")
 	}
-	if cfg.SnapshotMaterializationBatchBytes < cfg.MaxBytesPerSnapshotRow {
+	if t.snapshotMaterializationBatchBytes < t.maxBytesPerSnapshotRow {
 		return fmt.Errorf("snapshot materialization batch bytes must be >= max bytes per snapshot row")
 	}
-	if cfg.DefaultBytesPerSnapshotChunk > cfg.MaxBytesPerSnapshotChunk {
+	if t.defaultBytesPerSnapshotChunk > cfg.MaxBytesPerSnapshotChunk {
 		return fmt.Errorf("default bytes per snapshot chunk must be <= max bytes per snapshot chunk")
 	}
-	if cfg.MaxBytesPerSnapshotRow > cfg.MaxBytesPerSnapshotChunk {
+	if t.maxBytesPerSnapshotRow > cfg.MaxBytesPerSnapshotChunk {
 		return fmt.Errorf("max bytes per snapshot row must be <= max bytes per snapshot chunk")
 	}
 	return nil
 }
 
 func validateAdvertisedWireLimits(cfg *ServiceConfig) error {
-	if cfg.MaxBytesPerSnapshotRow > int64(cfg.MaxBytesPerBundle) {
-		return fmt.Errorf("MaxBytesPerSnapshotRow must be <= MaxBytesPerBundle")
+	rowLimit := cfg.tuning.maxBytesPerSnapshotRow
+	if rowLimit > int64(cfg.MaxBytesPerBundle) {
+		return fmt.Errorf("max bytes per snapshot row must be <= MaxBytesPerBundle")
 	}
-	minimumOneRowEnvelope := cfg.MaxBytesPerSnapshotRow + maxCompactSingleRowEnvelopeBytes
-	if minimumOneRowEnvelope < cfg.MaxBytesPerSnapshotRow {
+	minimumOneRowEnvelope := rowLimit + maxCompactSingleRowEnvelopeBytes
+	if minimumOneRowEnvelope < rowLimit {
 		return fmt.Errorf("advertised one-row envelope size overflows")
 	}
 	if cfg.MaxBytesPerPullResponse < minimumOneRowEnvelope {
-		return fmt.Errorf("MaxBytesPerPullResponse must represent MaxBytesPerSnapshotRow plus its mandatory envelope")
+		return fmt.Errorf("MaxBytesPerPullResponse must represent one maximum-size row plus its mandatory envelope")
 	}
 	if cfg.MaxBytesPerSnapshotChunk < minimumOneRowEnvelope {
-		return fmt.Errorf("MaxBytesPerSnapshotChunk must represent MaxBytesPerSnapshotRow plus its mandatory envelope")
+		return fmt.Errorf("MaxBytesPerSnapshotChunk must represent one maximum-size row plus its mandatory envelope")
 	}
 	return nil
 }
@@ -446,10 +517,10 @@ func (s *SyncService) bundleChangeWatchEnabled() bool {
 }
 
 func (s *SyncService) defaultRowsPerSnapshotChunk() int {
-	if s != nil && s.config != nil && s.config.DefaultRowsPerSnapshotChunk > 0 {
-		return s.config.DefaultRowsPerSnapshotChunk
+	if s != nil && s.config != nil && s.config.tuning.defaultRowsPerSnapshotChunk > 0 {
+		return s.config.tuning.defaultRowsPerSnapshotChunk
 	}
-	return defaultRowsPerSnapshotChunk
+	return min(defaultRowsPerSnapshotChunk, s.maxRowsPerSnapshotChunk())
 }
 
 func (s *SyncService) maxRowsPerSnapshotChunk() int {
@@ -481,10 +552,13 @@ func (s *SyncService) maxBytesPerSnapshotSession() int64 {
 }
 
 func (s *SyncService) defaultBytesPerSnapshotChunk() int64 {
-	return s.config.DefaultBytesPerSnapshotChunk
+	if s.config.tuning.defaultBytesPerSnapshotChunk > 0 {
+		return s.config.tuning.defaultBytesPerSnapshotChunk
+	}
+	return min(defaultBytesPerSnapshotChunk, s.config.MaxBytesPerSnapshotChunk)
 }
 func (s *SyncService) maxBytesPerSnapshotChunk() int64 { return s.config.MaxBytesPerSnapshotChunk }
-func (s *SyncService) maxBytesPerSnapshotRow() int64   { return s.config.MaxBytesPerSnapshotRow }
+func (s *SyncService) maxBytesPerSnapshotRow() int64   { return s.config.tuning.maxBytesPerSnapshotRow }
 
 func (s *SyncService) retainedBundlesPerUser() int64 {
 	if s != nil && s.config != nil && s.config.RetainedBundlesPerUser > 0 {
@@ -494,8 +568,8 @@ func (s *SyncService) retainedBundlesPerUser() int64 {
 }
 
 func (s *SyncService) retentionPruneBatchSize() int64 {
-	if s != nil && s.config != nil && s.config.RetentionPruneBatchSize > 0 {
-		return s.config.RetentionPruneBatchSize
+	if s != nil && s.config != nil && s.config.tuning.retentionPruneBatchSize > 0 {
+		return s.config.tuning.retentionPruneBatchSize
 	}
 	return defaultRetentionPruneBatchSize
 }
@@ -583,6 +657,7 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 		snapshotCleanupTrigger:     make(chan string, 1),
 		scopeReceiptCleanupTrigger: make(chan string, 1),
 	}
+	warnOnCapacityMismatch(logger, pool, config)
 
 	return service, nil
 }
@@ -621,6 +696,7 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 		if succeeded {
 			s.startBackgroundCleanupWorkers()
 			s.logger.Info("Sync bootstrap completed", "duration", time.Since(startedAt), "registered_table_count", len(s.config.RegisteredTables), "bootstrap_mode", bootstrapMode)
+			s.logEffectiveSettings()
 			return
 		}
 		s.logger.Warn("Sync bootstrap rejected or rolled back", "duration", time.Since(startedAt), "error", bootstrapErrorClass(err))
@@ -639,10 +715,12 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 	authorityDeadline := time.Now().Add(s.config.Readiness.LockTimeout)
 	attempt := 0
 	var committedCandidate *SyncService
+	var outcomeCeiling int64
 	var committedMetadata registeredTableCatalogMetadata
 	if err := runRetryableTx(ctx, 3, 50*time.Millisecond, func() error {
 		attempt++
 		currentAttempt := attempt
+		outcomeCeiling = newStorePushOutcomeCeiling(s.config)
 		return s.withReadinessTransaction(ctx, authorityDeadline, func(tx pgx.Tx) error {
 			if s.catalogHooks != nil && s.catalogHooks.inspectTransaction != nil {
 				if err := s.catalogHooks.inspectTransaction(ctx, tx); err != nil {
@@ -663,9 +741,11 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 				return err
 			}
 			if !freshLayout {
-				if err := s.validatePushOutcomeStore(ctx, tx); err != nil {
+				storedCeiling, err := s.validatePushOutcomeStore(ctx, tx)
+				if err != nil {
 					return err
 				}
+				outcomeCeiling = storedCeiling
 				if err := validateStaticManagedLayout(ctx, tx); err != nil {
 					s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
 					return err
@@ -962,6 +1042,7 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 		return fmt.Errorf("bootstrap committed without a catalog topology")
 	}
 	s.publishCatalogBootstrapCandidate(committedCandidate, committedMetadata)
+	s.pushOutcomeCeiling.Store(outcomeCeiling)
 	s.publishReadinessReport()
 	succeeded = true
 	return nil

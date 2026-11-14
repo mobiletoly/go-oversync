@@ -182,8 +182,8 @@ func TestBinaryWire_ScalarFloatExpansionDoesNotConsumeLogicalBundleBudget(t *tes
 		MaxRowsPerBundle:                8,
 		MaxBytesPerBundle:               logicalLimit,
 		MaxBytesPerPullResponse:         logicalLimit + maxCompactSingleRowEnvelopeBytes,
-		MaxBytesPerSnapshotRow:          logicalLimit,
 		MaxConcurrentHistoryProjections: 1,
+		tuning:                          serviceTuning{maxBytesPerSnapshotRow: logicalLimit},
 	}
 	service := newBootstrappedIntegrationService(t, ctx, pool, config, integrationTestLogger(slog.LevelWarn))
 	adopted := loadCommittedBundleForUser(t, ctx, service, "adopt", 1)
@@ -267,7 +267,7 @@ func TestRetainedWirePayloadFormattingDoesNotConsumeLogicalLimits(t *testing.T) 
 		SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), RegisteredTables: registered,
 		RegisteredTableCatalogRevision: 1, MaxRowsPerBundle: 8, MaxBytesPerBundle: logicalLimit,
 		MaxBytesPerPullResponse: logicalLimit + maxCompactSingleRowEnvelopeBytes, MaxConcurrentHistoryProjections: 1,
-		MaxBytesPerSnapshotRow: logicalLimit,
+		tuning: serviceTuning{maxBytesPerSnapshotRow: logicalLimit},
 	}, integrationTestLogger(slog.LevelWarn))
 	proof := testSchemaGenerationProofForService(service)
 	userID := "retained-wire-user-" + suffix

@@ -58,7 +58,7 @@ func outcomeImages(t *testing.T, run func(*testing.T, context.Context, *outcomeF
 			schema := "outcome_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 			require.NoError(t, resetTestBusinessSchema(ctx, pool, schema))
 			tables := []RegisteredTable{{Schema: schema, Table: "users", SyncKeyColumns: []string{"id"}}, {Schema: schema, Table: "posts", SyncKeyColumns: []string{"id"}}}
-			cfg := &ServiceConfig{AppName: "outcome-test", SchemaGenerations: testSchemaGenerationsForRegisteredTables(tables), RegisteredTables: tables, RegisteredTableCatalogRevision: 1, ReservedServerSourceIDs: []string{"server-writer"}, MaxBytesPerBundle: 16384, MaxBytesPerSnapshotRow: 16384, RetainedBundlesPerUser: 1}
+			cfg := &ServiceConfig{AppName: "outcome-test", SchemaGenerations: testSchemaGenerationsForRegisteredTables(tables), RegisteredTables: tables, RegisteredTableCatalogRevision: 1, ReservedServerSourceIDs: []string{"server-writer"}, MaxBytesPerBundle: 16384, RetainedBundlesPerUser: 1, tuning: serviceTuning{maxBytesPerSnapshotRow: 16384}}
 			svc := outcomeService(t, ctx, pool, cfg)
 			actor := Actor{UserID: "scope-" + schema, SourceID: "writer"}
 			mustInitializeEmptyScope(t, ctx, svc, actor.UserID, actor.SourceID)
@@ -651,19 +651,46 @@ func TestPushOutcome_BoundedRetention(t *testing.T) {
 		stats, err := f.svc.PushOutcomeStorage(ctx)
 		require.NoError(t, err)
 		require.Greater(t, stats.OldestAge, 999*24*time.Hour)
-		require.LessOrEqual(t, stats.PayloadBytes, f.svc.config.MaxPushOutcomeDecodedBytes)
-		t.Logf("OUTCOME_STORAGE before_ack count=%d payload_bytes=%d oldest_age=%s physical_bytes=%d ceiling=%d", stats.Outstanding, stats.PayloadBytes, stats.OldestAge, stats.PhysicalBytes, f.svc.config.MaxPushOutcomeDecodedBytes)
+		storedCeiling, known := f.svc.pushOutcomeCeilingBytes()
+		require.True(t, known)
+		require.LessOrEqual(t, stats.PayloadBytes, storedCeiling)
+		t.Logf("OUTCOME_STORAGE before_ack count=%d payload_bytes=%d oldest_age=%s physical_bytes=%d ceiling=%d", stats.Outstanding, stats.PayloadBytes, stats.OldestAge, stats.PhysicalBytes, storedCeiling)
 		// Configuration is persisted once, immutable, and checked before traffic.
 		_, err = f.pool.Exec(ctx, `UPDATE sync.push_protocol_store SET max_outcome_bytes=max_outcome_bytes+1`)
 		require.Error(t, err)
 		changed := *f.cfg
-		changed.MaxPushOutcomeDecodedBytes = f.svc.config.MaxPushOutcomeDecodedBytes + 1
+		changed.MaxPushOutcomeDecodedBytes = storedCeiling + 1
 		wrong, err := newTestRuntimeService(f.pool, &changed, integrationTestLogger(4))
 		require.NoError(t, err)
 		err = wrong.Bootstrap(ctx)
 		require.ErrorContains(t, err, "immutable push outcome ceiling mismatch")
 		require.NoError(t, wrong.Close(ctx))
+		// A bundle limit whose outcome cannot fit the stored ceiling refuses startup
+		// and names both values and the remedy.
+		raised := *f.cfg
+		raised.MaxPushOutcomeDecodedBytes = 0
+		raised.MaxBytesPerBundle = int(storedCeiling)
+		raised.MaxBytesPerPullResponse = maxMaxBytesPerPullResponse
+		raised.tuning = serviceTuning{}
+		tooLarge, err := newTestRuntimeService(f.pool, &raised, integrationTestLogger(4))
+		require.NoError(t, err)
+		err = tooLarge.Bootstrap(ctx)
+		require.ErrorContains(t, err, "immutable push outcome ceiling too small")
+		require.ErrorContains(t, err, fmt.Sprintf("stored=%d", storedCeiling))
+		require.ErrorContains(t, err, fmt.Sprintf("keep MaxBytesPerBundle at or below %d", storedCeiling-pushOutcomeEnvelopeAllowance))
+		require.NoError(t, tooLarge.Close(ctx))
 		f.query(t, ctx, `DROP TRIGGER age_outcome ON sync.push_outcomes`)
+		// A lower bundle limit adopts and keeps advertising the stored ceiling.
+		lowered := *f.cfg
+		lowered.MaxPushOutcomeDecodedBytes = 0
+		lowered.MaxBytesPerBundle = 4096
+		lowered.tuning = serviceTuning{}
+		adopting, err := newTestRuntimeService(f.pool, &lowered, integrationTestLogger(4))
+		require.NoError(t, err)
+		require.NoError(t, adopting.Bootstrap(ctx))
+		require.Equal(t, storedCeiling, adopting.EffectiveSettings().Limits.MaxPushOutcomeDecodedBytes)
+		require.Equal(t, storedCeiling, adopting.wireLimits().MaxPushOutcomeDecodedBytes)
+		require.NoError(t, adopting.Close(ctx))
 		f.ack(t, ctx, f.writer, result.Outcome)
 		stats, err = f.svc.PushOutcomeStorage(ctx)
 		require.NoError(t, err)
@@ -712,7 +739,9 @@ func TestPushOutcome_BoundedRetention(t *testing.T) {
 		hypothetical.Committed = &CommittedPushEffect{BundleSeq: 3, BundleHash: logicalHash, RowCount: 1, Rows: projectedGroups}
 		fullEnvelope, err := json.Marshal(hypothetical)
 		require.NoError(t, err)
-		require.Greater(t, int64(len(fullEnvelope)), f.svc.config.MaxPushOutcomeDecodedBytes)
+		ceiling, known := f.svc.pushOutcomeCeilingBytes()
+		require.True(t, known)
+		require.Greater(t, int64(len(fullEnvelope)), ceiling)
 		large := f.request(t, 3, f.userRow(uuid.New(), "expanded"))
 		groups, err := CompactGroupsForRows(generationDescriptor(f.svc.generationViews[1].contract), large.Rows)
 		require.NoError(t, err)

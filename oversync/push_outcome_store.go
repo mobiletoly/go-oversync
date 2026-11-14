@@ -148,7 +148,11 @@ func (s *SyncService) encodePushOutcome(outcome *PushOutcome, view *schemaGenera
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(raw)) > s.config.MaxPushOutcomeDecodedBytes {
+	ceiling, known := s.pushOutcomeCeilingBytes()
+	if !known {
+		return nil, errServiceNotReady
+	}
+	if int64(len(raw)) > ceiling {
 		return nil, outcomeError("push_outcome_too_large")
 	}
 	var checked PushOutcome

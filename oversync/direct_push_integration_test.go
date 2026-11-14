@@ -49,7 +49,7 @@ func newDirectPushFixture(t *testing.T, ctx context.Context, opts directPushFixt
 		MaxRowsPerBundle:               opts.maxRowsPerBundle,
 		MaxBytesPerBundle:              opts.maxBytesPerBundle,
 		MaxBytesPerPullResponse:        opts.maxBytesPerPullResponse,
-		MaxBytesPerSnapshotRow:         opts.maxBytesPerSnapshotRow,
+		tuning:                         serviceTuning{maxBytesPerSnapshotRow: opts.maxBytesPerSnapshotRow},
 		RegisteredTables:               registered,
 		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))

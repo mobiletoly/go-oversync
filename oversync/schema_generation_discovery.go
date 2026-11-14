@@ -55,10 +55,26 @@ func (s *SyncService) getGeneration(ctx context.Context, actor Actor, id SchemaG
 	if !ok {
 		return nil, &SchemaGenerationRequestError{Code: SchemaGenerationUnknown, GenerationID: id, Message: "schema generation is unknown"}
 	}
+	// An adopted push outcome ceiling is known only once Bootstrap has read the
+	// store; advertising a guess could understate a retained outcome.
+	if _, known := s.pushOutcomeCeilingBytes(); !known {
+		return nil, errServiceNotReady
+	}
 	return s.generationDiscoveryResponse(contract, s.bundleChangeWatchEnabled()), nil
 }
 
 func (s *SyncService) generationDiscoveryResponse(contract SchemaGenerationContract, watchEnabled bool) *GenerationDiscoveryResponse {
+	return &GenerationDiscoveryResponse{
+		ProtocolVersion:  SyncProtocolVersion,
+		SchemaGeneration: generationDescriptor(contract),
+		Limits:           s.wireLimits(),
+		WatchEnabled:     watchEnabled,
+	}
+}
+
+// wireLimits returns the client-enforced limits this instance advertises.
+func (s *SyncService) wireLimits() WireLimits {
+	pushOutcomeCeiling, _ := s.pushOutcomeCeilingBytes()
 	maxSnapshotRows := s.maxRowsPerSnapshotSession()
 	maxSnapshotLogicalBytes := s.maxBytesPerSnapshotSession()
 	// The service retains zero as the internal representation of an unbounded
@@ -70,22 +86,17 @@ func (s *SyncService) generationDiscoveryResponse(contract SchemaGenerationContr
 	if maxSnapshotLogicalBytes == 0 {
 		maxSnapshotLogicalBytes = 1 << 50
 	}
-	return &GenerationDiscoveryResponse{
-		ProtocolVersion:  SyncProtocolVersion,
-		SchemaGeneration: generationDescriptor(contract),
-		Limits: WireLimits{
-			MaxPushRows:                     s.config.MaxRowsPerBundle,
-			MaxPushDecodedBytes:             int64(s.config.MaxBytesPerBundle) + historyEnvelopeAllowance,
-			MaxPullBundles:                  defaultMaxBundlesPerPull,
-			MaxPullDecodedBytes:             s.config.MaxBytesPerPullResponse,
-			MaxSnapshotRowsPerChunk:         s.maxRowsPerSnapshotChunk(),
-			MaxSnapshotDecodedBytesPerChunk: s.maxBytesPerSnapshotChunk(),
-			MaxSnapshotRows:                 maxSnapshotRows,
-			MaxSnapshotLogicalBytes:         maxSnapshotLogicalBytes,
-			MaxRowDecodedBytes:              s.maxBytesPerSnapshotRow(),
-			MaxPushOutcomeDecodedBytes:      s.config.MaxPushOutcomeDecodedBytes,
-		},
-		WatchEnabled: watchEnabled,
+	return WireLimits{
+		MaxPushRows:                     s.config.MaxRowsPerBundle,
+		MaxPushDecodedBytes:             int64(s.config.MaxBytesPerBundle) + historyEnvelopeAllowance,
+		MaxPullBundles:                  defaultMaxBundlesPerPull,
+		MaxPullDecodedBytes:             s.config.MaxBytesPerPullResponse,
+		MaxSnapshotRowsPerChunk:         s.maxRowsPerSnapshotChunk(),
+		MaxSnapshotDecodedBytesPerChunk: s.maxBytesPerSnapshotChunk(),
+		MaxSnapshotRows:                 maxSnapshotRows,
+		MaxSnapshotLogicalBytes:         maxSnapshotLogicalBytes,
+		MaxRowDecodedBytes:              s.maxBytesPerSnapshotRow(),
+		MaxPushOutcomeDecodedBytes:      pushOutcomeCeiling,
 	}
 }
 
@@ -143,7 +154,10 @@ func (h *HTTPSyncHandlers) writeDiscoveryError(w http.ResponseWriter, r *http.Re
 func (s *SyncService) validateGenerationResponseSizes() error {
 	for _, id := range s.schemaGenerationRegistry.GenerationIDs() {
 		contract, _ := s.schemaGenerationRegistry.Generation(id)
-		for _, response := range []any{s.generationDiscoveryResponse(contract, false)} {
+		response := s.generationDiscoveryResponse(contract, false)
+		// The stored ceiling may still be unknown here; measure the widest value.
+		response.Limits.MaxPushOutcomeDecodedBytes = maximumPushOutcomeCeiling
+		for _, response := range []any{response} {
 			body, err := json.Marshal(response)
 			if err != nil {
 				return err

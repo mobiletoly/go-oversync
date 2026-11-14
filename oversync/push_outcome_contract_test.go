@@ -119,7 +119,9 @@ func TestRecoveryProtocol_OutcomeConfiguration(t *testing.T) {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
-				require.GreaterOrEqual(t, cfg.MaxPushOutcomeDecodedBytes, int64(16384+8192))
+				// Zero stays zero (adopt the stored ceiling); a new store records the minimum.
+				require.Equal(t, tc.limit, cfg.MaxPushOutcomeDecodedBytes)
+				require.GreaterOrEqual(t, newStorePushOutcomeCeiling(cfg), int64(16384+8192))
 			}
 		})
 	}

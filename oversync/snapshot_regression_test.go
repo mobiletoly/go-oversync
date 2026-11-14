@@ -164,8 +164,8 @@ func TestSnapshotHTTP_ChunkPermitIsHeldThroughResponseWrite(t *testing.T) {
 func TestSnapshotHTTP_SessionLimitIsStructuredConflict(t *testing.T) {
 	fixture := newSnapshotSessionFixture(t, "http_row_wire_limit", snapshotSessionFixtureOptions{})
 	fixture.pushUser(t, 1, uuid.New(), strings.Repeat("x", 512))
-	fixture.svc.config.MaxBytesPerSnapshotRow = 128
-	fixture.svc.config.SnapshotMaterializationBatchBytes = 128
+	fixture.svc.config.tuning.maxBytesPerSnapshotRow = 128
+	fixture.svc.config.tuning.snapshotMaterializationBatchBytes = 128
 	handlers := NewHTTPSyncHandlers(fixture.svc, integrationTestLogger(slog.LevelWarn))
 	recorder := httptest.NewRecorder()
 	handlers.HandleCreateSnapshotSession(recorder, snapshotRequestWithActor(http.MethodPost, "/sync/snapshot-sessions", "", fixture.reader, fixture.svc))
@@ -181,7 +181,7 @@ func TestSnapshotHTTP_SessionLimitIsStructuredConflict(t *testing.T) {
 }
 
 func TestSnapshotCleanup_StartupPublicationIsAtomicWithClose(t *testing.T) {
-	service, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), SnapshotCleanupInterval: time.Hour, RegisteredTables: runtimeServiceTestRegisteredTables(),
+	service, err := newTestRuntimeService(nil, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), tuning: serviceTuning{snapshotCleanupInterval: time.Hour}, RegisteredTables: runtimeServiceTestRegisteredTables(),
 		RegisteredTableCatalogRevision: 1}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	service.bootstrapReadiness = bootstrapReadinessReady
@@ -458,7 +458,7 @@ func TestSnapshotObservability_EmitsPerBuildChunkAndCleanupFacts(t *testing.T) {
 		metrics = fixture.svc.snapshotRuntimeMetricsSnapshot()
 		require.Equal(t, beforeCancellations+1, metrics.CleanupCancellations)
 
-		fixture.svc.config.SnapshotCleanupBatchTimeout = time.Nanosecond
+		fixture.svc.config.tuning.snapshotCleanupBatchTimeout = time.Nanosecond
 		beforeFailures := metrics.CleanupFailures
 		fixture.svc.runSnapshotCleanup(context.Background(), "test_failed")
 		metrics = fixture.svc.snapshotRuntimeMetricsSnapshot()

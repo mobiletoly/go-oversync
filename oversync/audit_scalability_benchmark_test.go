@@ -801,7 +801,7 @@ func BenchmarkAuditScalabilityRetentionPruning(b *testing.B) {
 			auditRequireScalabilityProfile(b, historyCount, 100)
 			fixture := newAuditDatabaseBenchmarkFixture(b, fmt.Sprintf("pruning_%d", historyCount))
 			fixture.svc.config.RetainedBundlesPerUser = retainedBundles
-			fixture.svc.config.RetentionPruneBatchSize = int64(historyCount)
+			fixture.svc.config.tuning.retentionPruneBatchSize = int64(historyCount)
 			userPK, err := lookupUserPK(fixture.ctx, fixture.pool, fixture.writer.UserID)
 			if err != nil {
 				b.Fatalf("lookup pruning profile user: %v", err)

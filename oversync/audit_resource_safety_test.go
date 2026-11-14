@@ -214,9 +214,9 @@ func TestAuditResourceSafety_DirectPushAndSnapshotSessionPressureExpiresAndClean
 func TestAuditResourceSafety_RetainedStorageAndFetchChunksStayWithinConfiguredBounds(t *testing.T) {
 	fixture := newAuditResourceSafetyFixture(t, "retained_storage", 4, func(config *ServiceConfig) {
 		config.RetainedBundlesPerUser = 2
-		config.RetentionPruneBatchSize = 100
+		config.tuning.retentionPruneBatchSize = 100
 		config.MaxRowsPerSnapshotChunk = 2
-		config.DefaultRowsPerSnapshotChunk = 2
+		config.tuning.defaultRowsPerSnapshotChunk = 2
 	})
 	mustInitializeEmptyScope(t, fixture.ctx, fixture.svc, fixture.userID, "initializer")
 

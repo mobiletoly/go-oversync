@@ -26,9 +26,12 @@ func (s *SyncService) ExpireRetiredTableHistory(ctx context.Context, tx pgx.Tx) 
 	if err != nil {
 		return result, err
 	}
-	if !p.ExpireHistory || p.RetentionWindow < 1 || p.RetentionWindow != s.retainedBundlesPerUser() || s.retentionPruneBatchSize() > int64(p.MaxRows) {
+	if !p.ExpireHistory || p.RetentionWindow < 1 || p.RetentionWindow != s.retainedBundlesPerUser() {
 		return result, fmt.Errorf("history_expiry_policy_mismatch")
 	}
+	// The plan's row budget (at most 4096) also bounds how many bundles one
+	// step may expire; the row check below keeps the expired rows within it.
+	maxStep := int64(p.MaxRows)
 	ctx, deadline := context.WithDeadline(ctx, p.Deadline)
 	defer deadline()
 	metadata, entries, err := readRegisteredTableCatalog(ctx, tx, true)
@@ -63,8 +66,8 @@ func (s *SyncService) ExpireRetiredTableHistory(ctx context.Context, tx pgx.Tx) 
 		return result, err
 	}
 	targetFloor := nextBundle - 1 - p.RetentionWindow
-	if targetFloor > before+s.retentionPruneBatchSize() {
-		targetFloor = before + s.retentionPruneBatchSize()
+	if targetFloor > before+maxStep {
+		targetFloor = before + maxStep
 	}
 	if err = tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM sync.bundle_log WHERE user_pk=$1 AND bundle_seq<=$2),(SELECT count(*) FROM sync.bundle_rows WHERE user_pk=$1 AND bundle_seq<=$2)`, userPK, targetFloor).Scan(&result.ExpiredBundles, &result.ExpiredRows); err != nil {
 		return result, err
@@ -72,7 +75,7 @@ func (s *SyncService) ExpireRetiredTableHistory(ctx context.Context, tx pgx.Tx) 
 	if result.ExpiredRows > int64(p.MaxRows) {
 		return result, fmt.Errorf("history_prefix_row_budget_exceeded")
 	}
-	if err = s.applyRetentionPolicyForUser(ctx, tx, userPK); err != nil {
+	if err = s.applyRetentionPolicyForUserInSteps(ctx, tx, userPK, maxStep); err != nil {
 		return result, err
 	}
 	var after int64

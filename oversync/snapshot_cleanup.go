@@ -35,7 +35,7 @@ func (s *SyncService) startSnapshotCleanupWorker() {
 	s.snapshotCleanupDone = done
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(s.config.SnapshotCleanupInterval)
+		ticker := time.NewTicker(s.config.tuning.snapshotCleanupInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -83,6 +83,10 @@ func (s *SyncService) requestSnapshotCleanup(reason string) {
 	}
 }
 
+// runSnapshotCleanup deletes expired snapshot sessions in bounded batches,
+// each in its own transaction. It keeps draining while batches make progress:
+// after every burst of batches it pauses briefly, so a large expired session is
+// removed promptly without one long transaction or waiting for the next tick.
 func (s *SyncService) runSnapshotCleanup(ctx context.Context, reason string) {
 	startedAt := time.Now()
 	s.snapshotMetrics.cleanupRuns.Add(1)
@@ -90,47 +94,73 @@ func (s *SyncService) runSnapshotCleanup(ctx context.Context, reason string) {
 	observeAtomicHighWater(&s.snapshotMetrics.cleanupRunHighWater, activeRuns)
 	defer s.snapshotMetrics.activeCleanupRuns.Add(-1)
 
+	tuning := &s.config.tuning
 	var totals snapshotCleanupBatchResult
 	batchCount := 0
 	outcome := "completed"
-	for batch := 0; batch < s.config.SnapshotCleanupMaxBatchesPerRun; batch++ {
-		batchCount++
-		s.snapshotMetrics.cleanupBatches.Add(1)
-		batchStartedAt := time.Now()
-		batchCtx, cancel := context.WithTimeout(ctx, s.config.SnapshotCleanupBatchTimeout)
-		result, err := s.cleanupSnapshotBatch(batchCtx)
-		cancel()
-		batchDuration := time.Since(batchStartedAt)
-		observeAtomicHighWater(&s.snapshotMetrics.cleanupBatchDurationHighWater, batchDuration.Nanoseconds())
-		observeAtomicHighWater(&s.snapshotMetrics.cleanupOldestExpiryAgeHighWater, result.oldestExpiryAge.Nanoseconds())
-		observeAtomicHighWater(&s.snapshotMetrics.cleanupCandidateSessionsHighWater, result.candidateSessions)
-		observeAtomicHighWater(&s.snapshotMetrics.cleanupDeletedRowsHighWater, result.deletedRows)
-		observeAtomicHighWater(&s.snapshotMetrics.cleanupDeletedSessionsHighWater, result.deletedSessions)
-		if err != nil {
-			outcome = "failed"
-			if ctx.Err() != nil {
-				outcome = "cancelled"
-				s.snapshotMetrics.cleanupCancellations.Add(1)
-			} else {
-				s.snapshotMetrics.cleanupFailures.Add(1)
-				s.logger.Warn("Snapshot cleanup batch failed", "reason", reason, "batch", batch+1, "error", err)
+	logRun := func() {
+		s.logger.Info("Snapshot cleanup run completed", "reason", reason, "outcome", outcome, "duration", time.Since(startedAt), "batch_count", batchCount, "candidate_sessions", totals.candidateSessions, "deleted_rows", totals.deletedRows, "deleted_sessions", totals.deletedSessions, "oldest_selected_expiry_age", totals.oldestExpiryAge, "active_run_high_water", s.snapshotMetrics.cleanupRunHighWater.Load())
+	}
+	for {
+		for range tuning.snapshotCleanupBatchesPerBurst {
+			batchCount++
+			result, err := s.runSnapshotCleanupBatch(ctx, reason, batchCount)
+			if err != nil {
+				outcome = s.snapshotCleanupFailureOutcome(ctx, reason, batchCount, err)
+				logRun()
+				return
 			}
-			s.logger.Info("Snapshot cleanup batch completed", "reason", reason, "batch", batch+1, "outcome", outcome, "duration", batchDuration, "candidate_sessions", result.candidateSessions, "deleted_rows", result.deletedRows, "deleted_sessions", result.deletedSessions, "oldest_selected_expiry_age", result.oldestExpiryAge)
-			s.logger.Info("Snapshot cleanup run completed", "reason", reason, "outcome", outcome, "duration", time.Since(startedAt), "batch_count", batchCount, "candidate_sessions", totals.candidateSessions, "deleted_rows", totals.deletedRows, "deleted_sessions", totals.deletedSessions, "oldest_selected_expiry_age", totals.oldestExpiryAge, "active_run_high_water", s.snapshotMetrics.cleanupRunHighWater.Load())
+			totals.candidateSessions += result.candidateSessions
+			totals.deletedRows += result.deletedRows
+			totals.deletedSessions += result.deletedSessions
+			totals.oldestExpiryAge = max(totals.oldestExpiryAge, result.oldestExpiryAge)
+			if result.candidateSessions == 0 || (result.deletedRows == 0 && result.deletedSessions == 0) {
+				logRun()
+				return
+			}
+		}
+		// The burst ended while batches still made progress: expired work
+		// remains. Pause to let other work use the database, then continue.
+		select {
+		case <-ctx.Done():
+			outcome = "cancelled"
+			s.snapshotMetrics.cleanupCancellations.Add(1)
+			logRun()
 			return
-		}
-		totals.candidateSessions += result.candidateSessions
-		totals.deletedRows += result.deletedRows
-		totals.deletedSessions += result.deletedSessions
-		if result.oldestExpiryAge > totals.oldestExpiryAge {
-			totals.oldestExpiryAge = result.oldestExpiryAge
-		}
-		s.logger.Info("Snapshot cleanup batch completed", "reason", reason, "batch", batch+1, "outcome", outcome, "duration", batchDuration, "candidate_sessions", result.candidateSessions, "deleted_rows", result.deletedRows, "deleted_sessions", result.deletedSessions, "oldest_selected_expiry_age", result.oldestExpiryAge)
-		if result.candidateSessions == 0 || (result.deletedRows == 0 && result.deletedSessions == 0) {
-			break
+		case <-time.After(tuning.snapshotCleanupDrainPause):
 		}
 	}
-	s.logger.Info("Snapshot cleanup run completed", "reason", reason, "outcome", outcome, "duration", time.Since(startedAt), "batch_count", batchCount, "candidate_sessions", totals.candidateSessions, "deleted_rows", totals.deletedRows, "deleted_sessions", totals.deletedSessions, "oldest_selected_expiry_age", totals.oldestExpiryAge, "active_run_high_water", s.snapshotMetrics.cleanupRunHighWater.Load())
+}
+
+func (s *SyncService) runSnapshotCleanupBatch(ctx context.Context, reason string, batch int) (snapshotCleanupBatchResult, error) {
+	s.snapshotMetrics.cleanupBatches.Add(1)
+	batchStartedAt := time.Now()
+	batchCtx, cancel := context.WithTimeout(ctx, s.config.tuning.snapshotCleanupBatchTimeout)
+	result, err := s.cleanupSnapshotBatch(batchCtx)
+	cancel()
+	batchDuration := time.Since(batchStartedAt)
+	observeAtomicHighWater(&s.snapshotMetrics.cleanupBatchDurationHighWater, batchDuration.Nanoseconds())
+	observeAtomicHighWater(&s.snapshotMetrics.cleanupOldestExpiryAgeHighWater, result.oldestExpiryAge.Nanoseconds())
+	observeAtomicHighWater(&s.snapshotMetrics.cleanupCandidateSessionsHighWater, result.candidateSessions)
+	observeAtomicHighWater(&s.snapshotMetrics.cleanupDeletedRowsHighWater, result.deletedRows)
+	observeAtomicHighWater(&s.snapshotMetrics.cleanupDeletedSessionsHighWater, result.deletedSessions)
+	outcome := "completed"
+	if err != nil {
+		outcome = "failed"
+	}
+	s.logger.Debug("Snapshot cleanup batch completed", "reason", reason, "batch", batch, "outcome", outcome, "duration", batchDuration, "candidate_sessions", result.candidateSessions, "deleted_rows", result.deletedRows, "deleted_sessions", result.deletedSessions, "oldest_selected_expiry_age", result.oldestExpiryAge)
+	return result, err
+}
+
+// snapshotCleanupFailureOutcome records a failed batch and names the run outcome.
+func (s *SyncService) snapshotCleanupFailureOutcome(ctx context.Context, reason string, batch int, err error) string {
+	if ctx.Err() != nil {
+		s.snapshotMetrics.cleanupCancellations.Add(1)
+		return "cancelled"
+	}
+	s.snapshotMetrics.cleanupFailures.Add(1)
+	s.logger.Warn("Snapshot cleanup batch failed", "reason", reason, "batch", batch, "error", err)
+	return "failed"
 }
 
 func (s *SyncService) cleanupSnapshotBatch(ctx context.Context) (result snapshotCleanupBatchResult, err error) {
@@ -150,7 +180,7 @@ func (s *SyncService) cleanupSnapshotBatch(ctx context.Context) (result snapshot
 			ORDER BY expires_at, snapshot_id
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
-		`, s.config.SnapshotCleanupBatchSessions)
+		`, s.config.tuning.snapshotCleanupBatchSessions)
 		if err != nil {
 			return fmt.Errorf("select expired snapshot sessions: %w", err)
 		}
@@ -188,7 +218,7 @@ func (s *SyncService) cleanupSnapshotBatch(ctx context.Context) (result snapshot
 			DELETE FROM sync.snapshot_session_rows AS row
 			USING doomed
 			WHERE row.ctid = doomed.ctid
-		`, ids, s.config.SnapshotCleanupBatchRows)
+		`, ids, s.config.tuning.snapshotCleanupBatchRows)
 		if err != nil {
 			return fmt.Errorf("delete expired snapshot rows: %w", err)
 		}
