@@ -54,6 +54,14 @@ func (s *SyncService) ProcessPull(
 	if targetBundleSeq < 0 {
 		return nil, fmt.Errorf("target_bundle_seq must be >= 0")
 	}
+	// Admit the pull before it takes any pooled connection, as push and the
+	// push-outcome reads do. A refused pull then costs no pool wait, so a pull
+	// storm far above the permits cannot queue on the pool ahead of admitted work.
+	releaseProjection, err := s.acquireHistoryProjection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHistoryProjection(&releaseProjection)
 	if _, err := s.requireExactSourceGenerationBinding(ctx, actor, proof); err != nil {
 		return nil, err
 	}
@@ -61,18 +69,11 @@ func (s *SyncService) ProcessPull(
 	if err != nil {
 		return nil, err
 	}
-	var releaseProjection func()
-	defer releaseHistoryProjection(&releaseProjection)
 
 	var txResp *PullResponse
 	txStart := s.stageStart()
 	err = withOriginTransaction(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
-		releaseHistoryProjection(&releaseProjection)
 		stableBundleSeq, bundleSeqs, hasMore, txErr := s.planPullPage(ctx, tx, actor.UserID, afterBundleSeq, maxBundles, targetBundleSeq)
-		if txErr != nil {
-			return txErr
-		}
-		releaseProjection, txErr = s.acquireHistoryProjection(ctx)
 		if txErr != nil {
 			return txErr
 		}
