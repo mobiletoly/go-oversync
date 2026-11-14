@@ -21,7 +21,22 @@ import (
 // Canonicalize validates raw JSON and returns its RFC 8785 representation.
 // Oversync hash inputs are always objects or arrays, as required by the
 // reference implementation.
+//
+// Every public function in this package first runs the single-pass parser and
+// encoder in canonical.go. Whenever that path declines an input, the function
+// falls back to the reference path below, so every refusal and its message
+// come from the reference path and the single-pass path only has to be exact
+// on inputs it accepts.
 func Canonicalize(raw []byte) ([]byte, error) {
+	if canonical, ok := canonicalizeSinglePass(raw); ok {
+		return canonical, nil
+	}
+	return canonicalizeReference(raw)
+}
+
+// canonicalizeReference validates raw JSON with encoding/json and transforms
+// it with the RFC 8785 reference implementation.
+func canonicalizeReference(raw []byte) ([]byte, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("JCS input is not valid UTF-8")
 	}
@@ -52,10 +67,22 @@ func Canonicalize(raw []byte) ([]byte, error) {
 // canonicalization. It never routes number tokens through binary floating
 // point.
 func Decode(raw []byte) (any, error) {
+	if value, ok := decodeSinglePass(raw, strictOptions); ok {
+		return value, nil
+	}
+	return decodeReference(raw, strictOptions)
+}
+
+var (
+	strictOptions   = validationOptions{maxDepth: 64, requireFiniteBinary64: true}
+	losslessOptions = validationOptions{maxDepth: -1}
+)
+
+func decodeReference(raw []byte, options validationOptions) (any, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("JSON input is not valid UTF-8")
 	}
-	return validateSingleJSONValue(raw, validationOptions{maxDepth: 64, requireFiniteBinary64: true})
+	return validateSingleJSONValue(raw, options)
 }
 
 // DecodeObject is Decode restricted to a JSON object.
@@ -76,10 +103,19 @@ func DecodeObject(raw []byte) (map[string]any, error) {
 // schema-specific numeric and nested-JSON validation before canonicalizing
 // the result.
 func DecodeObjectLossless(raw []byte) (map[string]any, error) {
+	if value, ok := decodeSinglePass(raw, losslessOptions); ok {
+		if object, isObject := value.(map[string]any); isObject {
+			return object, nil
+		}
+	}
+	return decodeObjectLosslessReference(raw)
+}
+
+func decodeObjectLosslessReference(raw []byte) (map[string]any, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("JSON input is not valid UTF-8")
 	}
-	value, err := validateSingleJSONValue(raw, validationOptions{maxDepth: -1})
+	value, err := validateSingleJSONValue(raw, losslessOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -95,20 +131,40 @@ func DecodeObjectLossless(raw []byte) (map[string]any, error) {
 // boundaries so malformed UTF-8, Unicode escapes, and duplicate object names
 // are rejected before encoding/json can repair or collapse them.
 func ValidateStructure(raw []byte) error {
+	if validateSinglePass(raw) {
+		return nil
+	}
+	return validateStructureReference(raw)
+}
+
+func validateStructureReference(raw []byte) error {
 	if !utf8.Valid(raw) {
 		return fmt.Errorf("JSON input is not valid UTF-8")
 	}
-	_, err := validateSingleJSONValue(raw, validationOptions{maxDepth: -1})
+	_, err := validateSingleJSONValue(raw, losslessOptions)
 	return err
 }
 
-// Marshal serializes value and returns RFC 8785 canonical bytes.
+// Marshal serializes value and returns RFC 8785 canonical bytes. Decoded JSON
+// trees are encoded directly; other values go through encoding/json first.
 func Marshal(value any) ([]byte, error) {
+	if canonical, ok := marshalSinglePass(value); ok {
+		return canonical, nil
+	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return nil, fmt.Errorf("marshal JSON for JCS: %w", err)
 	}
 	return Canonicalize(raw)
+}
+
+// marshalReference is Marshal without the single-pass encoder.
+func marshalReference(value any) ([]byte, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("marshal JSON for JCS: %w", err)
+	}
+	return canonicalizeReference(raw)
 }
 
 // Equal reports whether two JSON objects or arrays have identical RFC 8785
