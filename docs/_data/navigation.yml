@@ -12,6 +12,8 @@ main:
         url: "/documentation/server/"
       - title: "Deployment and Operations"
         url: "/documentation/server-deployment-and-operations/"
+      - title: "Sizing and Deployment"
+        url: "/documentation/sizing-and-deployment/"
       - title: "Server-Originated Writes"
         url: "/documentation/server-originated-writes/"
       - title: "Client"

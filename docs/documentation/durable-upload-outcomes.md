@@ -16,10 +16,13 @@ Automatic clean recovery remains a later phase. The governing contract is
 ## Durable ownership and bounds
 
 `sync.push_protocol_store` has one `singleton=true` row. Its format and
-`max_outcome_bytes` are immutable. `MaxPushOutcomeDecodedBytes=0` chooses
-`MaxBytesPerBundle+8192`; an explicit value must be between that minimum and
-`67117056` bytes. Every service bootstrap compares its normalized configuration
-with the stored ceiling. SQL rejects updates/deletion and oversized inserts.
+`max_outcome_bytes` are immutable. A new store records
+`MaxPushOutcomeDecodedBytes`, or `MaxBytesPerBundle+8192` when it is zero; an
+explicit value must be between that minimum and `67117056` bytes. Every later
+bootstrap with `MaxPushOutcomeDecodedBytes=0` adopts the stored ceiling, and an
+explicit value must equal it. Bootstrap fails before serving traffic when the
+stored ceiling is below `MaxBytesPerBundle+8192`; the error names both values.
+Generation discovery advertises the stored ceiling. SQL rejects updates/deletion and oversized inserts.
 There is no migration, prepaid slot, global quota or global admission counter.
 
 `sync.push_source_progress` is keyed by `(user_pk, source_id)` and references the

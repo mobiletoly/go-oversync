@@ -51,12 +51,13 @@ Caller cancellation stops further child launches and joins owned workers.
 ## Sizing snapshot rebuilds
 
 Snapshot limits are application configuration, not fixed framework capacity.
-On the server, `ServiceConfig` exposes session, row, chunk, materialization,
-concurrency, and cleanup bounds including `MaxRowsPerSnapshotSession`,
-`MaxBytesPerSnapshotSession`, `MaxBytesPerSnapshotRow`, the default/maximum
-row and byte limits per chunk, and the materialization and cleanup batch
-limits. The server publishes the effective transfer limits through generation
-discovery.
+On the server, `ServiceConfig` exposes the session caps
+`MaxRowsPerSnapshotSession` and `MaxBytesPerSnapshotSession`, the maximum rows
+and bytes per chunk, and the build and chunk concurrency permits (see
+[Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/)).
+The largest single row is derived from the bundle, pull, and chunk byte limits;
+materialization and cleanup batch sizes are internal. The server publishes the
+effective transfer limits through generation discovery.
 
 Clients request both a row limit and a byte limit for every chunk and then
 clamp those requests to the advertised server limits. Go applications tune

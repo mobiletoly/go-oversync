@@ -39,8 +39,10 @@ Do not place application objects in the `sync` schema or change Oversync-managed
 
 The following skeleton shows the lifecycle that a production host must provide. Replace
 `authenticate`, `trustedUserIDFromContext`, and `recordStageTiming` with your application code.
-Replace the numeric pool and capacity values with results from your load tests. Add each route your
-clients use; the example registers the complete current sync surface.
+The pool and capacity values come from the machine size; follow
+[Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/) to choose the
+machine and check the connection budget against PostgreSQL. Add each route your clients use; the
+example registers the complete current sync surface.
 
 ```go
 package main
@@ -53,6 +55,7 @@ import (
     "net/http"
     "os"
     "os/signal"
+    "runtime/debug"
     "strings"
     "syscall"
     "time"
@@ -70,12 +73,36 @@ func main() {
 func run() error {
     logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
+    serviceConfig := &oversync.ServiceConfig{
+        SchemaGenerations: schemaGenerations, // one or two complete declarations
+        AppName:          "my-sync-api",
+        RegisteredTables: []oversync.RegisteredTable{
+            {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
+            {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
+        },
+        StageMetrics: oversync.StageMetricsRecorderFunc(
+            func(ctx context.Context, timing oversync.StageTiming) {
+                recordStageTiming(timing) // Keep this callback fast and concurrency-safe.
+            },
+        ),
+        BundleChangeWatch: oversync.BundleChangeWatchConfig{Enabled: true},
+    }
+    // Size the admission permits for this machine (2 vCPU / 2 GiB here).
+    sizing, err := serviceConfig.ApplySizing(oversync.MachineSmall)
+    if err != nil {
+        return err
+    }
+    if os.Getenv("GOMEMLIMIT") == "" {
+        debug.SetMemoryLimit(sizing.GoMemoryLimitBytes)
+    }
+
     poolConfig, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
     if err != nil {
         return err
     }
-    poolConfig.MaxConns = 40 // Reserve room under the PostgreSQL connection limit.
-    poolConfig.MinConns = 4
+    // One instance's share of PostgreSQL connections; check the fleet total.
+    poolConfig.MaxConns = serviceConfig.ConnectionBudget().PoolMaxConns
+    poolConfig.MinConns = 2
     poolConfig.MaxConnLifetime = time.Hour
     poolConfig.MaxConnIdleTime = 30 * time.Minute
 
@@ -89,27 +116,6 @@ func run() error {
         return err
     }
     defer pool.Close()
-
-    serviceConfig := &oversync.ServiceConfig{
-        SchemaGenerations: schemaGenerations, // one or two complete declarations
-        AppName:          "my-sync-api",
-        RegisteredTables: []oversync.RegisteredTable{
-            {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
-            {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
-        },
-        MaxRowsPerBundle:                    10_000,
-        MaxBytesPerBundle:                   16 << 20,
-        MaxBytesPerPullResponse:             32 << 20,
-        MaxConcurrentHistoryProjections:     4,
-        MaxConcurrentSnapshotBuilds:         8,
-        MaxConcurrentSnapshotChunkRequests: 4,
-        StageMetrics: oversync.StageMetricsRecorderFunc(
-            func(ctx context.Context, timing oversync.StageTiming) {
-                recordStageTiming(timing) // Keep this callback fast and concurrency-safe.
-            },
-        ),
-        BundleChangeWatch: oversync.BundleChangeWatchConfig{Enabled: true},
-    }
 
     syncService, err := oversync.NewRuntimeService(pool, serviceConfig, logger)
     if err != nil {
@@ -143,11 +149,12 @@ func run() error {
     mux.HandleFunc("GET /syncx/status", handlers.HandleStatus)
 
     server := &http.Server{
-        Addr:         ":8080",
-        Handler:      syncHandler,
-        ReadTimeout:  120 * time.Second,
-        WriteTimeout: 120 * time.Second,
-        IdleTimeout:  60 * time.Second,
+        Addr:              ":8080",
+        Handler:           syncHandler,
+        ReadHeaderTimeout: 10 * time.Second,
+        ReadTimeout:       120 * time.Second, // a maximum-size push on a slow network
+        IdleTimeout:       120 * time.Second,
+        // WriteTimeout stays zero: GET /sync/watch is a long-lived event stream.
     }
 
     serveErr := make(chan error, 1)
@@ -263,27 +270,35 @@ Set a connection budget for the whole application. Oversync uses the supplied `p
 request transactions, bootstrap, cleanup, and the optional bundle-change listener. Your own SQL
 also consumes the same pool if you share it.
 
-Choose `MaxConns` below the PostgreSQL connection limit after subtracting connections used by
-administration, migrations, and other services. Watch pool acquisition duration and the counts
-returned by `pgxpool.Stat()`. A larger pool cannot repair slow queries or an undersized database.
+`ServiceConfig.ConnectionBudget()` returns the connections one instance can use at once, and
+`NewRuntimeService` warns when the pool is smaller. Across instances the budgets add up against the
+PostgreSQL connection limit; [Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/)
+gives the formula and a worked example. Use PostgreSQL directly or a session-mode pooler: pushes
+hold a session advisory lock and the watch uses `LISTEN`. Watch pool acquisition duration and the
+counts returned by `pgxpool.Stat()`. A larger pool cannot repair slow queries or an undersized
+database.
 
 The reference `nethttp_server` uses these development defaults:
 
 | Owner | Setting | Reference value |
 | --- | --- | ---: |
-| `nethttp_server` | PostgreSQL maximum connections | 50 |
-| `nethttp_server` | PostgreSQL minimum connections | 5 |
+| `nethttp_server` | PostgreSQL maximum connections | the connection budget |
+| `nethttp_server` | PostgreSQL minimum connections | 2 |
+| `nethttp_server` | Read header timeout | 10 seconds |
 | `nethttp_server` | Read timeout | 120 seconds |
-| `nethttp_server` | Write timeout | 120 seconds |
-| `nethttp_server` | Idle timeout | 60 seconds |
+| `nethttp_server` | Write timeout | none (watch streams) |
+| `nethttp_server` | Idle timeout | 120 seconds |
 | `nethttp_server` | Graceful HTTP shutdown deadline | 30 seconds |
 
-The integration server accepts `OVERSYNC_DB_POOL_MAX_CONNS` and `OVERSYNC_DB_POOL_MIN_CONNS`. It also sets a
-one-hour maximum connection lifetime and a 30-minute maximum idle time. Check these values against
-your request sizes, proxy timeouts, database limits, and shutdown budget before you copy them.
+The integration server accepts `OVERSYNC_MACHINE`, `OVERSYNC_DB_POOL_MAX_CONNS`, `OVERSYNC_DB_POOL_MIN_CONNS`,
+and the other variables listed in
+[Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/#reference-integrations).
+It also sets a one-hour maximum connection lifetime and a 30-minute maximum idle time. Check these
+values against your request sizes, proxy timeouts, database limits, and shutdown budget before you
+copy them.
 
-The integration server also accepts `OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS`. When unset, the service's
-bounded default of four applies. Projection permits can remain held until the HTTP response is
+The integration server also accepts `OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS`. When unset, the
+machine sizing or the service's bounded default of four applies. Projection permits can remain held until the HTTP response is
 written, so raise this only from measurements and size it with the PostgreSQL pool, request
 duration, and server memory. Admission overload returns retryable HTTP `503` with `Retry-After: 1`.
 The Go client's `PushCapacityRetryPolicy` handles this signal independently of the generic
@@ -300,8 +315,9 @@ Snapshot rebuilds have two independent admission limits:
 - `MaxConcurrentSnapshotBuilds` bounds frozen snapshot materialization.
 - `MaxConcurrentSnapshotChunkRequests` bounds reads from materialized snapshot sessions.
 
-Zero selects the Oversync defaults: eight active builds and four active chunk requests per server
-process. The integration server accepts positive overrides through
+Zero selects the Oversync defaults: four active builds and four active chunk requests per server
+process; `ApplySizing` derives both from the machine. The integration server accepts positive
+overrides through
 `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS` and
 `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS`.
 
@@ -336,7 +352,7 @@ Choose limits from measurements:
    budget.
 
 Use the [Performance]({{ site.baseurl }}/documentation/performance/) guide to size snapshot row,
-byte, session, materialization, and cleanup bounds from your application data.
+byte, and session bounds from your application data.
 
 Reducing client concurrency is the first control when a test creates a burst that production
 traffic would spread across time. Raise server admission or pool limits when measurements show
@@ -407,7 +423,10 @@ I/O in the callback.
 
 `LogStageTimings` writes stage timing at DEBUG level. Use it for a bounded investigation and keep
 it disabled during normal production service. The snapshot and scope-receipt cleanup workers log
-batch failures and completion details. Alert on cleanup failures and check whether expired session
+batch failures and a summary of each run; snapshot cleanup keeps draining in bounded batches while
+expired rows remain. `Bootstrap` logs one "Oversync effective settings" line with the permits,
+pool size, connection budget, Go memory limit, advertised limits, and a fingerprint of the
+settings every instance must share. Alert on cleanup failures and check whether expired session
 rows continue to grow.
 
 Monitor PostgreSQL pool acquisition, acquired and idle connections, database CPU, lock waits, and
@@ -444,7 +463,10 @@ reserved `sync` schema while any server or client uses the database.
 - [ ] Every registered table passes bootstrap validation on a staging copy of the production
   schema.
 - [ ] All instances use the same registered tables, one-or-two-generation registry, catalog
-  revision, source-admission limit, and reserved source IDs.
+  revision, source-admission limit, and reserved source IDs, and log the same
+  `shared_settings_fingerprint`.
+- [ ] Instances × connections per instance fits PostgreSQL `max_connections`, and `GOMEMLIMIT` is
+  set ([Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/)).
 - [ ] Every client has a fixed accepted generation proof and sends both required proof headers.
 - [ ] Authentication supplies an exact trusted `user_id`; clients supply a valid
   `Oversync-Source-ID`.
