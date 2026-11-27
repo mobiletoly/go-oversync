@@ -204,7 +204,7 @@ func TestEvolution_ScopeLifecycleRejectsSuppressedInventoryMutation(t *testing.T
 	_, err = CreateScope(ctx, pool, "suppressed-create")
 	require.ErrorContains(t, err, "scope_inventory_create_not_applied")
 
-	opts := oversync.ScopeWriteOptions{WriterID: "scope-lifecycle-test", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour)}}
+	opts := oversync.ScopeWriteOptions{WriterID: "scope-lifecycle-test", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour).Truncate(time.Microsecond)}}
 	err = DeleteScope(ctx, pool, oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}), "delete-me", incarnation, opts)
 	require.ErrorContains(t, err, "scope_inventory_delete_not_applied")
 	var activeCreate, activeDelete bool
@@ -223,7 +223,7 @@ func TestEvolution_ScopeLifecycleRejectsDivertedInventoryMutation(t *testing.T) 
 	_, err = CreateScope(ctx, pool, "diverted-create")
 	require.ErrorContains(t, err, "scope_inventory_create_not_applied")
 
-	opts := oversync.ScopeWriteOptions{WriterID: "scope-lifecycle-test", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour)}}
+	opts := oversync.ScopeWriteOptions{WriterID: "scope-lifecycle-test", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour).Truncate(time.Microsecond)}}
 	err = DeleteScope(ctx, pool, oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}), "delete-me", incarnation, opts)
 	require.ErrorContains(t, err, "scope_inventory_delete_not_applied")
 	var diverted, activeDelete bool
@@ -242,7 +242,7 @@ func TestEvolution_ScopeLifecycleRejectsAdditionalInventoryMutation(t *testing.T
 	_, err = CreateScope(ctx, pool, "duplicated-create")
 	require.ErrorContains(t, err, "scope_inventory_mutation_contract_changed")
 
-	opts := oversync.ScopeWriteOptions{WriterID: "scope-lifecycle-test", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour)}}
+	opts := oversync.ScopeWriteOptions{WriterID: "scope-lifecycle-test", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour).Truncate(time.Microsecond)}}
 	err = DeleteScope(ctx, pool, oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}), "delete-me", incarnation, opts)
 	require.ErrorContains(t, err, "scope_inventory_mutation_contract_changed")
 	var unexpected, activeDelete bool
@@ -261,7 +261,7 @@ func TestEvolution_ScopeLifecycleRejectsInternalForeignKeyTriggers(t *testing.T)
 
 	_, err = CreateScope(ctx, pool, "fk-trigger-create")
 	require.ErrorContains(t, err, "scope_inventory_mutation_contract_changed")
-	opts := oversync.ScopeWriteOptions{WriterID: "scope-lifecycle-test", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour)}}
+	opts := oversync.ScopeWriteOptions{WriterID: "scope-lifecycle-test", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour).Truncate(time.Microsecond)}}
 	err = DeleteScope(ctx, pool, oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}), "delete-me", incarnation, opts)
 	require.ErrorContains(t, err, "scope_inventory_mutation_contract_changed")
 	var created, stillActive bool

@@ -77,6 +77,10 @@ def check(m, lines, exit_code=0):
             errors.append('event must be an object')
             continue
         action, test, package = event.get('Action'), event.get('Test'), event.get('Package')
+        # Go emits compilation diagnostics as JSON build events. They cannot
+        # satisfy the separate, manifest-checked package and test events.
+        if action == 'build-output' and event.get('ImportPath') and isinstance(event.get('Output'), str):
+            continue
         if action not in ('start', 'run', 'pause', 'cont', 'output', 'pass', 'fail', 'skip', 'bench'):
             errors.append('unknown or cancelled event')
         if action in ('fail', 'skip'):
@@ -135,17 +139,18 @@ def run(extra):
     output = Path(os.environ.get('M0011_REPORT_DIR', '/tmp/m0011-' + str(time.time_ns())))
     output.mkdir(parents=True, exist_ok=False)
     before = identity()
-    env = dict(os.environ, GOTOOLCHAIN='go1.25.12', M0011_QUALIFY='1', OVERSYNC_TEST_DOCKER_VOLUME='1')
+    env = dict(os.environ, GOTOOLCHAIN='go1.25.12', MIXED_GENERATION_QUALIFY='1', OVERSYNC_TEST_DOCKER_VOLUME='1')
     command = ['go', 'test', '-json', '-count=1', './oversqlite_e2e', '-run', '^TestMixedSchema_C', '-timeout', '9m'] + extra
     # The enclosing test-lane timeout includes checking and artifact writing.
     # Leave time for bounded diagnostics when the package deadline fires.
     try:
-        proc = subprocess.run(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=550)
-        raw, code = proc.stdout.decode(errors='replace'), proc.returncode
+        proc = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, timeout=550)
+        stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
     except subprocess.TimeoutExpired as exc:
-        raw, code = (exc.stdout or b'').decode(errors='replace'), 124
-    raw = redact(raw)
+        stdout, stderr, code = exc.stdout or b'', exc.stderr or b'', 124
+    raw = redact(stdout.decode(errors='replace'))
     (output / 'test.jsonl').write_text(raw)
+    (output / 'stderr.log').write_text(redact(stderr.decode(errors='replace')))
     result = check(m, raw.splitlines(), code)
     if extra:
         result['complete'] = False

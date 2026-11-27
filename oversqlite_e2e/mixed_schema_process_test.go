@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,12 +81,10 @@ func TestMixedSchemaProcessHelper(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			if strings.HasSuffix(r.URL.Path, "/commit") && resp.StatusCode == http.StatusOK {
-				resp.Body.Close()
-				if phase == "newer" || phase == "committed" {
-					_, err = c.db.ExecContext(ctx, `UPDATE people SET name='A2' WHERE id=?`, mixedP)
-					require.NoError(t, err)
-				}
+			if r.Method == http.MethodPost && r.URL.Path == "/sync/push" && resp.StatusCode == http.StatusOK {
+				require.NoError(t, resp.Body.Close())
+				_, err = c.db.ExecContext(ctx, `UPDATE people SET name='A2' WHERE id=?`, mixedP)
+				require.NoError(t, err)
 				barrier(phase)
 				return nil, io.ErrUnexpectedEOF
 			}
@@ -98,16 +100,19 @@ func TestMixedSchemaProcessHelper(t *testing.T) {
 		})}
 	}
 	if phase == "final" {
+		c.db.SetMaxOpenConns(1)
 		conn, err := c.db.Conn(ctx)
 		require.NoError(t, err)
 		require.NoError(t, conn.Raw(func(raw any) error {
 			return raw.(*sqlite3.SQLiteConn).RegisterFunc("mixed_pause", func() int { barrier("final"); return 0 }, false)
 		}))
 		require.NoError(t, conn.Close())
-		// This TEMP trigger pauses before the first business-row deletion in promotion.
-		// The snapshot stage was committed by previous transactions, and no business
-		// deletion from this transaction is visible to the parent observer.
-		_, err = c.db.ExecContext(ctx, `CREATE TEMP TRIGGER mixed_pause_promotion BEFORE DELETE ON people BEGIN SELECT mixed_pause(); END`)
+		// The ready transition runs after all snapshot chunks have been staged
+		// and before promotion publishes any business rows or checkpoint.
+		_, err = c.db.ExecContext(ctx, `CREATE TEMP TRIGGER mixed_pause_promotion
+			AFTER UPDATE OF phase ON _sync_apply_plan
+			WHEN new.phase='ready'
+			BEGIN SELECT mixed_pause(); END`)
 		require.NoError(t, err)
 	}
 	if phase == "final" || phase == "nonfinal" {
@@ -417,9 +422,22 @@ func TestMixedSchema_C10_ProcessRecovery(t *testing.T) {
 			require.NoError(t, err)
 			f.server.Pool = pool
 			server := startMixedProcess(t, f.ctx, map[string]string{"MIXED_GENERATION_ROLE": "server", "MIXED_GENERATION_DSN": f.dsn})
-			url := server.observed(t)
-			require.True(t, strings.HasPrefix(url, "http://127.0.0.1:"))
-			child := f.child(f.a, url, phase)
+			var proxy atomic.Pointer[httputil.ReverseProxy]
+			pointAt := func(endpoint string) {
+				t.Helper()
+				target, err := url.Parse(endpoint)
+				require.NoError(t, err)
+				require.Equal(t, "http", target.Scheme)
+				require.Equal(t, "127.0.0.1", target.Hostname())
+				proxy.Store(httputil.NewSingleHostReverseProxy(target))
+			}
+			pointAt(server.observed(t))
+			// The upload journal pins the public authority across backend restarts.
+			authority := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				proxy.Load().ServeHTTP(w, r)
+			}))
+			t.Cleanup(authority.Close)
+			child := f.child(f.a, authority.URL, phase)
 			require.Equal(t, phase, child.observed(t))
 			db := mixedObserveDB(t, f.a.path)
 			frozen := mixedFrozen(t, f.ctx, db)
@@ -439,13 +457,17 @@ func TestMixedSchema_C10_ProcessRecovery(t *testing.T) {
 			child.kill(t)
 			server.kill(t)
 			restarted := startMixedProcess(t, f.ctx, map[string]string{"MIXED_GENERATION_ROLE": "server", "MIXED_GENERATION_DSN": f.dsn})
-			url = restarted.observed(t)
-			f.reopen(f.a, url)
-			f.b.c.BaseURL = url
+			pointAt(restarted.observed(t))
+			f.reopen(f.a, authority.URL)
+			f.b.c.BaseURL = authority.URL
 			require.Equal(t, source, requireCurrentSourceIDE2E(t, f.a.c, f.ctx))
 			require.Equal(t, frozen, mixedFrozen(t, f.ctx, f.a.db))
-			f.push(f.a)
-			mixedCommittedIdentity(t, f, request)
+			if phase == "staged" {
+				mixedPushSuccessorAfterCancellation(t, f, request)
+			} else {
+				f.push(f.a)
+				mixedCommittedIdentity(t, f, request)
+			}
 			require.Equal(t, seq+1, f.seq())
 			require.Equal(t, effects+1, f.effect())
 			name := "from-A"
@@ -559,6 +581,7 @@ func TestMixedSchema_C12_RetryRecovery(t *testing.T) {
 			if direction == "pull" {
 				f.exec(f.b, `UPDATE people SET note='secret-2'`)
 				f.push(f.b)
+				seq++
 				pendingCreated := false
 				f.a.c.HTTP = &http.Client{Timeout: 30 * time.Second, Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 					resp, err := http.DefaultTransport.RoundTrip(r)
@@ -594,11 +617,6 @@ func TestMixedSchema_C12_RetryRecovery(t *testing.T) {
 				var pushExhausted *oversqlite.RetryExhaustedError
 				require.ErrorAs(t, err, &pushExhausted)
 				require.Equal(t, 2, attempts)
-				frozen := mixedFrozen(t, f.ctx, f.a.db)
-				f.a.c.HTTP = &http.Client{Timeout: 30 * time.Second, Transport: mixedVisibilityTransport(1, http.DefaultTransport)}
-				require.Equal(t, frozen, mixedFrozen(t, f.ctx, f.a.db), "interrupted pull changed the pending edit")
-				f.push(f.a)
-				require.Equal(t, seq+2, f.seq())
 			} else {
 				f.exec(f.a, `UPDATE people SET name='retry'`)
 				attempts := 0
@@ -613,14 +631,13 @@ func TestMixedSchema_C12_RetryRecovery(t *testing.T) {
 				var exhausted *oversqlite.RetryExhaustedError
 				require.ErrorAs(t, err, &exhausted)
 				require.Equal(t, 2, attempts)
-				require.Equal(t, seq, f.seq())
-				frozen := mixedFrozen(t, f.ctx, f.a.db)
-				c.HTTP = &http.Client{Timeout: 30 * time.Second, Transport: mixedVisibilityTransport(1, http.DefaultTransport)}
-				require.Equal(t, frozen, mixedFrozen(t, f.ctx, f.a.db))
-				f.push(f.a)
-				require.Equal(t, seq+1, f.seq())
 			}
+			require.Equal(t, seq, f.seq())
+			frozen := mixedOutboxIdentity(t, f.ctx, f.a.db)
 			f.a.c.HTTP = &http.Client{Timeout: 30 * time.Second, Transport: mixedVisibilityTransport(1, http.DefaultTransport)}
+
+			mixedPushSuccessorAfterCancellation(t, f, frozen)
+			require.Equal(t, seq+1, f.seq())
 			f.settle()
 			name, note := "base", "secret-2"
 			if direction == "upload" {
@@ -632,6 +649,39 @@ func TestMixedSchema_C12_RetryRecovery(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Resolve cancels an upload that never reached the server. Its successor
+// commits the same local intent under a new sequence.
+func mixedPushSuccessorAfterCancellation(t *testing.T, f *mixedFixture, frozen mixedRequestIdentity) {
+	t.Helper()
+	ctx, cancel := mixedOperationContext(f.ctx)
+	defer cancel()
+	seq := f.seq()
+	report := mustPushPendingE2E(t, f.a.c, ctx)
+	require.Equal(t, oversqlite.PushOutcomeNoChange, report.Outcome)
+	require.Equal(t, seq, f.seq())
+
+	var ackSequence, next int64
+	var ackHash string
+	require.NoError(t, f.server.Pool.QueryRow(ctx, `
+		SELECT p.acknowledged_sequence, p.acknowledged_request_hash
+		FROM sync.push_source_progress p JOIN sync.user_state u USING (user_pk)
+		WHERE u.user_id=$1 AND p.source_id=$2`, mixedScope, frozen.SourceID).Scan(&ackSequence, &ackHash))
+	require.Equal(t, frozen.SourceBundleID, ackSequence)
+	require.Equal(t, frozen.RequestHash, ackHash)
+	require.NoError(t, f.a.db.QueryRowContext(ctx, `SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id=?`, frozen.SourceID).Scan(&next))
+	require.Equal(t, frozen.SourceBundleID+1, next)
+
+	successor := mixedRequestIdentity{SourceID: frozen.SourceID}
+	var captureErr error
+	previousHTTP := f.a.c.HTTP
+	defer func() { f.a.c.HTTP = previousHTTP }()
+	f.a.c.HTTP = &http.Client{Timeout: 30 * time.Second, Transport: mixedCapturePushIdentity(&successor, &captureErr, mixedVisibilityTransport(1, http.DefaultTransport))}
+	f.push(f.a)
+	require.NoError(t, captureErr)
+	require.Equal(t, next, successor.SourceBundleID)
+	mixedCommittedIdentity(t, f, successor)
 }
 
 type mixedBrokenBody struct {
@@ -666,6 +716,13 @@ func mixedCapturePushIdentity(target *mixedRequestIdentity, captureErr *error, n
 				*captureErr = err
 				return nil, err
 			}
+			sourceID := r.Header.Get(oversync.SourceIDHeader)
+			if sourceID == "" || (target.SourceID != "" && target.SourceID != sourceID) {
+				err := fmt.Errorf("unexpected source on successor push")
+				*captureErr = err
+				return nil, err
+			}
+			target.SourceID = sourceID
 			target.SourceBundleID = request.SourceBundleID
 			for _, group := range request.Rows {
 				target.PlannedRows += int64(len(group.Rows))

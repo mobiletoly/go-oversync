@@ -46,6 +46,12 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(mixed.check(self.m, ['{"Action":'])['complete'])
         self.assertFalse(mixed.check(self.m, ['[]'])['complete'])
 
+    def test_accepts_build_output_and_rejects_build_failure(self):
+        diagnostic = dict(Action='build-output', ImportPath='example.com/dependency', Output='compiler warning\n')
+        self.assertTrue(self.check([diagnostic] + self.events)['complete'])
+        failed_build = dict(Action='build-fail', ImportPath='example.com/dependency')
+        self.assertFalse(self.check([failed_build] + self.events)['complete'])
+
     def test_pending_never_passes(self):
         self.m['cases'][0]['status'] = 'pending'
         self.assertFalse(self.check(self.events)['complete'])

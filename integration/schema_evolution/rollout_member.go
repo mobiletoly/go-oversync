@@ -169,7 +169,7 @@ func rolloutMemberWriteHandler(service *oversync.SyncService, column bool, proce
 			http.Error(w, "scope required", 400)
 			return
 		}
-		_, err := oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}).ExecWrite(r.Context(), scope, oversync.ScopeWriteOptions{WriterID: "schema-evolution-writer", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: sha256.Sum256([]byte("fleet-write:" + scope)), OperationValidUntil: time.Now().Add(time.Minute)}}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
+		_, err := oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}).ExecWrite(r.Context(), scope, oversync.ScopeWriteOptions{WriterID: "schema-evolution-writer", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: sha256.Sum256([]byte("fleet-write:" + scope)), OperationValidUntil: time.Now().Add(time.Minute).Truncate(time.Microsecond)}}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 			statement := `UPDATE main.people SET name='Fleet' WHERE _sync_scope_id=$1`
 			if column {
 				statement = `UPDATE main.upgrade_people SET name='Fleet' WHERE _sync_scope_id=$1`

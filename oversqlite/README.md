@@ -81,15 +81,18 @@ Conflict decisions:
 - `ResolveConflict(ctx, selected PendingConflict, result MergeResult) error`
 - `RetryConflict(ctx, selected PendingConflict) error`
 
-v0.5.0 changes the default from server-wins to durable defer. To resolve automatically, set
-`ServerWinsResolver`, `ClientWinsResolver`, or an application resolver.
+v0.5.0 changes the default resolver from server-wins to durable defer. To resolve automatically,
+set `ServerWinsResolver`, `ClientWinsResolver`, or an application resolver.
 
 The SDK records the rejection and acknowledges it as a terminal upload outcome. A
 `ConflictNeedsResolutionError` leaves the rejected request and local intent available for
-inspection. Pass the current `PendingConflict` to `ResolveConflict` or `RetryConflict`. A
-valid decision updates local state and preserves newer edits in one transaction.
-`RetryConflict` requeues remaining intent for a successor upload. Call `PushPending` after
-the local decision. Stale decisions leave pending work intact.
+inspection. Conflict evidence must include `server_row`. Explicit JSON null represents a
+missing authoritative row.
+
+Pass the current `PendingConflict` to `ResolveConflict` or `RetryConflict`. A valid decision
+updates local state and preserves newer edits in one transaction. `RetryConflict` requeues
+remaining intent for a successor upload. Call `PushPending` after the local decision.
+Stale decisions leave pending work intact.
 
 Definitive application-level push rejections:
 

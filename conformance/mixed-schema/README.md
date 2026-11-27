@@ -16,7 +16,6 @@ historical SDKs, application migrations, or other client runtimes.
 From the repository root, with Docker, Python 3, and Go 1.25.12 available:
 
 ```sh
-python3 -B scripts/mixed-schema-fixture.py 16 coexistence
 python3 -B scripts/mixed-schema-fixture.py 17 coexistence
 python3 -B -m unittest discover -s scripts -p test_mixed_schema.py
 ```
@@ -29,10 +28,10 @@ outer limit. The ordinary root test run skips these opt-in cases.
 Other validation lanes use the same wrapper:
 
 ```sh
-python3 -B scripts/mixed-schema-fixture.py 16 package
-python3 -B scripts/mixed-schema-fixture.py 16 full
-python3 -B scripts/mixed-schema-fixture.py 16 mobile
-python3 -B scripts/mixed-schema-fixture.py 16 vet
+python3 -B scripts/mixed-schema-fixture.py 17 package
+python3 -B scripts/mixed-schema-fixture.py 17 full
+python3 -B scripts/mixed-schema-fixture.py 17 mobile
+python3 -B scripts/mixed-schema-fixture.py 17 vet
 ```
 
 The runner prints the report location. Reports contain redacted output, test

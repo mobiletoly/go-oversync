@@ -93,10 +93,13 @@ Rejection and cancellation can requeue intent for a successor. See
 
 ### Structured conflict recovery
 
-The default policy durably defers a conflict. The Go SDK records the rejection and acknowledges the
-terminal outcome. Inspect the retained `PendingConflict` and pass that decision identity to
-`ResolveConflict` or `RetryConflict`. A resolution can accept server state, keep local intent,
-or keep a merged full-row payload. Retry requeues surviving intent under a successor sequence.
+The default resolver durably defers conflicts. The Go SDK records the rejection and
+acknowledges the terminal outcome. Conflict evidence includes `server_row`. Explicit JSON
+null represents a missing authoritative row.
+
+Pass the retained `PendingConflict` to `ResolveConflict` or `RetryConflict`. A resolution
+can accept server state, keep local intent, or keep a merged full-row payload. Retry
+requeues surviving intent under a successor sequence.
 
 Applications can opt in to `ServerWinsResolver`, `ClientWinsResolver`, or a custom resolver.
 The SDK calls an automatic resolver after acknowledgment. Decisions preserve newer local edits

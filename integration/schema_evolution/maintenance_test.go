@@ -95,7 +95,7 @@ func TestEvolution_AdmissionLeaseDrainAndWorkerTakeover(t *testing.T) {
 	require.ErrorContains(t, verifyWorker(ctx, pool, old), "fenced")
 	// The obsolete capability cannot enter even the private Go write path.
 	manager := oversync.NewScopeManager(service, oversync.ScopeManagerConfig{})
-	_, err = manager.ExecWrite(context.WithValue(ctx, migrationContextKey{}, old), "scope", oversync.ScopeWriteOptions{WriterID: "schema-evolution-backfill", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour)}}, func(context.Context, oversync.DatabaseWriteTx) error { return nil })
+	_, err = manager.ExecWrite(context.WithValue(ctx, migrationContextKey{}, old), "scope", oversync.ScopeWriteOptions{WriterID: "schema-evolution-backfill", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour).Truncate(time.Microsecond)}}, func(context.Context, oversync.DatabaseWriteTx) error { return nil })
 	require.Error(t, err)
 }
 

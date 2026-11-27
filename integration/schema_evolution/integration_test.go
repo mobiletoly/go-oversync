@@ -140,7 +140,7 @@ func fixtureWrite(t *testing.T, service *oversync.SyncService, scope, sql string
 	t.Helper()
 	id := uuid.New()
 	hash := [32]byte{1}
-	_, err := oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}).ExecWrite(context.Background(), scope, oversync.ScopeWriteOptions{WriterID: "schema-evolution-writer", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: id, OperationHash: hash, OperationValidUntil: time.Now().Add(time.Hour)}}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
+	_, err := oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}).ExecWrite(context.Background(), scope, oversync.ScopeWriteOptions{WriterID: "schema-evolution-writer", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: id, OperationHash: hash, OperationValidUntil: time.Now().Add(time.Hour).Truncate(time.Microsecond)}}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		_, err := tx.Exec(ctx, sql, args...)
 		return err
 	})
@@ -263,7 +263,7 @@ func fixtureAuthorizedWrite(t *testing.T, pool *pgxpool.Pool, service *oversync.
 	capability, err := claimWorker(ctx, conn)
 	require.NoError(t, err)
 	ctx = context.WithValue(ctx, migrationContextKey{}, capability)
-	_, err = oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}).ExecWrite(ctx, scope, oversync.ScopeWriteOptions{WriterID: "schema-evolution-backfill", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour)}}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
+	_, err = oversync.NewScopeManager(service, oversync.ScopeManagerConfig{}).ExecWrite(ctx, scope, oversync.ScopeWriteOptions{WriterID: "schema-evolution-backfill", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{1}, OperationValidUntil: time.Now().Add(time.Hour).Truncate(time.Microsecond)}}, func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
 		if err := permitWorkerTransaction(ctx, tx); err != nil {
 			return err
 		}

@@ -492,6 +492,7 @@ func TestOpening_FreshMigrationFailureRollsBackBusinessState(t *testing.T) {
 		TargetVersion: 1, TargetGenerationID: contract.Proof.ID, testTarget: contract, Migrator: migrator,
 	}})
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
 	result, err := coordinator.Advance(context.Background())
 	require.Error(t, err)
 	require.Equal(t, UpgradeOutcomeLocalMigrationFailed, result.Status.Outcome)
@@ -530,6 +531,7 @@ func TestOpening_I05AtomicMigrationFailureMatrix(t *testing.T) {
 				TargetVersion: 1, TargetGenerationID: contract.Proof.ID, testTarget: contract, Migrator: testLocalMigrator{migrate: test.migrate},
 			}})
 			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
 			result, err := coordinator.Advance(context.Background())
 			require.Error(t, err)
 			require.Equal(t, UpgradeOutcomeLocalMigrationFailed, result.Status.Outcome)
@@ -731,6 +733,7 @@ func TestOpening_I07ReopenedWriterEnforcesForeignKeysBeforeReady(t *testing.T) {
 		}},
 	}})
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, local.Close()) })
 	result, err := local.Advance(context.Background())
 	require.Error(t, err)
 	require.Equal(t, UpgradeOutcomeLocalContractMismatch, result.Status.Outcome)
@@ -800,6 +803,7 @@ func TestOpening_I06MigrationCanTransformExistingSynchronizedRows(t *testing.T) 
 		},
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
 	result, err := coordinator.Advance(ctx)
 	require.Error(t, err)
 	require.Equal(t, UpgradeOutcomeCancelled, result.Status.Outcome)
@@ -898,6 +902,7 @@ func TestOpening_FailureLeavesDurableWriteFreeze(t *testing.T) {
 		InstalledVersion: 1, TargetVersion: 2, InstalledGenerationID: contract.Proof.ID, TargetGenerationID: contract.Proof.ID, testInstalled: contract, testTarget: contract, Migrator: failing,
 	}})
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
 	_, err = coordinator.Advance(context.Background())
 	require.Error(t, err)
 	_, err = db.Exec(`INSERT INTO people VALUES ('6ba7b810-9dad-11d1-80b4-00c04fd430c8', 'blocked')`)
@@ -1086,6 +1091,7 @@ func TestOpening_I02CancellationKeepsDurableFreeze(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
 	result, err := coordinator.Advance(ctx)
 	require.Error(t, err)
 	require.Equal(t, UpgradeOutcomeCancelled, result.Status.Outcome)

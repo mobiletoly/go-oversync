@@ -168,7 +168,7 @@ func (w *TableWorker) prepareTableBatch(ctx context.Context) (tableDescriptor, b
 		d.Plan = run.ID
 		d.Epoch = run.Epoch
 		d.Created = time.Now().UTC()
-		d.Deadline = minTableDeadline(d.Created.Add(7*24*time.Hour), run.Bounds.Deadline)
+		d.Deadline = minDeadline(d.Created.Add(7*24*time.Hour), run.Bounds.Deadline).Truncate(time.Microsecond)
 		d.Source = run.Source
 		d.BoundsDigest = digest(encodeJSON(run.Bounds))
 		d.MigrationDigest = oversync.MigrationManifestDigest(tableManifest())
@@ -204,13 +204,6 @@ func selectTablePeople(ctx context.Context, r oversync.DatabaseReadinessReader, 
 		keys = append(keys, key)
 	}
 	return keys, rows.Err()
-}
-
-func minTableDeadline(a, b time.Time) time.Time {
-	if a.Before(b) {
-		return a
-	}
-	return b
 }
 
 func (w *TableWorker) applyTableBatch(ctx context.Context, d tableDescriptor) error {

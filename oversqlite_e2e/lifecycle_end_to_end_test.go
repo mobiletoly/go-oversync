@@ -1053,7 +1053,7 @@ func TestEndToEnd_SourceRecoveryPersistsAcrossRestartAndFailsClosedUntilRebuild(
 	require.Positive(t, requestCount.Load(), "only original operation resolution may be attempted while transport is offline")
 	require.Equal(t, beforeOffline, durableRecoveryVectorE2E(t, restartedDB))
 	require.Equal(t, originalSourceID, requireCurrentSourceIDE2E(t, restartedClient, ctx))
-	requireFrozenRebuildRefusalE2E(t, restartedClient, restartedDB)
+	requireOfflineSourceRebuildPreservesUploadE2E(t, restartedClient, restartedDB)
 	restartedClient.HTTP = &http.Client{Transport: http.DefaultTransport}
 	settled, err := restartedClient.PushPending(ctx)
 	require.NoError(t, err)
@@ -1134,7 +1134,7 @@ func TestEndToEnd_SourceRecoveryRebuildRotatesManagedSourceAndSurvivesRestart(t 
 	require.True(t, info.SourceRecoveryRequired)
 	require.Equal(t, oversqlite.SourceRecoveryHistoryPruned, info.SourceRecoveryReason)
 
-	requireFrozenRebuildRefusalE2E(t, clientB, dbB)
+	requireOfflineSourceRebuildPreservesUploadE2E(t, clientB, dbB)
 	clientB.HTTP = &http.Client{Transport: baseTransport}
 	settled, err := clientB.PushPending(ctx)
 	require.NoError(t, err)
@@ -1221,7 +1221,7 @@ func TestEndToEnd_SourceRetirementIsVisibleOverHTTPAndReplacementBecomesActive(t
 	require.ErrorAs(t, err, &recoveryErr)
 	require.Equal(t, oversqlite.SourceRecoveryHistoryPruned, recoveryErr.Code)
 
-	requireFrozenRebuildRefusalE2E(t, clientB, dbB)
+	requireOfflineSourceRebuildPreservesUploadE2E(t, clientB, dbB)
 	settled, err := clientB.PushPending(ctx)
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.PushOutcomeCommitted, settled.Outcome)
@@ -1326,6 +1326,31 @@ func durableRecoveryVectorE2E(t *testing.T, db *sql.DB) string {
 	encoded, err := json.Marshal(values)
 	require.NoError(t, err)
 	return string(encoded)
+}
+
+func requireOfflineSourceRebuildPreservesUploadE2E(t *testing.T, client *oversqlite.Client, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	before := durableRecoveryVectorE2E(t, db)
+	source := requireCurrentSourceIDE2E(t, client, ctx)
+	previousHTTP := client.HTTP
+	defer func() { client.HTTP = previousHTTP }()
+	requests := 0
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/sync/push-outcomes/resolve", r.URL.Path)
+		require.Equal(t, source, r.Header.Get(oversync.SourceIDHeader))
+		return nil, context.DeadlineExceeded
+	})}
+	_, err := client.Rebuild(ctx)
+	var exhausted *oversqlite.RetryExhaustedError
+	require.ErrorAs(t, err, &exhausted)
+	require.Equal(t, "push_resolve", exhausted.LastFailure.Operation)
+	require.Positive(t, requests)
+	require.Equal(t, exhausted.Attempts, requests)
+	require.Equal(t, before, durableRecoveryVectorE2E(t, db))
+	require.Equal(t, source, requireCurrentSourceIDE2E(t, client, ctx))
 }
 
 func requireFrozenRebuildRefusalE2E(t *testing.T, client *oversqlite.Client, db *sql.DB) {

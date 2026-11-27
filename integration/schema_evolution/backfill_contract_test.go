@@ -76,7 +76,7 @@ func TestEvolution_ScopeIncarnationAndPostWatermarkCoverage(t *testing.T) {
 	ctx := context.Background()
 	worker := fixtureWorker(pool, service)
 	descriptor := fixturePrepareNext(t, worker)
-	opts := oversync.ScopeWriteOptions{WriterID: "schema-evolution-writer", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{9}, OperationValidUntil: time.Now().Add(time.Hour)}}
+	opts := oversync.ScopeWriteOptions{WriterID: "schema-evolution-writer", RetryableWriteOptions: oversync.RetryableWriteOptions{OperationID: uuid.New(), OperationHash: [32]byte{9}, OperationValidUntil: time.Now().Add(time.Hour).Truncate(time.Microsecond)}}
 	require.Error(t, DeleteScope(ctx, pool, worker.Manager, "scope", descriptor.Incarnation, opts))
 	_, err := CreateScope(ctx, pool, "scope")
 	require.Error(t, err)

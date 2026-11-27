@@ -56,12 +56,14 @@ def run(major, lane, extra_args=()):
         if settings != major + '|on|on|on':
             raise RuntimeError('wrong PostgreSQL version/durability')
         metadata['settings'] = settings
-        env = dict(os.environ, TEST_DATABASE_URL=f'postgres://postgres:{password}@127.0.0.1:{port}/postgres?sslmode=disable',
-                   GOTOOLCHAIN='go1.25.12', OVERSYNC_TEST_DOCKER_VOLUME='1', OVERSYNC_TEST_ISOLATE_DATABASES='1', OVERSYNC_TEST_RUN_ID=run_id,
+        database_url = f'postgres://postgres:{password}@127.0.0.1:{port}/postgres?sslmode=disable'
+        env = dict(os.environ, TEST_DATABASE_URL=database_url, OVERSYNC_EXAMPLE_TEST_DATABASE_URL=database_url,
+                   TRANSITION_TEST_DATABASE_URL=database_url, GOTOOLCHAIN='go1.25.12', OVERSYNC_TEST_DOCKER_VOLUME='1', OVERSYNC_TEST_ISOLATE_DATABASES='1', OVERSYNC_TEST_RUN_ID=run_id,
                    M0011_PG_MAJOR=major, M0011_REPORT_DIR=str(report))
         command = ['scripts/test-lane.sh', lane]
         if lane not in ('coexistence', 'vet'):
             command.append('-json')
+        if lane != 'vet':
             command.extend(extra_args)
         if lane == 'vet':
             command = ['scripts/run-with-timeout.pl', '240', '--', 'env', 'GOTOOLCHAIN=go1.25.12', 'go', 'vet', './...']

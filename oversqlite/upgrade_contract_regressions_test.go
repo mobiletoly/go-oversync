@@ -183,6 +183,7 @@ func TestUpgradeRegression_ApplicationTriggerCollisionRollsBackFreshMigration(t 
 		}},
 	}})
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, coordinator.Close()) })
 	result, err := coordinator.Advance(context.Background())
 	require.Error(t, err)
 	require.Equal(t, UpgradeOutcomeLocalContractMismatch, result.Status.Outcome)

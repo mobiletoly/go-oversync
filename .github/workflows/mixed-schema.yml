@@ -52,6 +52,7 @@ jobs:
         env:
           M0011_REPORT_DIR: ${{ runner.temp }}/mixed-schema-results
           OVERSQLITE_CONTRACTS_ROOT: ${{ github.workspace }}/.ci/sqlitenow-kmp/oversqlite-contracts
+          SQLITENOW_KMP_REPO: ${{ github.workspace }}/.ci/sqlitenow-kmp
       - uses: actions/upload-artifact@v4
         if: always()
         with:
