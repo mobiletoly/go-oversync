@@ -36,6 +36,14 @@ jobs:
         lane: [package, full, mobile, vet]
     steps:
       - uses: actions/checkout@v4
+      - name: Check out the paired Oversqlite contract corpus
+        if: matrix.lane == 'package' || matrix.lane == 'full'
+        uses: actions/checkout@v4
+        with:
+          repository: mobiletoly/sqlitenow-kmp
+          ref: 455f9911917399e15bf78f83315c665a0401a456
+          path: .ci/sqlitenow-kmp
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: 1.25.12
@@ -43,6 +51,7 @@ jobs:
       - run: python3 scripts/mixed-schema-fixture.py 17 '${{ matrix.lane }}'
         env:
           M0011_REPORT_DIR: ${{ runner.temp }}/mixed-schema-results
+          OVERSQLITE_CONTRACTS_ROOT: ${{ github.workspace }}/.ci/sqlitenow-kmp/oversqlite-contracts
       - uses: actions/upload-artifact@v4
         if: always()
         with:
