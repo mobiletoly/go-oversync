@@ -2,23 +2,22 @@
 
 `oversqlite` is the SQLite client runtime for go-oversync's bundle-based sync protocol.
 
-The client captures local writes with triggers, freezes one outbound bundle at a time, sends that
-bundle in one bounded `POST /sync/push` request, applies authoritative response rows locally, pulls committed remote
-bundles, and rebuilds from chunked snapshots when incremental history is unavailable or when a
-durable rebuild gate is active.
+The client captures local writes with triggers, sends bounded uploads, settles and acknowledges
+their outcomes, and pulls committed remote bundles. Clean recovery can install a sealed
+snapshot when incremental apply cannot continue.
 
 ## Managed Source Identity
 
 `source_id` is first-class on the wire. Authenticated sync requests sent by `oversqlite` carry
 `Oversync-Source-ID`. The application selects a generation ID plus stable database and service
-identities. `Open` is local-first: it validates and retains the local runtime without contacting the
-server. During `Attach`, the client discovers the configured generation, verifies its descriptor
+identities. Call `NewOpening` and `Advance` to create or open the database. Exact ready reopen and
+fresh opening can run offline. During first `Attach`, the client discovers the configured generation,
+verifies its descriptor
 against the local SQLite schema, and retains the confirmed fingerprint. Subsequent data-plane requests
 carry the immutable `Oversync-Schema-Generation-ID` and
 `Oversync-Schema-Generation-Fingerprint` proof. The host-facing contract is:
 
 - `oversqlite` generates and persists source identity internally
-- applications do not call `Open(ctx, sourceID)`
 - applications do not rotate source identity manually
 - applications do not provide replacement source ids during rebuild
 - applications configure a generation ID, database ID, and service ID rather than constructing a proof
@@ -31,9 +30,15 @@ The durable source/runtime state lives in:
 
 ## Public API
 
-Lifecycle:
+Database opening:
 
-- `Open(ctx) error`
+- `NewOpening(*OpeningConfig) (*Opening, error)`
+- `Opening.Advance(ctx) (OpeningResult, error)`
+- `OpeningResult.Ready` gives the application its `Client` and borrowed `Database()` pool.
+
+Ready-client lifecycle:
+
+- `Close() error`
 - `Attach(ctx, userID) (AttachResult, error)`
 - `Detach(ctx) (DetachResult, error)`
 - `PendingSyncStatus(ctx) (PendingSyncStatus, error)`
@@ -76,18 +81,15 @@ Conflict decisions:
 - `ResolveConflict(ctx, selected PendingConflict, result MergeResult) error`
 - `RetryConflict(ctx, selected PendingConflict) error`
 
-The default resolver durably defers every conflict. `ServerWinsResolver` and
-`ClientWinsResolver` are explicit opt-in policies.
-A `ConflictNeedsResolutionError` preserves the frozen request and local intent.
-Inspect `PendingConflict`, retain its identity and revision for an explicit decision,
-and pass that value to `ResolveConflict`. Stale or invalid decisions preserve the
-request. Retry exhaustion also preserves it. `RetryConflict` clears only the
-observation so a later `PushPending` can retry the exact request. Resolving a conflict
-performs no remote write; call `PushPending` afterward. Newer local edits remain protected.
-Malformed or mismatched server evidence never authorizes a decision.
-Missing `server_row` is invalid and is distinct from an explicit JSON null. A valid
-decision rewrites state and clears the outbox and conflict observation in one transaction;
-failure or cancellation rolls the complete decision back.
+v0.5.0 changes the default from server-wins to durable defer. To resolve automatically, set
+`ServerWinsResolver`, `ClientWinsResolver`, or an application resolver.
+
+The SDK records the rejection and acknowledges it as a terminal upload outcome. A
+`ConflictNeedsResolutionError` leaves the rejected request and local intent available for
+inspection. Pass the current `PendingConflict` to `ResolveConflict` or `RetryConflict`. A
+valid decision updates local state and preserves newer edits in one transaction.
+`RetryConflict` requeues remaining intent for a successor upload. Call `PushPending` after
+the local decision. Stale decisions leave pending work intact.
 
 Definitive application-level push rejections:
 
@@ -95,10 +97,10 @@ Definitive application-level push rejections:
 - `RetryPushRejection(ctx, selected PendingPushRejection) error`
 - `DiscardPushRejection(ctx, selected PendingPushRejection) error`
 
-HTTP 422 preserves the exact frozen request and returns
-`PushRejectionNeedsResolutionError`. Retry keeps that request unchanged. Discard first replays
-the selected whole frozen request to determine whether it committed, then abandons it
-while retaining newer dirty rows. A stale or ambiguous decision changes nothing.
+A terminal application rejection preserves its policy evidence and returns
+`PushRejectionNeedsResolutionError`. Retry requeues unsatisfied intent for a successor
+sequence. Discard abandons the rejected request in a guarded local transaction, preserving
+newer dirty rows. The successor upload waits for both the policy decision and acknowledgment.
 
 Diagnostics:
 
@@ -123,22 +125,18 @@ Watch events are wake-up hints only. `oversqlite` still applies data through `Sy
 
 ## Preconditions
 
-Require no prior lifecycle step:
-
-- `Open(ctx)`
-
-Require successful `Open(ctx)`:
+After `Advance(ctx)` returns a ready client:
 
 - `Attach(ctx, userID)`
 - `PendingSyncStatus(ctx)`
 - `SourceInfo(ctx)`
 - `UninstallSync(ctx)`
 
-Require successful `Open(ctx)` plus durable attached local state:
+With durable attached local state:
 
 - `Detach(ctx)`
 
-Require successful `Open(ctx)` plus successful `Attach(ctx, userID)`:
+After successful `Attach(ctx, userID)`:
 
 - `PushPending(ctx)`
 - `PullToStable(ctx)`
@@ -150,34 +148,31 @@ Require successful `Open(ctx)` plus successful `Attach(ctx, userID)`:
 
 ## Recovery
 
-- `PullToStable()` falls back to authoritative snapshot rebuild for pull-side `history_pruned` and
-  `checkpoint_ahead`
-- checkpoint recovery durably records `rebuild_required` before the snapshot and normal `Sync()` or
-  `PullToStable()` automatically resumes it after interruption
-- pending local work is frozen into the durable outbox and uploaded first; direct recovery can
-  return `CheckpointRecoveryBlockedError`, while interactive `Sync(ctx)` drains it through the
-  shared allowance and retains terminal error precedence
-- the durable checkpoint changes only when authoritative snapshot apply completes atomically
-- an ambiguous replay pruned below the retained floor uses keep-source rebuild behavior and only
-  clears the frozen outbox after recovery can establish the committed tuple
-- stale/pruned, out-of-order, changed, and retired source cases still enter durable fail-closed
-  source-recovery mode
-- `PushPending()`, `PullToStable()`, and `Sync()` fail closed while source recovery is required;
-  checkpoint recovery is automatically resumed by pull and sync
-- `Rebuild(ctx)` remains explicit and attached/authenticated
-- when source recovery is active, `Rebuild(ctx)` internally generates a fresh replacement source and
-  preserves frozen outbox intent across the rotated rebuild
+- `Sync` and `PullToStable` can install a sealed snapshot for eligible history failures when
+  automatic recovery is enabled and the scope is clean. The client advances its checkpoint
+  only when atomic snapshot apply commits.
+- After an uncertain upload, the SDK resolves the original request, applies its outcome locally,
+  and acknowledges it. After a lost freeze it can fetch the outcome by source sequence.
+  See [Durable upload outcomes](../docs/documentation/durable-upload-outcomes.md).
+- Use explicit `Rebuild(ctx)` when the source requires replacement. The client first settles
+  any recoverable upload under the original source. An outstanding outcome blocks server
+  replacement with `push_outcome_pending`. Eligible remaining intent carries to the new source.
+  See [Snapshot recovery](../docs/documentation/snapshot-recovery.md).
 
-Source recovery reasons map to server errors:
+## Upload limits and FK diagnostics
 
-- `history_pruned`
-- `source_sequence_out_of_order`
-- `source_sequence_changed`
-- `source_retired`
+`DefaultConfig` uses soft upload targets of 200 rows and 1 MiB. A complete dependency group
+can cross a soft target up to the discovery limits. Keep related edits together.
 
-Applications should not clear this state manually. Call `Rebuild(ctx)` after authentication and
-let the client preserve pending outbox intent, rotate source identity when required, and resume
-upload under the fresh source after snapshot recovery completes.
+- `FKReconciliationRequiredError` identifies a local dependency that needs correction.
+  Inspect its bounded key sample and reconcile the relationships before retrying.
+- `PushRowExceedsAdmittedLimitError` and `PushDependencyGroupExceedsAdmittedLimitError`
+  leave the blocked work dirty. For a group, use its `DiagnosticID` with
+  `ReadPushDependencyDiagnostic(ctx, id, cursor, pageSize)`. Start with an empty cursor
+  and follow `NextCursor`. Call `ReleasePushDependencyDiagnostic(ctx, id)` when finished.
+  Releasing the diagnostic leaves local intent in place.
+
+For snapshot workspace limits and pull paging, see the [Performance guide](../docs/documentation/performance.md).
 
 ## Generation wire values and database compatibility
 
@@ -206,10 +201,9 @@ descriptor and requires exactly one final effect for every uploaded key before a
 outbox. It applies authoritative effects atomically while retaining and rebasing any local edit
 made after the outbox was frozen, including a same-valued edit.
 
-Empty projected pull bundles remain real envelopes and advance the durable checkpoint. A push reply
-lost after server commit is resolved only by replaying the exact complete request or by a complete
-same-generation snapshot with unchanged proof/source, no newer local intent, and final transactional
-guards. Pruning alone never acknowledges a push.
+Empty projected pull bundles still advance the durable checkpoint. Upload resolution uses the
+retained terminal result independently of bundle history. The SDK commits local disposition
+before sending acknowledgment under the original binding.
 
 The client derives operation-specific decoded-body ceilings for push, pull, snapshots, rows, and
 structured conflicts from admitted generation discovery and enforces them after gzip
@@ -220,18 +214,19 @@ blocked states, explicit intent resolution, migrator ownership, and restart beha
 
 The opening drains old outboxes before application DDL and rotates the source only after the
 local migration commits. Separate devices may keep syncing on different server-supported
-generations. Changes to synchronized table identity, keys, or foreign keys remain outside upgrade.
+generations. The opening supports compatible table additions and omissions and qualifying
+nullable additive foreign keys. Shared identity and foreign-key semantics stay stable.
 Database ownership follows the SQLite file's device/inode identity, so a hard-link alias cannot
 overlap a ready client or opening, including when processes have different temporary-directory
 settings. Ready-client construction takes that ownership before inspecting mutable installed state.
 Opening `Close` does not release ownership until active upgrade work exits. A frozen whole-request
-tuple remains durable until its exact replay establishes commit or a definitive rejection permits
-the explicit drain; a transient failure cannot be mistaken for a completed drain.
+tuple stays durable until the client resolves and disposes of the outcome. Generation changes
+wait for outstanding acknowledgment and old-generation intent settlement.
 
 Generation-upgrade snapshot totals are recomputed with bounded pages on restart. Normal chunk
 commits advance durable row and encoded-byte progress incrementally, so accounting does not retain
-or repeatedly rescan the complete staged snapshot. Unsupported prototype control tables are not
-altered during initialization; a pre-`active_push_id` outbox layout fails closed.
+or repeatedly rescan the complete staged snapshot. v0.5.0 requires a fresh local database.
+See the [release notes](../docs/releases/v0.5.0.md).
 
 ## Quick Start
 
@@ -294,17 +289,19 @@ if _, err := client.Rebuild(context.Background()); err != nil {
 ## Invariants
 
 - `_sync_outbox_*` is durable and restart-resumable
-- `PullToStable()` and `Rebuild(ctx)` fail closed while `_sync_outbox_*` exists
-- `Sync()` fails closed while `_sync_attachment_state.rebuild_required = 1`
+- Clean recovery waits for pending uploads, acknowledgment, and local edits to settle
+- Explicit source-recovery rebuild can carry eligible intent across source replacement
 - `last_bundle_seq_seen` advances only after durable local apply
 - exactly one `oversqlite.Client` should own one SQLite database at a time
-- `Close()` releases client ownership of the SQLite database; it does not close the underlying
-  `*sql.DB`
+- `Close()` closes the SQLite pool and releases file ownership. Finish application queries
+  and transactions before calling it
 - `UninstallSync()` is more destructive than `Detach()` because it removes the installed sync
   metadata and triggers from the database
 
 Each push is one complete atomic `POST /sync/push`. The client freezes the request bytes
-and source tuple across retryable failures. If a response is uncertain or lost, retry the exact complete request.
+and source tuple across retryable failures. For an uncertain dispatch the SDK resolves the
+frozen operation. A custom client can retry the exact complete request while its outcome remains
+unacknowledged.
 There is no server upload session, acknowledged ordinal, staged
 prefix, or `_sync_push_progress` state.
 

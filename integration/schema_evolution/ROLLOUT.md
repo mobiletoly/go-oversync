@@ -88,11 +88,18 @@ database write access. Fresh Bootstrap and a separate reopen plan follow contrac
 
 ## Sessions, history and physical contraction
 
-Unexpired old push/snapshot sessions block retirement. Natural expiry still leaves
-durable staging and therefore still blocks it. `cleanup_staging` uses the existing
-private cleanup capability with bounded sessions/rows and atomic audit; it does not
-shorten TTLs or infer whether a push committed. Source watermarks and receipts remain
-authoritative.
+Before fencing the fleet for `retire_generation`, give clients a chance to settle and acknowledge
+outstanding upload outcomes under the retiring proof. The server retains outcomes until ack,
+independent of snapshot TTL and history pruning. Under the writer fence, use the authority
+connection to check `sync.push_outcomes` for the exact retiring `generation_id` and
+`generation_fingerprint`. Require zero matches before applying retirement. The reference
+report currently omits this check. If outcomes remain, keep the generation supported so clients
+can finish settlement. Removing it from the registry would make target bootstrap fail with
+`push_outcome_pending`.
+
+Snapshot staging still blocks retirement after natural expiry until cleanup removes it.
+`cleanup_staging` uses bounded session and row batches with atomic audit. It handles snapshot
+staging only. Keep source watermarks, retained outcomes, and acknowledgments intact.
 
 `retire_tables` checks live catalog/layout/FK dependencies and global staging/capture
 emptiness, locks registered roots and descendants, changes all selected catalog rows
@@ -146,7 +153,8 @@ HTTP 426 `retired_schema_generation` stops automatic Go client upload/download/w
 Keep the SQLite file, business rows, local-only rows, checkpoint, source identity,
 outbox hash/sequence and uncertain receipts. Pending retired work blocks destructive
 upgrade. Only a completely drained old file can use the normal supported-generation
-migration, source replacement and snapshot rebuild. No retired upload recovery exists.
+migration, source replacement and snapshot rebuild. An exact retry of the latest already applied
+acknowledgment can return HTTP 204 using the original proof after retirement.
 The stop is recorded in `_sync_action_required`; applications inspect it through
 `ApplicationActionRequired(ctx)` without contacting the retired server.
 

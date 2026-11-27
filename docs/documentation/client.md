@@ -102,14 +102,19 @@ The client persists admitted contracts, dirty rows, frozen outboxes, authoritati
 snapshot staging, row state, source lineage, attachment state, lifecycle operations, and apply mode
 in `_sync_*` tables. These tables are package-owned.
 
-The client retains the exact frozen whole-request tuple until its authoritative response is applied.
-If an ambiguous replay is later pruned, only a complete same-generation snapshot can settle it after
-all source, proof, checkpoint, newer-intent, and transaction guards pass. Source recovery is explicit:
-`PushPending`, `PullToStable`, and `Sync` fail closed while recovery is required, and `Rebuild`
-performs the supported repair while preserving frozen intent.
+The client resolves an uncertain upload under its original source, generation, sequence, and
+request hash. The server retains the outcome independently of history pruning. The SDK records
+local disposition and then acknowledges it. After a lost freeze, it can look up a retained
+outcome by source sequence. The default conflict policy now durably defers the decision.
+See [Durable upload outcomes]({{ site.baseurl }}/documentation/durable-upload-outcomes/).
+
+Automatic clean recovery can install a sealed snapshot after an eligible pull failure. Use
+explicit `Rebuild` if the client requires source replacement. It settles recoverable work
+under the original source before carrying eligible remaining intent into the replacement.
+See [Snapshot recovery]({{ site.baseurl }}/documentation/snapshot-recovery/).
 
 `SourceInfo` is diagnostic only. Its source ID is opaque and must not be persisted as an application
 identity.
 
-See [Go SQLite client upgrades](/client-upgrades/) for plan, migration, resolution, and restart
+See [Go SQLite client upgrades]({{ site.baseurl }}/client-upgrades/) for plan, migration, resolution, and restart
 behavior.

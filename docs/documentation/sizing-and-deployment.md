@@ -224,9 +224,11 @@ The 30-second windows are counted from the first refusal of a request; a retry w
 past the window is not sent. In recovery work (push-outcome resolve and retained reads, snapshot
 requests) every retry is also one of the 64 recovery requests a sync call may send.
 
-When the retries run out, the sync call fails with a retryable error (Go `RetryExhaustedError` or
-`PushCapacityRetryExhaustedError`; Kotlin reports an `OversqliteCategorizedException` in the
-`NETWORK` category). Local changes stay
+When the Go capacity window ends, pull returns `RetryExhaustedError`, push and outcome
+reads return `PushCapacityRetryExhaustedError`, and snapshot requests return
+`SnapshotCapacityRetryExhaustedError`. Disabling generic transport retries leaves these
+capacity policies active. Kotlin reports an `OversqliteCategorizedException` in the
+`NETWORK` category. Local changes stay
 pending and the next sync sends them. Many devices pulling at once, for example all catching up
 after the same burst of pushes, is therefore the case to plan for: on one 2 vCPU instance, before
 pulls had a capacity window, 26 to 38 of 50 devices that pulled together gave up after about

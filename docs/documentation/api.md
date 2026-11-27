@@ -10,8 +10,8 @@ All `/sync/*` endpoints are expected to be mounted behind authentication. The ha
 authenticated `oversync.Actor{UserID, SourceID}` in request context. Auxiliary `GET /syncx/health`
 and `GET /syncx/status` do not require an authenticated actor.
 
-All visible sync keys are structured JSON objects whose values are strings on the wire. UUID-valued
-keys use canonical dashed lowercase UUID strings. Hidden server ownership columns such as
+Compact push, pull, and snapshot rows carry ordered key arrays. Conflict details carry a JSON key
+object. UUID keys use canonical dashed lowercase UUID strings. Hidden server ownership columns such as
 `_sync_scope_id` never appear in client-visible payloads, conflicts, committed bundle rows, or
 snapshot rows.
 
@@ -34,10 +34,9 @@ Hash-only protocol counters are decimal strings inside the logical hash model. `
 length of those canonical logical bytes. This is standard JCS plus a typed wire schema, not an
 arbitrary-precision extension to JCS.
 
-Canonical history is stored once. Direct-push success and exact replay return the same complete
-compact authoritative row projection and `bundle_hash`. Pull returns indivisible compact bundles;
-there is no committed-row follow-up endpoint. A projection with no visible rows is still emitted by
-pull and advances the canonical bundle cursor.
+Canonical history is stored once. The server retains a terminal upload outcome separately
+until acknowledgment. Pull returns indivisible compact bundles. Even an empty projection
+advances the canonical bundle cursor.
 
 Push commit returns HTTP 422 `push_effect_coverage_incomplete` when any uploaded key lacks a final
 visible captured effect; the complete transaction is rolled back. Projection/history failures use
@@ -46,22 +45,29 @@ the documented `generation_history_unavailable`, `generation_projection_integrit
 discovery publishes finite logical and decoded-body limits for push, pull, snapshots, and rows.
 Row-bearing responses use compact JSON without HTML or U+2028/U+2029 escaping.
 
-Oversync does not migrate incompatible stored hashes, server history, staged sessions, or durable
-client state. To adopt this contract, deploy compatible server and client versions together and
-recreate the affected server and client databases. Mixed-version operation is unsupported.
+v0.5.0 replaces capabilities with generation discovery and replaces staged upload and committed-row
+paging with compact one-shot push and durable outcomes. See the
+[v0.5.0 release notes]({{ site.baseurl }}/releases/v0.5.0/) and
+[OpenAPI schemas and examples](https://github.com/mobiletoly/go-oversync/blob/main/swagger/two_way_sync.yaml).
 
-Authenticated discovery requests to `GET /sync/generations/{generation_id}` send authorization and
-`Oversync-Source-ID`, and must omit both generation-proof headers. After discovery and confirmation,
-all other authenticated `/sync/*` requests must send:
+## Authentication and headers
 
-- `Authorization: Bearer <token>`
-- `Oversync-Source-ID: <current-source-id>`
-- `Oversync-Schema-Generation-ID: <canonical-positive-decimal-id>`
-- `Oversync-Schema-Generation-Fingerprint: <complete-64-lowercase-hex-fingerprint>`
+Send these headers on every authenticated `/sync/*` request, including discovery:
 
-The two schema-generation headers are required again on every post-discovery retry and watch
-reconnect; a prior discovery response or `Last-Event-ID` never supplies them implicitly.
-Discovery, `/syncx/health`, and `/syncx/status` are proof-exempt.
+- `Authorization: Bearer <token>` when your host uses bearer authentication
+- `Oversync-Source-ID: <source-id>`
+- `Oversync-Protocol-Version: v1` as one exact header value. Missing, duplicate, or different
+  values return HTTP 426 `protocol_version_mismatch`.
+
+Omit both proof headers on `GET /sync/generations/{generation_id}`. On later requests, including
+retries and watch reconnects, send exactly one of each:
+
+- `Oversync-Schema-Generation-ID: <canonical-positive-decimal-id>` in the signed 32-bit range
+- `Oversync-Schema-Generation-Fingerprint: <64-lowercase-hex-characters>`
+
+Resolve, retained lookup, and acknowledgment use the upload's original source and generation proof.
+Use the newer target proof when requesting a `schema_generation_upgrade` snapshot under the old
+source. The `/syncx/health` and `/syncx/status` endpoints are outside these requirements.
 
 ## POST `/sync/connect`
 
@@ -104,41 +110,53 @@ Notes:
 
 ## POST `/sync/push`
 
-Commit one complete compact dirty-set bundle atomically. The request carries a source bundle ID,
-canonical request hash, optional initialization ID, and compact row groups. The response contains
-the complete authoritative compact effect with its committed bundle sequence and hash.
+Send one bounded bundle with `source_bundle_id`, `canonical_request_hash`, compact `rows`,
+and `initialization_id` when Connect requires it. Persist the source, generation proof, sequence,
+hash, and token together with the frozen request. Exact replay returns the retained outcome while
+it awaits acknowledgment.
 
-The server serializes the exact `(user_id, source_id, source_bundle_id)` tuple. Repeating the same
-complete request returns the same authoritative response; changing its hash is a sequence error.
-Clients retain the frozen request after a transport failure and replay it verbatim. There is no
-upload locator, chunk ordinal, commit call, or authoritative-row fetch.
+HTTP 200 carries a terminal outcome. Validate the immutable binding and `outcome_hash` before
+recording local disposition:
 
-Failure contract includes `push_conflict`, `history_pruned`, source-sequence errors, source
-retirement, initialization errors, and HTTP 422 application rejections. A conflict response has
-the same structured conflict object below.
+| Status | Local disposition |
+| --- | --- |
+| `committed` | Validate and apply the complete authoritative effect in `committed`, including its bundle sequence, hash, row count, and compact rows. Preserve edits made after the upload froze. |
+| `rejected` | Durably record `rejection.code` and preserve local intent for the application's decision. When the code is `push_conflict`, `rejection.conflict` includes the affected key, base and server versions, deletion flag, and current server row or explicit JSON null. The operation code is `i`, `u`, or `d`. |
+| `cancelled` | Record the cancellation and requeue remaining intent. |
 
-Push conflict response:
+All three statuses consume the source operation sequence. Acknowledge the outcome after local
+disposition commits. Retry surviving intent under a successor sequence. A snapshot cannot settle
+a pending outcome.
 
-```json
-{
-  "error": "push_conflict",
-  "message": "update conflict on business.users 550e8400-e29b-41d4-a716-446655440000: expected version 7, got 3",
-  "conflict": {
-    "schema": "business",
-    "table": "users",
-    "key": {"id": "550e8400-e29b-41d4-a716-446655440000"},
-    "op": "UPDATE",
-    "base_row_version": 3,
-    "server_row_version": 7,
-    "server_row_deleted": false,
-    "server_row": {
-      "id": "550e8400-e29b-41d4-a716-446655440000",
-      "name": "Jane Doe",
-      "email": "jane@example.com"
-    }
-  }
-}
-```
+HTTP 422 `push_effect_coverage_incomplete` rolls back the entire business transaction and is
+nonterminal. Other nonterminal failures include stale bindings, a pending outcome, and capacity
+refusals. If the request might have reached the server, keep the frozen request and use resolution
+before collecting a replacement.
+
+## POST `/sync/push-outcomes/resolve`
+
+Send `source_bundle_id`, `canonical_request_hash`, and the original `initialization_id` or
+JSON null. The server serializes this operation with push. It returns the matching retained
+outcome or durably cancels the next operation, fencing any delayed push of that operation.
+
+## POST `/sync/push-outcomes/retained`
+
+Send `source_bundle_id` only. Use this lookup after `push_outcome_mismatch` when the client has
+lost its original local freeze. It reads the immutable outcome owned by the same source and
+proof. A `409 push_outcome_absent` cannot establish whether an upload committed. Lookup neither
+cancels nor acknowledges the operation.
+
+## POST `/sync/push-outcomes/ack`
+
+After durable local disposition, send `source_bundle_id`, `canonical_request_hash`, and
+`outcome_hash`. HTTP 204 confirms acknowledgment. Keep the obligation across restart until
+confirmed. An exact retry of the latest ack can return 204 even after retirement or rebinding.
+Older acknowledged operations return `410 push_outcome_acknowledged`.
+
+Push, resolve, retained lookup, and pull can return HTTP 503
+`history_projection_capacity_exceeded` with `Retry-After: 1`. See
+[Durable upload outcomes]({{ site.baseurl }}/documentation/durable-upload-outcomes/) for the
+settlement order and recovery details.
 
 ## GET `/sync/pull`
 
@@ -225,56 +243,57 @@ Failure contract:
 
 ## POST `/sync/snapshot-sessions`
 
-Create one frozen snapshot session for hydration or destructive recovery.
-
-The request body is optional.
-
-Keep-source rebuild request:
+Create one frozen snapshot session. Send an empty body or `{}` for ordinary keep-source hydration.
+For clean recovery, supply the minimum snapshot checkpoint:
 
 ```json
-{}
+{
+  "recovery": {"minimum_bundle_seq": 42}
+}
 ```
 
-Rotated rebuild request:
+The server echoes the recovery request and seals the snapshot at a sequence at or above the floor.
+The client verifies the seal, stages the full snapshot, and atomically publishes the checkpoint.
+This empty recovery snapshot is the OpenAPI fixture example:
+
+```json
+{
+  "snapshot_id": "snapshot-fixture",
+  "snapshot_bundle_seq": 42,
+  "row_count": 0,
+  "logical_byte_count": 0,
+  "expires_at": "2026-10-23T13:00:00Z",
+  "snapshot_hash": "d293c0d8c2d8bd27d98d74ec351e0610add37cb8850111c4a1e4d0ca3d481942",
+  "recovery": {"minimum_bundle_seq": 42}
+}
+```
+
+For source replacement, send `source_replacement` in place of `recovery`:
 
 ```json
 {
   "source_replacement": {
     "previous_source_id": "device-old",
     "new_source_id": "device-new",
-    "reason": "history_pruned"
+    "reason": "schema_generation_upgrade"
   }
 }
 ```
 
-Notes:
-
-- omitting `source_replacement` means keep-source hydrate/rebuild
-- including `source_replacement` means rotated rebuild; the server reserves `new_source_id` and
-  retires `previous_source_id` atomically with snapshot-session creation
-- `previous_source_id` must match the authenticated `Oversync-Source-ID`
-- supported `reason` values are:
-  - `history_pruned`
-  - `source_sequence_out_of_order`
-  - `source_sequence_changed`
-  - `source_retired`
-
-Response:
-
-```json
-{
-  "snapshot_id": "2f2d3f7a-cd1f-42b9-8d08-c4d2b45d9f88",
-  "snapshot_bundle_seq": 156,
-  "row_count": 124,
-  "logical_byte_count": 18240,
-  "expires_at": "2026-03-22T12:00:00Z"
-}
-```
+- Send the previous source in `Oversync-Source-ID`. For `schema_generation_upgrade`, send the
+  newer target proof. The other supported reasons use the current proof: `history_pruned`,
+  `source_sequence_out_of_order`, `source_sequence_changed`, and `source_retired`.
+- The server retires the previous source and reserves the replacement in the transaction that
+  creates the snapshot. Use the replacement source and snapshot's proof for chunk reads and deletion.
+- Session creation returns `snapshot_hash` for both modes. The `recovery` field appears only
+  for a request that supplied it.
 
 Failure contract:
 
 - `400 snapshot_session_invalid`
 - `409 source_replacement_invalid`
+- `409 push_outcome_pending` when an outstanding outcome blocks clean recovery or replacement
+- `409 recovery_floor_ahead` when the recovery floor exceeds current committed history
 - `409 source_retired`
 - `409 scope_uninitialized`
 - `409 scope_initializing`
@@ -300,7 +319,8 @@ Structured `source_retired` response:
 
 ## GET `/sync/snapshot-sessions/{snapshot_id}`
 
-Fetch one deterministic chunk from a frozen snapshot session.
+Fetch one deterministic chunk from a frozen snapshot session under its owning source and proof.
+The first nonempty group starts at `after_row_ordinal + 1`.
 
 Query:
 
@@ -313,7 +333,7 @@ Response:
 ```json
 {
   "rows": [
-    [0, 0, [["i", ["550e8400-e29b-41d4-a716-446655440001"], 143,
+    [0, 1, [["i", ["550e8400-e29b-41d4-a716-446655440001"], 143,
       {"id":"550e8400-e29b-41d4-a716-446655440001","name":"Jane Doe","email":"jane@example.com"}]]]
   ],
   "next_row_ordinal": 1,

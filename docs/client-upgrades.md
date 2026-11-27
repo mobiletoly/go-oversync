@@ -1,6 +1,7 @@
 ---
 layout: default
 title: Go SQLite client upgrades
+permalink: /client-upgrades/
 ---
 
 # Go SQLite client upgrades
@@ -13,7 +14,7 @@ result contains the owned `Client`; every non-ready or actionable result has `Re
 Supply the desired target `Config` on every open. An exact already-ready target needs no historical
 plan and performs no network request. Fresh, pending, or target-changing work requires the exact
 `UpgradePlan`. Do not construct codec declarations or modify package metadata to bypass admission.
-Prototype sync databases are not migrated in place.
+v0.5.0 starts with fresh client databases. These plans apply to compatible formats.
 
 ## Migrator ownership
 
@@ -45,10 +46,10 @@ is transferred in memory after commit; a late cancellation cannot turn committed
 non-ready result.
 
 `needs_resolution` preserves the frozen old-generation request. Call
-`ResolvePendingIntent` with an explicit retry, discard, or merge decision. The opening increments
-the resolution revision and resumes under the old source and proof. Use the exact
-`OpeningStatus.PendingRequestHash` returned with that revision when constructing the resolution;
-the binding prevents a decision for one frozen request from being applied to another. A target
+`ResolvePendingIntent` with an explicit retry, discard, or merge decision. Supply the exact plan ID, resolution revision, and `OpeningStatus.PendingRequestHash`.
+Application rejections accept retry or discard. Conflicts also support server state, local intent,
+or an explicit merged payload. The opening settles and acknowledges the old outcome under its
+original source and proof before moving to the target. A target
 snapshot cannot clear old dirty rows or an unresolved receipt.
 
 Cancellation stops at the next safe boundary and leaves the journal resumable. A network error
@@ -59,9 +60,9 @@ and U8 ready publication are irreversible after their transactions commit.
 Ownership is keyed by the SQLite file's filesystem identity, not only its pathname. Symlinks and
 hard links therefore cannot acquire separate in-process or cross-process owners, even when
 processes use different temporary-directory settings. `Close` cancels active opening work but
-retains ownership until that work reaches a safe boundary and exits. A frozen old request is durable
-outbox evidence: a transient replay failure blocks the U2 drain witness until exact replay proves
-commit or a definitive rejection permits the drain.
+retains ownership until that work reaches a safe boundary and exits. The opening keeps the
+original upload evidence until it completes local disposition and acknowledgment. Transient
+failures leave the old-generation drain open.
 
 ## Fresh and same-proof modes
 
@@ -98,7 +99,7 @@ conflict blocks migration. Source rotation and the full target snapshot retain t
 boundaries. Local-only tables survive unless the application migration explicitly changes them.
 Server table omission retains its physical table, active catalog identity and old-generation history.
 
-The [worked table/FK controller](../integration/schema_evolution/table_evolution/README.md) closes
+The [worked table/FK controller](https://github.com/mobiletoly/go-oversync/tree/main/integration/schema_evolution/table_evolution) closes
 admission, expires and cleans staging with a private capability, appends empty tables before the
 old-child/new-parent FK is installed, then populates through captured writes. PostgreSQL transition
 writes/readiness remain under transition support. SQLiteNow runtime and generator work are separate
@@ -106,9 +107,7 @@ from this Go implementation.
 
 Target snapshot accounting is bounded: staged rows are verified in fixed-size pages on resume, and
 each chunk transaction durably advances both row and encoded-byte progress without rescanning or
-materializing the complete staged prefix. Database files created by an older unreleased prototype
-control layout are not migrated in place. In particular, an `_sync_outbox_bundle` without durable
-`active_push_id` evidence fails closed and must not be opened as if no session existed.
+materializing the complete staged prefix.
 
 Run the portable fixture verifier with:
 
@@ -124,8 +123,10 @@ standalone artifact/schema check; it is not complete Go conformance evidence.
 
 An authenticated request with an exact retired generation proof returns HTTP 426,
 `retired_schema_generation`, `retryable: false`, and remediation `upgrade_application`.
-This applies before source or session lookup, including a source that has never connected.
-Malformed proofs and wrong fingerprints retain their distinct validation errors.
+For ordinary sync this applies before source or session lookup, including an unconnected
+source. An exact retry of the latest already applied upload acknowledgment can still return
+HTTP 204 under the original proof. Malformed proofs and wrong fingerprints retain their
+distinct validation errors.
 
 Go clients expose the typed schema-generation error and stop unchanged-generation sync
 and watch retries. Retirement does not clear business rows, pending uploads, conflicts,
@@ -143,6 +144,6 @@ opening blocked before destructive phases. Applications must preserve that evide
 and request the appropriate application action; there is no automatic discard or retired
 upload recovery route.
 
-See the [rollout operator guide](../integration/schema_evolution/ROLLOUT.md) and
-[Go qualification coverage](../integration/schema_evolution/QUALIFICATION.md) for the
+See the [rollout operator guide](https://github.com/mobiletoly/go-oversync/blob/main/integration/schema_evolution/ROLLOUT.md) and
+[Go qualification coverage](https://github.com/mobiletoly/go-oversync/blob/main/integration/schema_evolution/QUALIFICATION.md) for the
 server maintenance, permanent identity, retention and recovery requirements.

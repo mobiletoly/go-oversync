@@ -1,17 +1,16 @@
 ---
-layout: documentation
+layout: doc
+parent: Architecture
 title: Durable upload outcomes
 permalink: /documentation/durable-upload-outcomes/
 ---
 
-The fresh server format retains one complete terminal upload result per
-`(user_pk, source_id)` independently of bundle-history retention. The sole wire
-marker is `v1`; old databases and old clients require recreation/replacement at
-adoption. Go and Kotlin clients now retain exact uploads, settle terminal results
-durably and acknowledge under the original binding. Explicit clean snapshot
-installation now uses the [guarded delta installer](../snapshot-recovery/).
-Automatic clean recovery remains a later phase. The governing contract is
-[`r0001`](../../specs/r0001-oversqlite-durable-recovery.md).
+The server retains one complete terminal upload result per `(user_pk, source_id)`
+independently of bundle history. Go and Kotlin clients retain the exact upload,
+settle its terminal result, and acknowledge under the original binding. Automatic
+clean recovery and explicit rebuild use the [guarded snapshot installer](../snapshot-recovery/).
+The governing contract is
+[`r0001`](https://github.com/mobiletoly/go-oversync/blob/main/specs/r0001-oversqlite-durable-recovery.md).
 
 ## Durable ownership and bounds
 
@@ -114,14 +113,14 @@ rollback, both race orders, sequence/ack fences, pruning/restart, lifecycle
 binding, bounded retention/storage failure, killed independent service processes
 and unrelated-scope progress on PostgreSQL 17.11. Native reports and the
 current C02 ledger determine which lanes actually ran; test existence alone does
-not establish qualification. Snapshot installation, mapped synthetic activity runtime
-acceptance and the full platform/final matrix remain later phases.
+not establish qualification. See the [snapshot recovery guide](../snapshot-recovery/)
+for the installer and its qualification scope.
 
 C02 server outcomes and the accepted distinct-owner rule have passed scoped
 independent review, the nine required families on both PostgreSQL versions and
 the targeted race checks. C03 completes Milestone A's scoped client settlement
 and acknowledgment proof. Full protocol qualification remains incomplete. See the
-[C02 handoff](../../.artifacts/durable-recovery-server-20261022/handoff.md).
+C02 handoff (`.artifacts/durable-recovery-server-20261022/handoff.md` in the local qualification workspace).
 
 ## Client journal and settlement ownership
 
@@ -163,8 +162,9 @@ outcome. The frozen rows did not produce it, so they are requeued as dirty inten
 their original bases. A committed outcome settles through the same final-state engine
 with no uploaded rows: committed keys with local intent are preserved as newer edits
 on the committed version (intent already equal to the committed effect is consumed),
-other committed keys apply authoritatively, and rows outside the outcome keep their
-intent. A rejected or cancelled outcome is disposed like a cancellation without
+other committed keys apply authoritatively. If a newer pulled row version already
+superseded an effect, the SDK keeps that newer state. Rows outside the outcome keep
+their intent. A rejected or cancelled outcome is disposed like a cancellation without
 invoking rejection policy, because its evidence binds the lost request. Ack uses the
 retained binding and the next freeze takes the following sequence. A journal that was
 rebound but not yet settled resumes from the stored outcome without another lookup.
@@ -197,7 +197,7 @@ unique dirty-closure and A1 tests now assert stored-C settlement, original bindi
 and no snapshot bypass. This is ownership consolidation around the shared apply,
 outbox, conflict, transaction and workspace engines; line count is not evidence
 of reliability. Exact executed bodies and retained failures are in the
-[C03 handoff](../../.artifacts/durable-recovery-client-20261022/handoff.md).
+C03 handoff (`.artifacts/durable-recovery-client-20261022/handoff.md` in the local qualification workspace).
 
 New/materially rewritten Go journal/lifecycle owners remain below 30 cognitive
 complexity. One intentional adjacent exception is `Opening.startInstalled`

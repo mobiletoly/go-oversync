@@ -1,10 +1,9 @@
 ---
 openapi: 3.1.0
 info:
-  title: Oversqlite v1 durable recovery — durable recovery contract
+  title: Oversqlite v1 HTTP API
   version: 1.0.0
-  description: Active sole-v1 wire contract for narrowed durable recovery. Runtime outcome and snapshot
-    implementation is phased separately. Sole v1 with exact terminal upload outcomes, resolve-or-cancel,
+  description: v1 wire contract with exact terminal upload outcomes, resolve-or-cancel,
     acknowledgment, and floor/hash-bound clean recovery snapshots. Snapshots cannot settle an outstanding
     upload. Existing row codecs and request/bundle hashes remain. No compatibility, per-column merge,
     decision/report API or prepaid storage quotas. Examples use independently computed shared golden vectors.
@@ -137,7 +136,7 @@ paths:
         '426':
           $ref: '#/components/responses/Error'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/HistoryProjectionUnavailable'
         '500':
           $ref: '#/components/responses/Error'
   /sync/pull:
@@ -171,7 +170,7 @@ paths:
         '500':
           $ref: '#/components/responses/Error'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/HistoryProjectionUnavailable'
   /sync/watch:
     get:
       summary: Receive optional coalescible bundle-sequence wake-up hints
@@ -241,7 +240,16 @@ paths:
         '426':
           $ref: '#/components/responses/Error'
         '429':
-          $ref: '#/components/responses/Error'
+          description: snapshot_build_capacity
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/CapacityRetryAfter'
+            Content-Encoding:
+              $ref: '#/components/headers/OptionalGzip'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/Error'
         '503':
@@ -283,7 +291,16 @@ paths:
         '426':
           $ref: '#/components/responses/Error'
         '429':
-          $ref: '#/components/responses/Error'
+          description: snapshot_chunk_capacity
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/CapacityRetryAfter'
+            Content-Encoding:
+              $ref: '#/components/headers/OptionalGzip'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/Error'
         '503':
@@ -358,7 +375,7 @@ paths:
         '500':
           $ref: '#/components/responses/Error'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/HistoryProjectionUnavailable'
         '200':
           $ref: '#/components/responses/PushOK'
   /sync/push-outcomes/retained:
@@ -400,7 +417,7 @@ paths:
         '500':
           $ref: '#/components/responses/Error'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/HistoryProjectionUnavailable'
         '200':
           $ref: '#/components/responses/PushOK'
   /sync/push-outcomes/ack:
@@ -461,9 +478,10 @@ components:
       name: Oversync-Schema-Generation-ID
       in: header
       required: true
+      description: Canonical positive decimal ID, at most 2147483647.
       schema:
         type: string
-        minLength: 1
+        pattern: '^[1-9][0-9]{0,9}$'
     SchemaGenerationFingerprintHeader:
       name: Oversync-Schema-Generation-Fingerprint
       in: header
@@ -485,9 +503,10 @@ components:
       name: generation_id
       in: path
       required: true
+      description: Canonical positive decimal ID, at most 2147483647.
       schema:
         type: string
-        minLength: 1
+        pattern: '^[1-9][0-9]{0,9}$'
     SnapshotIDPath:
       name: snapshot_id
       in: path
@@ -554,6 +573,12 @@ components:
         const: v1
       description: Missing, duplicate or non-v1 is HTTP426 before mutation. Exact literal; no negotiation.
   headers:
+    CapacityRetryAfter:
+      required: true
+      description: Delay in seconds before retrying a capacity refusal.
+      schema:
+        type: integer
+        const: 1
     OptionalGzip:
       schema:
         type: string
@@ -681,6 +706,22 @@ components:
     ServiceUnavailable:
       description: Service unavailable (including scope_admission_unavailable) or commit outcome unknown
       headers:
+        Content-Encoding:
+          $ref: '#/components/headers/OptionalGzip'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    HistoryProjectionUnavailable:
+      description: >
+        Service unavailable, or history_projection_capacity_exceeded. Only capacity refusals
+        include Retry-After, with an exact value of 1 second.
+      headers:
+        Retry-After:
+          description: Present on history_projection_capacity_exceeded responses.
+          schema:
+            type: integer
+            const: 1
         Content-Encoding:
           $ref: '#/components/headers/OptionalGzip'
       content:
@@ -983,7 +1024,9 @@ components:
           format: int64
           maximum: 9223372036854775807
           minimum: 1
-          description: Complete decoded push request bound. Terminal push/resolve responses use max_push_outcome_decoded_bytes.
+          description: >
+            Complete decoded push request bound. The push, resolve, and retained endpoints use
+            max_push_outcome_decoded_bytes for terminal responses.
         max_pull_bundles:
           type: integer
           minimum: 1
@@ -1501,6 +1544,12 @@ components:
               pattern: ^[!-~]{1,256}$
             reason:
               type: string
+              enum:
+              - history_pruned
+              - source_sequence_out_of_order
+              - source_sequence_changed
+              - source_retired
+              - schema_generation_upgrade
         recovery:
           $ref: '#/components/schemas/SnapshotRecovery'
       not:
@@ -1719,6 +1768,5 @@ components:
       - minimum_bundle_seq
       description: 'Closed clean-recovery request: minimum_bundle_seq only. Server rejects any unacknowledged
         source outcome. Client must also have no dirty intent, frozen upload, unsettled outcome or ack_pending.'
-x-implementation-status: contract-active-runtime-phases-pending
 x-governing-spec: ../specs/r0001-oversqlite-durable-recovery.md
 x-base-openapi-sha256: cb820edb6d3610d16a9eac26fb9d49c8f914f1022f1c20af18fd105a540c819e

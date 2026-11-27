@@ -66,6 +66,16 @@ the equivalent snapshot chunk and apply-page settings. Keep the row and byte
 controls together: a row-only limit does not bound a single large row or a
 compressed response after decoding.
 
+Size Go client workspace as well as transport chunks. `MaxSyncWorkspaceEntries` defaults
+to 131,072 and `MaxSyncWorkspaceBytes` to 256 MiB. The client can reject a snapshot after
+reading session metadata and before fetching chunks if its minimum entry requirement
+cannot fit. A 100,000-row snapshot exceeds the default entry quota even without local
+rows or dependency edges. Measure the local workload before raising either limit.
+
+Go pull starts at 16 bundles and adapts requests toward a 4 MiB decoded multi-bundle
+page, within the configured and advertised limits. An individual bundle still needs to fit
+the hard response ceiling.
+
 Use measured application data to choose limits. The project validation matrix
 uses these roles:
 
@@ -95,7 +105,7 @@ boundedness tests without enabling these workloads.
 - projection retains one bounded canonical bundle plus admitted visible output and is recomputed on
   demand; there is no projection cache or memory growth with retained-history length
 - keep managed table sets FK-closed
-- monitor prune fallback frequency, accepted-push replay hits, and rejected out-of-bundle writes
+- monitor prune fallback frequency, outstanding upload outcomes, and rejected out-of-bundle writes
 - treat malformed server responses as fail-closed conditions, not retry-forever conditions
 - treat `history_pruned` as an expected retained-history signal and size the retention policy
   around acceptable snapshot-rebuild frequency

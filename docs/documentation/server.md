@@ -45,7 +45,7 @@ Authoritative replication state:
 - `sync.row_state`: authoritative current row version and tombstone state keyed by
   `(user_pk, table_id, key_bytes)`
 - `sync.bundle_log`: one row per retained committed sync bundle, with the unique
-  `(user_pk, source_id, source_bundle_id)` replay/idempotency key
+  `(user_pk, source_id, source_bundle_id)` origin key
 - `sync.bundle_rows`: retained committed row effects using compact `table_id`, `key_bytes`, and
   `op_code`
 
@@ -58,6 +58,8 @@ Server-originated write authority:
 
 Transport and lifecycle state:
 
+- `sync.push_protocol_store`, `sync.push_source_progress`, and `sync.push_outcomes` hold
+  the immutable upload ceiling, acknowledgment fences, and terminal results awaiting ack
 - `sync.scope_state`: durable first-connect authority state keyed by `user_pk`
 - `sync.snapshot_sessions`: active frozen snapshot metadata pinned to its effective source and exact
   generation pair
@@ -110,16 +112,12 @@ Possible outcomes:
 
 ### Push
 
-The normal client write flow is one `POST /sync/push` containing the complete compact frozen
-bundle. Its response carries the complete authoritative effect for immediate local atomic apply.
-Retained duplicate replay is resolved through `sync.bundle_log`.
-If the exact source tuple is older than retained bundle history but `sync.source_state` proves that
-the source bundle id was already committed, the server returns `history_pruned` instead of
-accepting it again. If a source sends a future bundle id, the server returns
-`source_sequence_out_of_order`; commit revalidation can return `source_sequence_changed`.
-The canonical request hash is generation-bound and covers the ordered logical rows supplied by the
-client. The authoritative effect may differ after triggers, cascades, defaults, or transition
-writes.
+The client sends one `POST /sync/push` per bounded frozen upload. The request hash covers
+the ordered logical rows and the exact generation proof. A committed outcome contains the
+authoritative effect, which can reflect triggers, cascades, defaults, or transition writes.
+The server retains committed, rejected, and cancelled outcomes independently of bundle
+history. Clients record local disposition, then acknowledge under the original binding.
+See [Durable upload outcomes]({{ site.baseurl }}/documentation/durable-upload-outcomes/).
 
 ### Pull And Snapshot
 
@@ -210,11 +208,10 @@ bundle per populated scope in the same PostgreSQL transaction. The baseline reco
 observed at adoption time; it does not claim to recreate earlier modification history. Connect,
 pull, push, and snapshot operations return `503 service_not_ready` until that transaction commits.
 
-For the one-time adoption of an existing populated deployment, back up PostgreSQL, stop every old
-Oversync server and managed writer, start the upgraded server and wait for healthy readiness, then
-restore client traffic. Mixed old/new server operation during adoption is unsupported. Fresh
-adoption never updates or deletes authoritative business rows and retains exact post-persistence
-validation of row identity, payloads, history, hashes, counters, watermarks, and sessions.
+For first adoption of populated business tables, stop writers and back up PostgreSQL before
+bootstrapping the fresh sync layout. Wait for healthy readiness before opening client traffic.
+Fresh adoption preserves authoritative business rows. v0.5.0 rejects older managed layouts
+before adoption. See the [v0.5.0 release notes]({{ site.baseurl }}/releases/v0.5.0/).
 
 An unsupported registered schema or managed definition is rejected without modifying the database.
 Stop affected instances and restore a reviewed compatible backup or follow a separately reviewed
@@ -240,7 +237,7 @@ application triggers and indexes with other names remain supported.
 
 Every existing-layout `Bootstrap()` validates registered declarations, the marker and exact table
 catalog, then compares the complete version-independent semantic manifest for
-`server_postgres_sync_v1`. Validation covers relation
+`server_postgres_sync_catalog_v1`. Validation covers relation
 persistence/partition/RLS/replica identity, every column and default, PK/UNIQUE/CHECK/FK semantics,
 constraint-backed and explicit indexes, identity and metric sequences, exact managed-function body
 hashes and attributes, and the root/descendant trigger definitions and arguments. Expected and
@@ -249,9 +246,9 @@ hash equality alone, decide acceptance. Catalog object paths use exact dot-separ
 not PostgreSQL-rendered SQL identifiers, so server-version keyword classifications cannot change
 their semantic identity.
 
-A coherent marked layout takes the trusted-database attachment path. It reads no registered business
-rows or managed operational-state rows, takes no explicit business or managed data locks, and
-performs no DML, DDL, adoption, canonicalization, hashing, cleanup, or repair. Drift fails closed
+A coherent marked layout takes the trusted-database attachment path. Bootstrap reads the
+stored push outcome ceiling and checks the generation proofs of outstanding outcomes.
+It validates readiness without scanning registered business rows. Definition drift fails closed
 with `UnsupportedSchemaError` before readiness and preserves business rows, sync rows, bundles,
 checkpoints, functions, and triggers. Diagnostics start with
 `managed sync layout mismatch`, name the layout and both fingerprints, and include a bounded sorted

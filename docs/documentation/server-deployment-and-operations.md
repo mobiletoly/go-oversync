@@ -30,9 +30,10 @@ Oversync owns:
 - push, pull, snapshot, retention, and client recovery protocol behavior
 - rejection of registered-table writes that bypass an Oversync bundle context
 
-Give every server instance that shares a database the same registered-table catalog, schema
-version, reserved server source IDs, and layout-compatible configuration. Keep per-instance
-capacity settings aligned unless your load balancer and monitoring account for different limits.
+Give every server instance that shares a database the same registered-table catalog and revision,
+schema-generation registry, deployment readiness contract, and reserved server source IDs.
+Keep per-instance capacity settings aligned unless your load balancer and monitoring account for
+different limits.
 Do not place application objects in the `sync` schema or change Oversync-managed objects.
 
 ## Build The Host Server
@@ -74,8 +75,10 @@ func run() error {
     logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
     serviceConfig := &oversync.ServiceConfig{
-        SchemaGenerations: schemaGenerations, // one or two complete declarations
-        AppName:          "my-sync-api",
+        Readiness:                      applicationReadiness,
+        SchemaGenerations:              schemaGenerations, // one or two complete declarations
+        RegisteredTableCatalogRevision: 1,
+        AppName:                        "my-sync-api",
         RegisteredTables: []oversync.RegisteredTable{
             {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
             {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
@@ -200,6 +203,9 @@ func registerSyncRoutes(
 
     handle("POST /sync/connect", handlers.HandleConnect)
     handle("POST /sync/push", handlers.HandlePush)
+    handle("POST /sync/push-outcomes/resolve", handlers.HandlePushOutcomeResolve)
+    handle("POST /sync/push-outcomes/retained", handlers.HandlePushOutcomeRetained)
+    handle("POST /sync/push-outcomes/ack", handlers.HandlePushOutcomeAck)
     handle("GET /sync/pull", handlers.HandlePull)
     handle("GET /sync/watch", handlers.HandleWatch)
     handle("POST /sync/snapshot-sessions", handlers.HandleCreateSnapshotSession)
@@ -256,6 +262,14 @@ bypassed by process memory.
 `oversync.Actor{UserID, SourceID}`. If you reserve source IDs for trusted server writers, pass the
 same exact set to `ServiceConfig.ReservedServerSourceIDs` and
 `ActorMiddlewareConfig.ReservedServerSourceIDs`.
+
+Supply `applicationReadiness` as a `*oversync.ReadinessConfig` backed by matching database
+evidence. See [Getting Started]({{ site.baseurl }}/getting-started.html#step-3-create-the-server).
+The single pool shown here works with an adapter that inspects deployment evidence at bootstrap.
+For an `OperationAdmissionAdapter`, create a proven pair with `NewReadinessPoolPair`, assign
+`Readiness.PoolPair`, and pass its `ExecutionPool()` to `NewRuntimeService`. Close the service
+before closing the pair and budget both pools. See the
+[table-evolution reference](https://github.com/mobiletoly/go-oversync/tree/main/integration/schema_evolution/table_evolution).
 
 Call `Bootstrap()` before you advertise readiness or serve sync traffic. During shutdown, remove
 the instance from client traffic and start `http.Server.Shutdown` so the server stops accepting
@@ -359,11 +373,10 @@ Reducing client concurrency is the first control when a test creates a burst tha
 traffic would spread across time. Raise server admission or pool limits when measurements show
 headroom. Keep build and chunk limits separate because their database and memory costs differ.
 
-Authenticated clients can read effective transfer and concurrency limits from
-`GET /sync/generations/{generation_id}` during client admission. The request must carry the client's fixed generation proof, and the
-response confirms only that requested generation. It does not list other generation IDs, the
-registry fingerprint, catalog IDs, or omitted tables. Treat that response as advisory for the
-instance that served it; every later request validates both proof headers again.
+Clients use `GET /sync/generations/{generation_id}` to read the selected descriptor, transfer
+limits, and watch capability. Send authentication, `Oversync-Protocol-Version: v1`, and
+`Oversync-Source-ID`. Omit the generation proof during discovery, then carry it on subsequent
+data-plane requests. Keep the advertised limits aligned across instances.
 
 ## Reproduce A 500-User Run
 
@@ -431,26 +444,30 @@ settings every instance must share. Alert on cleanup failures and check whether 
 rows continue to grow.
 
 Monitor PostgreSQL pool acquisition, acquired and idle connections, database CPU, lock waits, and
-storage growth for `sync.bundle_log`, `sync.bundle_rows`, and snapshot-session tables. Track
-`history_pruned` frequency because it causes snapshot recovery. A rising frequency can indicate a
+storage growth for `sync.bundle_log`, `sync.bundle_rows`, and snapshot-session tables. Use
+`PushOutcomeStorage` to track outstanding outcome count, age, and storage separately. Track
+`history_pruned` frequency because it can trigger snapshot recovery. A rising frequency can indicate a
 retention window that is too short for your offline clients.
 
 ## Deploy, Upgrade, And Recover
 
-Back up PostgreSQL before first adoption of populated tables and before an upgrade that can change
-the managed layout. Test the restore procedure against a separate database.
+v0.5.0 requires a fresh managed layout and compatible clients. See the
+[v0.5.0 release notes]({{ site.baseurl }}/releases/v0.5.0/). Bootstrap rejects the v0.4.0
+layout with `layout_replacement_required`.
 
-For first adoption or a layout-affecting upgrade:
+For first adoption of populated business tables into a fresh v0.5.0 layout:
 
-1. Stop every old Oversync instance and every writer to registered tables.
-2. Back up PostgreSQL.
-3. Start one compatible server and let `Bootstrap()` finish.
+1. Stop writers to registered tables and take a PostgreSQL backup.
+2. Prepare the matching application deployment evidence.
+3. Start one server and wait for `Bootstrap()` to finish.
 4. Check `/syncx/health` and inspect `/syncx/status`.
-5. Start the remaining compatible instances, then restore client traffic.
+5. Start the remaining compatible instances, then open client traffic.
 
-Do not run mixed versions during adoption or a managed-layout change. Oversync validates the
-managed layout and fails closed on definition drift, but an older binary can still violate a newer
-contract before the new process starts.
+For later generation and catalog changes, use the
+[schema-evolution reference](https://github.com/mobiletoly/go-oversync/tree/main/integration/schema_evolution)
+and the [retirement runbook](https://github.com/mobiletoly/go-oversync/blob/main/integration/schema_evolution/ROLLOUT.md).
+Settle outstanding outcomes before retiring a generation. Test database restore against an isolated
+instance before deployment.
 
 Direct edits to `sync.*`, privileged trigger bypass, and changes to managed triggers fall outside
 the runtime contract. `Bootstrap()` does not audit or repair business and managed row values after
@@ -468,7 +485,8 @@ reserved `sync` schema while any server or client uses the database.
   `shared_settings_fingerprint`.
 - [ ] Instances × connections per instance fits PostgreSQL `max_connections`, and `GOMEMLIMIT` is
   set ([Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/)).
-- [ ] Every client has a fixed accepted generation proof and sends both required proof headers.
+- [ ] Clients omit proof headers during discovery and send the admitted proof on later operations.
+- [ ] A smoke test covers push and acknowledgment, ambiguous-upload resolution, and retained outcome lookup.
 - [ ] Authentication supplies an exact trusted `user_id`; clients supply a valid
   `Oversync-Source-ID`.
 - [ ] TLS, proxy limits, health-endpoint access, and secrets match your infrastructure policy.

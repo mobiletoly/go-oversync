@@ -80,52 +80,32 @@ legitimate server mutation changed committed payloads.
 
 ## Push
 
-Push is all-or-nothing at bundle level.
+The client sends one compact dependency-safe bundle in a bounded `POST /sync/push`. The server
+commits the business change and its terminal outcome together, or retains a safe rejection
+after rolling back the business write. Each uploaded key must have exactly one final captured
+effect visible to the pushing generation. Incomplete coverage is a nonterminal HTTP 422 and
+rolls back the whole business transaction.
 
-- The client sends one compact logical dirty set in a bounded `POST /sync/push`; `source_id` is the
-  authenticated header identity and `source_bundle_id` is in the request envelope.
-- The server validates the whole request and either rejects it or commits one bundle.
-- Retrying the same accepted `(user_id, source_id, source_bundle_id)` returns the same committed
-  bundle.
-- The server stores accepted-push replay metadata in `sync.bundle_log`.
-- Every uploaded key must have exactly one final captured effect visible to the pushing generation.
-  Trigger normalization and extra effects are valid; incomplete coverage returns HTTP 422 and
-  rolls back business, audit/cascade, bundle, and source progress together.
-- `sync.source_state` keeps a monotonic committed source-bundle watermark so stale or duplicate
-  source bundle ids cannot be accepted again after older bundle history is pruned.
-- Source bundle ids must be contiguous per source; stale/pruned, out-of-order, changed, or retired
-  source failures require source recovery instead of generic retry.
+An uncertain upload resolves under its original binding. Terminal outcomes survive bundle pruning
+and consume the source operation sequence. After durable local disposition, the client sends ack.
+Rejection and cancellation can requeue intent for a successor. See
+[Durable upload outcomes]({{ site.baseurl }}/documentation/durable-upload-outcomes/).
 
 ### Structured conflict recovery
 
-The supported client/runtime contract includes structured `push_conflict` recovery.
+The default policy durably defers a conflict. The Go SDK records the rejection and acknowledges the
+terminal outcome. Inspect the retained `PendingConflict` and pass that decision identity to
+`ResolveConflict` or `RetryConflict`. A resolution can accept server state, keep local intent,
+or keep a merged full-row payload. Retry requeues surviving intent under a successor sequence.
 
-- The default resolver is durable defer: `PushPending()` and `Sync()` return
-  `ConflictNeedsResolutionError` without acknowledging the request or clearing its outbox.
-- Inspect the exact retained `PendingConflict`, then call `ResolveConflict(selected, result)` or
-  `RetryConflict(selected)`. Retry clears only the observation and preserves the frozen request.
-- `ServerWinsResolver` and `ClientWinsResolver` are explicit opt-in policies; only those policies
-  perform automatic conflict decisions.
-- Only presence-aware, schema-validated machine-readable `push_conflict` payloads participate in
-  resolver-based recovery. Missing `server_row` differs from explicit JSON null.
-- Valid resolver outcomes are:
-  - accept server state
-  - keep local intent
-  - keep merged full-row payload
-- A selected decision validates the retained revision, rewrites local/row state, requeues surviving
-  intent, and clears the outbox and conflict observation in one transaction. Failure or cancellation
-  rolls the complete decision back.
-- Opt-in automatic decisions preserve the logical `source_bundle_id`; the bounded retry budget is
-  `2` inside one `PushPending()`.
+Applications can opt in to `ServerWinsResolver`, `ClientWinsResolver`, or a custom resolver.
+The SDK calls an automatic resolver after acknowledgment. Decisions preserve newer local edits
+and apply in one transaction. The automatic conflict retry budget is two inside a `PushPending` call.
 
 ## Administrative reset and TRUNCATE protection
 
-Oversync does not provide an in-place migration, canonicalization fallback, hash-version
-negotiation, compatibility alias, or mixed-version mode for incompatible database state. To reset
-a deployment, stop all server and client processes, recreate PostgreSQL and every Oversqlite client
-database, deploy compatible versions together, and reinitialize from authoritative business data.
-This procedure discards bundle history, staged sessions, outboxes, checkpoints, hashes, retry
-state, and offline work.
+Use a fresh sync layout and client databases for v0.5.0. See the
+[v0.5.0 release notes]({{ site.baseurl }}/releases/v0.5.0/).
 
 `TRUNCATE` fails closed on registered tables and current partitions. A rejection uses SQLSTATE
 `55000` and preserves business rows, row state, bundles, hashes, source watermarks, pull, and
@@ -135,9 +115,8 @@ managed-table DDL remain unsupported administrative risks.
 The `sync` schema is reserved for Oversync, and startup validates its complete semantic layout
 instead of trusting marker rows alone. A healthy restart performs no managed DDL. Drift returns a
 typed `managed sync layout mismatch` and is never repaired silently. Keep all server instances
-stopped while restoring the exact object, then retry; if exact repair is unsafe, use the coordinated
-server/client recreation procedure above. Do not mix versions during diagnosis or repair. These
-startup checks do not change wire messages, checkpoints, snapshots, bundles, or client local state.
+stopped while restoring from a reviewed compatible backup or following a separately reviewed
+recovery procedure.
 
 ## Pull
 
@@ -148,8 +127,6 @@ Pull is frozen to a stable ceiling.
 - Clients advance `last_bundle_seq_seen` only after durable local bundle apply.
 - `retained_bundle_floor` is the highest discarded bundle. Pull from the floor is valid and returns
   only bundles strictly above it; lower checkpoints return `history_pruned`.
-- Accepted-push replay remains stricter: replay at or below the floor returns `history_pruned`
-  because the committed bundle itself is no longer available.
 - A pull checkpoint or positive target above current committed history returns
   `checkpoint_ahead`, never a clamped stable checkpoint.
 
@@ -164,11 +141,10 @@ Use it for:
 - rebuild after `history_pruned`
 - rebuild after `checkpoint_ahead`
 
-Clients durably set the rebuild gate before authoritative checkpoint recovery. Normal sync resumes
-that recovery automatically after restart. Pending local work is frozen and uploaded first when it
-can be reconciled safely; otherwise recovery returns an actionable blocker and preserves the app
-row, outbox, checkpoint, and rebuild gate. The checkpoint changes only in the final atomic snapshot
-apply. `Rebuild` remains an optional explicit control, not a required resume step.
+Automatic recovery can install a sealed snapshot after an eligible pull failure when the scope is
+clean. Resume uses the durable recovery state. The final apply transaction publishes the new
+checkpoint. Explicit `Rebuild` uses the same installer. See
+[Snapshot recovery]({{ site.baseurl }}/documentation/snapshot-recovery/).
 
 When rebuild requires source rotation:
 
@@ -186,19 +162,11 @@ The supported envelope is intentionally strict.
 - bootstrap fails for unsupported FK/key shapes
 - bootstrap fails when the managed or registered table set is not FK-closed
 - bootstrap fails when required FK deferrability is missing
-- pull/hydrate/recover fail while local dirty rows exist
-- malformed server responses are rejected without advancing durable checkpoints
-- invalid automatic conflict decisions atomically restore missing dirty intent, clear the invalid
-  observation, and retire the frozen `_sync_outbox_*` request without overwriting newer dirty edits;
-  an explicit invalid decision retains the pending conflict and frozen request
-- inspect `PendingConflict`, then use `ResolveConflict` with the inspected decision identity;
-  stale decisions fail without discarding intent
-- `RetryConflict` clears only the conflict observation; the next `PushPending` retries the exact
-  frozen request. It does not acknowledge, rebase, or discard local edits
-- application HTTP 422 responses create a durable `PendingPushRejection`; explicit retry preserves
-  the frozen request, while explicit discard abandons that whole request only after server staging
-  is definitively retired and preserves every newer dirty edit
-- other non-conflict commit/replay failures still use the existing fail-closed recovery path
+- clean snapshot recovery requires local intent, upload outcomes, and acknowledgment to be settled
+- malformed responses leave durable checkpoints intact
+- stale or invalid explicit decisions preserve the pending conflict and newer edits
+- retry requeues intent for a successor sequence. Discarding a terminal application rejection
+  preserves newer dirty rows. See the [Go SDK reference]({{ site.baseurl }}/documentation/client/).
 
 ## Supported envelope
 

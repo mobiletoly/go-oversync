@@ -1,5 +1,6 @@
 ---
-layout: documentation
+layout: doc
+parent: Architecture
 title: Clean recovery and safe snapshots
 permalink: /documentation/snapshot-recovery/
 ---
@@ -8,7 +9,7 @@ Ordinary `Sync` in Go and Kotlin defaults to `automatic_clean`. When historical
 pull state cannot be replayed safely, a completely clean client can install a
 sealed authoritative snapshot and continue with ordinary pull after its boundary.
 Explicit `Rebuild` uses the same guarded delta and clean-state checks. The
-[r0001 contract](../../specs/r0001-oversqlite-durable-recovery.md) governs both.
+[r0001 contract](https://github.com/mobiletoly/go-oversync/blob/main/specs/r0001-oversqlite-durable-recovery.md) governs both.
 C06/C07 platform, Swift, broader resource and final protocol qualification remain
 separate gates; local/JVM evidence does not qualify those runtimes.
 
@@ -62,18 +63,19 @@ result, retained rejection or acknowledgment obligation. A committed upload that
 cannot settle safely stays blocked. Rebuild cannot bypass it. A later local
 synchronized write survives and prevents snapshot installation.
 
-One state is exempt, because the strict gate would otherwise strand local edits
-forever. When source recovery is required (`source_retired`,
-`source_sequence_out_of_order` or `source_sequence_changed`) the explicit
-`Rebuild` keeps pending edits instead of refusing. It first lets the old source
-settle and acknowledge an unsettled upload in the ordinary way. Whatever the
-server refuses stays in place while the snapshot is staged under the
-replacement source. The server admits that replacement only when the old source
-holds no unacknowledged outcome, so the refused upload is known to be void. The
-final writer then requeues each pending edit on top of the installed snapshot,
-keeps the local value visible and releases the retired source's frozen request.
-The next ordinary push uploads those edits as the replacement source's first
-bundle.
+Explicit `Rebuild` can carry pending edits when source recovery is required
+(`source_retired`, `source_sequence_out_of_order` or `source_sequence_changed`).
+It first tries to settle and acknowledge an unsettled upload under the old source.
+A deferred row conflict blocks replacement until the application resolves it.
+A retained application rejection can carry forward after acknowledgment. If the
+server refuses the old source, the client keeps the frozen request until replacement
+admission. The server refuses replacement with `push_outcome_pending` while an
+unacknowledged outcome exists.
+
+After successful admission, the client stages the snapshot under the replacement source.
+The final writer requeues eligible pending edits against the snapshot, keeps local
+values visible, and releases the retired source's frozen request. The next push uses
+the replacement source's first sequence.
 
 A pending edit never overwrites another device's change. An edit made from the
 row state the snapshot still holds is rebased onto the snapshot. An edit of a
@@ -190,7 +192,7 @@ nullable unique values and explicit Boolean/numeric/date/JSON wire mappings. The
 runtime fixtures live in these implementation repositories and never open the
 reference application checkout. DT01–DT06 local and actual HTTP evidence, failed
 attempts, review corrections, native counts and cleanup are recorded in the
-[C04 ledger](../../.artifacts/durable-recovery-snapshot-20261023/ledger.md).
+C04 ledger (`.artifacts/durable-recovery-snapshot-20261023/ledger.md` in the local qualification workspace).
 Compilation or structural inspection does not qualify platform runtime behavior.
 
 ## Complexity review
@@ -224,7 +226,7 @@ admitted before first business DML. No cleanup copy is free before release.
 
 Public automatic, disabled, dirty/pending, mode/schema/TEMP/comparison/child races,
 large-session dispatch resume, physical process death, file/WAL cleanup and DT07
-are recorded in the [C05 ledger](../../.artifacts/durable-recovery-automatic-20261023/ledger.md).
+are recorded in the C05 ledger (`.artifacts/durable-recovery-automatic-20261023/ledger.md` in the local qualification workspace).
 Its independent review dispositions and frozen handoff distinguish fresh runtime
 proof, reused C04 evidence, failures and remaining qualification gates. Historical
 source5862 SQL/accounting comparisons remain immutable historical input; current

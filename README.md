@@ -57,9 +57,10 @@ A push succeeds only when every uploaded key has a final captured effect visible
 generation. Trigger normalization and additional captured effects are allowed, but suppressed or
 uncovered uploaded keys reject the whole transaction with HTTP 422
 `push_effect_coverage_incomplete`. The fixed-generation Go client verifies projected counts,
-bytes, hashes, and Q39, preserves newer local edits while applying authoritative effects, and can
-use a guarded same-generation snapshot after a confirmed result has been pruned. Generation
-switching and local schema migration remain later work.
+bytes and hashes, preserves newer local edits while applying authoritative effects, and
+acknowledges each outcome under its original generation proof. Upload outcomes survive history
+pruning until acknowledgment. `Opening` supports same-proof local migrations and coordinated
+generation changes.
 
 ## Client Options
 
@@ -91,16 +92,21 @@ rebuild do not depend on it.
 
 ## Quick Start
 
+Use Go 1.25.0 or later and PostgreSQL 17. Development checks use Go 1.25.12.
+See the [v0.5.0 release notes](docs/releases/v0.5.0.md) for compatibility.
+
 Install the module:
 
 ```bash
 go get github.com/mobiletoly/go-oversync
 ```
 
-Run the fast checks:
+Run the package checks with Docker and the paired SQLiteNow contract corpus:
 
 ```bash
-go test ./oversync ./oversqlite
+GOTOOLCHAIN=go1.25.12 \
+  OVERSQLITE_CONTRACTS_ROOT="$PWD/../sqlitenow-kmp/oversqlite-contracts" \
+  go test ./oversync ./oversqlite
 ```
 
 Start the maintained sample server:
@@ -141,8 +147,10 @@ schemaGenerations := []oversync.SchemaGeneration{{
     },
 }}
 cfg := &oversync.ServiceConfig{
-    SchemaGenerations: schemaGenerations,
-    AppName:          "my-sync-app",
+    Readiness:                      yourApplicationReadiness,
+    SchemaGenerations:              schemaGenerations,
+    RegisteredTableCatalogRevision: 1,
+    AppName:                        "my-sync-app",
     RegisteredTables: []oversync.RegisteredTable{
         {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
         {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
@@ -180,6 +188,9 @@ mux := http.NewServeMux()
 // Register raw sync handlers. The outer dispatcher below owns admission.
 mux.HandleFunc("POST /sync/connect", handlers.HandleConnect)
 mux.HandleFunc("POST /sync/push", handlers.HandlePush)
+mux.HandleFunc("POST /sync/push-outcomes/resolve", handlers.HandlePushOutcomeResolve)
+mux.HandleFunc("POST /sync/push-outcomes/retained", handlers.HandlePushOutcomeRetained)
+mux.HandleFunc("POST /sync/push-outcomes/ack", handlers.HandlePushOutcomeAck)
 mux.HandleFunc("GET /sync/pull", handlers.HandlePull)
 mux.HandleFunc("POST /sync/snapshot-sessions", handlers.HandleCreateSnapshotSession)
 mux.HandleFunc("GET /sync/snapshot-sessions/{snapshot_id}", handlers.HandleGetSnapshotChunk)
@@ -217,15 +228,20 @@ syncHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 // Use syncHandler as the root http.Server Handler.
 ```
 
+Supply `yourApplicationReadiness` as an application-owned `*oversync.ReadinessConfig`.
+Prepare the matching deployment evidence before bootstrap. See the
+[readiness setup](docs/getting-started.md#step-3-create-the-server) and the
+[maintained sample server](examples/samplesync_server/server/setup.go).
+
 `yourAuthMiddleware` must authenticate the request and expose trusted `user_id` in request context.
 `oversync.ActorMiddleware(...)` reads `Oversync-Source-ID` from the client request and combines it
 with that trusted user identity. The runtime derives user sync scope id from `Actor.UserID`.
 
 Clients select a generation ID and discover its server-owned descriptor through
-`GET /sync/generations/{generation_id}`. This authenticated request includes `Oversync-Source-ID`
-and omits both generation proof headers. After validating discovery, the SDK sends the exact
-`Oversync-Schema-Generation-ID` and `Oversync-Schema-Generation-Fingerprint` on every subsequent
-`/sync` request. Applications do not provision a fingerprint or local codecs.
+`GET /sync/generations/{generation_id}`. Send `Oversync-Protocol-Version: v1` and
+`Oversync-Source-ID` on authenticated sync requests. Omit both generation proof headers
+during discovery. After validation, the SDK sends the exact `Oversync-Schema-Generation-ID`
+and `Oversync-Schema-Generation-Fingerprint` on every subsequent `/sync` request. Upload acknowledgment carries the original source and proof.
 Discovery bypasses only operational readiness. The root dispatcher runs before `http.ServeMux`, so
 malformed discovery paths remain authenticated and receive the protocol HTTP 400 response without
 a cleaning redirect. Non-GET discovery and all other `/sync/` requests remain behind operational
@@ -312,8 +328,8 @@ Both clients target the same go-oversync server protocol.
 The current contract is bundle-based:
 
 - PostgreSQL business tables are authoritative.
-- clients push one logical dirty set at a time through `POST /sync/push`
-- accepted pushes apply the authoritative response locally, atomically
+- clients freeze one bounded bundle of pending edits at a time for `POST /sync/push`
+- clients settle the terminal outcome locally and acknowledge it under the original binding
 - clients pull complete committed bundles only
 - fresh installs and prune recovery rebuild from frozen snapshot sessions
 
@@ -345,13 +361,12 @@ The SQLite client is likewise fail-closed:
 
 See `docs/getting-started.md` and `docs/documentation/server.md` for the full table requirements.
 
-`Opening` supports directed column-surface generation changes whose synchronized table,
-key, and foreign-key sets stay unchanged. Separate devices may remain on different supported
-generations with independent source identities. Deployments outside this envelope need a reviewed
-operator procedure or a compatible database backup.
+`Opening` supports planned changes to the visible column and table sets, including qualifying
+nullable additive foreign keys. Shared sync keys and shared foreign-key semantics stay stable.
+Separate devices can sync against different supported generations with independent source
+identities. See [Go SQLite client upgrades](docs/client-upgrades.md).
 
-Nullable identity declarations use a data-preserving operator migration rather than the destructive
-reset above. Stop all writers and mixed-version instances, resolve existing NULL owner/key values
+To correct nullable identity declarations, stop all writers and server instances, resolve existing NULL owner/key values
 according to application policy, add explicit `NOT NULL` to every reported PostgreSQL
 root/descendant or SQLite visible key, then retry bootstrap/initialization. Corrected binaries do not
 change the wire, checkpoint, or snapshot contract, but older binaries do not enforce this invariant.
@@ -364,16 +379,15 @@ runtime reset endpoint or bundle-context escape hatch.
 Supported populated registered tables are adopted only while creating a fresh managed layout,
 without rewriting their business rows. Bootstrap locks registered writes and commits trigger
 installation plus one replayable baseline bundle per populated scope atomically. Runtime operations
-remain unavailable until bootstrap succeeds. Existing populated deployments require a coordinated
-stop, backup, upgraded bootstrap, and readiness check for that one-time adoption.
+remain unavailable until bootstrap succeeds. For a first deployment with populated business
+tables, stop writers, take a backup, then bootstrap and verify readiness before opening traffic.
 
 The PostgreSQL `sync` namespace is reserved for Oversync. After the fresh transaction has committed,
 later `Bootstrap()` calls use a trusted-database attachment path: they revalidate registered-table
-declarations, the marker/catalog, and the complete `server_postgres_sync_v1` semantic definition,
-then publish readiness without reading business rows or managed operational state. Attachment takes
-no explicit data locks and performs no DML, DDL, adoption, canonicalization, hashing, cleanup, or
-repair. Missing, extra, disabled, invalid, or altered managed definitions return a typed
-`UnsupportedSchemaError` with expected/actual fingerprints and bounded field differences.
+declarations, the marker/catalog, the `server_postgres_sync_catalog_v1` definition, and the push
+outcome store. Attachment checks the stored ceiling and outstanding outcome generation proofs
+without scanning business rows. Definition drift returns a typed `UnsupportedSchemaError`
+with expected and actual fingerprints and bounded field differences.
 
 This fast path trusts PostgreSQL's committed durable data. It does not audit or repair business or
 managed row values after privileged trigger bypass or direct managed-state edits. Such intervention
@@ -403,6 +417,8 @@ HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable sta
 - server-originated writes: `docs/documentation/server-originated-writes.md`
 - client reference: `docs/documentation/client.md`
 - HTTP API reference: `docs/documentation/api.md`
+- [Durable upload outcomes](docs/documentation/durable-upload-outcomes.md)
+- [Snapshot recovery](docs/documentation/snapshot-recovery.md)
 
 ## Examples
 

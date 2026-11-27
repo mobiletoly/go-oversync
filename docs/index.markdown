@@ -13,8 +13,8 @@ PostgreSQL servers.
 The verified contract in this repository is:
 
 - PostgreSQL business tables are authoritative
-- clients push one logical dirty set through one bounded `POST /sync/push` request
-- clients replay the authoritative committed bundle returned by the server
+- clients send bounded uploads through `POST /sync/push`
+- clients settle terminal upload outcomes and acknowledge them under the original binding
 - clients pull complete committed bundles only
 - retained-history gaps, fresh installs, and source recovery rebuild through frozen snapshot
   sessions
@@ -44,6 +44,7 @@ The runtime is intentionally fail-closed.
 
 ## Start Here
 
+- Read the [v0.5.0 release notes]({{ site.baseurl }}/releases/v0.5.0/) before deploying.
 - Read [Core Concepts](documentation/core-concepts/) for the vocabulary and end-to-end model.
 - Use [Getting Started](getting-started.html) to stand up a server and client.
 - Run the maintained server example in `examples/samplesync_server/`.

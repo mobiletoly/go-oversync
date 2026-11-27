@@ -23,16 +23,14 @@ The current architecture has four main pieces:
 1. Your server registers the PostgreSQL tables that participate in sync.
 2. `Bootstrap()` validates the server schema and prepares the sync metadata/runtime topology. A
    fresh layout atomically adopts populated registered tables; a committed existing layout attaches
-   after declaration and managed-definition validation without scanning business or operational
-   sync rows.
-3. The SQLite client runs `Open()` on launch, then `Attach(userID)` after sign-in.
+   after declaration, managed-definition, and push outcome store checks.
+3. The Go client opens SQLite through `NewOpening` and `Advance`, then calls `Attach` after sign-in.
 4. The SQLite client tracks local writes in `_sync_dirty_rows` with triggers.
    After `Detach()`, those triggers stay active so offline anonymous writes continue to enqueue
    local dirty state immediately.
-5. `PushPending()` freezes those writes into `_sync_outbox_*`, sends exactly one bounded
-   `/sync/push` request, then atomically applies the authoritative response bundle. Process restart
-   keeps that singleton outbox durable and replays the same tuple instead of recollecting a new
-   local bundle.
+5. `PushPending()` freezes one bounded upload, settles its terminal outcome, and acknowledges
+   it under the original binding. After restart the outbox and upload journal let the client resume
+   resolution, local disposition, or acknowledgment.
 6. `PullToStable()` reads complete committed bundles from `/sync/pull` and advances the local
    checkpoint only after durable local apply.
 7. `Rebuild(ctx)` rebuilds managed tables from `/sync/snapshot-sessions` when a client is new or
@@ -76,6 +74,7 @@ Important runtime tables include:
 - `sync.row_state`
 - `sync.bundle_log`
 - `sync.bundle_rows`
+- `sync.push_protocol_store`, `sync.push_source_progress`, and `sync.push_outcomes`
 - `sync.scope_write_receipts`
 - `sync.server_source_reservations`
 - `sync.snapshot_sessions`
@@ -86,17 +85,17 @@ for registered tables, `key_bytes` for row keys, and `op_code` for operations. V
 fields such as `schema`, `table`, `key`, `op`, `row_version`, and payload JSON are reconstructed
 at the HTTP boundary.
 
-`sync.bundle_log` is the durable committed-bundle metadata and accepted-push replay source. Bundle
-history is retained only above each user's `retained_bundle_floor`; below that floor, clients
-recover through snapshot rebuild rather than best-effort historical replay.
+`sync.bundle_log` holds committed bundle metadata for pull above each user's retained floor.
+The server stores terminal upload outcomes separately until acknowledgment. Eligible clean clients
+below the retained pull floor recover from a sealed snapshot.
 
 ## Bootstrap Trust Boundary
 
 Fresh layout creation and populated-table adoption are one fail-closed PostgreSQL transaction with
 exact post-persistence validation. After that transaction commits, restart attachment trusts
-PostgreSQL's durable row state and validates only registered declarations plus the exact managed
-definition. It does not scan, rewrite, backfill, hash, reconcile, or repair business or operational
-sync rows.
+PostgreSQL's durable row state and validates registered declarations, the exact managed
+definition, and retained upload outcome authority. It reads the stored outcome ceiling and
+outstanding generation proofs without scanning business rows.
 
 Registered-table guards still reject ordinary direct DML without a bundle context and reject every
 `TRUNCATE`. Privileged trigger bypass and direct managed-row edits are outside the supported trust
@@ -117,18 +116,17 @@ and examples.
 ### [Core Concepts →]({{ site.baseurl }}/documentation/core-concepts/)
 
 Read the core concepts page for the exact vocabulary used by the current contract.
-# Schema-generation sessions
+## Schema-generation bindings
 
 The service is constructed with one or two complete `SchemaGenerations` declarations and joins
 each compiled immutable contract to the registered-table catalog and live PostgreSQL metadata at
 Bootstrap. There is no `MaxSupportedSchemaVersion` fallback. Fresh generation databases include
-`sync.source_generation_bindings`, generation-bound push and snapshot sessions, and
-`sync.bundle_log.planned_row_count`; pre-generation managed layouts fail closed instead of being
-automatically migrated.
+`sync.source_generation_bindings`, generation-bound upload outcomes and snapshot sessions, and
+`sync.bundle_log.planned_row_count`. v0.5.0 requires a fresh layout.
 
 Connect permanently binds a client `(user, source)` to an exact generation ID/fingerprint pair.
 Admission uses the indexed per-user source limit; retained active, reserved, and retired bindings
-remain protocol witnesses. Push and snapshot sessions pin that pair. The Q39 client request hash
+remain protocol witnesses. Upload outcomes and snapshot sessions pin that pair. The Q39 client request hash
 includes the generation proof and the exact ordered physical request rows. Its durable
 `planned_row_count` is distinct from `bundle_log.row_count`, which describes canonical server
 effects after transitions and cascades. In other words, request identity covers supplied rows while

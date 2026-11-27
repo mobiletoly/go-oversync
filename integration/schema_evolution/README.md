@@ -134,21 +134,22 @@ application must measure. Worst-case history reservations precede descriptor
 insertion; uncertain outcomes retain them, while completed metrics replace them
 idempotently with canonical byte counts. Restart retains the absolute deadline.
 
-The serving ServiceConfig.Readiness.AdmissionPool is mandatory for this adapter.
-Create a separate bounded pgxpool with the same database, restricted credentials,
-primary and fallback routes, TLS identity, protocol bounds and RuntimeParams. Use
-pgx's default connection transport; notice, error and tracing callbacks remain
-permitted, but connection/session/acquisition hooks do not. Both pools are caller-owned:
-close the service before closing either pool. Include both pools in deployment
-connection capacity. Initial bootstrap and catalog updates use provisioning credentials;
+This adapter requires a proven pair from `oversync.NewReadinessPoolPair(ctx, config, admissionMaxConns)`.
+Use the restricted serving credentials and declarative connection settings in the shared pgx
+configuration. Set `ServiceConfig.Readiness.PoolPair` to the pair and pass its `ExecutionPool()`
+to `NewRuntimeService`. Use pgx's default connection transport. The runtime permits notice,
+error, and tracing callbacks and rejects connection, session, and acquisition hooks. Budget both
+pools and close the service before closing the pair.
+
+Initial bootstrap and catalog updates use provisioning credentials;
 serving Bootstrap attaches to an existing validated layout. GrantRuntime revokes
 TRIGGER on the business table and independently rejects protected schema/table/function
 ownership, administrative attributes and reachable provisioning roles. Membership
 checks conservatively include transitive roles even when INHERIT/SET options currently
 deny their use. Remove those memberships before serving. Grant/revoke validation is
 atomic. PostgreSQL ownership cannot be neutralized through ordinary privilege revocation:
-https://www.postgresql.org/docs/16/ddl-priv.html and
-https://www.postgresql.org/docs/16/role-membership.html.
+https://www.postgresql.org/docs/17/ddl-priv.html and
+https://www.postgresql.org/docs/17/role-membership.html.
 
 Watches release database admission after registration and terminate when drain begins.
 Each service permits one running listener and owns one additional connection outside
@@ -176,8 +177,8 @@ inheritance and SET ROLE paths. Scope inventory permits INSERT and UPDATE(delete
 but not updates to its identity columns, DELETE, TRUNCATE, or trigger replacement.
 An unsafe role is rejected atomically; provisioning must remove unsafe grants before
 attachment. PostgreSQL's effective privilege functions include PUBLIC grants.
-See [parameter privileges](https://www.postgresql.org/docs/16/runtime-config-client.html#GUC-SESSION-REPLICATION-ROLE)
-and [column privilege inspection](https://www.postgresql.org/docs/16/functions-info.html#FUNCTIONS-INFO-ACCESS-TABLE).
+See [parameter privileges](https://www.postgresql.org/docs/17/runtime-config-client.html#GUC-SESSION-REPLICATION-ROLE)
+and [column privilege inspection](https://www.postgresql.org/docs/17/functions-info.html#FUNCTIONS-INFO-ACCESS-TABLE).
 
 Worker evidence mutations check the persisted total limit before commit, including
 conversion diagnostics, outcomes, metrics, and job metadata. Reservations remain

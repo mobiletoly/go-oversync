@@ -15,6 +15,9 @@ Endpoints
 - `POST /dummy-signin`
 - `POST /sync/connect`
 - `POST /sync/push`
+- `POST /sync/push-outcomes/resolve`
+- `POST /sync/push-outcomes/retained`
+- `POST /sync/push-outcomes/ack`
 - `GET /sync/pull`
 - `GET /sync/watch`
 - `POST /sync/snapshot-sessions`
@@ -69,14 +72,13 @@ Client settings
 
 - Base URL: `http://localhost:8080` (desktop/iOS) or `http://10.0.2.2:8080` (Android emulator)
 - Schema: `business`
-- Send `Oversync-Source-ID: <current-source-id>` on authenticated `/sync/*` requests
-- Send the fixed `Oversync-Schema-Generation-ID` and
-  `Oversync-Schema-Generation-Fingerprint` on every authenticated `/sync/*` request
-- The server declares one complete generation at `/sync/generations/{generation_id}`. Opening clients
-  cache that immutable contract; steady-state sync does not perform a discovery preflight.
+- Send `Oversync-Protocol-Version: v1` and `Oversync-Source-ID` on authenticated `/sync/*` requests.
+- Omit proof headers when reading the descriptor at `/sync/generations/{generation_id}`.
+- Send the admitted `Oversync-Schema-Generation-ID` and `Oversync-Schema-Generation-Fingerprint`
+  on subsequent requests. Acknowledge uploads under the original binding.
 - `/sync/watch` is available as an optional wake-up stream; clients still pull data through
   `/sync/pull`
-- Call `POST /sync/connect` after local `Open()` to resolve
+- Call `POST /sync/connect` after the local database is ready to resolve
   `remote_authoritative`, `initialize_local`, `initialize_empty`, or `retry_later`
 - Expect lifecycle-related sync failures:
   - `scope_uninitialized`

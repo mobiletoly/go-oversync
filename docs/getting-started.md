@@ -8,10 +8,13 @@ title: Getting Started
 This guide reflects the current contract implemented in this repository:
 
 - PostgreSQL business tables are authoritative
-- clients push one logical dirty set through one bounded `POST /sync/push` request
-- clients apply the authoritative response bundle atomically
+- clients send bounded bundles through `POST /sync/push`
+- clients settle each terminal outcome locally and acknowledge it under the original binding
 - clients pull complete committed bundles only
-- fresh installs and prune recovery rebuild through snapshot sessions
+- fresh installs and clean recovery install a sealed snapshot
+
+Start with the supported v0.5.0 formats. See the
+[release notes]({{ site.baseurl }}/releases/v0.5.0/) for compatibility.
 
 ## Supported Envelope
 
@@ -71,8 +74,8 @@ older binaries do not enforce it. HTTP/wire, checkpoint, pull, and snapshot sema
 For a fresh managed layout, Bootstrap locks registered tables and atomically adopts existing
 business rows before readiness. Once that transaction has committed, ordinary restarts use a
 trusted-database attachment path. Attachment revalidates registered declarations and exact managed
-definitions but reads no business rows or managed operational state, takes no explicit data locks,
-and performs no DML, DDL, adoption, hashing, or repair.
+definitions, the stored outcome ceiling, and the proofs for outstanding outcomes without
+scanning business rows.
 
 Normal direct registered-table `INSERT`, `UPDATE`, and `DELETE` without bundle context remain
 rejected, as does every registered-table `TRUNCATE`. Privileged guard bypass and direct edits to
@@ -295,6 +298,9 @@ func main() {
     // ServeMux cannot clean malformed discovery paths before authentication.
     mux.HandleFunc("POST /sync/connect", handlers.HandleConnect)
     mux.HandleFunc("POST /sync/push", handlers.HandlePush)
+    mux.HandleFunc("POST /sync/push-outcomes/resolve", handlers.HandlePushOutcomeResolve)
+    mux.HandleFunc("POST /sync/push-outcomes/retained", handlers.HandlePushOutcomeRetained)
+    mux.HandleFunc("POST /sync/push-outcomes/ack", handlers.HandlePushOutcomeAck)
     mux.HandleFunc("GET /sync/pull", handlers.HandlePull)
     mux.HandleFunc("GET /sync/watch", handlers.HandleWatch)
     mux.HandleFunc("POST /sync/snapshot-sessions", handlers.HandleCreateSnapshotSession)
@@ -340,10 +346,10 @@ func main() {
 the deployed migration manifest, registry and generation enablement. Its adapter reads durable
 application evidence; Bootstrap rejects missing or inconsistent evidence. Prepare that evidence
 through your deployment controller before starting the service. The repository’s
-[shared baseline readiness helper](../internal/baselinereadiness/baseline.go) shows the baseline
+[shared baseline readiness helper](https://github.com/mobiletoly/go-oversync/blob/main/internal/baselinereadiness/baseline.go) shows the baseline
 contract. Static applications provide a canonical semantic manifest, so only an intentional manifest
 revision changes their durable deployment identity. The repository's
-[schema-evolution harness](../integration/schema_evolution/README.md) supplies the maintenance,
+[schema-evolution harness](https://github.com/mobiletoly/go-oversync/tree/main/integration/schema_evolution) supplies the maintenance,
 SQL conversion, census and certificate implementation for migrations.
 
 `yourAuthMiddleware` must authenticate the request and expose trusted `user_id` in request context.
@@ -360,8 +366,9 @@ identity into `oversync.Actor{UserID, SourceID}`. The server derives `_sync_scop
 `Actor.UserID`, so clients must not send `_sync_scope_id` in push payloads.
 
 `schemaGenerations` is required. The client selects one generation ID and discovers its descriptor
-from the server. Discovery includes authentication and `Oversync-Source-ID`, with neither generation
-proof header. The SDK verifies and retains the descriptor, then includes both
+from the server. Discovery includes authentication, `Oversync-Source-ID`, and
+`Oversync-Protocol-Version: v1`. Omit both proof headers during discovery. The SDK verifies and
+retains the descriptor, then includes both
 `Oversync-Schema-Generation-ID` and `Oversync-Schema-Generation-Fingerprint` on all subsequent
 `/sync` operations. `/syncx/health` and `/syncx/status` remain exempt.
 
@@ -525,23 +532,21 @@ log.Printf("rebuild outcome: %s", rebuildReport.Outcome)
 Behavior to expect:
 
 - `Attach()` resolves first-account lifecycle through `POST /sync/connect`.
-- `Open()`, `PushPending()`, `PullToStable()`, `Sync()`, `Detach()`, and `Rebuild()` return
-  structured results in addition to `error`.
-- `PushPending()` freezes one outbound snapshot, sends it once to `/sync/push`, and applies the
-  authoritative response locally.
-- after an ambiguous push reply, `PushPending()` replays the exact same complete request with its
-  frozen source bundle ID and canonical request hash; an already-committed replay converges without
-  recollecting or changing rows.
+- `Opening.Advance()`, `PushPending()`, `PullToStable()`, `Sync()`, `Detach()`, and `Rebuild()`
+  return structured results alongside `error`.
+- `PushPending()` freezes one bounded upload, settles its terminal result on SQLite, then
+  acknowledges it under the original source and generation proof.
+- After an ambiguous reply, the client resolves the frozen upload. The server retains its
+  result independently of pull history. The client can also recover an outcome after losing
+  the local freeze. See [Durable upload outcomes]({{ site.baseurl }}/documentation/durable-upload-outcomes/).
 - `Attach()` may return `retry_later` as a normal retriable lifecycle outcome before the client
   becomes attached.
 - `PullToStable()` drains complete bundles until the frozen `stable_bundle_seq` is reached.
-- `PullToStable()` rebuilds automatically through snapshot sessions if the server returns
-  `history_pruned`.
-- an ambiguous push replay that falls below the retained floor rebuilds from a snapshot while
-  preserving the frozen source tuple until recovery establishes its outcome.
-- `Rebuild(ctx)` rebuilds through chunked snapshot sessions.
-- if stale/pruned, out-of-order, changed, or retired source recovery is active, `Rebuild(ctx)`
-  internally chooses the rebuild-plus-rotate path and preserves frozen local intent.
+- `Sync()` and `PullToStable()` can recover from eligible pull failures by installing a sealed
+  snapshot when the client is clean and automatic recovery is enabled.
+- `Rebuild(ctx)` requests an explicit snapshot rebuild. In source recovery it can settle an
+  outstanding upload under the old source, rotate the source, and carry remaining intent
+  forward. See [Snapshot recovery]({{ site.baseurl }}/documentation/snapshot-recovery/).
 - `Detach()` clears synced local cache/state after a successful attached detach, restores dirty-row
   capture before returning, and reports blocked detach as a normal `DetachResult`.
 - local writes made after `Detach()` are captured immediately as anonymous pending rows and can be synced after a later `Attach()`.
@@ -552,16 +557,16 @@ Each data-plane path uses the client's fixed generation proof. The server retain
 effect history and projects it to that proof for push replay, pull, conflicts, and snapshots.
 Projected empty pull envelopes still advance the checkpoint. Trigger-normalized results are
 accepted, while a push whose uploaded key is suppressed or otherwise uncovered fails atomically
-with `push_effect_coverage_incomplete`. This setup does not switch generations or perform local DDL;
-those remain upgrade responsibilities.
+with `push_effect_coverage_incomplete`. The fresh opening creates the local schema.
+For later schema changes, use [Go SQLite client upgrades]({{ site.baseurl }}/client-upgrades/).
 
 ## Important Client Rules
 
 - every managed table must declare its sync key explicitly
 - managed tables must be FK-closed
-- `PullToStable()` and `Rebuild(ctx)` fail closed while `_sync_outbox_*` exists
-- `Sync()` automatically resumes checkpoint recovery while
-  `_sync_attachment_state.rebuild_required = 1`; source-identity recovery remains explicit
+- Finish pending upload settlement and acknowledgment before clean recovery
+- Use explicit `Rebuild(ctx)` for source-identity recovery. The SDK preserves pending intent
+  through that path and refuses replacement while an outcome remains unacknowledged
 - the durable read checkpoint is `_sync_attachment_state.last_bundle_seq_seen`
 - the next outgoing client bundle id is `_sync_source_state.next_source_bundle_id`
 - sync-visible absolute timestamps should use RFC3339 or RFC3339Nano text with an explicit zone, for example `2026-03-24T18:02:00Z`
@@ -572,7 +577,11 @@ The server exposes:
 
 - `POST /sync/connect`
 - `POST /sync/push`
+- `POST /sync/push-outcomes/resolve`
+- `POST /sync/push-outcomes/retained`
+- `POST /sync/push-outcomes/ack`
 - `GET /sync/pull`
+- `GET /sync/watch` (optional)
 - `POST /sync/snapshot-sessions`
 - `GET /sync/snapshot-sessions/{snapshot_id}`
 - `DELETE /sync/snapshot-sessions/{snapshot_id}`
@@ -580,7 +589,8 @@ The server exposes:
 - `GET /syncx/health`
 - `GET /syncx/status`
 
-All authenticated `/sync/*` requests must send `Oversync-Source-ID: <current-source-id>`.
+See the [HTTP API]({{ site.baseurl }}/documentation/api/#authentication-and-headers) for the
+required headers, including the discovery and acknowledgment rules.
 
 ## Echo Integration
 
