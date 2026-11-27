@@ -25,8 +25,8 @@ def events(packages, terminal='pass'):
 
 class PartitionTests(unittest.TestCase):
     def test_ownership(self):
-        self.assertEqual('package', rp.lane_of(M + '/oversync'))
-        self.assertEqual('package', rp.lane_of(M + '/oversqlite'))
+        self.assertEqual('package-oversync', rp.lane_of(M + '/oversync'))
+        self.assertEqual('package-oversqlite', rp.lane_of(M + '/oversqlite'))
         self.assertEqual('root-evolution', rp.lane_of(M + '/integration/schema_evolution'))
         self.assertEqual('root-evolution', rp.lane_of(M + '/integration/schema_evolution/cmd/rollout'))
         self.assertEqual('root-rest', rp.lane_of(M + '/integration/schema_evolution_authority'))
@@ -50,7 +50,8 @@ class PartitionTests(unittest.TestCase):
             'duplicate across lanes': lambda l: l['root-rest'].append(M + '/oversync'),
             'wrong owner': lambda l: l['root-rest'].append(M + '/integration/schema_evolution/x'),
             'empty lane': lambda l: l.__setitem__('root-evolution', []),
-            'package lane not exact': lambda l: l['package'].remove(M + '/oversqlite'),
+            'L2 lanes swapped': lambda l: l.update({'package-oversync': [M + '/oversqlite'], 'package-oversqlite': [M + '/oversync']}),
+            'L2 lane widened': lambda l: (l['root-rest'].remove(M + '/oversqlite_e2e'), l['package-oversqlite'].append(M + '/oversqlite_e2e')),
             'mobile outside module': lambda l: l['mobile'].append(M + '/oversync_x'),
         }
         for name, mutate in mutations.items():
@@ -96,7 +97,7 @@ class ArtifactTests(unittest.TestCase):
                 fixture['packages'] = dict(complete=True)
                 (self.dir / ('mixed-schema-' + lane)).mkdir(parents=True, exist_ok=True)
                 (self.dir / ('mixed-schema-' + lane) / 'lane.log').write_text('\n'.join(events(self.lanes[lane])) + '\n')
-            if lane == 'package':
+            if lane == rp.SUPPORTING_TEST_LANE:
                 fixture['supporting_tests'] = [dict(test='TestSupport', passed=True)]
             self.write('mixed-schema-' + lane, 'fixture.json', fixture)
 
@@ -161,7 +162,7 @@ class ArtifactTests(unittest.TestCase):
         log.write_text('\n'.join(log.read_text().splitlines()[:-1]))
         self.assertIncomplete('truncated lane log')
         self.reset()
-        self.edit('mixed-schema-package', 'fixture.json', lambda f: f['supporting_tests'][0].__setitem__('passed', False))
+        self.edit('mixed-schema-package-oversync', 'fixture.json', lambda f: f['supporting_tests'][0].__setitem__('passed', False))
         self.assertIncomplete('supporting test')
 
     def test_coexistence_and_partition_failures(self):
@@ -182,6 +183,11 @@ class WorkflowTests(unittest.TestCase):
                      'workflow_dispatch:', "cache: ${{ github.event_name != 'workflow_dispatch' || inputs.go-cache }}"):
             self.assertIn(text, workflow)
         self.assertNotIn("'full'", workflow)
+        self.assertNotIn('lane: [package,', workflow)
+
+    def test_local_package_aggregate_covers_both_l2_lanes(self):
+        lanes = rp.assign(ROOT, MOBILE)
+        self.assertEqual(sorted(lanes['package-oversync'] + lanes['package-oversqlite']), sorted(rp.L2_LANES))
 
 
 if __name__ == '__main__':

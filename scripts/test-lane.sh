@@ -33,7 +33,7 @@ fast)
 		-run 'TestRegisteredTableCatalog|TestBootstrap_.*(Catalog|Layout|Adoption)|TestManagedLayout' \
 		-count=1 -timeout 3m30s "$@"
 	;;
-package | root-evolution | root-rest)
+package | package-oversync | package-oversqlite | root-evolution | root-rest)
 	packages=$(lane_packages "$lane")
 	# shellcheck disable=SC2086 # import paths contain no whitespace
 	exec "$timeout_runner" 240 -- env GOTOOLCHAIN=go1.25.12 "$test_runner" $packages -count=1 -timeout 3m30s "$@"
@@ -42,11 +42,11 @@ precompile)
 	# Build and link test binaries without executing them or their TestMain.
 	# Only the lane name is accepted: no selectors, overlays or test environment.
 	if [ "$#" -ne 1 ]; then
-		printf '%s\n' 'usage: scripts/test-lane.sh precompile {package|root-evolution|root-rest|full|mobile}' >&2
+		printf '%s\n' 'usage: scripts/test-lane.sh precompile {package|package-oversync|package-oversqlite|root-evolution|root-rest|full|mobile}' >&2
 		exit 2
 	fi
 	case "$1" in
-	package | root-evolution | root-rest | full)
+	package | package-oversync | package-oversqlite | root-evolution | root-rest | full)
 		packages=$(lane_packages "$1")
 		# shellcheck disable=SC2086 # import paths contain no whitespace
 		exec "$timeout_runner" 230 -- env GOTOOLCHAIN=go1.25.12 go test -count=1 -exec true $packages
@@ -73,15 +73,17 @@ mobile)
 	;;
 *)
 	cat >&2 <<'EOF'
-usage: scripts/test-lane.sh {fast|package|root-evolution|root-rest|full|audit|mobile|coexistence} [extra go test arguments...]
-       scripts/test-lane.sh precompile {package|root-evolution|root-rest|full|mobile}
+usage: scripts/test-lane.sh {fast|package|package-oversync|package-oversqlite|root-evolution|root-rest|full|audit|mobile|coexistence} [extra go test arguments...]
+       scripts/test-lane.sh precompile {package|package-oversync|package-oversqlite|root-evolution|root-rest|full|mobile}
 
   coexistence  complete manifest-checked mixed-schema matrix (600s)
   fast     focused schema/catalog/layout lane
-  package  oversync and oversqlite package lane (L2)
+  package  oversync and oversqlite (local aggregate of L2a and L2b)
+  package-oversync  oversync package lane (L2a)
+  package-oversqlite  oversqlite package lane (L2b)
   root-evolution  integration/schema_evolution packages (L3a)
   root-rest  every other root package (L3b)
-  full     repository root ./... lane (local aggregate of L2, L3a and L3b)
+  full     repository root ./... lane (local aggregate of L2a, L2b, L3a and L3b)
   precompile  build and link a lane's test binaries without running them
   audit    opt-in oversync_audit build-tag lane
   mobile   nested integration/mobile_flow module lane

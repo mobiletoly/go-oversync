@@ -17,11 +17,15 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 MODULE = 'github.com/mobiletoly/go-oversync'
 MOBILE_DIR = 'integration/mobile_flow'
-L2_PACKAGES = (MODULE + '/oversync', MODULE + '/oversqlite')
+# L2 is split so its two long packages never compete for one runner (m0011 §16.8).
+L2_LANES = {MODULE + '/oversync': 'package-oversync', MODULE + '/oversqlite': 'package-oversqlite'}
+SUPPORTING_TEST_LANE = 'package-oversync'
 EVOLUTION = MODULE + '/integration/schema_evolution'
-ROOT_LANES = ('package', 'root-evolution', 'root-rest')
+ROOT_LANES = ('package-oversync', 'package-oversqlite', 'root-evolution', 'root-rest')
+# Local aggregates: `package` is L2a+L2b and `full` is every root lane.
+AGGREGATE_LANES = ('package', 'full')
 # Lanes whose go test -json stream must account for every expected package.
-EVIDENCE_LANES = ROOT_LANES + ('mobile', 'full')
+EVIDENCE_LANES = ROOT_LANES + ('mobile',) + AGGREGATE_LANES
 # Hosted regression matrix legs, in addition to the coexistence job.
 REGRESSION_LANES = ROOT_LANES + ('mobile', 'vet')
 COEXISTENCE_ARTIFACT = 'mixed-schema-pg17'
@@ -36,8 +40,8 @@ def lane_of(package):
         raise ValueError('package outside the root module: ' + package)
     if package.startswith(MODULE + '/' + MOBILE_DIR + '/') or package == MODULE + '/' + MOBILE_DIR:
         raise ValueError('nested mobile module package in root list: ' + package)
-    if package in L2_PACKAGES:
-        return 'package'
+    if package in L2_LANES:
+        return L2_LANES[package]
     if package == EVOLUTION or package.startswith(EVOLUTION + '/'):
         return 'root-evolution'
     # Fail-safe default: a new package always lands in a required lane.
@@ -90,8 +94,9 @@ def partition_errors(lanes):
                     errors.append(f'{package}: assigned to {lane}, owned by {owner}')
             elif not (package == MODULE + '/' + MOBILE_DIR or package.startswith(MODULE + '/' + MOBILE_DIR + '/')):
                 errors.append('mobile: package outside the nested module: ' + package)
-    if not errors and sorted(lanes['package']) != sorted(L2_PACKAGES):
-        errors.append('package lane must own exactly ' + ', '.join(L2_PACKAGES))
+    for package, lane in L2_LANES.items():
+        if not errors and lanes[lane] != [package]:
+            errors.append(f'{lane} lane must own exactly {package}')
     return errors
 
 
@@ -110,7 +115,10 @@ def lane_packages(lane, root=ROOT):
         return sorted(go_list(root))
     if lane not in EVIDENCE_LANES:
         raise ValueError('no package evidence for lane: ' + lane)
-    return partition(root)['lanes'][lane]
+    lanes = partition(root)['lanes']
+    if lane == 'package':
+        return sorted(lanes['package-oversync'] + lanes['package-oversqlite'])
+    return lanes[lane]
 
 
 def check_lane(expected, lines, exit_code=0):
@@ -200,10 +208,10 @@ def check_artifacts(directory):
         fixture = _fixture_errors(lane_dir, lane, errors)
         if fixture is None or lane == 'vet':
             continue
-        if lane == 'package':
+        if lane == SUPPORTING_TEST_LANE:
             support = fixture.get('supporting_tests')
             if not support or not all(c.get('passed') is True for c in support):
-                errors.append('package: supporting test evidence missing or failed')
+                errors.append(lane + ': supporting test evidence missing or failed')
         if lanes is None:
             continue
         try:

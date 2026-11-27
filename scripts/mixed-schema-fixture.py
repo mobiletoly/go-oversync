@@ -11,7 +11,7 @@ import sys
 import time
 
 
-LANES = ('coexistence', 'fast', 'package', 'root-evolution', 'root-rest', 'full', 'audit', 'mobile', 'vet')
+LANES = ('coexistence', 'fast', 'package', 'package-oversync', 'package-oversqlite', 'root-evolution', 'root-rest', 'full', 'audit', 'mobile', 'vet')
 
 
 def load_partition():
@@ -99,7 +99,8 @@ def run(major, lane, extra_args=()):
         text = output.decode(errors='replace').replace(password, '[REDACTED]')
         report.mkdir(parents=True, exist_ok=True)
         (report / 'lane.log').write_text(text)
-        if lane == 'package':
+        # The manifest's supporting test belongs to L2; L2a runs it in hosted CI (§16.8).
+        if lane in ('package', 'package-oversync'):
             coverage = json.loads((root / 'conformance/mixed-schema/v1/manifest.json').read_text())
             supporting = coverage['supporting_tests']
             assert supporting, 'required supporting owners are missing'

@@ -29,7 +29,8 @@ outer limit. The ordinary root test run skips these opt-in cases.
 Other validation lanes use the same wrapper:
 
 ```sh
-python3 -B scripts/mixed-schema-fixture.py 17 package
+python3 -B scripts/mixed-schema-fixture.py 17 package-oversync
+python3 -B scripts/mixed-schema-fixture.py 17 package-oversqlite
 python3 -B scripts/mixed-schema-fixture.py 17 root-evolution
 python3 -B scripts/mixed-schema-fixture.py 17 root-rest
 python3 -B scripts/mixed-schema-fixture.py 17 mobile
@@ -37,17 +38,19 @@ python3 -B scripts/mixed-schema-fixture.py 17 vet
 ```
 
 The [partition](../../scripts/root-partition.py) assigns every root-module
-package to exactly one lane: `package` owns `oversync` and `oversqlite`,
+package to exactly one lane: `package-oversync` owns `oversync` and runs the
+manifest's supporting test, `package-oversqlite` owns `oversqlite`,
 `root-evolution` owns `integration/schema_evolution/...`, and `root-rest` owns
 every other package, including new ones. Each lane keeps a 240-second outer
-limit. The `package`, `root-evolution`, `root-rest`, `mobile` and `full` lanes
-record package evidence in `fixture.json`: every expected package must start
-once and pass, or skip when it has no test files. Runs with extra Go arguments
-are development runs and never count as package evidence.
+limit. These four lanes, `mobile`, and the local `package` and `full`
+aggregates record package evidence in `fixture.json`: every expected package
+must start once and pass, or skip when it has no test files. Runs with extra Go
+arguments are development runs and never count as package evidence.
 
-`python3 -B scripts/mixed-schema-fixture.py 17 full` remains a local aggregate
-of the three root lanes. To build a lane's test binaries without running them,
-as CI does before the timed lane, use `scripts/test-lane.sh precompile <lane>`.
+`package` (both L2 packages) and `full` (every root package) remain local
+aggregates; hosted CI runs the separate lanes. To build a lane's test binaries
+without running them, as CI does before the timed lane, use
+`scripts/test-lane.sh precompile <lane>`.
 
 The runner prints the report location. Reports contain redacted output, test
 counts, commands, runtime versions, and input fingerprints. The checker rejects
@@ -65,7 +68,8 @@ scenarios. The [runner](../../scripts/mixed-schema.py) enforces completeness.
 ## CI
 
 The [workflow](../../.github/workflows/mixed-schema.yml) runs the coexistence lane,
-the `package`, `root-evolution`, `root-rest`, `mobile` and `vet` regression lanes
+the `package-oversync`, `package-oversqlite`, `root-evolution`, `root-rest`,
+`mobile` and `vet` regression lanes
 on PostgreSQL 17.11, and the guards on pull requests and main pushes. Regression
 lanes build their test binaries in a separate step of at most four minutes
 before the timed lane. The guards check the partition against `go list ./...`

@@ -42,11 +42,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [package, root-evolution, root-rest, mobile, vet]
+        lane: [package-oversync, package-oversqlite, root-evolution, root-rest, mobile, vet]
     steps:
       - uses: actions/checkout@v4
       - name: Check out the paired Oversqlite contract corpus
-        if: matrix.lane == 'package' || matrix.lane == 'root-rest'
+        if: matrix.lane == 'package-oversync' || matrix.lane == 'package-oversqlite' || matrix.lane == 'root-rest'
         uses: actions/checkout@v4
         with:
           repository: mobiletoly/sqlitenow-kmp
