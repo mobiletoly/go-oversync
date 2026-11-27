@@ -266,7 +266,36 @@ class ArtifactTests(unittest.TestCase):
         self.assertIncomplete('partition without shard tests')
 
 
+REQUIRED_STRATEGY = ('    strategy:\n      fail-fast: false\n      matrix:\n'
+                     '        lane: [' + ', '.join(rp.REGRESSION_LANES) + ']\n    steps:\n')
+
+
+def strategy_errors(workflow):
+    """The regression matrix must be exactly the required lane list: no exclude, include or extra axis."""
+    errors = []
+    if workflow.count('strategy:') != 1 or workflow.count('matrix:') != 1:
+        errors.append('workflow must define exactly one matrix')
+    if REQUIRED_STRATEGY not in workflow:
+        errors.append('regression matrix must be exactly the required lane list')
+    return errors
+
+
 class WorkflowTests(unittest.TestCase):
+    def test_regression_matrix_cannot_drop_or_add_lanes(self):
+        workflow = (rp.ROOT / '.github/workflows/mixed-schema.yml').read_text()
+        self.assertEqual([], strategy_errors(workflow))
+        lane_line = '        lane: [' + ', '.join(rp.REGRESSION_LANES) + ']\n'
+        mutations = {
+            'exclude': lane_line + '        exclude:\n          - lane: root-rest\n',
+            'include': lane_line + '        include:\n          - lane: extra\n',
+            'extra axis': lane_line + '        shard: [1, 2]\n',
+            'dropped lane': lane_line.replace('root-rest, ', ''),
+        }
+        for name, replacement in mutations.items():
+            self.assertTrue(strategy_errors(workflow.replace(lane_line, replacement)), name)
+        second = workflow.replace('  guards:\n', '  guards:\n    strategy:\n      matrix:\n        x: [1]\n', 1)
+        self.assertTrue(strategy_errors(second), 'second matrix')
+
     def test_workflow_runs_every_required_lane(self):
         workflow = (rp.ROOT / '.github/workflows/mixed-schema.yml').read_text()
         self.assertIn('lane: [' + ', '.join(rp.REGRESSION_LANES) + ']', workflow)
