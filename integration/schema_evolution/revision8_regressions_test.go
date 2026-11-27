@@ -149,9 +149,12 @@ func TestEvolution_WorkerMetadataSerializesWithTakeover(t *testing.T) {
 	defer releaseSessionLock(nextLock, workerLock)
 	claimed := make(chan error, 1)
 	go func() { _, err := claimWorker(ctx, nextLock); claimed <- err }()
+	// The terminated predecessor, gate, blocked metadata transaction and successor
+	// hold four pool connections here. Observe through the idle gate session so the
+	// check does not need a fifth connection; it reads pg_locks and takes no locks.
 	require.Eventually(t, func() bool {
 		var waiting bool
-		err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND classid=1869833075 AND objid=9 AND NOT granted)`, int32(nextLock.Conn().PgConn().PID())).Scan(&waiting)
+		err := gate.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND classid=1869833075 AND objid=9 AND NOT granted)`, int32(nextLock.Conn().PgConn().PID())).Scan(&waiting)
 		return err == nil && waiting
 	}, time.Second, 10*time.Millisecond)
 	_, err = gate.Exec(ctx, `SELECT pg_advisory_unlock(1869833075,19)`)

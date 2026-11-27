@@ -82,6 +82,8 @@ func fixtureDSN(t *testing.T) string {
 	return fixtureServer.dsn
 }
 
+const fixturePoolMaxConns = 4
+
 func fixturePool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
@@ -98,7 +100,12 @@ func fixturePool(t *testing.T) *pgxpool.Pool {
 	parsed, err := url.Parse(base)
 	require.NoError(t, err)
 	parsed.Path = "/" + database
-	pool, err := pgxpool.New(ctx, parsed.String())
+	config, err := pgxpool.ParseConfig(parsed.String())
+	require.NoError(t, err)
+	// pgxpool defaults to max(4, NumCPU). Pin the floor so every host exercises
+	// the same connection budget as a 4-vCPU CI runner.
+	config.MaxConns = fixturePoolMaxConns
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		pool.Close()

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run one bounded lane against a named, durable, run-owned PostgreSQL fixture."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,16 @@ import signal
 import subprocess
 import sys
 import time
+
+
+LANES = ('coexistence', 'fast', 'package', 'root-evolution', 'root-rest', 'full', 'audit', 'mobile', 'vet')
+
+
+def load_partition():
+    spec = importlib.util.spec_from_file_location('root_partition', Path(__file__).with_name('root-partition.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def docker(*args, timeout=30):
@@ -19,8 +30,8 @@ def docker(*args, timeout=30):
 
 
 def run(major, lane, extra_args=()):
-    if major != '17' or lane not in ('coexistence', 'fast', 'package', 'full', 'audit', 'mobile', 'vet'):
-        raise ValueError('usage: mixed-schema-fixture.py 17 {coexistence|fast|package|full|audit|mobile|vet}')
+    if major != '17' or lane not in LANES:
+        raise ValueError('usage: mixed-schema-fixture.py 17 {' + '|'.join(LANES) + '}')
     root = Path(__file__).resolve().parents[1]
     run_id = 'm0011-' + secrets.token_hex(8)
     volume = run_id + '-data'
@@ -37,6 +48,9 @@ def run(major, lane, extra_args=()):
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     try:
+        partition = load_partition()
+        # Expected packages come from the checked-in partition, never from the lane's own output.
+        expected = partition.lane_packages(lane, root) if lane in partition.EVIDENCE_LANES else None
         docker('volume', 'create', '--label', 'com.mobiletoly.go-oversync.test-run=' + run_id, volume)
         created_volume = True
         docker('run', '-d', '--name', run_id, '--label', 'com.mobiletoly.go-oversync.test-run=' + run_id,
@@ -68,6 +82,7 @@ def run(major, lane, extra_args=()):
         if lane == 'vet':
             command = ['scripts/run-with-timeout.pl', '240', '--', 'env', 'GOTOOLCHAIN=go1.25.12', 'go', 'vet', './...']
         metadata['command'] = command
+        lane_started = time.monotonic()
         process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             output, _ = process.communicate(timeout=620 if lane == 'coexistence' else 260)
@@ -80,6 +95,7 @@ def run(major, lane, extra_args=()):
                 os.killpg(process.pid, signal.SIGKILL)
                 output, _ = process.communicate(timeout=10)
             status = 124
+        metadata['lane_elapsed_seconds'] = time.monotonic() - lane_started
         text = output.decode(errors='replace').replace(password, '[REDACTED]')
         report.mkdir(parents=True, exist_ok=True)
         (report / 'lane.log').write_text(text)
@@ -98,8 +114,17 @@ def run(major, lane, extra_args=()):
                 checks.append(dict(test=test['test'], passed=passed))
             metadata['supporting_tests'] = checks
             if not all(c['passed'] for c in checks): status = 1
+        if expected is not None:
+            evidence = partition.check_lane(expected, text.splitlines(), status)
+            if extra_args:
+                # Development arguments may select a subset; never report that as coverage.
+                evidence['complete'] = False
+                evidence['errors'].append('development arguments supplied; not package evidence')
+            elif not evidence['complete']:
+                status = 1
+            metadata['packages'] = evidence
         print(text)
-    except (RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+    except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
         metadata['failure'] = str(exc).replace(password, '[REDACTED]')
         status = 1
     finally:
