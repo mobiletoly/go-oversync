@@ -81,7 +81,7 @@ class DocumentationTests(unittest.TestCase):
 
     def test_required_workflow_obligations(self):
         workflow = (mixed.ROOT / '.github/workflows/mixed-schema.yml').read_text()
-        for text in ('mixed-schema-pg17', 'postgres:17.11', 'lane: [package-oversync, package-oversqlite, root-evolution, root-rest, mobile, vet]',
+        for text in ('mixed-schema-pg17', 'postgres:17.11', 'lane: [package-oversync, package-oversqlite-1, package-oversqlite-2, root-evolution, root-rest, mobile, vet]',
                      'needs: [coexistence, regression, guards]', 'if: always()',
                      'retention-days: 14', 'if-no-files-found: error',
                      "v['result'] == 'success'", 'name: mixed-schema-required'):

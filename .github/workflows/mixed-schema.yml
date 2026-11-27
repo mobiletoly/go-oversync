@@ -42,11 +42,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [package-oversync, package-oversqlite, root-evolution, root-rest, mobile, vet]
+        lane: [package-oversync, package-oversqlite-1, package-oversqlite-2, root-evolution, root-rest, mobile, vet]
     steps:
       - uses: actions/checkout@v4
       - name: Check out the paired Oversqlite contract corpus
-        if: matrix.lane == 'package-oversync' || matrix.lane == 'package-oversqlite' || matrix.lane == 'root-rest'
+        if: matrix.lane != 'root-evolution' && matrix.lane != 'mobile' && matrix.lane != 'vet'
         uses: actions/checkout@v4
         with:
           repository: mobiletoly/sqlitenow-kmp
@@ -78,7 +78,8 @@ jobs:
   guards:
     name: mixed-schema-guards
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The partition step compiles oversqlite's tests to list them for sharding.
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

@@ -30,7 +30,8 @@ Other validation lanes use the same wrapper:
 
 ```sh
 python3 -B scripts/mixed-schema-fixture.py 17 package-oversync
-python3 -B scripts/mixed-schema-fixture.py 17 package-oversqlite
+python3 -B scripts/mixed-schema-fixture.py 17 package-oversqlite-1
+python3 -B scripts/mixed-schema-fixture.py 17 package-oversqlite-2
 python3 -B scripts/mixed-schema-fixture.py 17 root-evolution
 python3 -B scripts/mixed-schema-fixture.py 17 root-rest
 python3 -B scripts/mixed-schema-fixture.py 17 mobile
@@ -39,13 +40,20 @@ python3 -B scripts/mixed-schema-fixture.py 17 vet
 
 The [partition](../../scripts/root-partition.py) assigns every root-module
 package to exactly one lane: `package-oversync` owns `oversync` and runs the
-manifest's supporting test, `package-oversqlite` owns `oversqlite`,
-`root-evolution` owns `integration/schema_evolution/...`, and `root-rest` owns
-every other package, including new ones. Each lane keeps a 240-second outer
-limit. These four lanes, `mobile`, and the local `package` and `full`
-aggregates record package evidence in `fixture.json`: every expected package
-must start once and pass, or skip when it has no test files. Runs with extra Go
-arguments are development runs and never count as package evidence.
+manifest's supporting test, `package-oversqlite-1` and `package-oversqlite-2`
+split the top-level tests of `oversqlite`, `root-evolution` owns
+`integration/schema_evolution/...`, and `root-rest` owns every other package,
+including new ones. Each lane keeps a 240-second outer limit. The root lanes,
+`mobile`, and the local `package` and `full` aggregates record package evidence
+in `fixture.json`: every expected package must start once and pass, or skip when
+it has no test files.
+
+The `oversqlite` shards take their test list from `go test -list .`. A short
+pin list keeps the longest tests apart; every other test goes to a shard by a
+hash of its name, so new tests are assigned automatically and existing ones do
+not move. Each shard also records test evidence: every assigned test must run
+once and pass or skip, and no other top-level test may run. Runs with extra Go
+arguments are development runs and never count as package or test evidence.
 
 `package` (both L2 packages) and `full` (every root package) remain local
 aggregates; hosted CI runs the separate lanes. To build a lane's test binaries
@@ -68,17 +76,19 @@ scenarios. The [runner](../../scripts/mixed-schema.py) enforces completeness.
 ## CI
 
 The [workflow](../../.github/workflows/mixed-schema.yml) runs the coexistence lane,
-the `package-oversync`, `package-oversqlite`, `root-evolution`, `root-rest`,
-`mobile` and `vet` regression lanes
+the `package-oversync`, `package-oversqlite-1`, `package-oversqlite-2`,
+`root-evolution`, `root-rest`, `mobile` and `vet` regression lanes
 on PostgreSQL 17.11, and the guards on pull requests and main pushes. Regression
 lanes build their test binaries in a separate step of at most four minutes
 before the timed lane. The guards check the partition against `go list ./...`
-and publish it as an artifact. Diagnostic artifacts are kept for 14 days. For a
+and `go test -list`, and publish it, with both shards' test lists, as an
+artifact. Diagnostic artifacts are kept for 14 days. For a
 run without Go caches, such as the release-gate run, dispatch the workflow on
 the exact commit with `go-cache` unchecked.
 
 Configure branch protection to require **mixed-schema-required**. This aggregate
 check succeeds only when all prerequisite jobs succeed and every lane artifact
 is present and complete: clean fixture results, the full coexistence manifest,
-and package evidence matching the published partition. Verify that a missing or
+package evidence matching the published partition, and shard test evidence
+covering every listed `oversqlite` test exactly once. Verify that a missing or
 failing check blocks merging; the workflow alone does not configure branch protection.

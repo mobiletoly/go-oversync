@@ -11,7 +11,7 @@ import sys
 import time
 
 
-LANES = ('coexistence', 'fast', 'package', 'package-oversync', 'package-oversqlite', 'root-evolution', 'root-rest', 'full', 'audit', 'mobile', 'vet')
+LANES = ('coexistence', 'fast', 'package', 'package-oversync', 'package-oversqlite-1', 'package-oversqlite-2', 'root-evolution', 'root-rest', 'full', 'audit', 'mobile', 'vet')
 
 
 def load_partition():
@@ -51,6 +51,7 @@ def run(major, lane, extra_args=()):
         partition = load_partition()
         # Expected packages come from the checked-in partition, never from the lane's own output.
         expected = partition.lane_packages(lane, root) if lane in partition.EVIDENCE_LANES else None
+        expected_tests = partition.lane_tests(lane, root)
         docker('volume', 'create', '--label', 'com.mobiletoly.go-oversync.test-run=' + run_id, volume)
         created_volume = True
         docker('run', '-d', '--name', run_id, '--label', 'com.mobiletoly.go-oversync.test-run=' + run_id,
@@ -124,6 +125,14 @@ def run(major, lane, extra_args=()):
             elif not evidence['complete']:
                 status = 1
             metadata['packages'] = evidence
+        if expected_tests is not None:
+            evidence = partition.check_tests(expected_tests, expected[0], text.splitlines())
+            if extra_args:
+                evidence['complete'] = False
+                evidence['errors'].append('development arguments supplied; not test evidence')
+            elif not evidence['complete']:
+                status = 1
+            metadata['tests'] = evidence
         print(text)
     except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
         metadata['failure'] = str(exc).replace(password, '[REDACTED]')
