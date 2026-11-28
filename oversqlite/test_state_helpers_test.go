@@ -3,7 +3,7 @@ package oversqlite
 import (
 	"context"
 	"database/sql"
-	"fmt"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -93,7 +93,7 @@ func requireOutboxBundle(t *testing.T, db *sql.DB) outboxBundleRecord {
 	t.Helper()
 	var rec outboxBundleRecord
 	require.NoError(t, db.QueryRow(`
-		SELECT state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id, remote_bundle_hash, remote_bundle_seq
+		SELECT state, source_id, source_bundle_id, canonical_request_hash, row_count, initialization_id
 		FROM _sync_outbox_bundle
 		WHERE singleton_key = 1
 	`).Scan(
@@ -103,8 +103,6 @@ func requireOutboxBundle(t *testing.T, db *sql.DB) outboxBundleRecord {
 		&rec.CanonicalRequestHash,
 		&rec.RowCount,
 		&rec.InitializationID,
-		&rec.RemoteBundleHash,
-		&rec.RemoteBundleSeq,
 	))
 	return rec
 }
@@ -117,12 +115,19 @@ func seedOutboxBundleForTest(t *testing.T, db *sql.DB, rec outboxBundleRecord) {
 func seedOutboxUserInsertForTest(t *testing.T, db *sql.DB, sourceBundleID int64, rowID, name, email string) {
 	t.Helper()
 
-	payload := fmt.Sprintf(`{"id":"%s","name":"%s","email":"%s"}`, rowID, name, email)
-	_, err := db.Exec(`
+	payload, err := json.Marshal(map[string]string{"id": rowID, "name": name, "email": email})
+	require.NoError(t, err)
+	localPayload, err := json.Marshal(map[string]any{
+		"id":    map[string]any{"storage": "text", "value": rowID},
+		"name":  map[string]any{"storage": "text", "value": name},
+		"email": map[string]any{"storage": "text", "value": email},
+	})
+	require.NoError(t, err)
+	_, err = db.Exec(`
 		INSERT INTO _sync_outbox_rows (
-			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload
-		) VALUES (?, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?)
-	`, sourceBundleID, rowKeyJSON(rowID), rowKeyJSON(rowID), payload, payload)
+			source_bundle_id, row_ordinal, schema_name, table_name, key_json, wire_key_json, op, base_row_version, local_payload, wire_payload, base_kind, base_payload, base_provenance
+		) VALUES (?, 0, 'main', 'users', ?, ?, 'INSERT', 0, ?, ?, 'absent',NULL,`+baselineProvenanceSQL("'never_published'", "0", "NULL")+`)
+	`, sourceBundleID, rowKeyJSON(rowID), rowKeyJSON(rowID), string(localPayload), string(payload))
 	require.NoError(t, err)
 }
 

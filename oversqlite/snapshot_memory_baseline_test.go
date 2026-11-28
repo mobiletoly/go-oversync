@@ -81,7 +81,7 @@ func TestOversqliteSnapshotApplyCursorStructuralBound(t *testing.T) {
 	var target *ast.FuncDecl
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Name.Name == "applyStagedSnapshotLocked" {
+		if ok && fn.Name.Name == "installStagedSnapshotRowsInTx" {
 			target = fn
 			break
 		}
@@ -145,23 +145,23 @@ func BenchmarkOversqliteSnapshotStageApplyBaseline(b *testing.B) {
 	_, err = db.Exec(`PRAGMA journal_mode = WAL`)
 	require.NoError(b, err)
 
-	config := DefaultConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}})
+	config := admittedFixtureConfig("main", []SyncTable{{TableName: "users", SyncKeyColumnName: "id"}}, testSchemaGenerationProof())
 	config.RetryPolicy = &RetryPolicy{Enabled: false}
-	client, err := NewClient(db, "http://example.invalid", tokenProviderForTests, config)
+	client, err := newAdmittedFixtureClient(db, "http://example.invalid", tokenProviderForTests, config)
 	require.NoError(b, err)
 	b.Cleanup(func() { require.NoError(b, client.Close()) })
 	client.sourceIDGenerator = func() string { return "memory-baseline-source" }
 	client.HTTP = &http.Client{Transport: rawRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		switch request.URL.Path {
-		case "/sync/capabilities":
-			return jsonResponse(oversync.CapabilitiesResponse{ProtocolVersion: requiredProtocolVersion, Features: map[string]bool{"connect_lifecycle": true}}), nil
+		case "/sync/generations/1":
+			return jsonResponse(oversync.GenerationDiscoveryResponse{ProtocolVersion: requiredProtocolVersion}), nil
 		case "/sync/connect":
 			return jsonResponse(oversync.ConnectResponse{Resolution: "initialize_empty"}), nil
 		default:
 			return errorJSONResponse(http.StatusNotFound, map[string]string{"error": "not_found"}), nil
 		}
 	})}
-	require.NoError(b, client.Open(ctx))
+	require.NoError(b, client.open(ctx))
 	_, err = client.Attach(ctx, "memory-baseline-user")
 	require.NoError(b, err)
 

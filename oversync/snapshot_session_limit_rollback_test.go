@@ -30,7 +30,7 @@ func TestSnapshotSessions_TotalLimitsRollBackAfterEarlierPageWasStaged(t *testin
 		{
 			name:      "byte count",
 			scenario:  "stagedbytes",
-			dimension: "byte_count",
+			dimension: "logical_byte_count",
 			setLimit: func(service *SyncService, firstRowWireBytes int64) {
 				service.config.MaxBytesPerSnapshotSession = firstRowWireBytes
 			},
@@ -45,7 +45,7 @@ func TestSnapshotSessions_TotalLimitsRollBackAfterEarlierPageWasStaged(t *testin
 			fixture.pushUser(t, 1, uuid.New(), "Alpha")
 			fixture.pushUser(t, 2, uuid.New(), "Bravo")
 
-			prior, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+			prior, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 			require.NoError(t, err)
 			var firstRowWireBytes int64
 			require.NoError(t, fixture.pool.QueryRow(fixture.ctx, `
@@ -62,7 +62,7 @@ func TestSnapshotSessions_TotalLimitsRollBackAfterEarlierPageWasStaged(t *testin
 				copyCalls++
 				return nil
 			}}
-			_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+			_, err = fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 			var limit *SnapshotSessionLimitExceededError
 			require.ErrorAs(t, err, &limit)
 			require.Equal(t, tc.dimension, limit.Dimension)
@@ -81,10 +81,10 @@ func TestSnapshotCleanup_TwoInstancesDoNotDoubleCountDeletedRows(t *testing.T) {
 	})
 	fixture.pushUser(t, 1, uuid.New(), "Alpha")
 	for i := 0; i < 4; i++ {
-		_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader)
+		_, err := fixture.svc.CreateSnapshotSession(fixture.ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 		require.NoError(t, err)
 	}
-	second, err := NewRuntimeService(fixture.pool, fixture.svc.config, integrationTestLogger(slog.LevelWarn))
+	second, err := newTestRuntimeService(fixture.pool, fixture.svc.config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	require.NoError(t, second.Bootstrap(fixture.ctx))
 	t.Cleanup(func() { _ = second.Close(context.Background()) })

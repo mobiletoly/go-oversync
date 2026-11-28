@@ -32,11 +32,119 @@ type BundleRow struct {
 }
 
 func PushRequest(rows []PushRow) (string, int64, error) {
+	return hashPushRows(rows)
+}
+
+// GenerationPinnedPushRequest hashes the exact Q39 generation-bound request envelope.
+func GenerationPinnedPushRequest(generationID, generationFingerprint string, rows []PushRow) (string, int64, error) {
+	hasher := NewGenerationPinnedPushRequestHasher(generationID, generationFingerprint)
+	for _, row := range rows {
+		if err := hasher.Add(row); err != nil {
+			return "", 0, err
+		}
+	}
+	return hasher.Sum()
+}
+
+// GenerationPinnedPushRequestHasher incrementally hashes the exact Q39 object.
+type GenerationPinnedPushRequestHasher struct {
+	digest    stdhash.Hash
+	rowCount  int64
+	byteCount int64
+	finished  bool
+	hash      string
+}
+
+func NewGenerationPinnedPushRequestHasher(generationID, generationFingerprint string) *GenerationPinnedPushRequestHasher {
+	prefix := []byte(`{"generation_fingerprint":`)
+	prefix = appendCanonicalJSONString(prefix, generationFingerprint)
+	prefix = append(prefix, `,"generation_id":`...)
+	prefix = appendCanonicalJSONString(prefix, generationID)
+	prefix = append(prefix, `,"rows":[`...)
+	h := &GenerationPinnedPushRequestHasher{digest: sha256.New(), byteCount: int64(len(prefix))}
+	_, _ = h.digest.Write(prefix)
+	return h
+}
+
+func (h *GenerationPinnedPushRequestHasher) Add(row PushRow) error {
+	if h == nil {
+		return fmt.Errorf("generation-pinned push request hasher is nil")
+	}
+	if h.finished {
+		return fmt.Errorf("generation-pinned push request hash is already finalized")
+	}
+	key, err := jcs.Marshal(row.Key)
+	if err != nil {
+		return err
+	}
+	payload, err := payloadValue(row.Op, row.Payload)
+	if err != nil {
+		return err
+	}
+	payloadBytes, err := jcs.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	canonical := []byte(`{"base_row_version":`)
+	canonical = appendCanonicalJSONString(canonical, strconv.FormatInt(row.BaseRowVersion, 10))
+	canonical = append(canonical, `,"key":`...)
+	canonical = append(canonical, key...)
+	canonical = append(canonical, `,"op":`...)
+	canonical = appendCanonicalJSONString(canonical, row.Op)
+	canonical = append(canonical, `,"payload":`...)
+	canonical = append(canonical, payloadBytes...)
+	canonical = append(canonical, `,"row_ordinal":`...)
+	canonical = appendCanonicalJSONString(canonical, strconv.FormatInt(h.rowCount, 10))
+	canonical = append(canonical, `,"schema":`...)
+	canonical = appendCanonicalJSONString(canonical, row.Schema)
+	canonical = append(canonical, `,"table":`...)
+	canonical = appendCanonicalJSONString(canonical, row.Table)
+	canonical = append(canonical, '}')
+	if h.rowCount > 0 {
+		_, _ = h.digest.Write([]byte{','})
+		h.byteCount++
+	}
+	_, _ = h.digest.Write(canonical)
+	h.byteCount += int64(len(canonical))
+	h.rowCount++
+	return nil
+}
+
+func (h *GenerationPinnedPushRequestHasher) CurrentByteCount() int64 {
+	if h == nil {
+		return 0
+	}
+	return h.byteCount + int64(len(`],"type":"oversync.generation-pinned-push-request.v1"}`))
+}
+
+func (h *GenerationPinnedPushRequestHasher) Sum() (string, int64, error) {
+	if h == nil {
+		return "", 0, fmt.Errorf("generation-pinned push request hasher is nil")
+	}
+	if !h.finished {
+		suffix := []byte(`],"type":"oversync.generation-pinned-push-request.v1"}`)
+		_, _ = h.digest.Write(suffix)
+		h.byteCount += int64(len(suffix))
+		h.hash = hex.EncodeToString(h.digest.Sum(nil))
+		h.finished = true
+	}
+	return h.hash, h.byteCount, nil
+}
+
+func hashPushRows(rows []PushRow) (string, int64, error) {
+	logicalRows, err := logicalPushRows(rows)
+	if err != nil {
+		return "", 0, err
+	}
+	return hash(logicalRows)
+}
+
+func logicalPushRows(rows []PushRow) ([]map[string]any, error) {
 	logicalRows := make([]map[string]any, 0, len(rows))
 	for ordinal, row := range rows {
 		payload, err := payloadValue(row.Op, row.Payload)
 		if err != nil {
-			return "", 0, fmt.Errorf("decode request payload for %s.%s row %d: %w", row.Schema, row.Table, ordinal, err)
+			return nil, fmt.Errorf("decode request payload for %s.%s row %d: %w", row.Schema, row.Table, ordinal, err)
 		}
 		logicalRows = append(logicalRows, map[string]any{
 			"row_ordinal":      strconv.Itoa(ordinal),
@@ -48,7 +156,7 @@ func PushRequest(rows []PushRow) (string, int64, error) {
 			"payload":          payload,
 		})
 	}
-	return hash(logicalRows)
+	return logicalRows, nil
 }
 
 func CommittedBundle(rows []BundleRow) (string, int64, error) {
@@ -122,6 +230,15 @@ func (h *CommittedBundleHasher) Add(row BundleRow) error {
 	h.byteCount += int64(len(canonical))
 	h.rowCount++
 	return nil
+}
+
+// CurrentByteCount returns the complete array byte count if the stream ended
+// after the rows added so far. It does not finalize the hasher.
+func (h *CommittedBundleHasher) CurrentByteCount() int64 {
+	if h == nil {
+		return 0
+	}
+	return h.byteCount + 1
 }
 
 func appendCanonicalJSONString(dst []byte, value string) []byte {

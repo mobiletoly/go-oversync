@@ -8,9 +8,11 @@ parent: Architecture
 Use this guide after you have a working server from [Getting Started]({{ site.baseurl }}/getting-started.html).
 It covers the production boundary around `oversync.SyncService`: database connections, snapshot
 capacity, HTTP lifecycle, monitoring, upgrades, and recovery. The
-[`nethttp_server`](https://github.com/mobiletoly/go-oversync/tree/main/examples/nethttp_server)
-example provides runnable reference code. Treat its authentication, CORS policy, secrets, and
-resource limits as development choices that your application must replace or review.
+repository-owned
+[`nethttp_server`](https://github.com/mobiletoly/go-oversync/tree/main/integration/nethttp_server)
+integration harness provides runnable operational reference code. It is not application starter
+code. Treat its authentication, CORS policy, secrets, and resource limits as test-environment
+choices that your application must replace or review.
 
 ## Production Ownership
 
@@ -28,17 +30,20 @@ Oversync owns:
 - push, pull, snapshot, retention, and client recovery protocol behavior
 - rejection of registered-table writes that bypass an Oversync bundle context
 
-Give every server instance that shares a database the same registered-table catalog, schema
-version, reserved server source IDs, and layout-compatible configuration. Keep per-instance
-capacity settings aligned unless your load balancer and monitoring account for different limits.
+Give every server instance that shares a database the same registered-table catalog and revision,
+schema-generation registry, deployment readiness contract, and reserved server source IDs.
+Keep per-instance capacity settings aligned unless your load balancer and monitoring account for
+different limits.
 Do not place application objects in the `sync` schema or change Oversync-managed objects.
 
 ## Build The Host Server
 
 The following skeleton shows the lifecycle that a production host must provide. Replace
 `authenticate`, `trustedUserIDFromContext`, and `recordStageTiming` with your application code.
-Replace the numeric pool and capacity values with results from your load tests. Add each route your
-clients use; the example registers the complete current sync surface.
+The pool and capacity values come from the machine size; follow
+[Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/) to choose the
+machine and check the connection budget against PostgreSQL. Add each route your clients use; the
+example registers the complete current sync surface.
 
 ```go
 package main
@@ -51,6 +56,8 @@ import (
     "net/http"
     "os"
     "os/signal"
+    "runtime/debug"
+    "strings"
     "syscall"
     "time"
 
@@ -67,12 +74,38 @@ func main() {
 func run() error {
     logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
+    serviceConfig := &oversync.ServiceConfig{
+        Readiness:                      applicationReadiness,
+        SchemaGenerations:              schemaGenerations, // one or two complete declarations
+        RegisteredTableCatalogRevision: 1,
+        AppName:                        "my-sync-api",
+        RegisteredTables: []oversync.RegisteredTable{
+            {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
+            {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
+        },
+        StageMetrics: oversync.StageMetricsRecorderFunc(
+            func(ctx context.Context, timing oversync.StageTiming) {
+                recordStageTiming(timing) // Keep this callback fast and concurrency-safe.
+            },
+        ),
+        BundleChangeWatch: oversync.BundleChangeWatchConfig{Enabled: true},
+    }
+    // Size the admission permits for this machine (2 vCPU / 2 GiB here).
+    sizing, err := serviceConfig.ApplySizing(oversync.MachineSmall)
+    if err != nil {
+        return err
+    }
+    if os.Getenv("GOMEMLIMIT") == "" {
+        debug.SetMemoryLimit(sizing.GoMemoryLimitBytes)
+    }
+
     poolConfig, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
     if err != nil {
         return err
     }
-    poolConfig.MaxConns = 40 // Reserve room under the PostgreSQL connection limit.
-    poolConfig.MinConns = 4
+    // One instance's share of PostgreSQL connections; check the fleet total.
+    poolConfig.MaxConns = serviceConfig.ConnectionBudget().PoolMaxConns
+    poolConfig.MinConns = 2
     poolConfig.MaxConnLifetime = time.Hour
     poolConfig.MaxConnIdleTime = 30 * time.Minute
 
@@ -86,23 +119,6 @@ func run() error {
         return err
     }
     defer pool.Close()
-
-    serviceConfig := &oversync.ServiceConfig{
-        MaxSupportedSchemaVersion: 1,
-        AppName:                   "my-sync-api",
-        RegisteredTables: []oversync.RegisteredTable{
-            {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
-            {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
-        },
-        MaxConcurrentSnapshotBuilds:        8,
-        MaxConcurrentSnapshotChunkRequests: 4,
-        StageMetrics: oversync.StageMetricsRecorderFunc(
-            func(ctx context.Context, timing oversync.StageTiming) {
-                recordStageTiming(timing) // Keep this callback fast and concurrency-safe.
-            },
-        ),
-        BundleChangeWatch: oversync.BundleChangeWatchConfig{Enabled: true},
-    }
 
     syncService, err := oversync.NewRuntimeService(pool, serviceConfig, logger)
     if err != nil {
@@ -123,21 +139,25 @@ func run() error {
     actorMiddleware := oversync.ActorMiddleware(oversync.ActorMiddlewareConfig{
         UserIDFromContext: trustedUserIDFromContext,
     })
-    withActor := func(next http.Handler) http.Handler {
+    withSyncAdmission := func(next http.Handler) http.Handler {
         return authenticate(actorMiddleware(next))
+    }
+    withOperationalReadiness := func(next http.Handler) http.Handler {
+        return syncService.ReadinessGuard(next)
     }
 
     mux := http.NewServeMux()
-    registerSyncRoutes(mux, handlers, withActor)
+    syncHandler := registerSyncRoutes(mux, handlers, withSyncAdmission, withOperationalReadiness)
     mux.HandleFunc("GET /syncx/health", handlers.HandleHealth)
     mux.HandleFunc("GET /syncx/status", handlers.HandleStatus)
 
     server := &http.Server{
-        Addr:         ":8080",
-        Handler:      mux,
-        ReadTimeout:  120 * time.Second,
-        WriteTimeout: 120 * time.Second,
-        IdleTimeout:  60 * time.Second,
+        Addr:              ":8080",
+        Handler:           syncHandler,
+        ReadHeaderTimeout: 10 * time.Second,
+        ReadTimeout:       120 * time.Second, // a maximum-size push on a slow network
+        IdleTimeout:       120 * time.Second,
+        // WriteTimeout stays zero: GET /sync/watch is a long-lived event stream.
     }
 
     serveErr := make(chan error, 1)
@@ -176,26 +196,65 @@ func run() error {
 func registerSyncRoutes(
     mux *http.ServeMux,
     handlers *oversync.HTTPSyncHandlers,
-    withActor func(http.Handler) http.Handler,
-) {
-    handle := func(pattern string, fn http.HandlerFunc) {
-        mux.Handle(pattern, withActor(fn))
-    }
+    withSyncAdmission func(http.Handler) http.Handler,
+    withOperationalReadiness func(http.Handler) http.Handler,
+) http.Handler {
+    handle := func(pattern string, fn http.HandlerFunc) { mux.HandleFunc(pattern, fn) }
 
     handle("POST /sync/connect", handlers.HandleConnect)
-    handle("POST /sync/push-sessions", handlers.HandleCreatePushSession)
-    handle("POST /sync/push-sessions/{push_id}/chunks", handlers.HandlePushSessionChunk)
-    handle("POST /sync/push-sessions/{push_id}/commit", handlers.HandleCommitPushSession)
-    handle("DELETE /sync/push-sessions/{push_id}", handlers.HandleDeletePushSession)
-    handle("GET /sync/committed-bundles/{bundle_seq}/rows", handlers.HandleGetCommittedBundleRows)
+    handle("POST /sync/push", handlers.HandlePush)
+    handle("POST /sync/push-outcomes/resolve", handlers.HandlePushOutcomeResolve)
+    handle("POST /sync/push-outcomes/retained", handlers.HandlePushOutcomeRetained)
+    handle("POST /sync/push-outcomes/ack", handlers.HandlePushOutcomeAck)
     handle("GET /sync/pull", handlers.HandlePull)
     handle("GET /sync/watch", handlers.HandleWatch)
     handle("POST /sync/snapshot-sessions", handlers.HandleCreateSnapshotSession)
     handle("GET /sync/snapshot-sessions/{snapshot_id}", handlers.HandleGetSnapshotChunk)
     handle("DELETE /sync/snapshot-sessions/{snapshot_id}", handlers.HandleDeleteSnapshotSession)
-    handle("GET /sync/capabilities", handlers.HandleCapabilities)
+    discovery := http.HandlerFunc(handlers.HandleGeneration)
+    mux.Handle("GET /sync/generations/{generation_id}", discovery)
+    mux.Handle("GET /sync/generations/", discovery)
+    isGenerationDiscovery := func(r *http.Request) bool {
+        return r.Method == http.MethodGet &&
+            (r.URL.Path == "/sync/generations" || strings.HasPrefix(r.URL.Path, "/sync/generations/"))
+    }
+    admissionTarget := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if isGenerationDiscovery(r) {
+            discovery.ServeHTTP(w, r)
+            return
+        }
+        mux.ServeHTTP(w, r)
+    })
+    admittedSync := withSyncAdmission(admissionTarget)
+    operational := withOperationalReadiness(admittedSync)
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if isGenerationDiscovery(r) {
+            admittedSync.ServeHTTP(w, r)
+            return
+        }
+        if strings.HasPrefix(r.URL.Path, "/sync/") {
+            operational.ServeHTTP(w, r)
+            return
+        }
+        mux.ServeHTTP(w, r)
+    })
 }
 ```
+
+Generation discovery bypasses only application operational readiness so a compatible client can
+discover its selected generation during rollout. It remains behind authentication, actor/source
+validation, deployment client policy, shutdown admission, cancellation, and operation tracking.
+The outer dispatcher reaches the authenticated handler before `http.ServeMux` can clean or redirect
+the request. Leading-zero, overflow, encoded, missing, repeated-slash, dot-segment, and suffixed paths
+therefore receive the canonical HTTP 400 envelope. Every other `/sync/` request, including non-GET
+discovery requests, uses operational readiness admission.
+
+History projection admission is non-blocking: saturation returns retryable HTTP 503
+`history_projection_capacity_exceeded`. Row-bearing push, pull, snapshot, and conflict bodies use
+the decoded ceilings advertised by generation discovery, and clients enforce those ceilings after
+gzip decompression. Monitor projection active/high-water counts and stable failure codes without
+user/source/key labels. Projection results are not cached, so pruning canonical history cannot be
+bypassed by process memory.
 
 `authenticate` must verify the caller before `ActorMiddleware` runs.
 `trustedUserIDFromContext` must return the exact authenticated `user_id` from the request context.
@@ -203,6 +262,14 @@ func registerSyncRoutes(
 `oversync.Actor{UserID, SourceID}`. If you reserve source IDs for trusted server writers, pass the
 same exact set to `ServiceConfig.ReservedServerSourceIDs` and
 `ActorMiddlewareConfig.ReservedServerSourceIDs`.
+
+Supply `applicationReadiness` as a `*oversync.ReadinessConfig` backed by matching database
+evidence. See [Getting Started]({{ site.baseurl }}/getting-started.html#step-3-create-the-server).
+The single pool shown here works with an adapter that inspects deployment evidence at bootstrap.
+For an `OperationAdmissionAdapter`, create a proven pair with `NewReadinessPoolPair`, assign
+`Readiness.PoolPair`, and pass its `ExecutionPool()` to `NewRuntimeService`. Close the service
+before closing the pair and budget both pools. See the
+[table-evolution reference](https://github.com/mobiletoly/go-oversync/tree/main/integration/schema_evolution/table_evolution).
 
 Call `Bootstrap()` before you advertise readiness or serve sync traffic. During shutdown, remove
 the instance from client traffic and start `http.Server.Shutdown` so the server stops accepting
@@ -217,28 +284,44 @@ Set a connection budget for the whole application. Oversync uses the supplied `p
 request transactions, bootstrap, cleanup, and the optional bundle-change listener. Your own SQL
 also consumes the same pool if you share it.
 
-Choose `MaxConns` below the PostgreSQL connection limit after subtracting connections used by
-administration, migrations, and other services. Watch pool acquisition duration and the counts
-returned by `pgxpool.Stat()`. A larger pool cannot repair slow queries or an undersized database.
+`ServiceConfig.ConnectionBudget()` returns the connections one instance can use at once, and
+`NewRuntimeService` warns when the pool is smaller. Across instances the budgets add up against the
+PostgreSQL connection limit; [Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/)
+gives the formula and a worked example. Use PostgreSQL directly or a session-mode pooler: pushes
+hold a session advisory lock and the watch uses `LISTEN`. Watch pool acquisition duration and the
+counts returned by `pgxpool.Stat()`. A larger pool cannot repair slow queries or an undersized
+database.
 
 The reference `nethttp_server` uses these development defaults:
 
 | Owner | Setting | Reference value |
 | --- | --- | ---: |
-| `nethttp_server` | PostgreSQL maximum connections | 50 |
-| `nethttp_server` | PostgreSQL minimum connections | 5 |
+| `nethttp_server` | PostgreSQL maximum connections | the connection budget |
+| `nethttp_server` | PostgreSQL minimum connections | 2 |
+| `nethttp_server` | Read header timeout | 10 seconds |
 | `nethttp_server` | Read timeout | 120 seconds |
-| `nethttp_server` | Write timeout | 120 seconds |
-| `nethttp_server` | Idle timeout | 60 seconds |
+| `nethttp_server` | Write timeout | none (watch streams) |
+| `nethttp_server` | Idle timeout | 120 seconds |
 | `nethttp_server` | Graceful HTTP shutdown deadline | 30 seconds |
 
-The example accepts `OVERSYNC_DB_POOL_MAX_CONNS` and `OVERSYNC_DB_POOL_MIN_CONNS`. It also sets a
-one-hour maximum connection lifetime and a 30-minute maximum idle time. Check these values against
-your request sizes, proxy timeouts, database limits, and shutdown budget before you copy them.
+The integration server accepts `OVERSYNC_MACHINE`, `OVERSYNC_DB_POOL_MAX_CONNS`, `OVERSYNC_DB_POOL_MIN_CONNS`,
+and the other variables listed in
+[Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/#reference-integrations).
+It also sets a one-hour maximum connection lifetime and a 30-minute maximum idle time. Check these
+values against your request sizes, proxy timeouts, database limits, and shutdown budget before you
+copy them.
+
+The integration server also accepts `OVERSYNC_MAX_CONCURRENT_HISTORY_PROJECTIONS`. When unset, the
+machine sizing or the service's bounded default of four applies. Projection permits can remain held until the HTTP response is
+written, so raise this only from measurements and size it with the PostgreSQL pool, request
+duration, and server memory. Admission overload returns retryable HTTP `503` with `Retry-After: 1`.
+The Go client's `PushCapacityRetryPolicy` and `PullCapacityRetryPolicy` handle this signal
+independently of the generic three-attempt transport retry budget; a nil policy uses a 30-second
+elapsed-time budget. The Kotlin client applies the same 30-second window to push and pull.
 
 Place TLS and public request controls in your application or trusted proxy. Keep
 `/syncx/health` and `/syncx/status` on an internal network or protect them with an access policy.
-The reference server exposes them without authentication for local development.
+The integration server exposes them without authentication for local development.
 
 ## Control Snapshot Capacity
 
@@ -247,8 +330,9 @@ Snapshot rebuilds have two independent admission limits:
 - `MaxConcurrentSnapshotBuilds` bounds frozen snapshot materialization.
 - `MaxConcurrentSnapshotChunkRequests` bounds reads from materialized snapshot sessions.
 
-Zero selects the Oversync defaults: eight active builds and four active chunk requests per server
-process. The reference server accepts positive overrides through
+Zero selects the Oversync defaults: four active builds and four active chunk requests per server
+process; `ApplySizing` derives both from the machine. The integration server accepts positive
+overrides through
 `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS` and
 `OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS`.
 
@@ -283,14 +367,16 @@ Choose limits from measurements:
    budget.
 
 Use the [Performance]({{ site.baseurl }}/documentation/performance/) guide to size snapshot row,
-byte, session, materialization, and cleanup bounds from your application data.
+byte, and session bounds from your application data.
 
 Reducing client concurrency is the first control when a test creates a burst that production
 traffic would spread across time. Raise server admission or pool limits when measurements show
 headroom. Keep build and chunk limits separate because their database and memory costs differ.
 
-Authenticated clients can read effective transfer and concurrency limits from
-`GET /sync/capabilities`. Treat that response as the authority for the instance that served it.
+Clients use `GET /sync/generations/{generation_id}` to read the selected descriptor, transfer
+limits, and watch capability. Send authentication, `Oversync-Protocol-Version: v1`, and
+`Oversync-Source-ID`. Omit the generation proof during discovery, then carry it on subsequent
+data-plane requests. Keep the advertised limits aligned across instances.
 
 ## Reproduce A 500-User Run
 
@@ -299,10 +385,10 @@ The mobile-flow simulator separates total work from active work:
 - `--parallel=500` creates 500 user simulations for the run.
 - `--concurrency=30` permits at most 30 whole-user lifecycles at once.
 
-Start the reference server, then run:
+Start the integration test server, then run:
 
 ```bash
-cd examples/mobile_flow
+cd integration/mobile_flow
 GOTOOLCHAIN=go1.25.12 go run . \
   --scenario=complex-multi-batch \
   --parallel=500 \
@@ -335,8 +421,8 @@ Use these surfaces for distinct jobs:
   service reports `unhealthy`.
 - `GET /syncx/status` reports lifecycle, in-flight work, retention windows, history-pruned count,
   accepted-push replay count, rejected registered writes, and committed-bundle totals.
-- `GET /sync/capabilities` reports protocol features and effective transfer and snapshot limits to
-  an authenticated client.
+- `GET /sync/generations/{generation_id}` supplies the immutable descriptor and effective limits
+  during client admission.
 
 Add HTTP instrumentation around the handlers. Count `snapshot_build_capacity` and
 `snapshot_chunk_capacity` responses, group latency by route and status, and alert on sustained 5xx
@@ -351,30 +437,37 @@ I/O in the callback.
 
 `LogStageTimings` writes stage timing at DEBUG level. Use it for a bounded investigation and keep
 it disabled during normal production service. The snapshot and scope-receipt cleanup workers log
-batch failures and completion details. Alert on cleanup failures and check whether expired session
+batch failures and a summary of each run; snapshot cleanup keeps draining in bounded batches while
+expired rows remain. `Bootstrap` logs one "Oversync effective settings" line with the permits,
+pool size, connection budget, Go memory limit, advertised limits, and a fingerprint of the
+settings every instance must share. Alert on cleanup failures and check whether expired session
 rows continue to grow.
 
 Monitor PostgreSQL pool acquisition, acquired and idle connections, database CPU, lock waits, and
-storage growth for `sync.bundle_log`, `sync.bundle_rows`, and snapshot-session tables. Track
-`history_pruned` frequency because it causes snapshot recovery. A rising frequency can indicate a
+storage growth for `sync.bundle_log`, `sync.bundle_rows`, and snapshot-session tables. Use
+`PushOutcomeStorage` to track outstanding outcome count, age, and storage separately. Track
+`history_pruned` frequency because it can trigger snapshot recovery. A rising frequency can indicate a
 retention window that is too short for your offline clients.
 
 ## Deploy, Upgrade, And Recover
 
-Back up PostgreSQL before first adoption of populated tables and before an upgrade that can change
-the managed layout. Test the restore procedure against a separate database.
+v0.5.0 requires a fresh managed layout and compatible clients. See the
+[v0.5.0 release notes]({{ site.baseurl }}/releases/v0.5.0/). Bootstrap rejects the v0.4.0
+layout with `layout_replacement_required`.
 
-For first adoption or a layout-affecting upgrade:
+For first adoption of populated business tables into a fresh v0.5.0 layout:
 
-1. Stop every old Oversync instance and every writer to registered tables.
-2. Back up PostgreSQL.
-3. Start one compatible server and let `Bootstrap()` finish.
+1. Stop writers to registered tables and take a PostgreSQL backup.
+2. Prepare the matching application deployment evidence.
+3. Start one server and wait for `Bootstrap()` to finish.
 4. Check `/syncx/health` and inspect `/syncx/status`.
-5. Start the remaining compatible instances, then restore client traffic.
+5. Start the remaining compatible instances, then open client traffic.
 
-Do not run mixed versions during adoption or a managed-layout change. Oversync validates the
-managed layout and fails closed on definition drift, but an older binary can still violate a newer
-contract before the new process starts.
+For later generation and catalog changes, use the
+[schema-evolution reference](https://github.com/mobiletoly/go-oversync/tree/main/integration/schema_evolution)
+and the [retirement runbook](https://github.com/mobiletoly/go-oversync/blob/main/integration/schema_evolution/ROLLOUT.md).
+Settle outstanding outcomes before retiring a generation. Test database restore against an isolated
+instance before deployment.
 
 Direct edits to `sync.*`, privileged trigger bypass, and changes to managed triggers fall outside
 the runtime contract. `Bootstrap()` does not audit or repair business and managed row values after
@@ -384,10 +477,16 @@ reserved `sync` schema while any server or client uses the database.
 
 ## Pre-Production Checklist
 
-- [ ] PostgreSQL runs a supported 16.x or 17.x release and has a tested backup and restore path.
+- [ ] PostgreSQL runs a 17.x release and has a tested backup and restore path.
 - [ ] Every registered table passes bootstrap validation on a staging copy of the production
   schema.
-- [ ] All instances use the same registered tables, schema version, and reserved source IDs.
+- [ ] All instances use the same registered tables, one-or-two-generation registry, catalog
+  revision, source-admission limit, and reserved source IDs, and log the same
+  `shared_settings_fingerprint`.
+- [ ] Instances × connections per instance fits PostgreSQL `max_connections`, and `GOMEMLIMIT` is
+  set ([Sizing and Deployment]({{ site.baseurl }}/documentation/sizing-and-deployment/)).
+- [ ] Clients omit proof headers during discovery and send the admitted proof on later operations.
+- [ ] A smoke test covers push and acknowledgment, ambiguous-upload resolution, and retained outcome lookup.
 - [ ] Authentication supplies an exact trusted `user_id`; clients supply a valid
   `Oversync-Source-ID`.
 - [ ] TLS, proxy limits, health-endpoint access, and secrets match your infrastructure policy.

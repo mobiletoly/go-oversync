@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
@@ -35,12 +36,24 @@ func ActorMiddleware(cfg ActorMiddlewareConfig) func(http.Handler) http.Handler 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			userID, err := cfg.UserIDFromContext(r.Context())
-			if err != nil || userID == "" {
+			if err != nil || !validAuthenticatedUserID(userID) {
 				writeMiddlewareError(w, http.StatusUnauthorized, "authentication_failed", "authenticated user_id not found in request context")
 				return
 			}
 
-			sourceID := r.Header.Get(SourceIDHeader)
+			if strings.Contains(r.URL.Path, "/sync/") {
+				if err := ValidateProtocolHeader(r.Header); err != nil {
+					writeMiddlewareError(w, http.StatusUpgradeRequired, "protocol_version_mismatch", "Require exactly Oversync-Protocol-Version: v1")
+					return
+				}
+			}
+
+			sourceValues := exactHeaderValues(r.Header, SourceIDHeader)
+			if len(sourceValues) != 1 {
+				writeMiddlewareError(w, http.StatusBadRequest, "invalid_request", SourceIDHeader+" header must appear exactly once")
+				return
+			}
+			sourceID := sourceValues[0]
 			if err := sourceid.Validate(sourceID); err != nil {
 				writeMiddlewareError(w, http.StatusBadRequest, "invalid_request", SourceIDHeader+" header must be a non-empty visible ASCII token")
 				return
@@ -57,6 +70,18 @@ func ActorMiddleware(cfg ActorMiddlewareConfig) func(http.Handler) http.Handler 
 			next.ServeHTTP(w, r.WithContext(ContextWithActor(r.Context(), actor)))
 		})
 	}
+}
+
+func validAuthenticatedUserID(value string) bool {
+	if value == "" || len(value) > 64*1024 || strings.TrimSpace(value) == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < ' ' || character == '\u007f' {
+			return false
+		}
+	}
+	return true
 }
 
 func writeMiddlewareError(w http.ResponseWriter, status int, code, message string) {

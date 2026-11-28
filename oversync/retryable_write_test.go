@@ -291,16 +291,17 @@ func TestRetryableDatabaseWriteCapability_IsRestrictedAndRequiresCallbackContext
 	schemaName := "retryable_capability_" + suffix
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "retryable-capability-test",
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "retryable-capability-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	actor := Actor{UserID: "retryable-capability-user-" + suffix}
 	source := BundleSource{SourceID: "server-app", SourceBundleID: 1}
-	mustInitializeEmptyScope(t, ctx, service, actor.UserID, source.SourceID)
+	mustInitializeEmptyScope(t, ctx, service, actor.UserID, "bootstrap-client")
 
 	var exposesCommit, exposesRawConn, rowsConnWasNil bool
 	err := service.WithinSyncBundle(ctx, actor, source, retryableBundleWriteOptionsForTest(), func(callbackCtx context.Context, tx DatabaseWriteTx) error {

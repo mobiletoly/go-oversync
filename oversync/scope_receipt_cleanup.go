@@ -30,7 +30,7 @@ func (s *SyncService) startScopeReceiptCleanupWorker() {
 	if s.scopeReceiptCleanupDone != nil {
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(withSyncMaintenanceContext(context.Background()))
 	done := make(chan struct{})
 	logger := s.logger
 	s.scopeReceiptCleanupCancel = cancel
@@ -122,7 +122,15 @@ func (s *SyncService) runScopeReceiptCleanup(ctx context.Context, logger *slog.L
 
 func (s *SyncService) cleanupScopeReceiptBatch(ctx context.Context) (int64, error) {
 	var deleted int64
-	err := pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+	err := withOriginTransaction(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		if s.config.Readiness != nil {
+			if adapter, ok := s.config.Readiness.Adapter.(OperationAdmissionAdapter); ok {
+				if err := adapter.Admit(ctx, tx); err != nil {
+					return err
+				}
+			}
+		}
+
 		tag, err := tx.Exec(ctx, `
 			WITH cleanup_clock AS MATERIALIZED (
 				SELECT clock_timestamp() AS cleanup_time

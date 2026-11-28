@@ -10,23 +10,25 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/mobiletoly/go-oversync/examples/internal/exampleauth"
+	"github.com/mobiletoly/go-oversync/internal/exampleauth"
+	"github.com/mobiletoly/go-oversync/internal/serverenv"
+	"github.com/mobiletoly/go-oversync/internal/syncroute"
 	"github.com/mobiletoly/go-oversync/oversync"
 )
 
 type ServerConfig struct {
-	DatabaseURL                        string
-	JWTSecret                          string
-	Logger                             *slog.Logger
-	AppName                            string
-	ReservedServerSourceIDs            []string
-	MaxConcurrentSnapshotBuilds        int
-	MaxConcurrentSnapshotChunkRequests int
+	DatabaseURL             string
+	JWTSecret               string
+	Logger                  *slog.Logger
+	AppName                 string
+	ReservedServerSourceIDs []string
+	// ConfigureService optionally adjusts the service configuration after the
+	// environment sizing is applied and before the pool is sized from it.
+	ConfigureService func(*oversync.ServiceConfig)
 }
 
 const maxLoggedBodyBytes = 100_000
@@ -37,8 +39,10 @@ type ServerComponents struct {
 	Auth        *exampleauth.TokenAuth
 	Handler     http.Handler
 	Logger      *slog.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
+	// Sizing is the machine sizing applied from the environment; nil without one.
+	Sizing *oversync.Sizing
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func (sc *ServerComponents) Close() {
@@ -55,9 +59,15 @@ func (sc *ServerComponents) Close() {
 
 func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	// The environment variables are read here, by the host, never by oversync.
+	envSettings, err := serverenv.Load(os.Getenv)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	logger := config.Logger
 	if logger == nil {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: envSettings.LogLevel}))
 	}
 	dsn := config.DatabaseURL
 	if dsn == "" {
@@ -68,13 +78,43 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		appName = "samplesync-server"
 	}
 
+	svcCfg := &oversync.ServiceConfig{
+		SchemaGenerations: []oversync.SchemaGeneration{{ID: 1, Tables: []oversync.GenerationTable{
+			{Schema: "business", Table: "comment", Columns: []oversync.GenerationColumn{{Name: "comment", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "person_id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "tags", WireType: oversync.GenerationWireTypeText, Nullable: true}}, ForeignKeys: []oversync.GenerationForeignKey{{Columns: []string{"person_id"}, ReferencedSchema: "business", ReferencedTable: "person", ReferencedColumns: []string{"id"}, OnDelete: oversync.GenerationForeignKeyCascade, OnUpdate: oversync.GenerationForeignKeyNoAction}}},
+			{Schema: "business", Table: "person", Columns: []oversync.GenerationColumn{{Name: "birth_date", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "email", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "first_name", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "is_active", WireType: oversync.GenerationWireTypeBoolean, Nullable: false}, {Name: "last_name", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "notes", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "phone", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "score", WireType: oversync.GenerationWireTypeFloat64, Nullable: true}, {Name: "ssn", WireType: oversync.GenerationWireTypeInt64, Nullable: true}, {Name: "updated_at", WireType: oversync.GenerationWireTypeText, Nullable: false}}},
+			{Schema: "business", Table: "person_address", Columns: []oversync.GenerationColumn{{Name: "address_type", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "city", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "country", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "created_at", WireType: oversync.GenerationWireTypeText, Nullable: false}, {Name: "id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "is_primary", WireType: oversync.GenerationWireTypeBoolean, Nullable: false}, {Name: "person_id", WireType: oversync.GenerationWireTypeUUID, Nullable: false}, {Name: "postal_code", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "state", WireType: oversync.GenerationWireTypeText, Nullable: true}, {Name: "street", WireType: oversync.GenerationWireTypeText, Nullable: false}}, ForeignKeys: []oversync.GenerationForeignKey{{Columns: []string{"person_id"}, ReferencedSchema: "business", ReferencedTable: "person", ReferencedColumns: []string{"id"}, OnDelete: oversync.GenerationForeignKeyCascade, OnUpdate: oversync.GenerationForeignKeyNoAction}}},
+		}}},
+		AppName: appName,
+		BundleChangeWatch: oversync.BundleChangeWatchConfig{
+			Enabled: true,
+		},
+		RegisteredTables: []oversync.RegisteredTable{
+			{Schema: "business", Table: "person", SyncKeyColumns: []string{"id"}},
+			{Schema: "business", Table: "person_address", SyncKeyColumns: []string{"id"}},
+			{Schema: "business", Table: "comment", SyncKeyColumns: []string{"id"}},
+		},
+		ReservedServerSourceIDs:        append([]string(nil), config.ReservedServerSourceIDs...),
+		RegisteredTableCatalogRevision: 1,
+	}
+	sizing, err := envSettings.ApplyService(svcCfg)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if config.ConfigureService != nil {
+		config.ConfigureService(svcCfg)
+	}
+	// Set the Go memory limit before the service starts, so its startup checks see it.
+	if limit := serverenv.ApplyGoMemoryLimit(sizing, os.Getenv); limit > 0 {
+		logger.Info("Go memory limit", "bytes", limit)
+	}
+
 	poolCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	poolCfg.MaxConns = 20
-	poolCfg.MinConns = 2
+	envSettings.ApplyPool(poolCfg, dsn, *svcCfg)
 	poolCfg.MaxConnIdleTime = time.Minute * 30
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -93,36 +133,11 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 		return nil, err
 	}
 
-	svcCfg := &oversync.ServiceConfig{
-		MaxSupportedSchemaVersion:          1,
-		AppName:                            appName,
-		MaxConcurrentSnapshotBuilds:        config.MaxConcurrentSnapshotBuilds,
-		MaxConcurrentSnapshotChunkRequests: config.MaxConcurrentSnapshotChunkRequests,
-		BundleChangeWatch: oversync.BundleChangeWatchConfig{
-			Enabled: true,
-		},
-		RegisteredTables: []oversync.RegisteredTable{
-			{Schema: "business", Table: "person", SyncKeyColumns: []string{"id"}},
-			{Schema: "business", Table: "person_address", SyncKeyColumns: []string{"id"}},
-			{Schema: "business", Table: "comment", SyncKeyColumns: []string{"id"}},
-		},
-		ReservedServerSourceIDs: append([]string(nil), config.ReservedServerSourceIDs...),
-	}
-	builds, chunks, err := configuredSnapshotConcurrencyFromEnv(
-		svcCfg.MaxConcurrentSnapshotBuilds,
-		svcCfg.MaxConcurrentSnapshotChunkRequests,
-	)
-	if err != nil {
-		pool.Close()
+	if err := prepareBaselineReadiness(ctx, pool, svcCfg); err != nil {
 		cancel()
+		pool.Close()
 		return nil, err
 	}
-	svcCfg.MaxConcurrentSnapshotBuilds = builds
-	svcCfg.MaxConcurrentSnapshotChunkRequests = chunks
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OVERSYNC_LOG_STAGE_TIMINGS"))); v == "1" || v == "true" || v == "yes" {
-		svcCfg.LogStageTimings = true
-	}
-
 	syncService, err := oversync.NewRuntimeService(pool, svcCfg, logger)
 	if err != nil {
 		pool.Close()
@@ -165,26 +180,28 @@ func SetupServer(config *ServerConfig) (*ServerComponents, error) {
 	withSyncActor := func(next http.Handler) http.Handler {
 		return auth.Middleware(actorMiddleware(next))
 	}
-	mux.Handle("POST /sync/push-sessions", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleCreatePushSession)), logger))
+	mux.Handle("POST /sync/push", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePush)), logger))
+	mux.Handle("POST /sync/push-outcomes/resolve", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushOutcomeResolve)), logger))
+	mux.Handle("POST /sync/push-outcomes/retained", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushOutcomeRetained)), logger))
+	mux.Handle("POST /sync/push-outcomes/ack", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushOutcomeAck)), logger))
 	mux.Handle("POST /sync/connect", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleConnect)), logger))
-	mux.Handle("POST /sync/push-sessions/{push_id}/chunks", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePushSessionChunk)), logger))
-	mux.Handle("POST /sync/push-sessions/{push_id}/commit", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleCommitPushSession)), logger))
-	mux.Handle("DELETE /sync/push-sessions/{push_id}", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleDeletePushSession)), logger))
-	mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandleGetCommittedBundleRows)), logger))
 	mux.Handle("GET /sync/pull", LoggingMiddleware(true, withSyncActor(http.HandlerFunc(syncHandlers.HandlePull)), logger))
 	// Keep SSE responses off the body-capturing logger so http.Flusher remains available.
 	mux.Handle("GET /sync/watch", withSyncActor(http.HandlerFunc(syncHandlers.HandleWatch)))
 	mux.Handle("POST /sync/snapshot-sessions", withSyncActor(http.HandlerFunc(syncHandlers.HandleCreateSnapshotSession)))
 	mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(syncHandlers.HandleGetSnapshotChunk)))
 	mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(syncHandlers.HandleDeleteSnapshotSession)))
-	mux.Handle("GET /sync/capabilities", withSyncActor(http.HandlerFunc(syncHandlers.HandleCapabilities)))
+	generationHandler := withSyncActor(http.HandlerFunc(syncHandlers.HandleGeneration))
+	mux.Handle("GET /sync/generations/{generation_id}", generationHandler)
+	mux.Handle("GET /sync/generations/", generationHandler)
 
 	return &ServerComponents{
 		Pool:        pool,
 		SyncService: syncService,
 		Auth:        auth,
-		Handler:     BrowserTestCORSMiddleware(mux),
+		Handler:     BrowserTestCORSMiddleware(sampleReadinessGuard(syncService, mux, generationHandler)),
 		Logger:      logger,
+		Sizing:      sizing,
 		ctx:         ctx,
 		cancel:      cancel,
 	}, nil
@@ -225,37 +242,12 @@ func sampleSyncDummySigninHandler(auth *exampleauth.TokenAuth, logger *slog.Logg
 	})
 }
 
-func configuredSnapshotConcurrencyFromEnv(builds, chunks int) (int, int, error) {
-	parse := func(name string, current int) (int, error) {
-		value := strings.TrimSpace(os.Getenv(name))
-		if value == "" {
-			return current, nil
-		}
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed < 1 {
-			return 0, fmt.Errorf("%s must be a positive integer", name)
-		}
-		return parsed, nil
-	}
-
-	var err error
-	builds, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_BUILDS", builds)
-	if err != nil {
-		return 0, 0, err
-	}
-	chunks, err = parse("OVERSYNC_MAX_CONCURRENT_SNAPSHOT_CHUNK_REQUESTS", chunks)
-	if err != nil {
-		return 0, 0, err
-	}
-	return builds, chunks, nil
-}
-
 // BrowserTestCORSMiddleware keeps the example server usable from browser-based demos.
 // It is intentionally permissive because this binary is a local sample server.
 func BrowserTestCORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, "+oversync.SourceIDHeader)
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, "+oversync.SourceIDHeader+", "+oversync.SchemaGenerationIDHeader+", "+oversync.SchemaGenerationFingerprintHeader)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Max-Age", "600")
 		if r.Method == http.MethodOptions {
@@ -287,14 +279,14 @@ func LoggingMiddleware(enable bool, next http.Handler, logger *slog.Logger) http
 		rw := &respCapture{ResponseWriter: w, status: http.StatusOK, limit: maxLoggedBodyBytes}
 		next.ServeHTTP(rw, r)
 		fields := map[string]any{"status": rw.status, "duration": time.Since(start).String()}
-		if (r.URL.Path == "/sync/pull" || strings.HasPrefix(r.URL.Path, "/sync/push-sessions") || strings.HasPrefix(r.URL.Path, "/sync/committed-bundles/")) && len(rw.buf) > 0 && !rw.truncated {
+		if (r.URL.Path == "/sync/pull" || r.URL.Path == "/sync/push") && len(rw.buf) > 0 && !rw.truncated {
 			fields["body"] = string(rw.buf)
 		}
 		// Extra structured logs for dev: push/download summaries and user id
 		actor, _ := oversync.ActorFromContext(r.Context())
 		userID := actor.UserID
-		if strings.HasPrefix(r.URL.Path, "/sync/push-sessions") && len(rw.buf) > 0 {
-			logger.Info("Push session summary", "user", userID, "path", r.URL.Path, "status", rw.status)
+		if r.URL.Path == "/sync/push" && len(rw.buf) > 0 {
+			logger.Info("Whole-request push summary", "user", userID, "status", rw.status)
 		}
 		if r.URL.Path == "/sync/pull" && len(rw.buf) > 0 {
 			type pullResp struct {
@@ -335,4 +327,19 @@ func (w *respCapture) Write(b []byte) (int, error) {
 		w.truncated = true
 	}
 	return n, err
+}
+
+func sampleReadinessGuard(service *oversync.SyncService, next, generation http.Handler) http.Handler {
+	guarded := service.ReadinessGuard(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if syncroute.IsRootGenerationDiscoveryPath(r) {
+			generation.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/sync/") {
+			guarded.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

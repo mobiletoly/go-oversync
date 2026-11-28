@@ -1,0 +1,24 @@
+{
+  "keys": [
+    "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "7ba7b810-9dad-11d1-80b4-00c04fd430c8"
+  ],
+  "old_generation": 1,
+  "target_generation": 3,
+  "queued_legacy": "Newer|Value",
+  "after_target_write": "Target|Value",
+  "after_old_write": [
+    "Old",
+    "Again"
+  ],
+  "runtime_rejection_status": 426,
+  "runtime_rejection_error": "client_runtime_upgrade_required",
+  "runtime_rejection_message": "Update the application; keep local data and pending sync work",
+  "preserve_fields": [
+    "source_id",
+    "next_source_bundle_id",
+    "canonical_request_hash",
+    "frozen_rows",
+    "business_intent"
+  ]
+}

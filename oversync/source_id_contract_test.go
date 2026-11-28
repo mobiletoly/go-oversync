@@ -40,7 +40,8 @@ func TestValidateSnapshotSourceReplacement_RejectsNormalizedOrNonASCIISourceIDs(
 }
 
 func TestValidateSnapshotSourceReplacement_RejectsReservedServerSources(t *testing.T) {
-	service := &SyncService{config: &ServiceConfig{ReservedServerSourceIDs: []string{"server-writer"}}}
+	service := &SyncService{config: &ServiceConfig{ReservedServerSourceIDs: []string{"server-writer"},
+		RegisteredTableCatalogRevision: 1}}
 	_, err := service.validateSnapshotSourceReplacement(
 		Actor{UserID: "user-1", SourceID: "device-a"},
 		&SnapshotSourceReplacement{

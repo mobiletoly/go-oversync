@@ -96,12 +96,14 @@ sequenceDiagram
   A-->>D: Rebuild locally in one deferred-FK transaction
 
   Note over D: Normal operation
-  D->>A: Push dirty set (source_bundle_id)
-  A->>S: Validate + apply to business tables
-  S->>P: Commit one bundle and capture row effects
-  P-->>S: Committed bundle + bundle_seq
-  S-->>A: Authoritative bundle response
-  A-->>D: Replay authoritative bundle locally
+  D->>A: Push bounded upload (source_bundle_id)
+  A->>S: Validate and apply to business tables
+  S->>P: Commit business effects and terminal outcome
+  P-->>S: Committed outcome
+  S-->>A: Authoritative outcome
+  A-->>D: Settle locally
+  D->>A: Acknowledge under the original binding
+  A->>S: Persist acknowledgment
 
   D->>A: Pull since last_bundle_seq_seen
   A->>S: Request committed bundles to stable_bundle_seq
@@ -121,10 +123,10 @@ sequenceDiagram
 ### Push
 
 - Each logical push is identified by `(source_id, source_bundle_id)` for safe retry
-- The client submits its full current dirty set as one logical bundle
-- The server either rejects the entire push or commits one bundle
-- On success, the server returns the authoritative committed bundle derived from the actual
-  business-table transaction
+- The client freezes one bounded bundle of local intent at a time
+- The server retains the terminal outcome until the client acknowledges it
+- A committed outcome carries the authoritative effects of the business transaction
+- The client records local disposition before sending acknowledgment
 
 ### Structured push conflicts
 
@@ -165,7 +167,11 @@ sequenceDiagram
 - Sync metadata is derived from committed business-table effects
 - Server-side cascades and trigger-driven writes are captured into bundles naturally because they are
   part of the committed database transaction
-- There is no projection backlog in the core sync path
+- There is no projection backlog in the core sync path: generation-visible history is derived on
+  demand from one canonical stream under finite row, byte, response, and concurrency bounds
+- Invisible-only canonical bundles remain empty pull envelopes so durable checkpoints never stall
+- A push is atomic only if every uploaded key has a final captured effect visible to its fixed
+  generation; uncovered trigger-suppressed work rolls back completely
 
 ## Summary
 

@@ -96,11 +96,7 @@ func TestBlobPrimaryKeySupport(t *testing.T) {
 		t.Fatal("Expected payload to be present")
 	}
 
-	var payloadData map[string]interface{}
-	err = json.Unmarshal([]byte(payload.String), &payloadData)
-	if err != nil {
-		t.Fatalf("Failed to parse payload JSON: %v", err)
-	}
+	payloadData := decodeDirtyPayload(t, payload.String)
 
 	// Check that BLOB fields are hex encoded (lowercase)
 	idField, ok := payloadData["id"].(string)
@@ -158,9 +154,10 @@ func TestBlobSerializeRow(t *testing.T) {
 	}
 
 	// Create configuration
-	config := DefaultConfig("test", []SyncTable{
+	config := admittedFixtureConfig("test", []SyncTable{
 		{TableName: "blob_documents", SyncKeyColumnName: "id"},
-	})
+	}, testSchemaGenerationProof())
+	config = testConfigWithLocalContract(t, db, config)
 
 	// Mock token function
 	tokenFunc := func(ctx context.Context) (string, error) {
@@ -168,7 +165,7 @@ func TestBlobSerializeRow(t *testing.T) {
 	}
 
 	// Create client
-	client, err := NewClient(db, "http://localhost:8080", tokenFunc, config)
+	client, err := newAdmittedFixtureClient(db, "http://localhost:8080", tokenFunc, config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -202,11 +199,7 @@ func TestBlobSerializeRow(t *testing.T) {
 	}
 
 	// Parse the payload
-	var payloadData map[string]interface{}
-	err = json.Unmarshal(payload, &payloadData)
-	if err != nil {
-		t.Fatalf("Failed to parse payload JSON: %v", err)
-	}
+	payloadData := decodeDirtyPayload(t, string(payload))
 
 	// Verify BLOB primary key is hex encoded (lowercase)
 	idField, ok := payloadData["id"].(string)

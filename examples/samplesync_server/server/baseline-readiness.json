@@ -1,0 +1,15 @@
+{
+  "format": "go-oversync.static-baseline.v1",
+  "authority_id": "go-oversync.examples.samplesync-server",
+  "deployment_revision": 2,
+  "transition_revision": "static-schema-v2",
+  "transition_phase": "baseline",
+  "application": {
+    "id": "samplesync-server",
+    "revision": 2
+  },
+  "qualification": {
+    "id": "samplesync-server-example-suite",
+    "revision": 2
+  }
+}

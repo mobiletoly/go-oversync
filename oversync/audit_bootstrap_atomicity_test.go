@@ -26,8 +26,6 @@ var auditBootstrapManagedTables = []string{
 	"bundle_capture_stage",
 	"bundle_log",
 	"bundle_rows",
-	"push_sessions",
-	"push_session_rows",
 	"snapshot_sessions",
 	"snapshot_session_rows",
 }
@@ -161,12 +159,13 @@ func newAuditBootstrapAtomicityService(t *testing.T, pool *pgxpool.Pool, schemaN
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	service, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "audit-bootstrap-atomicity",
+	service, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "audit-bootstrap-atomicity",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() {

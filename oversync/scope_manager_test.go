@@ -24,15 +24,19 @@ func newScopeManagerIntegrationService(
 ) (*SyncService, *ScopeManager) {
 	t.Helper()
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "scope-manager-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "file_reviews", SyncKeyColumns: []string{"id"}},
+	}), AppName: "scope-manager-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "file_reviews", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	return svc, NewScopeManager(svc, ScopeManagerConfig{Logger: logger})
 }
@@ -113,7 +117,8 @@ func TestScopeManager_ExecWrite_AutoInitializesAndCommitsVisibleBundle(t *testin
 	require.Equal(t, scopeID, storedScopeID)
 
 	reader := Actor{UserID: scopeID, SourceID: "reader"}
-	pullResp, err := svc.ProcessPull(ctx, reader, 0, 10, 0)
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
+	pullResp, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), 0, 10, 0)
 	require.NoError(t, err)
 	require.Equal(t, result.Bundle.BundleSeq, pullResp.StableBundleSeq)
 	require.Len(t, pullResp.Bundles, 1)
@@ -161,7 +166,7 @@ func TestScopeManager_ExecWrite_FailsClosedWhenScopeInitializing(t *testing.T) {
 	svc, mgr := newScopeManagerIntegrationService(t, ctx, pool, schemaName, logger)
 
 	scopeID := "scope-initializing-" + suffix
-	resp, err := svc.Connect(ctx, Actor{UserID: scopeID, SourceID: "device-a"}, &ConnectRequest{HasLocalPendingRows: true})
+	resp, err := svc.Connect(ctx, Actor{UserID: scopeID, SourceID: "device-a"}, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 	require.NoError(t, err)
 	require.Equal(t, "initialize_local", resp.Resolution)
 
@@ -374,7 +379,7 @@ func TestScopeManager_ExecWrite_WriterSequencingAcrossScopesAndWriters(t *testin
 	require.Equal(t, int64(1), aOther.Bundle.SourceBundleID)
 }
 
-func TestScopeManager_ExecWrite_CollisionWithClientSourceUsesUnderlyingRuntimeRules(t *testing.T) {
+func TestScopeManager_ExecWrite_RejectsClientSourceBeforeCallback(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -390,7 +395,7 @@ func TestScopeManager_ExecWrite_CollisionWithClientSourceUsesUnderlyingRuntimeRu
 	sharedWriter := "shared-writer"
 	rowID := uuid.New()
 	actor := Actor{UserID: scopeID, SourceID: sharedWriter}
-	bundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, []PushRequestRow{{
+	bundle, err := pushRowsOneShot(t, ctx, svc, actor, 1, []PushRequestRow{{
 		Schema:         schemaName,
 		Table:          "users",
 		Key:            SyncKey{"id": rowID.String()},
@@ -401,7 +406,9 @@ func TestScopeManager_ExecWrite_CollisionWithClientSourceUsesUnderlyingRuntimeRu
 	require.NoError(t, err)
 	require.NotNil(t, bundle)
 
+	called := false
 	result, err := mgr.ExecWrite(ctx, scopeID, ScopeWriteOptions{WriterID: sharedWriter, RetryableWriteOptions: retryableWriteOptionsForTest()}, func(ctx context.Context, tx DatabaseWriteTx) error {
+		called = true
 		_, err := tx.Exec(ctx, fmt.Sprintf(`
 			UPDATE %s.users
 			SET name = $3
@@ -410,8 +417,12 @@ func TestScopeManager_ExecWrite_CollisionWithClientSourceUsesUnderlyingRuntimeRu
 		`, pgx.Identifier{schemaName}.Sanitize()), scopeID, rowID, "Server")
 		return err
 	})
-	require.NoError(t, err)
-	require.Equal(t, int64(2), result.Bundle.SourceBundleID)
+	require.ErrorAs(t, err, new(*SourceGenerationError))
+	require.Nil(t, result)
+	require.False(t, called)
+	var name string
+	require.NoError(t, pool.QueryRow(ctx, fmt.Sprintf(`SELECT name FROM %s.users WHERE id=$1`, pgx.Identifier{schemaName}.Sanitize()), rowID).Scan(&name))
+	require.Equal(t, "Client", name)
 }
 
 func TestScopeManager_ExecWrite_RejectsCrossScopeMutations(t *testing.T) {
@@ -544,14 +555,14 @@ func TestScopeManager_ExecWrite_ComplexScopeSafeSQLAndTriggerEffects(t *testing.
 	`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "scope-manager-complex",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-			{Schema: schemaName, Table: "profiles", SyncKeyColumns: []string{"id"}},
-			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
-		},
+	registered := []RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "profiles", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
+	}
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "scope-manager-complex",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	mgr := NewScopeManager(svc, ScopeManagerConfig{Logger: logger})
 
@@ -583,7 +594,8 @@ func TestScopeManager_ExecWrite_ComplexScopeSafeSQLAndTriggerEffects(t *testing.
 	require.Equal(t, int64(3), result.Bundle.RowCount)
 
 	reader := Actor{UserID: scopeID, SourceID: "reader"}
-	pullResp, err := svc.ProcessPull(ctx, reader, 0, 10, 0)
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
+	pullResp, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), 0, 10, 0)
 	require.NoError(t, err)
 	require.Len(t, pullResp.Bundles, 1)
 	require.Len(t, pullResp.Bundles[0].Rows, 3)
@@ -613,7 +625,7 @@ func TestScopeManager_ExecWrite_DifferentScopeDoesNotObserveChanges(t *testing.T
 	})
 	require.NoError(t, err)
 
-	respB, err := svc.ProcessPull(ctx, Actor{UserID: scopeB, SourceID: "reader-b"}, 0, 10, 0)
+	respB, err := svc.ProcessPull(ctx, Actor{UserID: scopeB, SourceID: "reader-b"}, testSchemaGenerationProofForService(svc), 0, 10, 0)
 	require.NoError(t, err)
 	require.Len(t, respB.Bundles, 0)
 	require.Equal(t, int64(0), respB.StableBundleSeq)
@@ -682,7 +694,7 @@ func TestScopeManager_ExecWrite_ConcurrentUsage(t *testing.T) {
 	}
 }
 
-func TestScopeManager_ExecWrite_PreservesPullRetentionAndCommittedBundleRowVisibility(t *testing.T) {
+func TestScopeManager_ExecWrite_PreservesPullRetentionVisibility(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -696,6 +708,7 @@ func TestScopeManager_ExecWrite_PreservesPullRetentionAndCommittedBundleRowVisib
 
 	scopeID := "scope-retention-" + suffix
 	reader := Actor{UserID: scopeID, SourceID: "reader"}
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
 
 	writeUser := func(name string) *ScopeWriteResult {
 		t.Helper()
@@ -715,24 +728,18 @@ func TestScopeManager_ExecWrite_PreservesPullRetentionAndCommittedBundleRowVisib
 	require.Equal(t, int64(1), first.Bundle.SourceBundleID)
 	require.Equal(t, int64(2), second.Bundle.SourceBundleID)
 
-	rowsResp, err := svc.GetCommittedBundleRows(ctx, reader, second.Bundle.BundleSeq, nil, 10)
+	page, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), 0, 10, 0)
 	require.NoError(t, err)
-	require.NotNil(t, rowsResp)
-	require.Equal(t, second.Bundle.BundleSeq, rowsResp.BundleSeq)
-	require.Len(t, rowsResp.Rows, 1)
-	require.Equal(t, schemaName, rowsResp.Rows[0].Schema)
-	require.Equal(t, "users", rowsResp.Rows[0].Table)
+	require.Len(t, page.Bundles, 2)
+	require.Equal(t, second.Bundle.BundleSeq, page.Bundles[1].BundleSeq)
 
 	_, err = pool.Exec(ctx, `UPDATE sync.user_state SET retained_bundle_floor = $2 WHERE user_id = $1`, scopeID, second.Bundle.BundleSeq)
 	require.NoError(t, err)
 
-	_, err = svc.ProcessPull(ctx, reader, first.Bundle.BundleSeq, 10, 0)
+	_, err = svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), first.Bundle.BundleSeq, 10, 0)
 	var prunedErr *HistoryPrunedError
 	require.ErrorAs(t, err, &prunedErr)
 	require.Equal(t, first.Bundle.BundleSeq, prunedErr.ProvidedSeq)
 	require.Equal(t, second.Bundle.BundleSeq, prunedErr.RetainedFloor)
 
-	_, err = svc.GetCommittedBundleRows(ctx, reader, first.Bundle.BundleSeq, nil, 10)
-	require.ErrorAs(t, err, &prunedErr)
-	require.Equal(t, second.Bundle.BundleSeq, prunedErr.RetainedFloor)
 }

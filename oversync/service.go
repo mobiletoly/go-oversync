@@ -10,10 +10,13 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -22,38 +25,49 @@ type serviceLifecycleState string
 type bootstrapReadinessState string
 
 const (
-	serviceLifecycleRunning                   serviceLifecycleState   = "running"
-	serviceLifecycleShuttingDown              serviceLifecycleState   = "shutting_down"
-	serviceLifecycleClosed                    serviceLifecycleState   = "closed"
-	bootstrapReadinessNotReady                bootstrapReadinessState = "not_ready"
-	bootstrapReadinessBootstrapping           bootstrapReadinessState = "bootstrapping"
-	bootstrapReadinessReady                   bootstrapReadinessState = "ready"
-	defaultMaxBundlesPerPull                  int                     = 5000
-	defaultPullBundlesPerRequest              int                     = 1000
-	defaultRowsPerPushChunk                   int                     = 1000
-	defaultMaxRowsPerPushChunk                int                     = 5000
-	defaultPushSessionTTL                     time.Duration           = 15 * time.Minute
-	defaultRowsPerCommittedBundleChunk        int                     = 1000
-	defaultMaxRowsPerCommittedBundleChunk     int                     = 5000
-	defaultMaxRowsPerSnapshotChunk            int                     = 5000
-	defaultRowsPerSnapshotChunk               int                     = 1000
-	defaultSnapshotSessionTTL                 time.Duration           = 15 * time.Minute
-	defaultSnapshotMaterializationBatchRows   int                     = 512
-	defaultSnapshotMaterializationBatchBytes  int64                   = 4 << 20
-	defaultMaxConcurrentSnapshotBuilds        int                     = 8
-	defaultMaxConcurrentSnapshotChunkRequests int                     = 4
-	defaultBytesPerSnapshotChunk              int64                   = 4 << 20
-	defaultMaxBytesPerSnapshotChunk           int64                   = 16 << 20
-	defaultMaxBytesPerSnapshotRow             int64                   = 4 << 20
-	defaultSnapshotCleanupInterval            time.Duration           = time.Minute
-	defaultSnapshotCleanupBatchRows           int                     = 5000
-	defaultSnapshotCleanupBatchSessions       int                     = 32
-	defaultSnapshotCleanupMaxBatchesPerRun    int                     = 8
-	defaultSnapshotCleanupBatchTimeout        time.Duration           = 5 * time.Second
-	defaultRetainedBundlesPerUser             int64                   = 10000
-	defaultRetentionPruneBatchSize            int64                   = 1000
-	defaultBundleChangeNotifyChannel          string                  = "oversync_bundle_change_v1"
-	defaultBundleChangeHeartbeatInterval      time.Duration           = 25 * time.Second
+	serviceLifecycleRunning                serviceLifecycleState   = "running"
+	serviceLifecycleShuttingDown           serviceLifecycleState   = "shutting_down"
+	serviceLifecycleClosed                 serviceLifecycleState   = "closed"
+	bootstrapReadinessNotReady             bootstrapReadinessState = "not_ready"
+	bootstrapReadinessBootstrapping        bootstrapReadinessState = "bootstrapping"
+	bootstrapReadinessReady                bootstrapReadinessState = "ready"
+	defaultMaxBundlesPerPull               int                     = 5000
+	defaultMaxRowsPerBundle                int                     = 10000
+	maxMaxRowsPerBundle                    int                     = 100000
+	defaultMaxBytesPerBundle               int                     = 16 << 20
+	maxMaxBytesPerBundle                   int                     = 64 << 20
+	defaultMaxBytesPerPullResponse         int64                   = 32 << 20
+	maxMaxBytesPerPullResponse             int64                   = 128 << 20
+	defaultMaxConcurrentHistoryProjections int                     = 4
+	maxMaxConcurrentHistoryProjections     int                     = 32
+	historyEnvelopeAllowance               int64                   = 4096
+	// maxCompactSingleRowEnvelopeBytes is a conservative upper bound for the
+	// fixed JSON members, maximum escaped source token, hashes, and int64
+	// counters surrounding one compact row. Runtime codec sizing remains exact.
+	maxCompactSingleRowEnvelopeBytes          int64         = 1024
+	defaultPullBundlesPerRequest              int           = 1000
+	defaultMaxRowsPerSnapshotChunk            int           = 5000
+	defaultRowsPerSnapshotChunk               int           = 1000
+	defaultSnapshotSessionTTL                 time.Duration = 15 * time.Minute
+	defaultSnapshotMaterializationBatchRows   int           = 512
+	defaultSnapshotMaterializationBatchBytes  int64         = 4 << 20
+	defaultMaxConcurrentSnapshotBuilds        int           = 4
+	defaultMaxConcurrentSnapshotChunkRequests int           = 4
+	defaultBytesPerSnapshotChunk              int64         = 4 << 20
+	defaultMaxBytesPerSnapshotChunk           int64         = 16 << 20
+	defaultMaxBytesPerSnapshotRow             int64         = 4 << 20
+	defaultSnapshotCleanupInterval            time.Duration = time.Minute
+	defaultSnapshotCleanupBatchRows           int           = 5000
+	defaultSnapshotCleanupBatchSessions       int           = 32
+	defaultSnapshotCleanupBatchesPerBurst     int           = 8
+	defaultSnapshotCleanupDrainPause          time.Duration = 100 * time.Millisecond
+	defaultSnapshotCleanupBatchTimeout        time.Duration = 5 * time.Second
+	defaultRetainedBundlesPerUser             int64         = 10000
+	defaultRetentionPruneBatchSize            int64         = 1000
+	defaultBundleChangeNotifyChannel          string        = "oversync_bundle_change_v1"
+	defaultBundleChangeHeartbeatInterval      time.Duration = 25 * time.Second
+	defaultMaxClientSourcesPerUser            int           = 64
+	maxMaxClientSourcesPerUser                int           = 4096
 )
 
 var (
@@ -130,20 +144,26 @@ func (t RegisteredTable) normalizedSyncKeyColumns() []string {
 // SyncService provides the core synchronization functionality
 // This is the main SDK component that developers integrate into their applications
 type SyncService struct {
-	pool                *pgxpool.Pool
-	logger              *slog.Logger
-	config              *ServiceConfig
-	bundleChangeHub     *bundleChangeHub
-	registeredTables    map[string]bool // Set of "schema.table" combinations allowed in sync operations
-	registeredTableInfo map[string]registeredTableRuntimeInfo
-	registeredTableByID map[int32]registeredTableRuntimeInfo
-	columnTypesByTable  map[string]map[string]string
+	pool                     *pgxpool.Pool
+	logger                   *slog.Logger
+	config                   *ServiceConfig
+	bundleChangeHub          *bundleChangeHub
+	registeredTables         map[string]bool // Set of "schema.table" combinations allowed in sync operations
+	registeredTableInfo      map[string]registeredTableRuntimeInfo
+	registeredTableByID      map[int32]registeredTableRuntimeInfo
+	retainedTableByID        map[int32]registeredTableRuntimeInfo
+	catalogMetadata          registeredTableCatalogMetadata
+	columnTypesByTable       map[string]map[string]string
+	schemaGenerationRegistry *SchemaGenerationRegistry
+	generationViews          map[SchemaGenerationID]*schemaGenerationView
 
 	// Internal adoption instrumentation is nil/empty in normal runtime use. It
 	// keeps retry, progress, and owned-spool tests on the production Bootstrap
 	// path without exposing a public configuration surface.
 	adoptionSpoolDir          string
 	adoptionHooks             *adoptionTestHooks
+	catalogHooks              *registeredTableCatalogTestHooks
+	uploadConnHooks           *userUploadConnTestHooks
 	bootstrapProgressNow      func() time.Time
 	bootstrapProgressInterval time.Duration
 
@@ -151,18 +171,27 @@ type SyncService struct {
 	discoveredSchema *DiscoveredSchema
 
 	// Runtime lifecycle tracking.
-	bootstrapMu        sync.Mutex
-	mu                 sync.RWMutex
-	lifecycle          serviceLifecycleState
-	bootstrapReadiness bootstrapReadinessState
-	inFlightOps        int
-	drainedCh          chan struct{}
-	bootstrapDrainedCh chan struct{}
-	closedCh           chan struct{}
-	closeOnce          sync.Once
+	readinessReport             ReadinessReport
+	readinessWithdrawn          bool
+	readinessContentionHook     func()
+	bootstrapMu                 sync.Mutex
+	mu                          sync.RWMutex
+	lifecycle                   serviceLifecycleState
+	bootstrapReadiness          bootstrapReadinessState
+	inFlightOps                 int
+	userUploadGatesMu           sync.Mutex
+	userUploadGates             map[string]*userUploadGate
+	drainedCh                   chan struct{}
+	drainStartedCh              chan struct{}
+	bundleChangeListenerRunning bool
+	bootstrapDrainedCh          chan struct{}
+	closedCh                    chan struct{}
+	closeOnce                   sync.Once
 
 	snapshotBuildPermits       chan struct{}
 	snapshotChunkPermits       chan struct{}
+	historyProjectionPermits   chan struct{}
+	pushBodies                 *pushBodyAdmission
 	snapshotCleanupMu          sync.Mutex
 	snapshotCleanupCancel      context.CancelFunc
 	snapshotCleanupDone        chan struct{}
@@ -171,14 +200,19 @@ type SyncService struct {
 	scopeReceiptCleanupCancel  context.CancelFunc
 	scopeReceiptCleanupDone    chan struct{}
 	scopeReceiptCleanupTrigger chan string
+	generationMetrics          generationRuntimeMetrics
 	snapshotMetrics            snapshotRuntimeMetrics
+	historyProjectionMetrics   historyProjectionRuntimeMetrics
 	snapshotHooks              *snapshotTestHooks
+	// pushOutcomeCeiling is the stored push outcome ceiling, set by Bootstrap.
+	pushOutcomeCeiling atomic.Int64
 }
 
 type snapshotTestHooks struct {
 	afterBuildPermit                   func(context.Context) error
 	afterChunkPermit                   func(context.Context) error
 	afterChunkSessionRead              func(context.Context) error
+	afterDeleteSessionRead             func(context.Context) error
 	afterSnapshotFence                 func(context.Context) error
 	afterSnapshotCommit                func(context.Context) error
 	afterSnapshotRowRead               func(context.Context) error
@@ -186,47 +220,78 @@ type snapshotTestHooks struct {
 	beforeSnapshotCopy                 func(context.Context) error
 	beforeSnapshotFinalize             func(context.Context) error
 	beforeSnapshotCleanupWorkerPublish func()
+	afterSnapshotMaterializedRowScan   func(snapshotPayloadScanObservation)
+	afterSnapshotChunkRowScan          func(snapshotPayloadScanObservation)
 }
 
 // ServiceConfig holds configuration for the sync service
 type ServiceConfig struct {
-	MaxSupportedSchemaVersion int               // Current schema version to return
-	AppName                   string            // Application name for connection tracking
-	RegisteredTables          []RegisteredTable // Schema.table combinations allowed for sync (required)
+	// ScopeTransactionAdmission optionally fences each scoped mutation inside its
+	// SQL transaction. Nil preserves ordinary SDK behavior.
+	ScopeTransactionAdmission      ScopeTransactionAdmission
+	Readiness                      *ReadinessConfig   // Required application-owned deployment evidence
+	SchemaGenerations              []SchemaGeneration // Required immutable client generation contracts
+	AppName                        string             // Application name reported by the status endpoint
+	RegisteredTables               []RegisteredTable  // Schema.table combinations allowed for sync (required)
+	RegisteredTableCatalogRevision int64              // Required target revision for the durable table catalog
+	MaxClientSourcesPerUser        int                // Zero selects 64; explicit values must be in 1..4096
 	// ReservedServerSourceIDs is the exact frozen set of SourceIDs rejected at
 	// client boundaries and available to trusted ScopeManager writes.
 	ReservedServerSourceIDs []string
 
-	MaxRowsPerBundle  int // Maximum number of row effects allowed in one committed bundle (0 = unlimited)
-	MaxBytesPerBundle int // Maximum JSON payload size allowed in one committed bundle (0 = unlimited)
-	// Push-session chunking limits. Zero uses the runtime defaults.
-	DefaultRowsPerPushChunk int
-	MaxRowsPerPushChunk     int
-	PushSessionTTL          time.Duration
-	InitializationLeaseTTL  time.Duration
-	// Committed-bundle row fetch limits. Zero uses the runtime defaults.
-	DefaultRowsPerCommittedBundleChunk int
-	MaxRowsPerCommittedBundleChunk     int
-	// Snapshot chunking limits. Zero uses the runtime defaults.
-	DefaultRowsPerSnapshotChunk        int
-	MaxRowsPerSnapshotChunk            int
-	SnapshotSessionTTL                 time.Duration
-	MaxRowsPerSnapshotSession          int64
-	MaxBytesPerSnapshotSession         int64
-	SnapshotMaterializationBatchRows   int
-	SnapshotMaterializationBatchBytes  int64
-	MaxConcurrentSnapshotBuilds        int
+	// Wire limits. Clients read them from generation discovery, so they must be
+	// identical on every instance. Zero selects the default.
+
+	// MaxRowsPerBundle bounds rows per push. Zero selects 10,000; maximum 100,000.
+	MaxRowsPerBundle int
+	// MaxBytesPerBundle bounds the decoded push body and drives push memory
+	// (about six times this value per admitted push). Zero selects 16 MiB;
+	// maximum 64 MiB.
+	MaxBytesPerBundle int
+	// MaxPushOutcomeDecodedBytes bounds one retained push outcome. It is stored
+	// when the push outcome store is created and never changes afterwards. Zero
+	// adopts the stored value, or MaxBytesPerBundle+8 KiB for a new store. A
+	// non-zero value must equal the stored value. Startup fails when the stored
+	// value is below MaxBytesPerBundle+8 KiB.
+	MaxPushOutcomeDecodedBytes int64
+	// MaxBytesPerPullResponse bounds one pull page. Zero selects 32 MiB; it must
+	// be between MaxBytesPerBundle and 128 MiB.
+	MaxBytesPerPullResponse int64
+	// MaxRowsPerSnapshotChunk and MaxBytesPerSnapshotChunk cap what one snapshot
+	// chunk request may return. Zero selects 5,000 rows and 16 MiB.
+	MaxRowsPerSnapshotChunk  int
+	MaxBytesPerSnapshotChunk int64
+	// MaxRowsPerSnapshotSession and MaxBytesPerSnapshotSession bound one
+	// snapshot session. Zero means unbounded. An account above the bound can
+	// never build a snapshot, so these are product decisions.
+	MaxRowsPerSnapshotSession  int64
+	MaxBytesPerSnapshotSession int64
+
+	// Per-process admission. Each permit holds at most one PostgreSQL
+	// connection; see ConnectionBudget and ApplySizing. Zero selects the default.
+
+	// MaxConcurrentHistoryProjections bounds pushes, pulls and push-outcome
+	// reads in flight. Excess requests get 503 with Retry-After.
+	// Zero selects 4; maximum 32.
+	MaxConcurrentHistoryProjections int
+	// MaxConcurrentSnapshotBuilds bounds snapshot session builds in flight.
+	// Excess requests get 429 with Retry-After. Zero selects 4.
+	MaxConcurrentSnapshotBuilds int
+	// MaxConcurrentSnapshotChunkRequests bounds snapshot chunk requests in
+	// flight. Excess requests get 429 with Retry-After. Zero selects 4.
 	MaxConcurrentSnapshotChunkRequests int
-	DefaultBytesPerSnapshotChunk       int64
-	MaxBytesPerSnapshotChunk           int64
-	MaxBytesPerSnapshotRow             int64
-	SnapshotCleanupInterval            time.Duration
-	SnapshotCleanupBatchRows           int
-	SnapshotCleanupBatchSessions       int
-	SnapshotCleanupMaxBatchesPerRun    int
-	SnapshotCleanupBatchTimeout        time.Duration
-	RetainedBundlesPerUser             int64
-	RetentionPruneBatchSize            int64
+
+	// Lifecycle policy. These act on shared database state, so keep them
+	// identical on every instance. Zero selects the default.
+
+	// InitializationLeaseTTL bounds a scope initialization lease. Zero selects 15 minutes.
+	InitializationLeaseTTL time.Duration
+	// SnapshotSessionTTL is how long a snapshot session and its staged rows live
+	// unless the client deletes it first. Zero selects 15 minutes.
+	SnapshotSessionTTL time.Duration
+	// RetainedBundlesPerUser is the per-user bundle history kept for pulls; a
+	// client behind it must rebuild from a snapshot. Zero selects 10,000.
+	RetainedBundlesPerUser int64
 	// UploadLockTimeout bounds lock waits inside upload transactions.
 	// Zero disables SET LOCAL lock_timeout so lock waits are governed only by the request context,
 	// which is the reliability-first default.
@@ -238,14 +303,71 @@ type ServiceConfig struct {
 
 	// StageMetrics optionally records per-stage timings for sync hot paths.
 	// The recorder is called synchronously; it must be fast and concurrency-safe.
-	StageMetrics StageMetricsRecorder
+	StageMetrics          StageMetricsRecorder
+	GenerationObservation GenerationObservationConfig
 
 	// LogStageTimings logs per-stage timings via the service logger at DEBUG.
 	// Useful for profiling; keep disabled in production.
 	LogStageTimings bool
 
 	// BundleChangeWatch optionally enables metadata-only bundle change wakeups.
+	// When enabled, each instance holds one extra PostgreSQL connection outside
+	// its pool for LISTEN.
 	BundleChangeWatch BundleChangeWatchConfig
+
+	// tuning holds internal batch sizes and cleanup cadence. Only package tests
+	// set it; zero fields select the defaults.
+	tuning serviceTuning
+}
+
+// serviceTuning holds mechanism settings that are not part of the public
+// configuration: they do not size a deployment and only tests vary them.
+type serviceTuning struct {
+	defaultRowsPerSnapshotChunk       int
+	defaultBytesPerSnapshotChunk      int64
+	maxBytesPerSnapshotRow            int64
+	snapshotMaterializationBatchRows  int
+	snapshotMaterializationBatchBytes int64
+	snapshotCleanupInterval           time.Duration
+	snapshotCleanupBatchRows          int
+	snapshotCleanupBatchSessions      int
+	snapshotCleanupBatchesPerBurst    int
+	snapshotCleanupBatchTimeout       time.Duration
+	snapshotCleanupDrainPause         time.Duration
+	retentionPruneBatchSize           int64
+}
+
+func normalizeHistoryProjectionConfig(cfg *ServiceConfig) error {
+	if cfg.MaxRowsPerBundle == 0 {
+		cfg.MaxRowsPerBundle = defaultMaxRowsPerBundle
+	}
+	if cfg.MaxBytesPerBundle == 0 {
+		cfg.MaxBytesPerBundle = defaultMaxBytesPerBundle
+	}
+	// Zero adopts the stored ceiling at Bootstrap; only an explicit value is
+	// checked here.
+	if cfg.MaxPushOutcomeDecodedBytes != 0 && (cfg.MaxPushOutcomeDecodedBytes < minimumPushOutcomeCeiling(cfg.MaxBytesPerBundle) || cfg.MaxPushOutcomeDecodedBytes > maximumPushOutcomeCeiling) {
+		return fmt.Errorf("MaxPushOutcomeDecodedBytes must be zero or between MaxBytesPerBundle+%d and %d", pushOutcomeEnvelopeAllowance, maximumPushOutcomeCeiling)
+	}
+	if cfg.MaxBytesPerPullResponse == 0 {
+		cfg.MaxBytesPerPullResponse = defaultMaxBytesPerPullResponse
+	}
+	if cfg.MaxConcurrentHistoryProjections == 0 {
+		cfg.MaxConcurrentHistoryProjections = defaultMaxConcurrentHistoryProjections
+	}
+	if cfg.MaxRowsPerBundle < 1 || cfg.MaxRowsPerBundle > maxMaxRowsPerBundle {
+		return fmt.Errorf("MaxRowsPerBundle must be in 1..%d", maxMaxRowsPerBundle)
+	}
+	if cfg.MaxBytesPerBundle < 2 || cfg.MaxBytesPerBundle > maxMaxBytesPerBundle {
+		return fmt.Errorf("MaxBytesPerBundle must be in 2..%d", maxMaxBytesPerBundle)
+	}
+	if cfg.MaxBytesPerPullResponse < int64(cfg.MaxBytesPerBundle) || cfg.MaxBytesPerPullResponse > maxMaxBytesPerPullResponse {
+		return fmt.Errorf("MaxBytesPerPullResponse must be between MaxBytesPerBundle and %d", maxMaxBytesPerPullResponse)
+	}
+	if cfg.MaxConcurrentHistoryProjections < 1 || cfg.MaxConcurrentHistoryProjections > maxMaxConcurrentHistoryProjections {
+		return fmt.Errorf("MaxConcurrentHistoryProjections must be in 1..%d", maxMaxConcurrentHistoryProjections)
+	}
+	return nil
 }
 
 func normalizeBundleChangeWatchConfig(cfg BundleChangeWatchConfig) (BundleChangeWatchConfig, error) {
@@ -265,12 +387,9 @@ func normalizeBundleChangeWatchConfig(cfg BundleChangeWatchConfig) (BundleChange
 }
 
 func normalizeSnapshotConfig(cfg *ServiceConfig) error {
-	if cfg.DefaultRowsPerSnapshotChunk < 0 || cfg.MaxRowsPerSnapshotChunk < 0 ||
-		cfg.MaxRowsPerSnapshotSession < 0 || cfg.MaxBytesPerSnapshotSession < 0 || cfg.SnapshotSessionTTL < 0 {
+	if cfg.MaxRowsPerSnapshotChunk < 0 || cfg.MaxRowsPerSnapshotSession < 0 ||
+		cfg.MaxBytesPerSnapshotSession < 0 || cfg.SnapshotSessionTTL < 0 {
 		return fmt.Errorf("snapshot row and session limits must not be negative")
-	}
-	if cfg.DefaultRowsPerSnapshotChunk == 0 {
-		cfg.DefaultRowsPerSnapshotChunk = defaultRowsPerSnapshotChunk
 	}
 	if cfg.MaxRowsPerSnapshotChunk == 0 {
 		cfg.MaxRowsPerSnapshotChunk = defaultMaxRowsPerSnapshotChunk
@@ -278,61 +397,105 @@ func normalizeSnapshotConfig(cfg *ServiceConfig) error {
 	if cfg.SnapshotSessionTTL == 0 {
 		cfg.SnapshotSessionTTL = defaultSnapshotSessionTTL
 	}
-	if cfg.SnapshotMaterializationBatchRows == 0 {
-		cfg.SnapshotMaterializationBatchRows = defaultSnapshotMaterializationBatchRows
-	}
-	if cfg.SnapshotMaterializationBatchBytes == 0 {
-		cfg.SnapshotMaterializationBatchBytes = defaultSnapshotMaterializationBatchBytes
-	}
 	if cfg.MaxConcurrentSnapshotBuilds == 0 {
 		cfg.MaxConcurrentSnapshotBuilds = defaultMaxConcurrentSnapshotBuilds
 	}
 	if cfg.MaxConcurrentSnapshotChunkRequests == 0 {
 		cfg.MaxConcurrentSnapshotChunkRequests = defaultMaxConcurrentSnapshotChunkRequests
 	}
-	if cfg.DefaultBytesPerSnapshotChunk == 0 {
-		cfg.DefaultBytesPerSnapshotChunk = defaultBytesPerSnapshotChunk
-	}
 	if cfg.MaxBytesPerSnapshotChunk == 0 {
 		cfg.MaxBytesPerSnapshotChunk = defaultMaxBytesPerSnapshotChunk
 	}
-	if cfg.MaxBytesPerSnapshotRow == 0 {
-		cfg.MaxBytesPerSnapshotRow = defaultMaxBytesPerSnapshotRow
+	if cfg.MaxConcurrentSnapshotBuilds <= 0 || cfg.MaxConcurrentSnapshotChunkRequests <= 0 ||
+		cfg.MaxBytesPerSnapshotChunk <= 0 {
+		return fmt.Errorf("snapshot admission and chunk limits must be positive")
 	}
-	if cfg.SnapshotCleanupInterval == 0 {
-		cfg.SnapshotCleanupInterval = defaultSnapshotCleanupInterval
+	return normalizeServiceTuning(cfg)
+}
+
+// normalizeServiceTuning fills internal defaults after the public limits are
+// normalized; the defaults are clamped to those limits so that any valid
+// public configuration has a valid internal one.
+func normalizeServiceTuning(cfg *ServiceConfig) error {
+	t := &cfg.tuning
+	if t.defaultRowsPerSnapshotChunk == 0 {
+		t.defaultRowsPerSnapshotChunk = min(defaultRowsPerSnapshotChunk, cfg.MaxRowsPerSnapshotChunk)
 	}
-	if cfg.SnapshotCleanupBatchRows == 0 {
-		cfg.SnapshotCleanupBatchRows = defaultSnapshotCleanupBatchRows
+	if t.defaultBytesPerSnapshotChunk == 0 {
+		t.defaultBytesPerSnapshotChunk = min(defaultBytesPerSnapshotChunk, cfg.MaxBytesPerSnapshotChunk)
 	}
-	if cfg.SnapshotCleanupBatchSessions == 0 {
-		cfg.SnapshotCleanupBatchSessions = defaultSnapshotCleanupBatchSessions
+	if t.maxBytesPerSnapshotRow == 0 {
+		maximumAdvertisableRow := min(defaultMaxBytesPerSnapshotRow, int64(cfg.MaxBytesPerBundle))
+		maximumAdvertisableRow = min(maximumAdvertisableRow, cfg.MaxBytesPerPullResponse-maxCompactSingleRowEnvelopeBytes)
+		maximumAdvertisableRow = min(maximumAdvertisableRow, cfg.MaxBytesPerSnapshotChunk-maxCompactSingleRowEnvelopeBytes)
+		if maximumAdvertisableRow <= 0 {
+			return fmt.Errorf("wire response limits cannot represent one row plus its mandatory envelope")
+		}
+		t.maxBytesPerSnapshotRow = maximumAdvertisableRow
 	}
-	if cfg.SnapshotCleanupMaxBatchesPerRun == 0 {
-		cfg.SnapshotCleanupMaxBatchesPerRun = defaultSnapshotCleanupMaxBatchesPerRun
+	if t.snapshotMaterializationBatchRows == 0 {
+		t.snapshotMaterializationBatchRows = defaultSnapshotMaterializationBatchRows
 	}
-	if cfg.SnapshotCleanupBatchTimeout == 0 {
-		cfg.SnapshotCleanupBatchTimeout = defaultSnapshotCleanupBatchTimeout
+	if t.snapshotMaterializationBatchBytes == 0 {
+		t.snapshotMaterializationBatchBytes = max(defaultSnapshotMaterializationBatchBytes, t.maxBytesPerSnapshotRow)
 	}
-	if cfg.SnapshotMaterializationBatchRows <= 0 || cfg.SnapshotMaterializationBatchBytes <= 0 ||
-		cfg.MaxConcurrentSnapshotBuilds <= 0 || cfg.MaxConcurrentSnapshotChunkRequests <= 0 ||
-		cfg.DefaultBytesPerSnapshotChunk <= 0 || cfg.MaxBytesPerSnapshotChunk <= 0 ||
-		cfg.MaxBytesPerSnapshotRow <= 0 || cfg.SnapshotCleanupInterval <= 0 ||
-		cfg.SnapshotCleanupBatchRows <= 0 || cfg.SnapshotCleanupBatchSessions <= 0 ||
-		cfg.SnapshotCleanupMaxBatchesPerRun <= 0 || cfg.SnapshotCleanupBatchTimeout <= 0 {
+	if t.snapshotCleanupInterval == 0 {
+		t.snapshotCleanupInterval = defaultSnapshotCleanupInterval
+	}
+	if t.snapshotCleanupBatchRows == 0 {
+		t.snapshotCleanupBatchRows = defaultSnapshotCleanupBatchRows
+	}
+	if t.snapshotCleanupBatchSessions == 0 {
+		t.snapshotCleanupBatchSessions = defaultSnapshotCleanupBatchSessions
+	}
+	if t.snapshotCleanupBatchesPerBurst == 0 {
+		t.snapshotCleanupBatchesPerBurst = defaultSnapshotCleanupBatchesPerBurst
+	}
+	if t.snapshotCleanupBatchTimeout == 0 {
+		t.snapshotCleanupBatchTimeout = defaultSnapshotCleanupBatchTimeout
+	}
+	if t.snapshotCleanupDrainPause == 0 {
+		t.snapshotCleanupDrainPause = defaultSnapshotCleanupDrainPause
+	}
+	if t.retentionPruneBatchSize == 0 {
+		t.retentionPruneBatchSize = defaultRetentionPruneBatchSize
+	}
+	if t.defaultRowsPerSnapshotChunk <= 0 || t.defaultBytesPerSnapshotChunk <= 0 || t.maxBytesPerSnapshotRow <= 0 ||
+		t.snapshotMaterializationBatchRows <= 0 || t.snapshotMaterializationBatchBytes <= 0 ||
+		t.snapshotCleanupInterval <= 0 || t.snapshotCleanupBatchRows <= 0 || t.snapshotCleanupBatchSessions <= 0 ||
+		t.snapshotCleanupBatchesPerBurst <= 0 || t.snapshotCleanupBatchTimeout <= 0 || t.snapshotCleanupDrainPause < 0 ||
+		t.retentionPruneBatchSize <= 0 {
 		return fmt.Errorf("snapshot bounded-work configuration values must be positive")
 	}
-	if cfg.DefaultRowsPerSnapshotChunk > cfg.MaxRowsPerSnapshotChunk {
+	if t.defaultRowsPerSnapshotChunk > cfg.MaxRowsPerSnapshotChunk {
 		return fmt.Errorf("default rows per snapshot chunk must be <= max rows per snapshot chunk")
 	}
-	if cfg.SnapshotMaterializationBatchBytes < cfg.MaxBytesPerSnapshotRow {
+	if t.snapshotMaterializationBatchBytes < t.maxBytesPerSnapshotRow {
 		return fmt.Errorf("snapshot materialization batch bytes must be >= max bytes per snapshot row")
 	}
-	if cfg.DefaultBytesPerSnapshotChunk > cfg.MaxBytesPerSnapshotChunk {
+	if t.defaultBytesPerSnapshotChunk > cfg.MaxBytesPerSnapshotChunk {
 		return fmt.Errorf("default bytes per snapshot chunk must be <= max bytes per snapshot chunk")
 	}
-	if cfg.MaxBytesPerSnapshotRow > cfg.MaxBytesPerSnapshotChunk {
+	if t.maxBytesPerSnapshotRow > cfg.MaxBytesPerSnapshotChunk {
 		return fmt.Errorf("max bytes per snapshot row must be <= max bytes per snapshot chunk")
+	}
+	return nil
+}
+
+func validateAdvertisedWireLimits(cfg *ServiceConfig) error {
+	rowLimit := cfg.tuning.maxBytesPerSnapshotRow
+	if rowLimit > int64(cfg.MaxBytesPerBundle) {
+		return fmt.Errorf("max bytes per snapshot row must be <= MaxBytesPerBundle")
+	}
+	minimumOneRowEnvelope := rowLimit + maxCompactSingleRowEnvelopeBytes
+	if minimumOneRowEnvelope < rowLimit {
+		return fmt.Errorf("advertised one-row envelope size overflows")
+	}
+	if cfg.MaxBytesPerPullResponse < minimumOneRowEnvelope {
+		return fmt.Errorf("MaxBytesPerPullResponse must represent one maximum-size row plus its mandatory envelope")
+	}
+	if cfg.MaxBytesPerSnapshotChunk < minimumOneRowEnvelope {
+		return fmt.Errorf("MaxBytesPerSnapshotChunk must represent one maximum-size row plus its mandatory envelope")
 	}
 	return nil
 }
@@ -354,10 +517,10 @@ func (s *SyncService) bundleChangeWatchEnabled() bool {
 }
 
 func (s *SyncService) defaultRowsPerSnapshotChunk() int {
-	if s != nil && s.config != nil && s.config.DefaultRowsPerSnapshotChunk > 0 {
-		return s.config.DefaultRowsPerSnapshotChunk
+	if s != nil && s.config != nil && s.config.tuning.defaultRowsPerSnapshotChunk > 0 {
+		return s.config.tuning.defaultRowsPerSnapshotChunk
 	}
-	return defaultRowsPerSnapshotChunk
+	return min(defaultRowsPerSnapshotChunk, s.maxRowsPerSnapshotChunk())
 }
 
 func (s *SyncService) maxRowsPerSnapshotChunk() int {
@@ -365,41 +528,6 @@ func (s *SyncService) maxRowsPerSnapshotChunk() int {
 		return s.config.MaxRowsPerSnapshotChunk
 	}
 	return defaultMaxRowsPerSnapshotChunk
-}
-
-func (s *SyncService) defaultRowsPerPushChunk() int {
-	if s != nil && s.config != nil && s.config.DefaultRowsPerPushChunk > 0 {
-		return s.config.DefaultRowsPerPushChunk
-	}
-	return defaultRowsPerPushChunk
-}
-
-func (s *SyncService) maxRowsPerPushChunk() int {
-	if s != nil && s.config != nil && s.config.MaxRowsPerPushChunk > 0 {
-		return s.config.MaxRowsPerPushChunk
-	}
-	return defaultMaxRowsPerPushChunk
-}
-
-func (s *SyncService) pushSessionTTL() time.Duration {
-	if s != nil && s.config != nil && s.config.PushSessionTTL > 0 {
-		return s.config.PushSessionTTL
-	}
-	return defaultPushSessionTTL
-}
-
-func (s *SyncService) defaultRowsPerCommittedBundleChunk() int {
-	if s != nil && s.config != nil && s.config.DefaultRowsPerCommittedBundleChunk > 0 {
-		return s.config.DefaultRowsPerCommittedBundleChunk
-	}
-	return defaultRowsPerCommittedBundleChunk
-}
-
-func (s *SyncService) maxRowsPerCommittedBundleChunk() int {
-	if s != nil && s.config != nil && s.config.MaxRowsPerCommittedBundleChunk > 0 {
-		return s.config.MaxRowsPerCommittedBundleChunk
-	}
-	return defaultMaxRowsPerCommittedBundleChunk
 }
 
 func (s *SyncService) snapshotSessionTTL() time.Duration {
@@ -424,10 +552,13 @@ func (s *SyncService) maxBytesPerSnapshotSession() int64 {
 }
 
 func (s *SyncService) defaultBytesPerSnapshotChunk() int64 {
-	return s.config.DefaultBytesPerSnapshotChunk
+	if s.config.tuning.defaultBytesPerSnapshotChunk > 0 {
+		return s.config.tuning.defaultBytesPerSnapshotChunk
+	}
+	return min(defaultBytesPerSnapshotChunk, s.config.MaxBytesPerSnapshotChunk)
 }
 func (s *SyncService) maxBytesPerSnapshotChunk() int64 { return s.config.MaxBytesPerSnapshotChunk }
-func (s *SyncService) maxBytesPerSnapshotRow() int64   { return s.config.MaxBytesPerSnapshotRow }
+func (s *SyncService) maxBytesPerSnapshotRow() int64   { return s.config.tuning.maxBytesPerSnapshotRow }
 
 func (s *SyncService) retainedBundlesPerUser() int64 {
 	if s != nil && s.config != nil && s.config.RetainedBundlesPerUser > 0 {
@@ -437,8 +568,8 @@ func (s *SyncService) retainedBundlesPerUser() int64 {
 }
 
 func (s *SyncService) retentionPruneBatchSize() int64 {
-	if s != nil && s.config != nil && s.config.RetentionPruneBatchSize > 0 {
-		return s.config.RetentionPruneBatchSize
+	if s != nil && s.config != nil && s.config.tuning.retentionPruneBatchSize > 0 {
+		return s.config.tuning.retentionPruneBatchSize
 	}
 	return defaultRetentionPruneBatchSize
 }
@@ -447,19 +578,47 @@ func (s *SyncService) retentionPruneBatchSize() int64 {
 // It does not mutate database schema or discover runtime topology.
 func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.Logger) (*SyncService, error) {
 	if config == nil {
-		config = &ServiceConfig{
-			MaxSupportedSchemaVersion: 1,
-			AppName:                   "go-oversync-app",
-		}
+		return nil, fmt.Errorf("service config cannot be nil")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if err := validateAdmissionPool(pool, config.Readiness); err != nil {
+		return nil, err
+	}
 	configCopy := *config
-	configCopy.RegisteredTables = append([]RegisteredTable(nil), config.RegisteredTables...)
+	configCopy.Readiness = cloneReadinessConfig(config.Readiness)
+	configCopy.RegisteredTables = cloneRegisteredTables(config.RegisteredTables)
+	configCopy.SchemaGenerations = cloneSchemaGenerations(config.SchemaGenerations)
+	sort.Slice(configCopy.RegisteredTables, func(i, j int) bool {
+		return compareRegisteredTables(configCopy.RegisteredTables[i], configCopy.RegisteredTables[j]) < 0
+	})
 	configCopy.ReservedServerSourceIDs = append([]string(nil), config.ReservedServerSourceIDs...)
 	configCopy.DependencyOverrides = cloneDependencyOverrides(config.DependencyOverrides)
 	config = &configCopy
+	if config.RegisteredTableCatalogRevision < 1 {
+		return nil, &RegisteredTableCatalogError{
+			Code:           RegisteredTableCatalogInvalidTargetRevision,
+			Field:          "RegisteredTableCatalogRevision",
+			Value:          strconv.FormatInt(config.RegisteredTableCatalogRevision, 10),
+			TargetRevision: config.RegisteredTableCatalogRevision,
+		}
+	}
+	if err := validateRegisteredTables(config.RegisteredTables); err != nil {
+		return nil, err
+	}
+	registry, err := CompileSchemaGenerationRegistry(config.RegisteredTables, config.SchemaGenerations)
+	if err != nil {
+		return nil, fmt.Errorf("compile schema generation registry: %w", err)
+	}
+	if config.MaxClientSourcesPerUser == 0 {
+		config.MaxClientSourcesPerUser = defaultMaxClientSourcesPerUser
+	} else if config.MaxClientSourcesPerUser < 1 || config.MaxClientSourcesPerUser > maxMaxClientSourcesPerUser {
+		return nil, fmt.Errorf("MaxClientSourcesPerUser must be in 1..%d", maxMaxClientSourcesPerUser)
+	}
+	if err := normalizeHistoryProjectionConfig(config); err != nil {
+		return nil, err
+	}
 	if err := validateReservedServerSourceIDs(config.ReservedServerSourceIDs); err != nil {
 		return nil, err
 	}
@@ -471,31 +630,34 @@ func NewRuntimeService(pool *pgxpool.Pool, config *ServiceConfig, logger *slog.L
 	if err := normalizeSnapshotConfig(config); err != nil {
 		return nil, err
 	}
+	if err := validateAdvertisedWireLimits(config); err != nil {
+		return nil, err
+	}
 
 	service := &SyncService{
 		pool:                       pool,
+		readinessReport:            ReadinessReport{ProcessStartID: uuid.NewString()},
 		logger:                     logger,
 		config:                     config,
 		bundleChangeHub:            newBundleChangeHub(),
 		registeredTables:           make(map[string]bool),
 		registeredTableInfo:        make(map[string]registeredTableRuntimeInfo),
 		registeredTableByID:        make(map[int32]registeredTableRuntimeInfo),
+		retainedTableByID:          make(map[int32]registeredTableRuntimeInfo),
 		columnTypesByTable:         make(map[string]map[string]string),
+		schemaGenerationRegistry:   registry,
+		generationViews:            make(map[SchemaGenerationID]*schemaGenerationView),
 		lifecycle:                  serviceLifecycleRunning,
 		bootstrapReadiness:         bootstrapReadinessNotReady,
 		closedCh:                   make(chan struct{}),
 		snapshotBuildPermits:       make(chan struct{}, config.MaxConcurrentSnapshotBuilds),
 		snapshotChunkPermits:       make(chan struct{}, config.MaxConcurrentSnapshotChunkRequests),
+		historyProjectionPermits:   make(chan struct{}, config.MaxConcurrentHistoryProjections),
+		pushBodies:                 newPushBodyAdmission(config.MaxConcurrentHistoryProjections, int64(config.MaxBytesPerBundle)+historyEnvelopeAllowance),
 		snapshotCleanupTrigger:     make(chan string, 1),
 		scopeReceiptCleanupTrigger: make(chan string, 1),
 	}
-
-	// Initialize registered tables set and handlers
-	for _, regTable := range config.RegisteredTables {
-		// Normalize keys to lowercase to match request validation normalization
-		key := regTable.normalizedKey()
-		service.registeredTables[key] = true
-	}
+	warnOnCapacityMismatch(logger, pool, config)
 
 	return service, nil
 }
@@ -527,13 +689,14 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 	succeeded := false
 	bootstrapMode := ""
 	defer func() {
+		if !succeeded {
+			s.recordReadinessFailure(err)
+		}
 		s.finishBootstrap(succeeded)
 		if succeeded {
-			s.startScopeReceiptCleanupWorker()
-			s.requestScopeReceiptCleanup("post_bootstrap")
-			s.startSnapshotCleanupWorker()
-			s.requestSnapshotCleanup("post_bootstrap")
+			s.startBackgroundCleanupWorkers()
 			s.logger.Info("Sync bootstrap completed", "duration", time.Since(startedAt), "registered_table_count", len(s.config.RegisteredTables), "bootstrap_mode", bootstrapMode)
+			s.logEffectiveSettings()
 			return
 		}
 		s.logger.Warn("Sync bootstrap rejected or rolled back", "duration", time.Since(startedAt), "error", bootstrapErrorClass(err))
@@ -542,35 +705,28 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 		return err
 	}
 
-	preflightStartedAt := s.stageStart()
-	if err := validateRegisteredTablePersistence(ctx, s.pool, s.config.RegisteredTables); err != nil {
-		s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, err)
+	if err := s.validateGenerationResponseSizes(); err != nil {
 		return err
 	}
-	if err := s.normalizeAndValidateRegisteredSyncKeys(ctx, s.pool); err != nil {
-		s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, err)
-		return err
-	}
-	if err := s.validateRegisteredIdentityNullability(ctx, s.pool); err != nil {
-		s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, err)
-		return err
-	}
-	if err := s.validateIdentityCollations(ctx, s.pool); err != nil {
-		s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, err)
-		return err
-	}
-	if err := s.discoverSchemaRelationships(ctx); err != nil {
-		err = fmt.Errorf("failed to discover schema relationships: %w", err)
-		s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, err)
-		return err
-	}
-	s.observeStageErr(ctx, "bootstrap", "preflight", preflightStartedAt, len(s.config.RegisteredTables), 0, nil)
 
+	if err := validateReadinessConfig(s.config.Readiness, s.schemaGenerationRegistry); err != nil {
+		return err
+	}
+	authorityDeadline := time.Now().Add(s.config.Readiness.LockTimeout)
 	attempt := 0
+	var committedCandidate *SyncService
+	var outcomeCeiling int64
+	var committedMetadata registeredTableCatalogMetadata
 	if err := runRetryableTx(ctx, 3, 50*time.Millisecond, func() error {
 		attempt++
 		currentAttempt := attempt
-		return pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		outcomeCeiling = newStorePushOutcomeCeiling(s.config)
+		return s.withReadinessTransaction(ctx, authorityDeadline, func(tx pgx.Tx) error {
+			if s.catalogHooks != nil && s.catalogHooks.inspectTransaction != nil {
+				if err := s.catalogHooks.inspectTransaction(ctx, tx); err != nil {
+					return err
+				}
+			}
 			lockStartedAt := s.stageStart()
 			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, syncBootstrapLockKey); err != nil {
 				err = fmt.Errorf("acquire sync bootstrap lock: %w", err)
@@ -579,110 +735,327 @@ func (s *SyncService) Bootstrap(ctx context.Context) (err error) {
 			s.logger.Debug("Sync bootstrap advisory lock acquired")
 
 			managedStartedAt := s.stageStart()
-			if err := validateRegisteredTablePersistence(ctx, tx, s.config.RegisteredTables); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
-				return err
-			}
-			if err := s.normalizeAndValidateRegisteredSyncKeys(ctx, tx); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
-				return err
-			}
-			if err := s.validateRegisteredIdentityNullability(ctx, tx); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
-				return err
-			}
-			if err := s.validateIdentityCollations(ctx, tx); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
-				return err
-			}
-			expectedCatalog, err := s.expectedTableCatalogRows()
+			freshLayout, err := classifyRegisteredTableCatalogLayout(ctx, tx)
 			if err != nil {
 				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
 				return err
 			}
-			existingLayout, err := validateExistingSyncLayout(ctx, tx, expectedCatalog)
-			if err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
-				return err
-			}
-			if existingLayout {
-				if err := s.validateManagedLayout(ctx, tx); err != nil {
+			if !freshLayout {
+				storedCeiling, err := s.validatePushOutcomeStore(ctx, tx)
+				if err != nil {
+					return err
+				}
+				outcomeCeiling = storedCeiling
+				if err := validateStaticManagedLayout(ctx, tx); err != nil {
 					s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
 					return err
 				}
-				if err := s.validateServerSourceReservations(ctx, tx); err != nil {
+			}
+
+			if freshLayout {
+				if s.config.RegisteredTableCatalogRevision != 1 {
+					err := &RegisteredTableCatalogError{
+						Code:            RegisteredTableCatalogRevisionConflict,
+						Field:           "RegisteredTableCatalogRevision",
+						CatalogRevision: 0,
+						TargetRevision:  s.config.RegisteredTableCatalogRevision,
+						Expected:        "1",
+						Actual:          strconv.FormatInt(s.config.RegisteredTableCatalogRevision, 10),
+					}
+					s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
 					return err
 				}
+				candidate, err := s.prepareCatalogBootstrapCandidate(ctx, tx)
+				if err != nil {
+					return err
+				}
+				metadata, entries, err := seedRegisteredTableCatalog(s.config.RegisteredTables, candidate.registeredTableInfo)
+				if err != nil {
+					return err
+				}
+				if err := candidate.applyCatalogEntries(entries); err != nil {
+					return err
+				}
+				if err := candidate.discoverSchemaRelationships(ctx, tx); err != nil {
+					return fmt.Errorf("failed to discover schema relationships: %w", err)
+				}
+				if err := candidate.lockRegisteredTablesForAdoption(ctx, tx); err != nil {
+					s.observeStageErr(ctx, "bootstrap", "advisory_table_lock_wait", lockStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+					return err
+				}
+				s.observeStageErr(ctx, "bootstrap", "advisory_table_lock_wait", lockStartedAt, len(s.config.RegisteredTables), currentAttempt, nil)
+				candidate, err = s.prepareCatalogBootstrapCandidate(ctx, tx)
+				if err != nil {
+					return err
+				}
+				metadata, entries, err = seedRegisteredTableCatalog(s.config.RegisteredTables, candidate.registeredTableInfo)
+				if err != nil {
+					return err
+				}
+				if err := candidate.applyCatalogEntries(entries); err != nil {
+					return err
+				}
+				if err := candidate.discoverSchemaRelationships(ctx, tx); err != nil {
+					return fmt.Errorf("failed to discover schema relationships: %w", err)
+				}
+				if err := candidate.buildAndValidateGenerationViews(ctx, tx); err != nil {
+					return err
+				}
+				if err := candidate.createFreshSyncLayoutInTx(ctx, tx); err != nil {
+					return fmt.Errorf("initialize first durable sync layout: %w", err)
+				}
+				if err := candidate.installServerSourceReservations(ctx, tx); err != nil {
+					return err
+				}
+				if err := candidate.installRegisteredTableCaptureTriggersInTx(ctx, tx); err != nil {
+					return fmt.Errorf("install registered table capture triggers: %w", err)
+				}
+				if err := persistRegisteredTableCatalogSeed(ctx, tx, metadata, entries); err != nil {
+					return err
+				}
+				if err := candidate.validateManagedLayout(ctx, tx); err != nil {
+					return err
+				}
+				if err := candidate.adoptFreshPopulatedRegisteredTables(ctx, tx, currentAttempt); err != nil {
+					return fmt.Errorf("adopt populated registered tables: %w", err)
+				}
+				if err := candidate.validateManagedLayoutVolatileFacts(ctx, tx); err != nil {
+					return err
+				}
+				if err := candidate.buildAndValidateGenerationViews(ctx, tx); err != nil {
+					return err
+				}
+				committedCandidate = candidate
+				committedMetadata = metadata
+				bootstrapMode = "fresh_seed"
 				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, nil)
-				bootstrapMode = "existing_attach"
 				return nil
 			}
 
-			if err := s.lockRegisteredTablesForAdoption(ctx, tx); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "advisory_table_lock_wait", lockStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+			if err := s.runRegisteredTableCatalogMutationHook("before_metadata_lock", 0); err != nil {
 				return err
 			}
-			s.observeStageErr(ctx, "bootstrap", "advisory_table_lock_wait", lockStartedAt, len(s.config.RegisteredTables), currentAttempt, nil)
-			if err := validateRegisteredTablePersistence(ctx, tx, s.config.RegisteredTables); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
-				return err
-			}
-			if err := s.normalizeAndValidateRegisteredSyncKeys(ctx, tx); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
-				return err
-			}
-			if err := s.validateRegisteredIdentityNullability(ctx, tx); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
-				return err
-			}
-			expectedCatalog, err = s.expectedTableCatalogRows()
+			metadata, entries, err := loadRegisteredTableCatalogForTarget(ctx, tx, s.config.RegisteredTableCatalogRevision)
 			if err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
 				return err
 			}
-			if err := s.createFreshSyncLayoutInTx(ctx, tx); err != nil {
-				s.logger.Error("Failed to initialize database schema", "error", err)
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+			if err := s.runRegisteredTableCatalogMutationHook("after_metadata_lock", 0); err != nil {
 				return err
 			}
-			if err := s.installServerSourceReservations(ctx, tx); err != nil {
+			if err := validateLoadedRegisteredTableCatalog(metadata, entries); err != nil {
 				return err
 			}
-			if err := s.validateIdentityCollations(ctx, tx); err != nil {
+			identityKinds, err := loadConfiguredCatalogIdentityKinds(
+				ctx,
+				tx,
+				s.config.RegisteredTables,
+				entries,
+			)
+			if err != nil {
 				return err
 			}
-			if err := s.installRegisteredTableCaptureTriggersInTx(ctx, tx); err != nil {
-				err = fmt.Errorf("failed to install registered table capture triggers: %w", err)
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+			appendTables, err := reconcileRegisteredTableCatalog(
+				s.config.RegisteredTables,
+				s.config.RegisteredTableCatalogRevision,
+				metadata,
+				entries,
+				identityKinds,
+			)
+			if err != nil {
 				return err
 			}
-			if err := s.validateManagedLayout(ctx, tx); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+			activeEntries := activeRegisteredTableCatalogEntries(entries)
+			activeTables := registeredTableDeclarationsForCatalogEntries(activeEntries)
+			candidate, err := s.prepareCatalogBootstrapCandidateForTables(ctx, tx, activeTables)
+			if err != nil {
 				return err
 			}
-			if err := persistSyncLayoutMetadata(ctx, tx, expectedCatalog); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+			if err := candidate.applyCatalogEntries(entries); err != nil {
 				return err
 			}
-			s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, nil)
+			if err := candidate.discoverSchemaRelationships(ctx, tx); err != nil {
+				return fmt.Errorf("validate active schema relationships: %w", err)
+			}
+			if err := candidate.validateManagedLayout(ctx, tx); err != nil {
+				return err
+			}
+			if err := candidate.validateServerSourceReservations(ctx, tx); err != nil {
+				return err
+			}
+			planMode, err := registeredTableCatalogPlanModeForTarget(
+				metadata,
+				s.config.RegisteredTableCatalogRevision,
+				len(appendTables),
+			)
+			if err != nil {
+				return err
+			}
+			if planMode == registeredTableCatalogPlanAttach {
+				if err := candidate.buildAndValidateGenerationViews(ctx, tx); err != nil {
+					return err
+				}
+				committedCandidate = candidate
+				committedMetadata = metadata
+				bootstrapMode = "existing_attach"
+				s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, nil)
+				return nil
+			}
 
-			if err := s.adoptFreshPopulatedRegisteredTables(ctx, tx, currentAttempt); err != nil {
-				return fmt.Errorf("adopt populated registered tables: %w", err)
-			}
-			volatileStartedAt := s.stageStart()
-			if err := s.validateManagedLayoutVolatileFacts(ctx, tx); err != nil {
-				s.observeStageErr(ctx, "bootstrap", "final_volatile_fact_validation", volatileStartedAt, len(s.config.RegisteredTables), currentAttempt, err)
+			if err := validateRegisteredTableCatalogAppendDrain(ctx, tx); err != nil {
 				return err
 			}
-			s.observeStageErr(ctx, "bootstrap", "final_volatile_fact_validation", volatileStartedAt, len(s.config.RegisteredTables), currentAttempt, nil)
-			bootstrapMode = "fresh_adoption"
+			if err := lockRegisteredTables(ctx, tx, appendTables); err != nil {
+				return err
+			}
+			if err := s.runRegisteredTableCatalogMutationHook("after_append_table_locks", 0); err != nil {
+				return err
+			}
+			candidate, err = s.prepareCatalogBootstrapCandidate(ctx, tx)
+			if err != nil {
+				return err
+			}
+			metadata, entries, err = loadRegisteredTableCatalog(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if err := validateLoadedRegisteredTableCatalog(metadata, entries); err != nil {
+				return err
+			}
+			appendTables, err = reconcileRegisteredTableCatalog(
+				s.config.RegisteredTables,
+				s.config.RegisteredTableCatalogRevision,
+				metadata,
+				entries,
+				candidate.registeredTableInfo,
+			)
+			if err != nil {
+				return err
+			}
+			planMode, err = registeredTableCatalogPlanModeForTarget(
+				metadata,
+				s.config.RegisteredTableCatalogRevision,
+				len(appendTables),
+			)
+			if err != nil {
+				return err
+			}
+			if planMode != registeredTableCatalogPlanAppend {
+				return fmt.Errorf("catalog append revalidation produced non-append plan")
+			}
+			if err := candidate.discoverSchemaRelationships(ctx, tx); err != nil {
+				return fmt.Errorf("validate append schema relationships: %w", err)
+			}
+			if err := validateNoReservedRegisteredTriggersForTables(ctx, tx, appendTables); err != nil {
+				return err
+			}
+			if err := validateRegisteredTableCatalogAppendTablesEmpty(ctx, tx, appendTables); err != nil {
+				return err
+			}
+			sort.Slice(appendTables, func(i, j int) bool { return compareRegisteredTables(appendTables[i], appendTables[j]) < 0 })
+			plan, err := allocateRegisteredTableCatalogAppend(
+				metadata,
+				entries,
+				appendTables,
+				candidate.registeredTableInfo,
+				s.config.RegisteredTableCatalogRevision,
+			)
+			if err != nil {
+				return err
+			}
+			if err := candidate.applyCatalogEntries(plan.entries); err != nil {
+				return err
+			}
+			if err := candidate.discoverSchemaRelationships(ctx, tx); err != nil {
+				return fmt.Errorf("validate allocated append schema relationships: %w", err)
+			}
+			if err := candidate.buildAndValidateGenerationViews(ctx, tx); err != nil {
+				return err
+			}
+			if err := s.runRegisteredTableCatalogMutationHook("after_plan_validation", 0); err != nil {
+				return err
+			}
+			for index, entry := range plan.appended {
+				if err := insertRegisteredTableCatalogEntries(ctx, tx, []registeredTableCatalogEntry{entry}); err != nil {
+					return err
+				}
+				if err := s.runRegisteredTableCatalogMutationHook("after_catalog_insert", index); err != nil {
+					return err
+				}
+			}
+			if err := candidate.installRegisteredTableCaptureTriggersForTablesInTx(ctx, tx, appendTables); err != nil {
+				return err
+			}
+			if err := s.runRegisteredTableCatalogMutationHook("before_metadata_update", 0); err != nil {
+				return err
+			}
+			if err := publishRegisteredTableCatalogMetadata(ctx, tx, plan.metadata); err != nil {
+				return err
+			}
+			if err := s.runRegisteredTableCatalogMutationHook("after_metadata_update", 0); err != nil {
+				return err
+			}
+			if err := s.runRegisteredTableCatalogMutationHook("before_final_validation", 0); err != nil {
+				return err
+			}
+			persistedMetadata, persistedEntries, err := loadRegisteredTableCatalog(ctx, tx)
+			if err != nil {
+				return err
+			}
+			persistedPlan, err := planExistingRegisteredTableCatalog(
+				s.config.RegisteredTables,
+				s.config.RegisteredTableCatalogRevision,
+				persistedMetadata,
+				persistedEntries,
+				candidate.registeredTableInfo,
+			)
+			if err != nil {
+				return fmt.Errorf("validate persisted registered table catalog: %w", err)
+			}
+			if persistedPlan.mode != registeredTableCatalogPlanAttach {
+				return fmt.Errorf("validate persisted registered table catalog: expected exact attach plan")
+			}
+			if err := s.runRegisteredTableCatalogMutationHook("during_final_managed_validation", 0); err != nil {
+				return err
+			}
+			if err := candidate.validateManagedLayout(ctx, tx); err != nil {
+				return err
+			}
+			if err := candidate.buildAndValidateGenerationViews(ctx, tx); err != nil {
+				return err
+			}
+			committedCandidate = candidate
+			committedMetadata = persistedMetadata
+			bootstrapMode = "catalog_append"
+			s.observeStageErr(ctx, "bootstrap", "managed_layout_validation", managedStartedAt, len(s.config.RegisteredTables), currentAttempt, nil)
+			if err := s.runRegisteredTableCatalogMutationHook("before_commit_known_rollback", 0); err != nil {
+				return err
+			}
 			return nil
 		})
 	}); err != nil {
 		return err
 	}
+	if err := s.runRegisteredTableCatalogMutationHook("after_commit_ambiguous", 0); err != nil {
+		return err
+	}
+	if committedCandidate == nil {
+		return fmt.Errorf("bootstrap committed without a catalog topology")
+	}
+	s.publishCatalogBootstrapCandidate(committedCandidate, committedMetadata)
+	s.pushOutcomeCeiling.Store(outcomeCeiling)
+	s.publishReadinessReport()
 	succeeded = true
 	return nil
+}
+
+func (s *SyncService) startBackgroundCleanupWorkers() {
+	if s.config.Readiness != nil && s.config.Readiness.DisableBackgroundWorkers {
+		return
+	}
+	s.startScopeReceiptCleanupWorker()
+	s.requestScopeReceiptCleanup("post_bootstrap")
+	s.startSnapshotCleanupWorker()
+	s.requestSnapshotCleanup("post_bootstrap")
 }
 
 func bootstrapErrorClass(err error) string {
@@ -815,6 +1188,10 @@ ORDER BY
 
 func (s *SyncService) beginBootstrap(ctx context.Context) (bool, error) {
 	s.mu.Lock()
+	if s.readinessWithdrawn {
+		s.mu.Unlock()
+		return false, errServiceNotReady
+	}
 	if s.lifecycle != serviceLifecycleRunning {
 		s.mu.Unlock()
 		return false, errServiceShuttingDown
@@ -1194,6 +1571,7 @@ func (s *SyncService) Close(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
+	s.signalDrainStartedLocked()
 	switch s.lifecycle {
 	case serviceLifecycleClosed:
 		s.closeServiceSignalLocked()
@@ -1251,7 +1629,15 @@ func (s *SyncService) IsTableRegistered(schemaName, tableName string) bool {
 	return s.registeredTables[key]
 }
 
-func (s *SyncService) beginOperation() (func(), error) {
+func (s *SyncService) beginLocalOperation() (func(), error) {
+	return s.beginTrackedOperation(true)
+}
+
+func (s *SyncService) beginLifecycleOperation() (func(), error) {
+	return s.beginTrackedOperation(false)
+}
+
+func (s *SyncService) beginTrackedOperation(requireReady bool) (func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1261,7 +1647,7 @@ func (s *SyncService) beginOperation() (func(), error) {
 	case serviceLifecycleClosed:
 		return nil, errors.New("sync service has been closed")
 	}
-	if s.pool != nil && s.bootstrapReadiness != bootstrapReadinessReady {
+	if requireReady && (s.readinessWithdrawn || (s.pool != nil && s.bootstrapReadiness != bootstrapReadinessReady)) {
 		return nil, errServiceNotReady
 	}
 
@@ -1330,8 +1716,21 @@ func (s *SyncService) lifecycleSnapshot() (serviceLifecycleState, int, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	accepting := s.lifecycle == serviceLifecycleRunning &&
+		!s.readinessWithdrawn &&
 		(s.pool == nil || s.bootstrapReadiness == bootstrapReadinessReady)
 	return s.lifecycle, s.inFlightOps, accepting
+}
+
+func (s *SyncService) requestReadinessError() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lifecycle != serviceLifecycleRunning {
+		return errServiceShuttingDown
+	}
+	if s.bootstrapReadiness != bootstrapReadinessReady {
+		return errServiceNotReady
+	}
+	return nil
 }
 
 type operationalInvariantSnapshot struct {
@@ -1438,17 +1837,16 @@ func (s *SyncService) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	}
 
 	lifecycle, inFlightOps, accepting := s.lifecycleSnapshot()
-	if !accepting && lifecycle == serviceLifecycleRunning {
-		caps := s.GetCapabilities()
+	if !accepting {
 		return &StatusResponse{
 			Status:              "unhealthy",
-			Version:             caps.ProtocolVersion,
-			AppName:             caps.AppName,
+			Version:             SyncProtocolVersion,
+			AppName:             s.config.AppName,
 			Lifecycle:           string(lifecycle),
 			AcceptingOperations: false,
 			InFlightOperations:  inFlightOps,
-			RegisteredTables:    caps.RegisteredTables,
-			Features:            caps.Features,
+			RegisteredTables:    s.statusRegisteredTables(),
+			Features:            s.serviceFeatures(),
 		}, nil
 	}
 	invariantStats, err := s.operationalInvariantStats(ctx)
@@ -1466,16 +1864,15 @@ func (s *SyncService) GetStatus(ctx context.Context) (*StatusResponse, error) {
 		}
 	}
 
-	caps := s.GetCapabilities()
 	return &StatusResponse{
 		Status:                            status,
-		Version:                           caps.ProtocolVersion,
-		AppName:                           caps.AppName,
+		Version:                           SyncProtocolVersion,
+		AppName:                           s.config.AppName,
 		Lifecycle:                         string(lifecycle),
 		AcceptingOperations:               accepting,
 		InFlightOperations:                inFlightOps,
-		RegisteredTables:                  caps.RegisteredTables,
-		Features:                          caps.Features,
+		RegisteredTables:                  s.statusRegisteredTables(),
+		Features:                          s.serviceFeatures(),
 		UserStateRetentionFloorAheadCount: invariantStats.UserStateRetentionFloorAheadCount,
 		LatestBundleSeqMax:                invariantStats.LatestBundleSeqMax,
 		RetainedBundleFloorMin:            invariantStats.RetainedBundleFloorMin,
@@ -1490,24 +1887,12 @@ func (s *SyncService) GetStatus(ctx context.Context) (*StatusResponse, error) {
 	}, nil
 }
 
-// GetSchemaVersion returns the current schema version
-func (s *SyncService) GetSchemaVersion() int {
-	return s.config.MaxSupportedSchemaVersion
-}
-
-// GetCapabilities returns the currently supported sync protocol surface.
-func (s *SyncService) GetCapabilities() CapabilitiesResponse {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	features := map[string]bool{
+func (s *SyncService) serviceFeatures() map[string]bool {
+	return map[string]bool{
 		"bundle_pull":                         true,
-		"push_session_chunking":               true,
-		"committed_bundle_row_fetch":          true,
 		"snapshot_chunking":                   true,
 		"status_endpoint":                     true,
 		"graceful_shutdown":                   true,
-		"capabilities_endpoint":               true,
 		"server_checkpoint_tracking":          false,
 		"history_pruned_errors":               true,
 		"bundle_push":                         true,
@@ -1522,55 +1907,15 @@ func (s *SyncService) GetCapabilities() CapabilitiesResponse {
 		"scope_initialization_leases":         true,
 		"bundle_change_watch":                 s.bundleChangeWatchEnabled(),
 	}
+}
 
+func (s *SyncService) statusRegisteredTables() []string {
 	tables := make([]string, 0, len(s.config.RegisteredTables))
-	specs := make([]RegisteredTableSpec, 0, len(s.config.RegisteredTables))
 	for _, tbl := range s.config.RegisteredTables {
 		tables = append(tables, tbl.normalizedKey())
-		specs = append(specs, RegisteredTableSpec{
-			Schema:         tbl.normalizedSchema(),
-			Table:          tbl.normalizedTable(),
-			SyncKeyColumns: tbl.normalizedSyncKeyColumns(),
-		})
 	}
 	slices.Sort(tables)
-	slices.SortFunc(specs, func(a, b RegisteredTableSpec) int {
-		left := a.Schema + "." + a.Table
-		right := b.Schema + "." + b.Table
-		return strings.Compare(left, right)
-	})
-
-	return CapabilitiesResponse{
-		ProtocolVersion:      SyncProtocolVersion,
-		SchemaVersion:        s.GetSchemaVersion(),
-		AppName:              s.config.AppName,
-		RegisteredTables:     tables,
-		RegisteredTableSpecs: specs,
-		Features:             features,
-		BundleLimits: BundleCapabilitiesLimits{
-			MaxRowsPerBundle:                   s.config.MaxRowsPerBundle,
-			MaxBytesPerBundle:                  s.config.MaxBytesPerBundle,
-			MaxBundlesPerPull:                  defaultMaxBundlesPerPull,
-			DefaultRowsPerPushChunk:            s.defaultRowsPerPushChunk(),
-			MaxRowsPerPushChunk:                s.maxRowsPerPushChunk(),
-			PushSessionTTLSeconds:              int(s.pushSessionTTL().Seconds()),
-			DefaultRowsPerCommittedBundleChunk: s.defaultRowsPerCommittedBundleChunk(),
-			MaxRowsPerCommittedBundleChunk:     s.maxRowsPerCommittedBundleChunk(),
-			DefaultRowsPerSnapshotChunk:        s.defaultRowsPerSnapshotChunk(),
-			MaxRowsPerSnapshotChunk:            s.maxRowsPerSnapshotChunk(),
-			SnapshotSessionTTLSeconds:          int(s.snapshotSessionTTL().Seconds()),
-			MaxRowsPerSnapshotSession:          s.maxRowsPerSnapshotSession(),
-			MaxBytesPerSnapshotSession:         s.maxBytesPerSnapshotSession(),
-			DefaultBytesPerSnapshotChunk:       s.defaultBytesPerSnapshotChunk(),
-			MaxBytesPerSnapshotChunk:           s.maxBytesPerSnapshotChunk(),
-			MaxBytesPerSnapshotRow:             s.maxBytesPerSnapshotRow(),
-			SnapshotMaterializationBatchRows:   s.config.SnapshotMaterializationBatchRows,
-			SnapshotMaterializationBatchBytes:  s.config.SnapshotMaterializationBatchBytes,
-			MaxConcurrentSnapshotBuilds:        s.config.MaxConcurrentSnapshotBuilds,
-			MaxConcurrentSnapshotChunkRequests: s.config.MaxConcurrentSnapshotChunkRequests,
-			InitializationLeaseTTLSeconds:      int(s.initializationLeaseTTL().Seconds()),
-		},
-	}
+	return tables
 }
 
 func (s *SyncService) uploadLockTimeoutMillis() (int64, bool) {
@@ -1593,4 +1938,26 @@ func (s *SyncService) configureUploadTx(ctx context.Context, tx pgx.Tx) error {
 		return fmt.Errorf("failed to set upload lock timeout: %w", err)
 	}
 	return nil
+}
+
+func (s *SyncService) signalDrainStartedLocked() {
+	if s.drainStartedCh == nil {
+		s.drainStartedCh = make(chan struct{})
+	}
+	select {
+	case <-s.drainStartedCh:
+	default:
+		close(s.drainStartedCh)
+	}
+}
+func (s *SyncService) drainStartedChannel() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.drainStartedCh == nil {
+		s.drainStartedCh = make(chan struct{})
+	}
+	if s.lifecycle != serviceLifecycleRunning {
+		s.signalDrainStartedLocked()
+	}
+	return s.drainStartedCh
 }

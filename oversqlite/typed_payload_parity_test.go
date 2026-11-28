@@ -36,18 +36,41 @@ func TestSerializeRowInTx_TypedRows_PreservesNullBlobAndTimestampText(t *testing
 	payload, err := client.serializeRowInTx(ctx, tx, "typed_rows", "typed-1")
 	require.NoError(t, err)
 	require.JSONEq(t, `{
-		"id":"typed-1",
-		"name":"Ada",
-		"note":null,
-		"count_value":null,
-		"enabled_flag":"1",
-		"rating":"6.5711147369600704",
-		"data":null,
-		"created_at":"2026-03-24T10:42:11-08:00"
-	}`, string(payload))
+  "id": {
+    "storage": "text",
+    "value": "typed-1"
+  },
+  "name": {
+    "storage": "text",
+    "value": "Ada"
+  },
+  "note": {
+    "storage": "null",
+    "value": null
+  },
+  "count_value": {
+    "storage": "null",
+    "value": null
+  },
+  "enabled_flag": {
+    "storage": "integer",
+    "value": "1"
+  },
+  "rating": {
+    "storage": "real",
+    "value": "6.571114736960070424"
+  },
+  "data": {
+    "storage": "null",
+    "value": null
+  },
+  "created_at": {
+    "storage": "text",
+    "value": "2026-03-24T10:42:11-08:00"
+  }
+}`, string(payload))
 
-	var decoded map[string]any
-	require.NoError(t, json.Unmarshal(payload, &decoded))
+	decoded := decodeDirtyPayload(t, string(payload))
 	require.Contains(t, decoded, "data")
 	require.Nil(t, decoded["data"])
 	require.Equal(t, "2026-03-24T10:42:11-08:00", decoded["created_at"])
@@ -68,15 +91,39 @@ func TestProcessPayloadForUpload_TypedRows_Base64EncodesBlobAndKeepsNulls(t *tes
 	`)
 
 	rawPayload := `{
-		"id":"typed-blob",
-		"name":"Blob Row",
-		"note":null,
-		"count_value":null,
-		"enabled_flag":"0",
-		"rating":1.25,
-		"data":"001122ff",
-		"created_at":"2026-03-24T18:42:11Z"
-	}`
+  "id": {
+    "storage": "text",
+    "value": "typed-blob"
+  },
+  "name": {
+    "storage": "text",
+    "value": "Blob Row"
+  },
+  "note": {
+    "storage": "null",
+    "value": null
+  },
+  "count_value": {
+    "storage": "null",
+    "value": null
+  },
+  "enabled_flag": {
+    "storage": "integer",
+    "value": "0"
+  },
+  "rating": {
+    "storage": "real",
+    "value": "1.25"
+  },
+  "data": {
+    "storage": "blob",
+    "value": "001122ff"
+  },
+  "created_at": {
+    "storage": "text",
+    "value": "2026-03-24T18:42:11Z"
+  }
+}`
 	out, err := client.processPayloadForUpload("typed_rows", rawPayload)
 	require.NoError(t, err)
 
@@ -121,8 +168,7 @@ func TestDirtyRowCapture_TypedRows_NullBlobRemainsJsonNull(t *testing.T) {
 		WHERE table_name = 'typed_rows' AND key_json = ?
 	`, rowKeyJSON("typed-null-blob")).Scan(&raw))
 
-	var payload map[string]any
-	require.NoError(t, json.Unmarshal([]byte(raw), &payload))
+	payload := decodeDirtyPayload(t, raw)
 	require.Contains(t, payload, "data")
 	require.Nil(t, payload["data"])
 }

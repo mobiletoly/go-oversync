@@ -1,4 +1,4 @@
-// Package sessionid validates canonical push-session and initialization tokens.
+// Package sessionid validates canonical initialization tokens.
 package sessionid
 
 import (
@@ -7,8 +7,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// ErrInvalid is returned when a session token is not an exact lowercase dashed UUID.
-var ErrInvalid = errors.New("invalid canonical session token")
+// ErrInvalid is returned when an initialization token is not an exact lowercase dashed UUID.
+var ErrInvalid = errors.New("invalid canonical initialization token")
 
 // Validate requires an exact lowercase dashed UUID spelling.
 func Validate(raw string) error {

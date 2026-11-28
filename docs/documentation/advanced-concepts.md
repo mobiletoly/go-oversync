@@ -22,6 +22,12 @@ A bundle is the smallest durable sync unit.
 - `sync.bundle_rows` records normalized row effects for that bundle.
 - Clients apply complete bundles only.
 
+The stored bundle is canonical and generation-independent. At each request the server validates
+that canonical framing, filters it through the pinned immutable generation, preserves surviving
+order, and computes a new visible count, byte count, and hash. Hidden-only bundles remain empty
+pull envelopes. No durable projection copies, transformation callbacks, aliases, or projection
+cache participate in authority.
+
 ## Structured keys
 
 Rows are identified by structured sync keys, not by an implicit single `pk` field on the wire.
@@ -52,60 +58,57 @@ resolver code.
 
 ## Canonical JSON and numeric values
 
-Canonical protocol bytes use RFC 8785 JCS plus `jcs_uniform_numeric_strings_v1`. PostgreSQL
-`SMALLINT`, `INTEGER`, `BIGINT`, `NUMERIC`, `DECIMAL`, `REAL`, and `DOUBLE PRECISION` business
-values are JSON strings on every wire surface. Floating strings use the shortest finite RFC 8785
-binary64 spelling and normalize negative zero to `"0"`. SQLite clients upload `INTEGER` and finite
-`REAL` affinity as those canonical strings; exact decimals remain SQLite `TEXT` strings.
+Generation-bound protocol bytes use RFC 8785 JCS plus the exact declared wire token. Integers are
+range-checked canonical strings. Decimals preserve bounded non-exponent text. `float64` uses the
+shortest finite spelling for both PostgreSQL `float4` and `float8`; committed `float4` values may
+reflect storage normalization. Boolean values are
+JSON literals, never `"0"` or `"1"` strings. Bytes, UUIDs, text, and inner JSON are likewise
+validated without trimming, normalization, or repair. Text and inner-JSON strings preserve every
+Unicode scalar except PostgreSQL-infeasible U+0000. SQL NULL is outer JSON `null`; a JSON document
+whose value is null is the outer string `"null"`.
 
-SQLite Boolean affinity may upload only the strict strings `"0"` and `"1"`. PostgreSQL commits,
-conflicts, pulls, and snapshots emit JSON Booleans. Numeric behavior comes from PostgreSQL schema
-discovery and SQLite affinity; clients do not configure per-column numeric maps.
+SQLite affinity cannot select between several of those tokens. generation provisions a fixed proof but
+does not add the per-column local codec metadata owned by upgrade, so the current `oversqlite`
+affinity bridge is not a generation-token fallback.
 
-Invalid signed-64, decimal, binary64, or Boolean wire values are rejected before durable staging,
+Invalid integer, decimal, floating-point, Boolean, base64, UUID, text, or inner-JSON wire values are rejected before durable staging,
 business mutation, or SQLite mutation. Native JSON/JSONB numbers remain inside the ordinary JCS
 binary64 domain; exact nested values must be modeled as strings by the application schema.
 `bundle_hash` authenticates server-committed rows. The separately stored `canonical_request_hash`
-proves that an ambiguous `already_committed` response belongs to the client's frozen original
-request even when legitimate server mutation changed committed payloads.
+proves that an exact direct-push replay belongs to the client's frozen original request even when
+legitimate server mutation changed committed payloads.
 
 ## Push
 
-Push is all-or-nothing at bundle level.
+The client sends one compact dependency-safe bundle in a bounded `POST /sync/push`. The server
+commits the business change and its terminal outcome together, or retains a safe rejection
+after rolling back the business write. Each uploaded key must have exactly one final captured
+effect visible to the pushing generation. Incomplete coverage is a nonterminal HTTP 422 and
+rolls back the whole business transaction.
 
-- The client sends one logical dirty set with `source_id`, `source_bundle_id`, and `base_bundle_seq`.
-- The server validates the whole request and either rejects it or commits one bundle.
-- Retrying the same accepted `(user_id, source_id, source_bundle_id)` returns the same committed
-  bundle.
-- The server stores accepted-push replay metadata in `sync.bundle_log`.
-- `sync.source_state` keeps a monotonic committed source-bundle watermark so stale or duplicate
-  source bundle ids cannot be accepted again after older bundle history is pruned.
-- Source bundle ids must be contiguous per source; stale/pruned, out-of-order, changed, or retired
-  source failures require source recovery instead of generic retry.
+An uncertain upload resolves under its original binding. Terminal outcomes survive bundle pruning
+and consume the source operation sequence. After durable local disposition, the client sends ack.
+Rejection and cancellation can requeue intent for a successor. See
+[Durable upload outcomes]({{ site.baseurl }}/documentation/durable-upload-outcomes/).
 
 ### Structured conflict recovery
 
-The supported client/runtime contract includes structured `push_conflict` recovery.
+The default resolver durably defers conflicts. The Go SDK records the rejection and
+acknowledges the terminal outcome. Conflict evidence includes `server_row`. Explicit JSON
+null represents a missing authoritative row.
 
-- Only decoded machine-readable `push_conflict` payloads participate in resolver-based recovery
-- Valid resolver outcomes are:
-  - accept server state
-  - keep local intent
-  - keep merged full-row payload
-- Automatic structured recovery rewrites local row state, requeues surviving dirty intents,
-  clears `_sync_outbox_*`, and retries from a fresh outbound snapshot
-- Structured retries preserve the same logical `source_bundle_id`; `next_source_bundle_id` advances
-  only after a successful committed replay
-- The retry budget is bounded to `2` automatic retries inside one `PushPending()`
+Pass the retained `PendingConflict` to `ResolveConflict` or `RetryConflict`. A resolution
+can accept server state, keep local intent, or keep a merged full-row payload. Retry
+requeues surviving intent under a successor sequence.
+
+Applications can opt in to `ServerWinsResolver`, `ClientWinsResolver`, or a custom resolver.
+The SDK calls an automatic resolver after acknowledgment. Decisions preserve newer local edits
+and apply in one transaction. The automatic conflict retry budget is two inside a `PushPending` call.
 
 ## Administrative reset and TRUNCATE protection
 
-Oversync does not provide an in-place migration, canonicalization fallback, hash-version
-negotiation, compatibility alias, or mixed-version mode for incompatible database state. To reset
-a deployment, stop all server and client processes, recreate PostgreSQL and every Oversqlite client
-database, deploy compatible versions together, and reinitialize from authoritative business data.
-This procedure discards bundle history, staged sessions, outboxes, checkpoints, hashes, retry
-state, and offline work.
+Use a fresh sync layout and client databases for v0.5.0. See the
+[v0.5.0 release notes]({{ site.baseurl }}/releases/v0.5.0/).
 
 `TRUNCATE` fails closed on registered tables and current partitions. A rejection uses SQLSTATE
 `55000` and preserves business rows, row state, bundles, hashes, source watermarks, pull, and
@@ -115,9 +118,8 @@ managed-table DDL remain unsupported administrative risks.
 The `sync` schema is reserved for Oversync, and startup validates its complete semantic layout
 instead of trusting marker rows alone. A healthy restart performs no managed DDL. Drift returns a
 typed `managed sync layout mismatch` and is never repaired silently. Keep all server instances
-stopped while restoring the exact object, then retry; if exact repair is unsafe, use the coordinated
-server/client recreation procedure above. Do not mix versions during diagnosis or repair. These
-startup checks do not change wire messages, checkpoints, snapshots, bundles, or client local state.
+stopped while restoring from a reviewed compatible backup or following a separately reviewed
+recovery procedure.
 
 ## Pull
 
@@ -128,8 +130,6 @@ Pull is frozen to a stable ceiling.
 - Clients advance `last_bundle_seq_seen` only after durable local bundle apply.
 - `retained_bundle_floor` is the highest discarded bundle. Pull from the floor is valid and returns
   only bundles strictly above it; lower checkpoints return `history_pruned`.
-- Accepted-push replay remains stricter: replay at or below the floor returns `history_pruned`
-  because the committed bundle itself is no longer available.
 - A pull checkpoint or positive target above current committed history returns
   `checkpoint_ahead`, never a clamped stable checkpoint.
 
@@ -144,11 +144,10 @@ Use it for:
 - rebuild after `history_pruned`
 - rebuild after `checkpoint_ahead`
 
-Clients durably set the rebuild gate before authoritative checkpoint recovery. Normal sync resumes
-that recovery automatically after restart. Pending local work is frozen and uploaded first when it
-can be reconciled safely; otherwise recovery returns an actionable blocker and preserves the app
-row, outbox, checkpoint, and rebuild gate. The checkpoint changes only in the final atomic snapshot
-apply. `Rebuild` remains an optional explicit control, not a required resume step.
+Automatic recovery can install a sealed snapshot after an eligible pull failure when the scope is
+clean. Resume uses the durable recovery state. The final apply transaction publishes the new
+checkpoint. Explicit `Rebuild` uses the same installer. See
+[Snapshot recovery]({{ site.baseurl }}/documentation/snapshot-recovery/).
 
 When rebuild requires source rotation:
 
@@ -166,13 +165,11 @@ The supported envelope is intentionally strict.
 - bootstrap fails for unsupported FK/key shapes
 - bootstrap fails when the managed or registered table set is not FK-closed
 - bootstrap fails when required FK deferrability is missing
-- pull/hydrate/recover fail while local dirty rows exist
-- malformed server responses are rejected without advancing durable checkpoints
-- invalid structured conflict resolutions clear `_sync_outbox_*` and restore replayable intents
-  to `_sync_dirty_rows`
-- structured conflict retry exhaustion also clears `_sync_outbox_*` and leaves unresolved
-  intents replayable
-- generic non-conflict commit/replay failures still use the existing fail-closed recovery path
+- clean snapshot recovery requires local intent, upload outcomes, and acknowledgment to be settled
+- malformed responses leave durable checkpoints intact
+- stale or invalid explicit decisions preserve the pending conflict and newer edits
+- retry requeues intent for a successor sequence. Discarding a terminal application rejection
+  preserves newer dirty rows. See the [Go SDK reference]({{ site.baseurl }}/documentation/client/).
 
 ## Supported envelope
 

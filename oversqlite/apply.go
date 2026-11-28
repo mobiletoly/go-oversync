@@ -6,18 +6,23 @@ package oversqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"strings"
-
-	"github.com/mobiletoly/go-oversync/internal/wirevalue"
 )
 
-func (c *Client) upsertRowInTx(ctx context.Context, tx *sql.Tx, table string, payload map[string]interface{}) error {
+func (c *Client) upsertRowInTx(ctx context.Context, tx sqliteTransaction, table string, payload map[string]interface{}) error {
 	return c.upsertRowInTxUsing(ctx, tx, tx, table, payload)
 }
 
 func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, tx tableInfoQueryer, table string, payload map[string]interface{}) error {
+	return c.upsertPayloadInTxUsing(ctx, execer, tx, table, payload, false)
+}
+
+func (c *Client) upsertLocalRowInTxUsing(ctx context.Context, execer execContexter, tx tableInfoQueryer, table string, payload map[string]interface{}) error {
+	return c.upsertPayloadInTxUsing(ctx, execer, tx, table, payload, true)
+}
+
+func (c *Client) upsertPayloadInTxUsing(ctx context.Context, execer execContexter, tx tableInfoQueryer, table string, payload map[string]interface{}, storedLocal bool) error {
 	tableInfo, err := c.getTableInfoTx(tx, strings.ToLower(table))
 	if err != nil {
 		return fmt.Errorf("failed to get table info for %s: %w", table, err)
@@ -28,62 +33,28 @@ func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, t
 		return err
 	}
 
-	columnByLower := make(map[string]ColumnInfo, len(tableInfo.Columns))
-	for _, col := range tableInfo.Columns {
-		columnByLower[strings.ToLower(col.Name)] = col
+	bindings, err := c.bindUpsertPayload(table, payload, storedLocal, tableInfo, pkColumn)
+	if err != nil {
+		return err
 	}
-	if len(payload) != len(columnByLower) {
-		return fmt.Errorf("payload for %s must contain every table column", table)
-	}
+	columns, values, updateAssignments := bindings.columns, bindings.values, bindings.updateAssignments
 
-	columns := make([]string, 0, len(tableInfo.Columns))
-	values := make([]interface{}, 0, len(tableInfo.Columns))
-	updateAssignments := make([]string, 0, len(tableInfo.Columns))
-
-	for _, col := range tableInfo.Columns {
-		key := strings.ToLower(col.Name)
-		val, ok := payload[key]
-		if !ok {
-			return fmt.Errorf("payload for %s is missing column %s", table, col.Name)
-		}
-
-		if col.IsBlob() && val != nil {
-			s, ok := val.(string)
-			if !ok {
-				return fmt.Errorf("payload for %s column %s must be string-encoded blob data", table, col.Name)
-			}
-			var (
-				decoded []byte
-				err     error
-			)
-			if strings.EqualFold(col.Name, pkColumn) || tableInfo.IsBlobReferenceColumn(col.Name) {
-				decoded, err = decodeCanonicalWireUUIDBytes(s)
-				if err != nil {
-					return fmt.Errorf("failed to decode canonical wire UUID payload field %s: %w", col.Name, err)
-				}
-			} else {
-				decoded, err = decodeCanonicalWireBlobBytes(s)
-				if err != nil {
-					return fmt.Errorf("failed to decode canonical wire blob payload field %s: %w", col.Name, err)
-				}
-			}
-			val = decoded
-		} else if val != nil {
-			val, err = c.sqliteValueForWireJSON(table, col, val)
-			if err != nil {
-				return fmt.Errorf("payload for %s column %s: %w", table, col.Name, err)
-			}
-		}
-
-		columns = append(columns, quoteIdent(col.Name))
-		values = append(values, val)
-		if !strings.EqualFold(col.Name, pkColumn) {
-			updateAssignments = append(updateAssignments, fmt.Sprintf("%s = excluded.%s", quoteIdent(col.Name), quoteIdent(col.Name)))
-		}
+	if handled, err := c.reusePreparedUniqueUpsert(ctx, tx, table, tableInfo, pkColumn, values); err != nil || handled {
+		return err
 	}
 
 	if _, ok := payload[strings.ToLower(pkColumn)]; !ok {
 		return fmt.Errorf("payload for %s is missing primary key column %s", table, pkColumn)
+	}
+	if rowid, ok := ctx.Value(applyRowIDKey{}).(sql.NullInt64); ok && rowid.Valid {
+		alias, err := c.observableRowIDColumn(ctx, tx, table)
+		if err != nil {
+			return err
+		}
+		if alias != "" {
+			columns = append(columns, quoteIdent(alias))
+			values = append(values, rowid.Int64)
+		}
 	}
 
 	placeholders := make([]string, len(columns))
@@ -109,51 +80,6 @@ func (c *Client) upsertRowInTxUsing(ctx context.Context, execer execContexter, t
 	return nil
 }
 
-func (c *Client) sqliteValueForWireJSON(table string, col ColumnInfo, value any) (any, error) {
-	if col.IsInteger() {
-		switch typed := value.(type) {
-		case bool:
-			if typed {
-				return int64(1), nil
-			}
-			return int64(0), nil
-		case string:
-			if _, err := wirevalue.ParseInt64(typed); err != nil {
-				return nil, fmt.Errorf("invalid canonical signed-64 string: %w", err)
-			}
-			return typed, nil
-		default:
-			return nil, fmt.Errorf("INTEGER requires a canonical signed-64 JSON string or Boolean")
-		}
-	}
-	if col.IsReal() {
-		raw, ok := value.(string)
-		if !ok {
-			return nil, fmt.Errorf("REAL requires a canonical finite binary64 JSON string")
-		}
-		parsed, err := wirevalue.ParseFloat64(raw)
-		if err != nil {
-			return nil, err
-		}
-		return parsed, nil
-	}
-	if _, isNumber := value.(json.Number); isNumber {
-		return nil, fmt.Errorf("JSON number requires a compatible INTEGER or REAL destination")
-	}
-	return value, nil
-}
-
-func (c *Client) updateRowMetaInTxUsing(ctx context.Context, execer execContexter, tx tableInfoQueryer, pk, tableName string, serverVersion int64, deleted bool) error {
-	keyJSON, err := c.syncKeyJSONForPKInTx(tx, tableName, pk)
-	if err != nil {
-		return err
-	}
-	if err := c.updateStructuredRowStateInTxUsing(ctx, execer, c.config.Schema, tableName, keyJSON, serverVersion, deleted); err != nil {
-		return err
-	}
-	return nil
-}
-
 func (c *Client) syncKeyJSONForPKInTx(tx tableInfoQueryer, tableName, pk string) (string, error) {
 	keyColumns, err := c.syncKeyColumnsForTable(tableName)
 	if err != nil {
@@ -162,40 +88,18 @@ func (c *Client) syncKeyJSONForPKInTx(tx tableInfoQueryer, tableName, pk string)
 	if len(keyColumns) != 1 {
 		return "", fmt.Errorf("table %s must declare exactly one sync key column in the current client runtime", tableName)
 	}
-	keyJSONBytes, err := json.Marshal(map[string]any{strings.ToLower(keyColumns[0]): pk})
+	keyJSON, err := localKeyJSON(tx, strings.ToLower(keyColumns[0]), pk)
 	if err != nil {
 		return "", fmt.Errorf("failed to encode sync key for table %s column %s: %w", tableName, keyColumns[0], err)
 	}
-	return string(keyJSONBytes), nil
-}
-
-func (c *Client) updateStructuredRowStateInTx(ctx context.Context, tx *sql.Tx, schemaName, tableName, keyJSON string, rowVersion int64, deleted bool) error {
-	return c.updateStructuredRowStateInTxUsing(ctx, tx, schemaName, tableName, keyJSON, rowVersion, deleted)
-}
-
-func (c *Client) updateStructuredRowStateInTxUsing(ctx context.Context, execer execContexter, schemaName, tableName, keyJSON string, rowVersion int64, deleted bool) error {
-	deletedInt := 0
-	if deleted {
-		deletedInt = 1
-	}
-	if _, err := execer.ExecContext(ctx, `
-		INSERT INTO _sync_row_state(schema_name, table_name, key_json, row_version, deleted, updated_at)
-		VALUES(?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-		ON CONFLICT(schema_name, table_name, key_json) DO UPDATE SET
-			row_version = excluded.row_version,
-			deleted = excluded.deleted,
-			updated_at = excluded.updated_at
-	`, schemaName, tableName, keyJSON, rowVersion, deletedInt); err != nil {
-		return fmt.Errorf("failed to update structured row state for %s.%s: %w", schemaName, tableName, err)
-	}
-	return nil
+	return keyJSON, nil
 }
 
 // GetTableRowCount returns the number of rows in a business table
 func (c *Client) GetTableRowCount(tableName string) (int64, error) {
 	var count int64
 	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteIdent(tableName))
-	err := c.DB.QueryRow(query).Scan(&count)
+	err := c.db.QueryRow(query).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count rows in %s: %w", tableName, err)
 	}
@@ -205,7 +109,7 @@ func (c *Client) GetTableRowCount(tableName string) (int64, error) {
 // GetTableRows returns all rows from a business table (for debugging/inspection)
 func (c *Client) GetTableRows(tableName string) ([]map[string]interface{}, error) {
 	query := fmt.Sprintf("SELECT * FROM %s", quoteIdent(tableName))
-	rows, err := c.DB.Query(query)
+	rows, err := c.db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query %s: %w", tableName, err)
 	}
@@ -245,4 +149,65 @@ func (c *Client) GetTableRows(tableName string) ([]map[string]interface{}, error
 	}
 
 	return results, nil
+}
+
+type upsertBindings struct {
+	columns           []string
+	values            []interface{}
+	updateAssignments []string
+}
+
+// Validate the complete image and decode physical bindings before attempting
+// either a prepared final-image reuse or the original upsert statement.
+func (c *Client) bindUpsertPayload(table string, payload map[string]interface{}, storedLocal bool, tableInfo *TableInfo, pkColumn string) (upsertBindings, error) {
+	var err error
+	if storedLocal {
+		if err := c.validateAndUnwrapCapturedPayload(table, payload); err != nil {
+			return upsertBindings{}, err
+		}
+	}
+
+	columnByLower := make(map[string]ColumnInfo, len(tableInfo.Columns))
+	for _, col := range tableInfo.Columns {
+		columnByLower[strings.ToLower(col.Name)] = col
+	}
+	if len(payload) != len(columnByLower) {
+		return upsertBindings{}, fmt.Errorf("payload for %s must contain every table column", table)
+	}
+
+	columns := make([]string, 0, len(tableInfo.Columns))
+	values := make([]interface{}, 0, len(tableInfo.Columns))
+	updateAssignments := make([]string, 0, len(tableInfo.Columns))
+
+	for _, col := range tableInfo.Columns {
+		key := strings.ToLower(col.Name)
+		val, ok := payload[key]
+		if !ok {
+			return upsertBindings{}, fmt.Errorf("payload for %s is missing column %s", table, col.Name)
+		}
+
+		if storedLocal {
+			codec, declared, ok := c.declaredColumn(table, col.Name)
+			if !ok {
+				return upsertBindings{}, fmt.Errorf("payload for %s column %s is absent from the local generation contract", table, col.Name)
+			}
+			if val == nil && !declared.Nullable {
+				return upsertBindings{}, fmt.Errorf("payload for %s column %s is unexpectedly null", table, col.Name)
+			}
+			val, err = sqliteValueFromLocalCodec(codec, val)
+		} else {
+			val, err = c.sqliteValueWithDeclaredCodec(table, col, val)
+		}
+		if err != nil {
+			return upsertBindings{}, fmt.Errorf("payload for %s column %s: %w", table, col.Name, err)
+		}
+
+		columns = append(columns, quoteIdent(col.Name))
+		values = append(values, val)
+		if !strings.EqualFold(col.Name, pkColumn) {
+			updateAssignments = append(updateAssignments, fmt.Sprintf("%s = excluded.%s", quoteIdent(col.Name), quoteIdent(col.Name)))
+		}
+	}
+
+	return upsertBindings{columns, values, updateAssignments}, nil
 }

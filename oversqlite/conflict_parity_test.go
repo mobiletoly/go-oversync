@@ -134,10 +134,10 @@ func serverConflictUserRow(userID, name, email string) map[string]any {
 	}
 }
 
-func setStructuredConflictPushServer(t *testing.T, client *Client, serverRowDeleted bool, serverRow map[string]any) *mockPushSessionServer {
+func setStructuredConflictPushServer(t *testing.T, client *Client, serverRowDeleted bool, serverRow map[string]any) *mockPushServer {
 	t.Helper()
-	server := newMockPushSessionServer(t)
-	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+	server := newMockPushServer(t)
+	server.pushHook = func(session *mockDirectPush) *http.Response {
 		return structuredConflictResponse(session.Rows[0], 2, serverRowDeleted, serverRow)
 	}
 	client.HTTP = &http.Client{Transport: server}
@@ -146,7 +146,12 @@ func setStructuredConflictPushServer(t *testing.T, client *Client, serverRowDele
 
 func requireInvalidConflictResolution(t *testing.T, client *Client, ctx context.Context) {
 	t.Helper()
-	_, err := client.PushPending(ctx)
+	pending, err := client.PendingConflict(ctx)
+	require.NoError(t, err)
+	if pending != nil {
+		require.NoError(t, client.RetryConflict(ctx, *pending))
+	}
+	_, err = client.PushPending(ctx)
 	require.Error(t, err)
 	var invalidErr *InvalidConflictResolutionError
 	require.ErrorAs(t, err, &invalidErr)
@@ -184,8 +189,8 @@ func requireNextSourceBundleIDInSourceState(t *testing.T, db *sql.DB, client *Cl
 	require.Equal(t, expected, nextSourceBundleID)
 }
 
-func TestDecodePushConflictError_RequiresStructuredConflict(t *testing.T) {
-	structured := decodePushConflictError(http.StatusConflict, mustJSONPayload(t, map[string]any{
+func TestHistoricalPushConflictFixture_RequiresStructuredConflict(t *testing.T) {
+	structured := decodeHistoricalPushConflictFixture(http.StatusConflict, mustJSONPayload(t, map[string]any{
 		"error":   "push_conflict",
 		"message": "bundle conflict",
 		"conflict": map[string]any{
@@ -206,7 +211,7 @@ func TestDecodePushConflictError_RequiresStructuredConflict(t *testing.T) {
 	require.NotNil(t, structured)
 	require.NotNil(t, structured.Conflict())
 
-	unstructured := decodePushConflictError(http.StatusConflict, mustJSONPayload(t, map[string]any{
+	unstructured := decodeHistoricalPushConflictFixture(http.StatusConflict, mustJSONPayload(t, map[string]any{
 		"error":   "push_conflict",
 		"message": "bundle conflict",
 	}))
@@ -236,8 +241,8 @@ func TestPushPending_StructuredConflictBuildsConflictContextFromOutboundSnapshot
 	resolver := &capturingResolver{result: AcceptServer{}}
 	client.Resolver = resolver
 
-	server := newMockPushSessionServer(t)
-	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+	server := newMockPushServer(t)
+	server.pushHook = func(session *mockDirectPush) *http.Response {
 		return structuredConflictResponse(session.Rows[0], 2, false, map[string]any{
 			"id":    userID,
 			"name":  "Ada Server",
@@ -269,13 +274,14 @@ func TestPushPending_StructuredConflictServerWinsResolverRecoversToServerState(t
 		)
 	`)
 
+	client.Resolver = &ServerWinsResolver{}
 	userID := uuid.NewString()
 	seedSyncedUserRow(t, client, db, userID, "Ada", 1)
 	_, err := db.Exec(`UPDATE users SET name = ? WHERE id = ?`, "Ada Local", userID)
 	require.NoError(t, err)
 
-	server := newMockPushSessionServer(t)
-	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+	server := newMockPushServer(t)
+	server.pushHook = func(session *mockDirectPush) *http.Response {
 		return structuredConflictResponse(session.Rows[0], 2, false, map[string]any{
 			"id":    userID,
 			"name":  "Ada Server",
@@ -303,7 +309,7 @@ func TestPushPending_StructuredConflictServerWinsResolverRecoversToServerState(t
 	require.Equal(t, 0, outboundCount)
 
 	nextSourceBundleID, lastBundleSeqSeen := requireClientBundleState(t, db, client.UserID)
-	require.Equal(t, int64(1), nextSourceBundleID)
+	require.Equal(t, int64(2), nextSourceBundleID)
 	require.Equal(t, int64(0), lastBundleSeqSeen)
 }
 
@@ -323,11 +329,11 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 	_, err := db.Exec(`UPDATE users SET name = ? WHERE id = ?`, "Ada Local", userID)
 	require.NoError(t, err)
 
-	server := newMockPushSessionServer(t)
-	successHook := newFixedVersionCommitHook(t, server, 3)
+	server := newMockPushServer(t)
+	successHook := newFixedVersionPushHook(t, server, 3)
 	var sourceBundleIDs []int64
 	attempt := 0
-	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+	server.pushHook = func(session *mockDirectPush) *http.Response {
 		attempt++
 		sourceBundleIDs = append(sourceBundleIDs, session.SourceBundleID)
 		if attempt == 1 {
@@ -339,9 +345,9 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 		}
 		var nextSourceBundleID int64
 		require.NoError(t, db.QueryRow(`SELECT next_source_bundle_id FROM _sync_source_state WHERE source_id = (SELECT current_source_id FROM _sync_attachment_state WHERE singleton_key = 1) AND ? IS NOT NULL`, client.UserID).Scan(&nextSourceBundleID))
-		require.Equal(t, int64(1), nextSourceBundleID)
+		require.Equal(t, int64(2), nextSourceBundleID)
 		require.Equal(t, int64(2), session.Rows[0].BaseRowVersion)
-		return successHook(pushID, session)
+		return successHook(session)
 	}
 	client.HTTP = &http.Client{Transport: server}
 
@@ -350,7 +356,7 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 	name, _, exists := loadUserForKey(t, db, userID)
 	require.True(t, exists)
 	require.Equal(t, "Ada Local", name)
-	require.Equal(t, []int64{1, 1}, sourceBundleIDs)
+	require.Equal(t, []int64{1, 2}, sourceBundleIDs)
 
 	rowVersion, deleted, rowStateExists := loadUserRowStateForKey(t, db, rowKeyJSON(userID))
 	require.True(t, rowStateExists)
@@ -358,8 +364,8 @@ func TestPushPending_StructuredConflictClientWinsResolverAutoRetriesAndWins(t *t
 	require.Equal(t, int64(3), rowVersion)
 
 	nextSourceBundleID, lastBundleSeqSeen := requireClientBundleState(t, db, client.UserID)
-	require.Equal(t, int64(2), nextSourceBundleID)
-	require.Equal(t, int64(1), lastBundleSeqSeen)
+	require.Equal(t, int64(3), nextSourceBundleID)
+	require.Equal(t, int64(0), lastBundleSeqSeen)
 }
 
 func TestPushPending_StructuredConflictKeepMergedRetriesMergedPayload(t *testing.T) {
@@ -382,10 +388,10 @@ func TestPushPending_StructuredConflictKeepMergedRetriesMergedPayload(t *testing
 		"email": "merged@example.com",
 	})}}
 
-	server := newMockPushSessionServer(t)
-	successHook := newFixedVersionCommitHook(t, server, 3)
+	server := newMockPushServer(t)
+	successHook := newFixedVersionPushHook(t, server, 3)
 	attempt := 0
-	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+	server.pushHook = func(session *mockDirectPush) *http.Response {
 		attempt++
 		if attempt == 1 {
 			return structuredConflictResponse(session.Rows[0], 2, false, map[string]any{
@@ -396,7 +402,7 @@ func TestPushPending_StructuredConflictKeepMergedRetriesMergedPayload(t *testing
 		}
 		require.JSONEq(t, `{"id":"`+userID+`","name":"Ada Merged","email":"merged@example.com"}`, string(session.Rows[0].Payload))
 		require.Equal(t, int64(2), session.Rows[0].BaseRowVersion)
-		return successHook(pushID, session)
+		return successHook(session)
 	}
 	client.HTTP = &http.Client{Transport: server}
 
@@ -436,7 +442,7 @@ func TestPushPending_StructuredConflictKeepMergedLatestUpdatedAtWins(t *testing.
 
 	tx, err := db.Begin()
 	require.NoError(t, err)
-	require.NoError(t, client.updateStructuredRowStateInTx(ctx, tx, "main", "users", rowKeyJSON(userID), 1, false))
+	require.NoError(t, client.seedFixtureRowStateInTx(ctx, tx, "main", "users", rowKeyJSON(userID), 1, false))
 	require.NoError(t, tx.Commit())
 	_, err = db.Exec(`DELETE FROM _sync_dirty_rows`)
 	require.NoError(t, err)
@@ -451,10 +457,10 @@ func TestPushPending_StructuredConflictKeepMergedLatestUpdatedAtWins(t *testing.
 	require.NoError(t, err)
 	client.Resolver = &latestUpdatedAtTestResolver{}
 
-	server := newMockPushSessionServer(t)
-	successHook := newFixedVersionCommitHook(t, server, 3)
+	server := newMockPushServer(t)
+	successHook := newFixedVersionPushHook(t, server, 3)
 	attempt := 0
-	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+	server.pushHook = func(session *mockDirectPush) *http.Response {
 		attempt++
 		if attempt == 1 {
 			return structuredConflictResponse(session.Rows[0], 2, false, map[string]any{
@@ -473,7 +479,7 @@ func TestPushPending_StructuredConflictKeepMergedLatestUpdatedAtWins(t *testing.
 			"updated_at": localUpdatedAt,
 		})), string(session.Rows[0].Payload))
 		require.Equal(t, int64(2), session.Rows[0].BaseRowVersion)
-		return successHook(pushID, session)
+		return successHook(session)
 	}
 	client.HTTP = &http.Client{Transport: server}
 
@@ -515,10 +521,10 @@ func TestPushPending_StructuredConflictPreservesSiblingRowsFromRejectedBundle(t 
 	_, err = db.Exec(`INSERT INTO users (id, name, email) VALUES (?, ?, ?)`, siblingUserID, "Sibling", "sibling@example.com")
 	require.NoError(t, err)
 
-	server := newMockPushSessionServer(t)
-	successHook := newFixedVersionCommitHook(t, server, 3)
+	server := newMockPushServer(t)
+	successHook := newFixedVersionPushHook(t, server, 3)
 	attempt := 0
-	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+	server.pushHook = func(session *mockDirectPush) *http.Response {
 		attempt++
 		if attempt == 1 {
 			require.Len(t, session.Rows, 2)
@@ -529,13 +535,13 @@ func TestPushPending_StructuredConflictPreservesSiblingRowsFromRejectedBundle(t 
 			})
 		}
 		require.Len(t, session.Rows, 2)
-		require.Equal(t, int64(1), session.SourceBundleID)
+		require.Equal(t, int64(2), session.SourceBundleID)
 		seenIDs := []string{
 			session.Rows[0].Key["id"].(string),
 			session.Rows[1].Key["id"].(string),
 		}
 		require.ElementsMatch(t, []string{conflictUserID, siblingUserID}, seenIDs)
-		return successHook(pushID, session)
+		return successHook(session)
 	}
 	client.HTTP = &http.Client{Transport: server}
 
@@ -551,7 +557,7 @@ func TestPushPending_StructuredConflictPreservesSiblingRowsFromRejectedBundle(t 
 	require.Equal(t, "sibling@example.com", siblingEmail)
 }
 
-func TestPushPending_StructuredConflictInvalidKeepMergedForDeleteRestoresReplayableDirtyState(t *testing.T) {
+func TestPushPending_StructuredConflictInvalidKeepMergedForDeleteRestoresDirtyIntent(t *testing.T) {
 	ctx := context.Background()
 	client, db := newUsersBundleClient(t)
 	userID := seedSyncedConflictUser(t, client, db)
@@ -562,10 +568,10 @@ func TestPushPending_StructuredConflictInvalidKeepMergedForDeleteRestoresReplaya
 	requireInvalidConflictResolution(t, client, ctx)
 	requireReplayableDirtyUser(t, db, userID, oversync.OpDelete, 1, false)
 	requireDirtyOutboxCounts(t, db, 1, 0)
-	requireClientBundleStateValues(t, db, client.UserID, 1, 0)
+	requireClientBundleStateValues(t, db, client.UserID, 2, 0)
 }
 
-func TestPushPending_StructuredConflictInvalidResolutionForDeletedAuthoritativeUpdateRestoresReplayableDirtyState(t *testing.T) {
+func TestPushPending_StructuredConflictInvalidResolutionForDeletedAuthoritativeUpdateRestoresDirtyIntent(t *testing.T) {
 	cases := []struct {
 		name                    string
 		result                  func(*testing.T, string) MergeResult
@@ -591,13 +597,14 @@ func TestPushPending_StructuredConflictInvalidResolutionForDeletedAuthoritativeU
 			userID := seedSyncedConflictUser(t, client, db)
 			updateConflictUserName(t, db, userID, "Ada Local")
 			client.Resolver = &staticResolver{result: tc.result(t, userID)}
-			setStructuredConflictPushServer(t, client, false, nil)
+			setStructuredConflictPushServer(t, client, true, nil)
 
 			requireInvalidConflictResolution(t, client, ctx)
 			requireReplayableDirtyUser(t, db, userID, oversync.OpUpdate, 1, true)
+			requireDirtyOutboxCounts(t, db, 1, 0)
 			if tc.requireNextSourceBundle {
 				nextSourceBundleID, _ := requireClientBundleState(t, db, client.UserID)
-				require.Equal(t, int64(1), nextSourceBundleID)
+				require.Equal(t, int64(2), nextSourceBundleID)
 			}
 		})
 	}
@@ -631,6 +638,7 @@ func TestPushPending_StructuredConflictRejectsInvalidMergedPayloadShape(t *testi
 
 			requireInvalidConflictResolution(t, client, ctx)
 			requireReplayableDirtyUser(t, db, userID, oversync.OpUpdate, 1, true)
+			requireDirtyOutboxCounts(t, db, 1, 0)
 		})
 	}
 }
@@ -643,11 +651,11 @@ func TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState
 	userID := seedSyncedConflictUser(t, client, db)
 	updateConflictUserName(t, db, userID, "Ada Local")
 
-	server := newMockPushSessionServer(t)
+	server := newMockPushServer(t)
 	var sourceBundleIDs []int64
-	server.commitHook = func(pushID string, session *mockPushSession) *http.Response {
+	server.pushHook = func(session *mockDirectPush) *http.Response {
 		sourceBundleIDs = append(sourceBundleIDs, session.SourceBundleID)
-		requireNextSourceBundleIDInSourceState(t, db, client, 1)
+		requireNextSourceBundleIDInSourceState(t, db, client, int64(len(sourceBundleIDs)))
 		return structuredConflictResponse(session.Rows[0], 2, false, serverConflictUserRow(userID, "Ada Server", "ada@example.com"))
 	}
 	client.HTTP = &http.Client{Transport: server}
@@ -658,9 +666,28 @@ func TestPushPending_StructuredConflictRetryExhaustionLeavesReplayableDirtyState
 	require.ErrorAs(t, err, &exhaustedErr)
 	require.Equal(t, 2, exhaustedErr.RetryCount)
 	require.Equal(t, 1, exhaustedErr.RemainingDirtyCount)
-	require.Equal(t, []int64{1, 1, 1}, sourceBundleIDs)
+	require.Equal(t, []int64{1, 2, 3}, sourceBundleIDs)
+	require.Len(t, server.ackRequests, 3)
 
 	requireReplayableDirtyUser(t, db, userID, oversync.OpUpdate, 2, true)
 	requireDirtyOutboxCounts(t, db, 1, 0)
-	requireClientBundleStateValues(t, db, client.UserID, 1, 0)
+	requireClientBundleStateValues(t, db, client.UserID, 4, 0)
+}
+
+// Historical fixture input only; ordinary transport accepts terminal certificates.
+func decodeHistoricalPushConflictFixture(status int, body []byte) *PushConflictError {
+	if status != http.StatusConflict {
+		return nil
+	}
+
+	response, err := completeConflictResponse(body)
+	if err != nil {
+		return nil
+	}
+	response.Message = ""
+	return &PushConflictError{
+		Status:   status,
+		RawBody:  "",
+		Response: *response,
+	}
 }

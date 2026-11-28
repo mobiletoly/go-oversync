@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Run one bounded lane against a named, durable, run-owned PostgreSQL fixture."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import secrets
+import signal
+import subprocess
+import sys
+import time
+
+
+LANES = ('coexistence', 'fast', 'package', 'package-oversync', 'package-oversqlite-1', 'package-oversqlite-2', 'root-evolution', 'root-rest', 'full', 'audit', 'mobile', 'vet')
+
+
+def load_partition():
+    spec = importlib.util.spec_from_file_location('root_partition', Path(__file__).with_name('root-partition.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def docker(*args, timeout=30):
+    p = subprocess.run(['docker', *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    if p.returncode:
+        # Avoid surfacing command/environment data in failure diagnostics.
+        raise RuntimeError('docker ' + ' '.join(args[:2]) + ' failed: ' + p.stderr.strip())
+    return p.stdout.strip()
+
+
+def run(major, lane, extra_args=()):
+    if major != '17' or lane not in LANES:
+        raise ValueError('usage: mixed-schema-fixture.py 17 {' + '|'.join(LANES) + '}')
+    root = Path(__file__).resolve().parents[1]
+    run_id = 'm0011-' + secrets.token_hex(8)
+    volume = run_id + '-data'
+    password = secrets.token_hex(24)
+    report = Path(os.environ.get('M0011_REPORT_DIR', '/tmp/' + run_id))
+    # The lane creates its evidence directory; fixture metadata is kept beside it.
+    report.parent.mkdir(parents=True, exist_ok=True)
+    metadata = dict(run_id=run_id, postgres_major=int(major), lane=lane, cleanup='pending')
+    created_volume = created_container = False
+    status = 1
+    started = time.monotonic()
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    try:
+        partition = load_partition()
+        # Expected packages come from the checked-in partition, never from the lane's own output.
+        expected = partition.lane_packages(lane, root) if lane in partition.EVIDENCE_LANES else None
+        expected_tests = partition.lane_tests(lane, root)
+        docker('volume', 'create', '--label', 'com.mobiletoly.go-oversync.test-run=' + run_id, volume)
+        created_volume = True
+        docker('run', '-d', '--name', run_id, '--label', 'com.mobiletoly.go-oversync.test-run=' + run_id,
+               '-e', 'POSTGRES_PASSWORD=' + password, '-p', '127.0.0.1::5432', '-v', volume + ':/var/lib/postgresql/data', 'postgres:17.11')
+        created_container = True
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                docker('exec', run_id, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres', timeout=3)
+                break
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('PostgreSQL startup deadline')
+                time.sleep(.1)  # Readiness retry only, never scenario ordering.
+        port = docker('port', run_id, '5432/tcp').rsplit(':', 1)[1]
+        settings = docker('exec', run_id, 'psql', '-U', 'postgres', '-Atc', "SELECT current_setting('server_version_num')::int/10000,current_setting('fsync'),current_setting('synchronous_commit'),current_setting('full_page_writes')")
+        if settings != major + '|on|on|on':
+            raise RuntimeError('wrong PostgreSQL version/durability')
+        metadata['settings'] = settings
+        database_url = f'postgres://postgres:{password}@127.0.0.1:{port}/postgres?sslmode=disable'
+        env = dict(os.environ, TEST_DATABASE_URL=database_url, OVERSYNC_EXAMPLE_TEST_DATABASE_URL=database_url,
+                   TRANSITION_TEST_DATABASE_URL=database_url, GOTOOLCHAIN='go1.25.12', OVERSYNC_TEST_DOCKER_VOLUME='1', OVERSYNC_TEST_ISOLATE_DATABASES='1', OVERSYNC_TEST_RUN_ID=run_id,
+                   M0011_PG_MAJOR=major, M0011_REPORT_DIR=str(report))
+        command = ['scripts/test-lane.sh', lane]
+        if lane not in ('coexistence', 'vet'):
+            command.append('-json')
+        if lane != 'vet':
+            command.extend(extra_args)
+        if lane == 'vet':
+            command = ['scripts/run-with-timeout.pl', '240', '--', 'env', 'GOTOOLCHAIN=go1.25.12', 'go', 'vet', './...']
+        metadata['command'] = command
+        lane_started = time.monotonic()
+        process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            output, _ = process.communicate(timeout=620 if lane == 'coexistence' else 260)
+            status = process.returncode
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                output, _ = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                output, _ = process.communicate(timeout=10)
+            status = 124
+        metadata['lane_elapsed_seconds'] = time.monotonic() - lane_started
+        text = output.decode(errors='replace').replace(password, '[REDACTED]')
+        report.mkdir(parents=True, exist_ok=True)
+        (report / 'lane.log').write_text(text)
+        # The manifest's supporting test belongs to L2; L2a runs it in hosted CI (§16.8).
+        if lane in ('package', 'package-oversync'):
+            coverage = json.loads((root / 'conformance/mixed-schema/v1/manifest.json').read_text())
+            supporting = coverage['supporting_tests']
+            assert supporting, 'required supporting owners are missing'
+            events = []
+            for line in text.splitlines():
+                try: events.append(json.loads(line))
+                except ValueError: pass
+            checks = []
+            for test in supporting:
+                actions = [e.get('Action') for e in events if e.get('Package') == test['package'] and e.get('Test') == test['test']]
+                passed = actions.count('run') == 1 and actions.count('pass') == 1 and not any(a in actions for a in ('fail', 'skip'))
+                checks.append(dict(test=test['test'], passed=passed))
+            metadata['supporting_tests'] = checks
+            if not all(c['passed'] for c in checks): status = 1
+        if expected is not None:
+            evidence = partition.check_lane(expected, text.splitlines(), status)
+            if extra_args:
+                # Development arguments may select a subset; never report that as coverage.
+                evidence['complete'] = False
+                evidence['errors'].append('development arguments supplied; not package evidence')
+            elif not evidence['complete']:
+                status = 1
+            metadata['packages'] = evidence
+        if expected_tests is not None:
+            evidence = partition.check_tests(expected_tests, expected[0], text.splitlines())
+            if extra_args:
+                evidence['complete'] = False
+                evidence['errors'].append('development arguments supplied; not test evidence')
+            elif not evidence['complete']:
+                status = 1
+            metadata['tests'] = evidence
+        print(text)
+    except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+        metadata['failure'] = str(exc).replace(password, '[REDACTED]')
+        status = 1
+    finally:
+        leftovers = []
+        if created_container:
+            try: docker('rm', '-fv', run_id)
+            except (RuntimeError, subprocess.TimeoutExpired): leftovers.append(run_id)
+        if created_volume:
+            try: docker('volume', 'rm', volume)
+            except (RuntimeError, subprocess.TimeoutExpired): leftovers.append(volume)
+        metadata.update(exit_code=status, elapsed_seconds=time.monotonic()-started,
+                        cleanup='failed' if leftovers else 'complete', leftovers=leftovers)
+        report.mkdir(parents=True, exist_ok=True)
+        (report / 'fixture.json').write_text(json.dumps(metadata, indent=2) + '\n')
+        if leftovers: status = 1
+    return status
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        sys.exit('major and lane required')
+    try:
+        sys.exit(run(sys.argv[1], sys.argv[2], sys.argv[3:]))
+    except (ValueError, RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+        print(type(exc).__name__ + ': fixture failed; inspect fixture.json', file=sys.stderr)
+        sys.exit(1)

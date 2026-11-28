@@ -102,6 +102,9 @@ func retireSourceState(ctx context.Context, tx pgx.Tx, userPK int64, sourceID, r
 	if err := sourceid.Validate(replacedBySourceID); err != nil {
 		return err
 	}
+	if err := requireNoPendingPushOutcome(ctx, tx, userPK, sourceID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO sync.source_state (
 			user_pk, source_id, state, max_committed_source_bundle_id, replaced_by_source_id, retirement_reason

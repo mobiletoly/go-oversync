@@ -18,9 +18,7 @@ import (
 
 // BundleChangeEvent is a metadata-only wake-up hint for a newer committed bundle.
 type BundleChangeEvent struct {
-	BundleSeq      int64  `json:"bundle_seq"`
-	SourceID       string `json:"source_id,omitempty"`
-	SourceBundleID int64  `json:"source_bundle_id,omitempty"`
+	BundleSeq int64 `json:"bundle_seq"`
 }
 
 var errBundleChangeWatchDisabled = errors.New("bundle change watch is disabled")
@@ -183,20 +181,15 @@ func (s *SyncService) ensureBundleChangeHub() *bundleChangeHub {
 	return s.bundleChangeHub
 }
 
-func (s *SyncService) emitBundleChangeNotify(ctx context.Context, tx pgx.Tx, userPK int64, event BundleChangeEvent) error {
+func (s *SyncService) emitBundleChangeNotify(ctx context.Context, tx pgx.Tx, notification bundleChangeNotification) error {
 	if !s.bundleChangeWatchEnabled() {
 		return nil
 	}
-	if err := sourceid.ValidateOptional(event.SourceID); err != nil {
+	if err := sourceid.ValidateOptional(notification.SourceID); err != nil {
 		return fmt.Errorf("bundle change event source_id is invalid: %w", err)
 	}
 	cfg := s.effectiveBundleChangeWatchConfig()
-	payload, err := json.Marshal(bundleChangeNotification{
-		UserPK:         userPK,
-		BundleSeq:      event.BundleSeq,
-		SourceID:       event.SourceID,
-		SourceBundleID: event.SourceBundleID,
-	})
+	payload, err := json.Marshal(notification)
 	if err != nil {
 		return fmt.Errorf("marshal bundle change notification: %w", err)
 	}
@@ -221,11 +214,25 @@ func (s *SyncService) RunBundleChangeListener(ctx context.Context) error {
 		return fmt.Errorf("bundle change listener requires a database pool")
 	}
 
+	done, err := s.beginLocalOperation()
+	if err != nil {
+		return err
+	}
+	defer done()
+	s.mu.Lock()
+	if s.bundleChangeListenerRunning {
+		s.mu.Unlock()
+		return fmt.Errorf("bundle change listener already running")
+	}
+	s.bundleChangeListenerRunning = true
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.bundleChangeListenerRunning = false; s.mu.Unlock() }()
+
 	listenerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
 		select {
-		case <-s.serviceClosedChannel():
+		case <-s.drainStartedChannel():
 			cancel()
 		case <-listenerCtx.Done():
 		}
@@ -266,11 +273,18 @@ func (s *SyncService) runBundleChangeListenerSession(ctx context.Context) error 
 		return err
 	}
 
-	conn, err := s.pool.Acquire(ctx)
+	lease, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire bundle change listener connection: %w", err)
 	}
-	defer conn.Release()
+	// Preserve pool connection/session hooks, then transfer ownership outside
+	// execution capacity. At most one listener connection exists per service.
+	conn := lease.Hijack()
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(cleanup)
+	}()
 
 	if _, err := conn.Exec(ctx, "LISTEN "+quotedChannel); err != nil {
 		return fmt.Errorf("listen for bundle changes: %w", err)
@@ -280,7 +294,7 @@ func (s *SyncService) runBundleChangeListenerSession(ctx context.Context) error 
 	}
 
 	for {
-		notification, err := conn.Conn().WaitForNotification(ctx)
+		notification, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -310,11 +324,7 @@ func (s *SyncService) publishBundleChangeNotification(payload string) error {
 	if err := sourceid.ValidateOptional(notification.SourceID); err != nil {
 		return fmt.Errorf("bundle change notification source_id is invalid: %w", err)
 	}
-	s.ensureBundleChangeHub().publish(notification.UserPK, BundleChangeEvent{
-		BundleSeq:      notification.BundleSeq,
-		SourceID:       notification.SourceID,
-		SourceBundleID: notification.SourceBundleID,
-	})
+	s.ensureBundleChangeHub().publish(notification.UserPK, BundleChangeEvent{BundleSeq: notification.BundleSeq})
 	return nil
 }
 
@@ -352,6 +362,7 @@ func (s *SyncService) catchUpActiveBundleChangeSubscribers(ctx context.Context) 
 func (s *SyncService) SubscribeBundleChanges(
 	ctx context.Context,
 	actor Actor,
+	proof SchemaGenerationProof,
 	afterBundleSeq int64,
 ) (<-chan BundleChangeEvent, error) {
 	if err := rejectRetryableCallbackContext(ctx, "SubscribeBundleChanges"); err != nil {
@@ -360,24 +371,40 @@ func (s *SyncService) SubscribeBundleChanges(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !s.bundleChangeWatchEnabled() {
-		return nil, errBundleChangeWatchDisabled
+	if err := s.validateClientActor(actor, true); err != nil {
+		return nil, err
 	}
-	if err := s.validateClientActor(actor, false); err != nil {
+	if err := validateSchemaGenerationProof(proof); err != nil {
+		return nil, err
+	}
+	done, err := s.beginOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	view, err := s.resolveRequestGeneration(ctx, actor, proof)
+	if err != nil {
 		return nil, err
 	}
 	if afterBundleSeq < 0 {
 		return nil, fmt.Errorf("after_bundle_seq must be >= 0")
 	}
-
-	done, err := s.beginOperation()
+	if _, err := s.requireExactSourceGenerationBinding(ctx, actor, proof); err != nil {
+		return nil, err
+	}
+	selection, err := selectionFromResolvedGeneration(proof, view)
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	if err := watchGenerationBoundary(selection); err != nil {
+		return nil, err
+	}
+	if !s.bundleChangeWatchEnabled() {
+		return nil, errBundleChangeWatchDisabled
+	}
 
 	var userPK int64
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
+	err = withOriginTransaction(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
 		if err := requireScopeInitializedQuerier(ctx, tx, actor.UserID); err != nil {
 			return err
 		}
@@ -392,7 +419,7 @@ func (s *SyncService) SubscribeBundleChanges(
 	subCtx, cancel := context.WithCancel(ctx)
 	go func() {
 		select {
-		case <-s.serviceClosedChannel():
+		case <-s.drainStartedChannel():
 			cancel()
 		case <-subCtx.Done():
 		}
@@ -408,6 +435,7 @@ func (s *SyncService) SubscribeBundleChanges(
 		s.ensureBundleChangeHub().publish(userPK, BundleChangeEvent{BundleSeq: latestBundleSeq})
 	}
 
+	releaseStreamingAdmission(ctx, s)
 	return ch, nil
 }
 

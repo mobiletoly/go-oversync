@@ -3,9 +3,9 @@ package oversync
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"github.com/mobiletoly/go-oversync/internal/jcs"
-	"strings"
 
 	"github.com/google/uuid"
 )
@@ -41,7 +41,7 @@ func (s *SyncService) tableInfoForID(tableID int32) (registeredTableRuntimeInfo,
 	if s == nil {
 		return registeredTableRuntimeInfo{}, fmt.Errorf("table_id %d is not configured for sync", tableID)
 	}
-	info, ok := s.registeredTableByID[tableID]
+	info, ok := s.retainedTableByID[tableID]
 	if !ok {
 		return registeredTableRuntimeInfo{}, fmt.Errorf("table_id %d is not configured for sync", tableID)
 	}
@@ -63,6 +63,9 @@ func encodeKeyBytes(keyType, keyString string) ([]byte, any, error) {
 		copy(raw, parsed[:])
 		return raw, parsed, nil
 	case syncKeyTypeText:
+		if strings.IndexByte(keyString, 0) >= 0 {
+			return nil, nil, fmt.Errorf("text key must not contain U+0000")
+		}
 		return []byte(keyString), keyString, nil
 	default:
 		return nil, nil, fmt.Errorf("unsupported sync key type %q", keyType)

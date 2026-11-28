@@ -44,18 +44,20 @@ func TestApplyBundleRowAuthoritativelyInTx_BlobUUIDPK_ServerSendsUUIDString(t *t
 			id BLOB PRIMARY KEY NOT NULL,
 			file_id BLOB NOT NULL,
 			review TEXT NOT NULL,
-			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 		)
 	`)
 	require.NoError(t, err)
 
-	config := DefaultConfig("business", []SyncTable{
+	config := admittedFixtureConfig("business", []SyncTable{
 		{TableName: "files", SyncKeyColumnName: "id"},
 		{TableName: "file_reviews", SyncKeyColumnName: "id"},
-	})
+	}, testSchemaGenerationProof())
+	config = testConfigWithLocalContract(t, db, config)
+
 	tokenFunc := func(ctx context.Context) (string, error) { return "mock-token", nil }
 
-	client, err := NewClient(db, "http://localhost:8080", tokenFunc, config)
+	client, err := newAdmittedFixtureClient(db, "http://localhost:8080", tokenFunc, config)
 	require.NoError(t, err)
 	attachTestClient(t, client, "test-user", "test-source")
 
@@ -157,7 +159,7 @@ func TestApplyBundleRowAuthoritativelyInTx_BlobUUIDPK_ServerSendsUUIDString(t *t
 
 	var deletedInt int
 	var gotServerVersion int64
-	err = db.QueryRow(`SELECT deleted, row_version FROM _sync_row_state WHERE schema_name='business' AND table_name='files' AND key_json=?`, `{"id":"`+fileHex+`"}`).Scan(&deletedInt, &gotServerVersion)
+	err = db.QueryRow(`SELECT server_kind='deleted', row_version FROM _sync_row_state WHERE schema_name='business' AND table_name='files' AND key_json=?`, `{"id":"`+fileHex+`"}`).Scan(&deletedInt, &gotServerVersion)
 	require.NoError(t, err)
 	require.Equal(t, 1, deletedInt)
 	require.Equal(t, int64(12), gotServerVersion)
@@ -171,7 +173,8 @@ func TestSnapshotReachableBlobKeyErrorsRedactRawPrimaryKey(t *testing.T) {
 	db.SetMaxIdleConns(1)
 	_, err = db.Exec(`CREATE TABLE files (id BLOB PRIMARY KEY NOT NULL, name TEXT NOT NULL)`)
 	require.NoError(t, err)
-	client, err := NewClient(db, "http://example.invalid", tokenProviderForTests, DefaultConfig("main", []SyncTable{{TableName: "files", SyncKeyColumnName: "id"}}))
+	config := testConfigWithLocalContract(t, db, admittedFixtureConfig("main", []SyncTable{{TableName: "files", SyncKeyColumnName: "id"}}, testSchemaGenerationProof()))
+	client, err := newAdmittedFixtureClient(db, "http://example.invalid", tokenProviderForTests, config)
 	require.NoError(t, err)
 	defer client.Close()
 
@@ -213,17 +216,18 @@ func TestApplyBundleRowAuthoritativelyInTx_UpsertPreservesChildrenForBlobPKTable
 			id BLOB PRIMARY KEY NOT NULL,
 			file_id BLOB NOT NULL,
 			review TEXT NOT NULL,
-			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 		)
 	`)
 	require.NoError(t, err)
 
-	client, err := NewClient(db, "http://localhost:8080", func(context.Context) (string, error) {
-		return "mock-token", nil
-	}, DefaultConfig("business", []SyncTable{
+	config := testConfigWithLocalContract(t, db, admittedFixtureConfig("business", []SyncTable{
 		{TableName: "files", SyncKeyColumnName: "id"},
 		{TableName: "file_reviews", SyncKeyColumnName: "id"},
-	}))
+	}, testSchemaGenerationProof()))
+	client, err := newAdmittedFixtureClient(db, "http://localhost:8080", func(context.Context) (string, error) {
+		return "mock-token", nil
+	}, config)
 	require.NoError(t, err)
 	attachTestClient(t, client, "test-user", "test-source")
 
@@ -311,11 +315,12 @@ func TestApplyBundleRowAuthoritativelyInTx_RejectsNonCanonicalWireEncodingsForBl
 	`)
 	require.NoError(t, err)
 
-	client, err := NewClient(db, "http://localhost:8080", func(context.Context) (string, error) {
-		return "mock-token", nil
-	}, DefaultConfig("business", []SyncTable{
+	config := testConfigWithLocalContract(t, db, admittedFixtureConfig("business", []SyncTable{
 		{TableName: "files", SyncKeyColumnName: "id"},
-	}))
+	}, testSchemaGenerationProof()))
+	client, err := newAdmittedFixtureClient(db, "http://localhost:8080", func(context.Context) (string, error) {
+		return "mock-token", nil
+	}, config)
 	require.NoError(t, err)
 	attachTestClient(t, client, "test-user", "test-source")
 
@@ -346,7 +351,7 @@ func TestApplyBundleRowAuthoritativelyInTx_RejectsNonCanonicalWireEncodingsForBl
 		RowVersion: 1,
 	}, localPK)
 	require.Error(t, err)
-	require.ErrorContains(t, err, "failed to decode canonical wire blob payload field data")
+	require.ErrorContains(t, err, "wire bytes must use canonical padded base64")
 	require.NoError(t, tx.Rollback())
 
 	tx, err = db.BeginTx(ctx, nil)

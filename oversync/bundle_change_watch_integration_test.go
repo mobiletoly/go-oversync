@@ -36,12 +36,13 @@ func newBundleChangeWatchFixture(t *testing.T, watchEnabled bool) *bundleChangeW
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	cfg := &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "watch-test",
+	cfg := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "watch-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}
 	if watchEnabled {
 		cfg.BundleChangeWatch = BundleChangeWatchConfig{
@@ -78,9 +79,10 @@ func (f *bundleChangeWatchFixture) userInsert(name string) PushRequestRow {
 
 func (f *bundleChangeWatchFixture) pushOne(t *testing.T, actor Actor, sourceBundleID int64, name string) *Bundle {
 	t.Helper()
-	bundle, err := pushRowsViaSession(t, f.ctx, f.svc, actor, sourceBundleID, []PushRequestRow{f.userInsert(name)})
+	bundle, err := pushRowsOneShot(t, f.ctx, f.svc, actor, sourceBundleID, []PushRequestRow{f.userInsert(name)})
 	require.NoError(t, err)
 	require.NotNil(t, bundle)
+	acknowledgeRetainedOutcomeForTest(t, f.ctx, f.svc, actor, testSchemaGenerationProofForService(f.svc))
 	return bundle
 }
 
@@ -162,26 +164,25 @@ func assertNoRawBundleChangeNotification(t *testing.T, conn *pgxpool.Conn) {
 	require.ErrorIs(t, err, context.DeadlineExceeded, "unexpected notification: %#v", notification)
 }
 
-func TestSubscribeBundleChanges_RejectsDisabledFeature(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{AppName: "watch-disabled-test"}, slog.Default())
-	require.NoError(t, err)
+func watchTestRegisteredTables() []RegisteredTable {
+	return []RegisteredTable{{Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}}}
+}
 
-	ch, err := svc.SubscribeBundleChanges(context.Background(), Actor{UserID: "user"}, 0)
+func TestSubscribeBundleChanges_RejectsDisabledFeature(t *testing.T) {
+	f := newBundleChangeWatchFixture(t, false)
+	actor := f.actor("disabled", "device-a")
+	mustInitializeEmptyScope(t, f.ctx, f.svc, actor.UserID, actor.SourceID)
+
+	ch, err := f.svc.SubscribeBundleChanges(context.Background(), actor, testSchemaGenerationProofForService(f.svc), 0)
 
 	require.Nil(t, ch)
 	require.ErrorIs(t, err, errBundleChangeWatchDisabled)
 }
 
 func TestSubscribeBundleChanges_RejectsInvalidAfterBundleSeq(t *testing.T) {
-	svc, err := NewRuntimeService(nil, &ServiceConfig{
-		AppName: "watch-invalid-after-test",
-		BundleChangeWatch: BundleChangeWatchConfig{
-			Enabled: true,
-		},
-	}, slog.Default())
-	require.NoError(t, err)
+	f := newBundleChangeWatchFixture(t, true)
 
-	ch, err := svc.SubscribeBundleChanges(context.Background(), Actor{UserID: "user"}, -1)
+	ch, err := f.svc.SubscribeBundleChanges(context.Background(), Actor{UserID: "user", SourceID: "device-a"}, testSchemaGenerationProofForService(f.svc), -1)
 
 	require.Nil(t, ch)
 	require.EqualError(t, err, "after_bundle_seq must be >= 0")
@@ -189,12 +190,15 @@ func TestSubscribeBundleChanges_RejectsInvalidAfterBundleSeq(t *testing.T) {
 
 func TestSubscribeBundleChanges_RejectsUninitializedScope(t *testing.T) {
 	f := newBundleChangeWatchFixture(t, true)
+	actor := f.actor("uninitialized", "device-a")
+	_, err := f.svc.Connect(f.ctx, actor, testSchemaGenerationProofForService(f.svc), &ConnectRequest{HasLocalPendingRows: true})
+	require.NoError(t, err)
 
-	ch, err := f.svc.SubscribeBundleChanges(f.ctx, f.actor("uninitialized", "device-a"), 0)
+	ch, err := f.svc.SubscribeBundleChanges(f.ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 
 	require.Nil(t, ch)
-	var uninitializedErr *ScopeUninitializedError
-	require.ErrorAs(t, err, &uninitializedErr)
+	var initializingErr *ScopeInitializingError
+	require.ErrorAs(t, err, &initializingErr)
 }
 
 func TestSubscribeBundleChanges_ImmediateEventWhenBehind(t *testing.T) {
@@ -204,7 +208,7 @@ func TestSubscribeBundleChanges_ImmediateEventWhenBehind(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
-	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, 0)
+	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 
 	event := receiveBundleChangeEvent(t, ch)
@@ -220,7 +224,7 @@ func TestBundleChangeSubscriberCountForTest_PreservesExactUserIdentity(t *testin
 
 	watchCtx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
-	_, err := f.svc.SubscribeBundleChanges(watchCtx, Actor{UserID: spaced, SourceID: "spaced-device"}, 0)
+	_, err := f.svc.SubscribeBundleChanges(watchCtx, Actor{UserID: spaced, SourceID: "spaced-device"}, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 
 	plainCount, err := f.svc.BundleChangeSubscriberCountForTest(f.ctx, plain)
@@ -239,14 +243,12 @@ func TestSubscribeBundleChanges_WakesOnCommittedBundle(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
-	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, 0)
+	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 
 	bundle := f.pushOne(t, actor, 1, "committed")
 	event := receiveBundleChangeEvent(t, ch)
 	require.Equal(t, bundle.BundleSeq, event.BundleSeq)
-	require.Equal(t, actor.SourceID, event.SourceID)
-	require.Equal(t, int64(1), event.SourceBundleID)
 }
 
 func TestSubscribeBundleChanges_DoesNotWakeOnRolledBackBundle(t *testing.T) {
@@ -257,10 +259,10 @@ func TestSubscribeBundleChanges_DoesNotWakeOnRolledBackBundle(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
-	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, 0)
+	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 
-	err = f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err = f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		tableIdent := pgx.Identifier{f.schemaName, "users"}.Sanitize()
 		_, execErr := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (_sync_scope_id, id, name, email) VALUES ($1, $2, $3, $4)`, tableIdent), actor.UserID, uuid.New(), "rollback", "rollback@example.com")
 		require.NoError(t, execErr)
@@ -284,7 +286,7 @@ func TestSubscribeBundleChanges_IsolatesDifferentUsers(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
-	ch, err := f.svc.SubscribeBundleChanges(ctx, actorA, 0)
+	ch, err := f.svc.SubscribeBundleChanges(ctx, actorA, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 
 	f.pushOne(t, actorB, 1, "isolated-b")
@@ -302,7 +304,7 @@ func TestSubscribeBundleChanges_UnregistersOnContextCancel(t *testing.T) {
 	userPK := f.userPK(t, actor)
 
 	ctx, cancel := context.WithCancel(f.ctx)
-	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, 0)
+	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, f.svc.bundleChangeSubscriberCount(userPK))
 
@@ -342,7 +344,7 @@ func TestBundleChangeNotify_NoCapturedChangesEmitsNoPostgresNotify(t *testing.T)
 	mustInitializeEmptyScope(t, f.ctx, f.svc, actor.UserID, actor.SourceID)
 	rawListener := acquireRawBundleChangeListener(t, f.ctx, f.pool, f.svc.effectiveBundleChangeWatchConfig())
 
-	err := f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
+	err := f.svc.WithinSyncBundle(f.ctx, actor, BundleSource{SourceID: "trusted-server-writer", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx DatabaseWriteTx) error {
 		return nil
 	})
 	var noChanges *ScopeWriteNoCapturedChangesError
@@ -358,7 +360,7 @@ func TestSubscribeBundleChanges_AfterMissedNotifyImmediateCheckCatchesUp(t *test
 
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
-	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, 0)
+	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 
 	event := receiveBundleChangeEvent(t, ch)
@@ -372,7 +374,7 @@ func TestRunBundleChangeListener_ReconnectCatchUpWakesActiveSubscribers(t *testi
 
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
-	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, 0)
+	ch, err := f.svc.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
 
 	bundle := f.pushOne(t, actor, 1, "reconnect-catchup")
@@ -387,9 +389,9 @@ func TestBundleChangeWatch_MultipleServicesReceiveSameCommittedNotify(t *testing
 	actor := f.actor("multi-service", "device-a")
 	mustInitializeEmptyScope(t, f.ctx, f.svc, actor.UserID, actor.SourceID)
 
-	cfg := &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "watch-test-secondary",
+	cfg := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: f.schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "watch-test-secondary",
 		RegisteredTables: []RegisteredTable{
 			{Schema: f.schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
@@ -397,6 +399,7 @@ func TestBundleChangeWatch_MultipleServicesReceiveSameCommittedNotify(t *testing
 			Enabled:           true,
 			HeartbeatInterval: time.Second,
 		},
+		RegisteredTableCatalogRevision: 1,
 	}
 	second := newBootstrappedIntegrationService(t, f.ctx, f.pool, cfg, integrationTestLogger(slog.LevelWarn))
 
@@ -405,9 +408,9 @@ func TestBundleChangeWatch_MultipleServicesReceiveSameCommittedNotify(t *testing
 
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()
-	chA, err := f.svc.SubscribeBundleChanges(ctx, actor, 0)
+	chA, err := f.svc.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(f.svc), 0)
 	require.NoError(t, err)
-	chB, err := second.SubscribeBundleChanges(ctx, actor, 0)
+	chB, err := second.SubscribeBundleChanges(ctx, actor, testSchemaGenerationProofForService(second), 0)
 	require.NoError(t, err)
 
 	bundle := f.pushOne(t, actor, 1, "multi-service")

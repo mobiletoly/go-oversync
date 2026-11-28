@@ -25,8 +25,8 @@ CREATE TABLE IF NOT EXISTS business.person(
   email      TEXT NOT NULL,
   phone      TEXT,
   birth_date TEXT,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP::text,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP::text,
   score      DOUBLE PRECISION,
   is_active  BOOLEAN NOT NULL DEFAULT true,
   ssn        BIGINT,
@@ -54,11 +54,12 @@ CREATE TABLE IF NOT EXISTS business.person_address(
   postal_code TEXT,
   country TEXT NOT NULL,
   is_primary BOOLEAN NOT NULL DEFAULT false,
-  created_at TIMESTAMPTZ DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP::text,
   PRIMARY KEY (_sync_scope_id, id),
   CONSTRAINT person_address_person_id_fkey
     FOREIGN KEY (_sync_scope_id, person_id)
     REFERENCES business.person(_sync_scope_id, id)
+    ON DELETE CASCADE
     DEFERRABLE INITIALLY DEFERRED
 )`); err != nil {
 			return fmt.Errorf("create person_address: %w", err)
@@ -70,12 +71,13 @@ CREATE TABLE IF NOT EXISTS business.comment(
   id UUID NOT NULL,
   person_id UUID NOT NULL,
   comment TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT now(),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP::text,
   tags TEXT,
   PRIMARY KEY (_sync_scope_id, id),
   CONSTRAINT comment_person_id_fkey
     FOREIGN KEY (_sync_scope_id, person_id)
     REFERENCES business.person(_sync_scope_id, id)
+    ON DELETE CASCADE
     DEFERRABLE INITIALLY DEFERRED
 )`); err != nil {
 			return fmt.Errorf("create comment: %w", err)

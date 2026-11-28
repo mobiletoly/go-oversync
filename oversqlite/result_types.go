@@ -1,5 +1,7 @@
 package oversqlite
 
+import "github.com/mobiletoly/go-oversync/oversync"
+
 // DetachOutcome describes the lifecycle outcome of Detach.
 type DetachOutcome string
 
@@ -20,6 +22,8 @@ type DetachResult struct {
 type AuthorityStatus string
 
 const (
+	// AuthorityStatusLocalOnly means local data has not been attached to a server user.
+	AuthorityStatusLocalOnly AuthorityStatus = "local_only"
 	// AuthorityStatusPendingLocalSeed means an attached scope still has a pending initialization seed upload.
 	AuthorityStatusPendingLocalSeed AuthorityStatus = "pending_local_seed"
 	// AuthorityStatusAuthoritativeEmpty means the connected scope has no live authoritative rows materialized locally.
@@ -28,12 +32,38 @@ const (
 	AuthorityStatusAuthoritativeMaterialized AuthorityStatus = "authoritative_materialized"
 )
 
-// SyncStatus reports the canonical status for the currently connected scope.
+// SyncStatus reports durable local and attachment state without network access.
 type SyncStatus struct {
+	ContractConfirmed bool
+	NeedsResolution   bool
 	Authority         AuthorityStatus
 	Pending           PendingSyncStatus
 	LastBundleSeqSeen int64
+	ActionRequired    ApplicationActionRequired
 }
+
+// ApplicationAction identifies a durable condition that automatic sync cannot
+// resolve without an application-owned workflow.
+type ApplicationAction string
+
+const (
+	// ApplicationActionNone means automatic sync has not recorded an action gate
+	// for the client's current schema generation.
+	ApplicationActionNone ApplicationAction = ""
+	// ApplicationActionUpgrade means the current generation was retired and the
+	// application must run its preserving upgrade workflow.
+	ApplicationActionUpgrade ApplicationAction = "upgrade_application"
+)
+
+// ApplicationActionRequired is local durable state. It can be inspected even
+// when connecting to the server is impossible or automatic loops have stopped.
+type ApplicationActionRequired struct {
+	Action     ApplicationAction
+	Generation oversync.SchemaGenerationProof
+}
+
+// Required reports whether an application-owned action is pending.
+func (s ApplicationActionRequired) Required() bool { return s.Action != ApplicationActionNone }
 
 // RestoreSummary summarizes a snapshot-based restore applied locally.
 type RestoreSummary struct {
@@ -90,11 +120,23 @@ type SyncReport struct {
 
 // SyncThenDetachResult reports the public result of SyncThenDetach.
 type SyncThenDetachResult struct {
-	LastSync                 SyncReport
+	// LastSync is absent when no round completed a full remote sync.
+	LastSync                 *SyncReport
 	Detach                   DetachResult
 	SyncRounds               int
 	RemainingPendingRowCount int64
+	BlockedReason            DetachBlockedReason
 }
+
+type DetachBlockedReason string
+
+const (
+	DetachBlockedPushAttemptLimit DetachBlockedReason = "push_attempt_limit"
+	DetachBlockedNoProgress       DetachBlockedReason = "no_progress"
+	DetachBlockedUploadsPaused    DetachBlockedReason = "uploads_paused"
+	DetachBlockedDownloadsPaused  DetachBlockedReason = "downloads_paused"
+	DetachBlockedSyncRoundLimit   DetachBlockedReason = "sync_round_limit"
+)
 
 // IsSuccess reports whether SyncThenDetach finished with a successful detach.
 func (r SyncThenDetachResult) IsSuccess() bool {

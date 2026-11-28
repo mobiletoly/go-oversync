@@ -65,7 +65,8 @@ func requireContainsAllStages(t *testing.T, got []string, expected ...string) {
 func TestBootstrapProgress_IsStageAwareBoundedAndSecretSafe(t *testing.T) {
 	var logs bytes.Buffer
 	service := &SyncService{
-		config: &ServiceConfig{LogStageTimings: true},
+		config: &ServiceConfig{LogStageTimings: true,
+			RegisteredTableCatalogRevision: 1},
 		logger: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	progress := newBootstrapProgress(service, 17)
@@ -105,7 +106,8 @@ func TestBootstrapProgress_IsStageAwareBoundedAndSecretSafe(t *testing.T) {
 
 func TestObserveStageDuration_RecordsZeroDuration(t *testing.T) {
 	recorder := &collectedStageMetrics{}
-	service := &SyncService{config: &ServiceConfig{StageMetrics: recorder}}
+	service := &SyncService{config: &ServiceConfig{StageMetrics: recorder,
+		RegisteredTableCatalogRevision: 1}}
 	service.observeStageDuration(context.Background(), "bootstrap", "business_row_scan_canonicalization", 0, 0, 1, true)
 
 	records := recorder.recordsForOperation("bootstrap")["business_row_scan_canonicalization"]
@@ -125,21 +127,23 @@ func TestProcessPull_EmitsStageMetrics(t *testing.T) {
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
 	recorder := &collectedStageMetrics{}
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "pull-metrics-test",
-		StageMetrics:              recorder,
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "pull-metrics-test",
+		StageMetrics: recorder,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "pull-metrics-user-" + suffix
 	writer := Actor{UserID: userID, SourceID: "writer"}
 	reader := Actor{UserID: userID, SourceID: "reader"}
+	mustInitializeEmptyScope(t, ctx, svc, reader.UserID, reader.SourceID)
 
 	rowID := uuid.New()
-	_, err := pushRowsViaSession(t, ctx, svc, writer, 1, []PushRequestRow{{
+	_, err := pushRowsOneShot(t, ctx, svc, writer, 1, []PushRequestRow{{
 		Schema:         schemaName,
 		Table:          "users",
 		Key:            SyncKey{"id": rowID.String()},
@@ -149,7 +153,7 @@ func TestProcessPull_EmitsStageMetrics(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	resp, err := svc.ProcessPull(ctx, reader, 0, 10, 0)
+	resp, err := svc.ProcessPull(ctx, reader, testSchemaGenerationProofForService(svc), 0, 10, 0)
 	require.NoError(t, err)
 	require.Len(t, resp.Bundles, 1)
 

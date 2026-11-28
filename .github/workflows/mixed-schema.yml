@@ -1,0 +1,128 @@
+name: Mixed schema qualification
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # m0011 §16.6: the v0.5.0 release gate needs a run of the exact release commit
+  # with Go caches disabled. Dispatch on that commit with go-cache unchecked.
+  workflow_dispatch:
+    inputs:
+      go-cache:
+        description: Restore and save Go caches (uncheck for the cold release-gate run)
+        type: boolean
+        default: true
+permissions:
+  contents: read
+jobs:
+  coexistence:
+    name: mixed-schema-pg17
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+          cache: ${{ github.event_name != 'workflow_dispatch' || inputs.go-cache }}
+      - run: docker pull postgres:17.11
+      - run: python3 scripts/mixed-schema-fixture.py 17 coexistence
+        env:
+          M0011_REPORT_DIR: ${{ runner.temp }}/mixed-schema-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mixed-schema-pg17
+          path: ${{ runner.temp }}/mixed-schema-results
+          if-no-files-found: error
+          retention-days: 14
+  regression:
+    name: mixed-schema-${{ matrix.lane }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [package-oversync, package-oversqlite-1, package-oversqlite-2, root-evolution, root-rest, mobile, vet]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the paired Oversqlite contract corpus
+        if: matrix.lane != 'root-evolution' && matrix.lane != 'mobile' && matrix.lane != 'vet'
+        uses: actions/checkout@v4
+        with:
+          repository: mobiletoly/sqlitenow-kmp
+          ref: 455f9911917399e15bf78f83315c665a0401a456
+          path: .ci/sqlitenow-kmp
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+          cache: ${{ github.event_name != 'workflow_dispatch' || inputs.go-cache }}
+      - run: docker pull postgres:17.11
+      # m0011 §16.2 C: build outside the timed lane; never runs tests or TestMain.
+      - name: Precompile test binaries
+        if: matrix.lane != 'vet'
+        timeout-minutes: 4
+        run: scripts/test-lane.sh precompile '${{ matrix.lane }}'
+      - run: python3 scripts/mixed-schema-fixture.py 17 '${{ matrix.lane }}'
+        env:
+          M0011_REPORT_DIR: ${{ runner.temp }}/mixed-schema-results
+          OVERSQLITE_CONTRACTS_ROOT: ${{ github.workspace }}/.ci/sqlitenow-kmp/oversqlite-contracts
+          SQLITENOW_KMP_REPO: ${{ github.workspace }}/.ci/sqlitenow-kmp
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mixed-schema-${{ matrix.lane }}
+          path: ${{ runner.temp }}/mixed-schema-results
+          if-no-files-found: error
+          retention-days: 14
+  guards:
+    name: mixed-schema-guards
+    runs-on: ubuntu-latest
+    # The partition step compiles oversqlite's tests to list them for sharding.
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+          # This job compiles nothing; saving its empty cache would block real ones.
+          cache: false
+      - run: python3 -B -m unittest discover -s scripts -p test_mixed_schema.py
+      - run: python3 -B -m unittest discover -s scripts -p test_root_partition.py
+      - run: python3 -B scripts/mixed-schema.py manifest
+      - run: python3 -B scripts/root-partition.py partition --output '${{ runner.temp }}/mixed-schema-partition/partition.json'
+      - run: test -z "$(gofmt -l oversync/integration_test_postgres_test.go oversync/generation_data_plane_integration_test.go oversqlite/conflict_pending.go oversqlite/conflict_pending_test.go oversqlite_e2e/mixed_schema_test.go oversqlite_e2e/mixed_schema_process_test.go integration/schema_evolution/integration_test.go integration/schema_evolution/revision8_regressions_test.go)"
+      - run: git diff --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mixed-schema-partition
+          path: ${{ runner.temp }}/mixed-schema-partition
+          if-no-files-found: error
+          retention-days: 14
+  mixed-schema-required:
+    name: mixed-schema-required
+    if: always()
+    needs: [coexistence, regression, guards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every qualification job
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          assert set(results) == {'coexistence', 'regression', 'guards'}, 'missing required job'
+          assert all(v['result'] == 'success' for v in results.values()), 'failed, cancelled, skipped or missing qualification'
+          PY
+      - uses: actions/checkout@v4
+        if: always()
+      - uses: actions/download-artifact@v4
+        if: always()
+        with:
+          pattern: mixed-schema-*
+          path: ${{ runner.temp }}/mixed-schema-artifacts
+      - name: Require complete lane and package evidence
+        if: always()
+        run: python3 -B scripts/root-partition.py check-artifacts '${{ runner.temp }}/mixed-schema-artifacts'

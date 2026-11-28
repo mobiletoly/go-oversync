@@ -10,14 +10,16 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	exampleserver "github.com/mobiletoly/go-oversync/examples/nethttp_server/server"
+	exampleserver "github.com/mobiletoly/go-oversync/integration/nethttp_server/server"
 	"github.com/mobiletoly/go-oversync/oversqlite"
+	"github.com/mobiletoly/go-oversync/oversync"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,7 +38,7 @@ const postsDDL = `
 		id TEXT PRIMARY KEY NOT NULL,
 		title TEXT NOT NULL,
 		content TEXT NOT NULL,
-		author_id TEXT NOT NULL,
+		author_id TEXT NULL,
 		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (author_id) REFERENCES users(id) DEFERRABLE INITIALLY DEFERRED
@@ -75,13 +77,36 @@ func integrationTestDatabaseURL() string {
 	return "postgres://postgres:password@localhost:5432/clisync_oversqlite_e2e_test?sslmode=disable"
 }
 
-func newExampleServer(t *testing.T, schema string) *exampleserver.TestServer {
+func newExampleServer(t *testing.T, schema string, tables ...string) *exampleserver.TestServer {
 	t.Helper()
-	return newExampleServerWithConfig(t, schema, func(*exampleserver.ServerConfig) {})
+	if len(tables) == 0 {
+		tables = []string{"users"}
+	}
+	return newExampleServerWithConfig(t, schema, func(config *exampleserver.ServerConfig) {
+		config.SchemaGenerations = exampleGenerationForTables(schema, tables)
+	})
+}
+
+func exampleGenerationForTables(schema string, tables []string) []oversync.SchemaGeneration {
+	selected := oversync.SchemaGeneration{ID: 1}
+	for _, table := range exampleserver.SchemaGenerationsForBusinessSchema(schema)[0].Tables {
+		for _, name := range tables {
+			if name == table.Table {
+				selected.Tables = append(selected.Tables, table)
+			}
+		}
+	}
+	return []oversync.SchemaGeneration{selected}
+}
+
+func defaultOversqliteConfig(schema string, tables []oversqlite.SyncTable) *oversqlite.Config {
+	config := oversqlite.DefaultConfig(1, tables)
+	config.DatabaseID, config.ServiceID = "e2e-client", schema
+	return config
 }
 
 func newRetryingConfig(schema string, tables []oversqlite.SyncTable) *oversqlite.Config {
-	config := oversqlite.DefaultConfig(schema, tables)
+	config := defaultOversqliteConfig(schema, tables)
 	config.RetryPolicy = &oversqlite.RetryPolicy{
 		Enabled:        true,
 		MaxAttempts:    3,
@@ -93,7 +118,7 @@ func newRetryingConfig(schema string, tables []oversqlite.SyncTable) *oversqlite
 }
 
 func newNoRetryConfig(schema string, tables []oversqlite.SyncTable) *oversqlite.Config {
-	config := oversqlite.DefaultConfig(schema, tables)
+	config := defaultOversqliteConfig(schema, tables)
 	config.RetryPolicy = &oversqlite.RetryPolicy{
 		Enabled: false,
 	}
@@ -120,6 +145,9 @@ func newExampleServerWithConfig(
 		configure(cfg)
 	}
 
+	if cfg.SchemaGenerations == nil {
+		cfg.SchemaGenerations = exampleGenerationForTables(schema, []string{"users"})
+	}
 	ts, err := exampleserver.NewTestServer(cfg)
 	require.NoError(t, err)
 
@@ -189,33 +217,17 @@ func newSQLiteClient(
 ) (*oversqlite.Client, *sql.DB) {
 	t.Helper()
 
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err)
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	for _, stmt := range ddl {
-		_, err := db.Exec(stmt)
-		require.NoError(t, err)
-	}
-
-	var client *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
 		return ts.GenerateToken(userID, time.Hour)
 	}
-
-	client, err = oversqlite.NewClient(db, ts.URL(), tokenFn, config)
-	require.NoError(t, err)
+	client := openFreshSQLiteClient(t, filepath.Join(t.TempDir(), "client.sqlite"), ts.URL(), tokenFn, config, ddl...)
 	_ = sourceID
-	err = client.Open(context.Background())
-	require.NoError(t, err)
 	connectResult, err := client.Attach(context.Background(), userID)
 	require.NoError(t, err)
 	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
 
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	t.Cleanup(func() { _ = db.Close() })
-	return client, db
+	return client, client.Database()
 }
 
 func newSQLiteClientWithoutConnect(
@@ -228,30 +240,122 @@ func newSQLiteClientWithoutConnect(
 ) (*oversqlite.Client, *sql.DB) {
 	t.Helper()
 
-	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err)
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	for _, stmt := range ddl {
-		_, err := db.Exec(stmt)
-		require.NoError(t, err)
-	}
-
-	var client *oversqlite.Client
 	tokenFn := func(ctx context.Context) (string, error) {
 		return ts.GenerateToken(userID, time.Hour)
 	}
-
-	client, err = oversqlite.NewClient(db, ts.URL(), tokenFn, config)
-	require.NoError(t, err)
+	client := openFreshSQLiteClient(t, filepath.Join(t.TempDir(), "client.sqlite"), ts.URL(), tokenFn, config, ddl...)
 	_ = sourceID
-	err = client.Open(context.Background())
-	require.NoError(t, err)
 
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	t.Cleanup(func() { _ = db.Close() })
-	return client, db
+	return client, client.Database()
+}
+
+type freshDDLMigrator struct {
+	ddl []string
+}
+
+func (m freshDDLMigrator) InstalledVersion(ctx context.Context, reader oversqlite.LocalMigrationReader) (int64, error) {
+	var version int64
+	err := reader.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version)
+	return version, err
+}
+
+func (m freshDDLMigrator) Migrate(ctx context.Context, tx oversqlite.LocalMigrationTx, _ oversqlite.LocalMigrationStep) error {
+	for _, statement := range m.ddl {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, `PRAGMA user_version=1`)
+	return err
+}
+
+func openFreshSQLiteClient(
+	t *testing.T,
+	path string,
+	baseURL string,
+	token func(context.Context) (string, error),
+	config *oversqlite.Config,
+	ddl ...string,
+) *oversqlite.Client {
+	t.Helper()
+	config = readyTestConfig(config)
+	plan := &oversqlite.UpgradePlan{
+		PlanID: "test-fresh-v1", Mode: oversqlite.UpgradeModeFresh,
+		DatabaseID: config.DatabaseID, ServiceID: config.ServiceID,
+		TargetGenerationID: config.GenerationID, TargetVersion: 1,
+		LocalOnlyTables: append([]string(nil), config.LocalOnlyTables...),
+		Migrator:        freshDDLMigrator{ddl: append([]string(nil), ddl...)},
+	}
+	opening, err := oversqlite.NewOpening(&oversqlite.OpeningConfig{
+		DatabasePath: path, Plan: plan, BaseURL: baseURL, Token: token,
+		TargetClientConfig: config,
+	})
+	require.NoError(t, err)
+	result, err := opening.Advance(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, result.Ready)
+	return result.Ready
+}
+
+func openReadySQLiteClient(
+	t *testing.T,
+	path string,
+	baseURL string,
+	token func(context.Context) (string, error),
+	config *oversqlite.Config,
+) *oversqlite.Client {
+	t.Helper()
+	config = readyTestConfig(config)
+	opening, err := oversqlite.NewOpening(&oversqlite.OpeningConfig{
+		DatabasePath: path, BaseURL: baseURL, Token: token,
+		TargetClientConfig: config,
+	})
+	require.NoError(t, err)
+	result, err := opening.Advance(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, result.Ready)
+	return result.Ready
+}
+
+func readyTestConfig(config *oversqlite.Config) *oversqlite.Config {
+	copyValue := *config
+	copyValue.Tables = append([]oversqlite.SyncTable(nil), config.Tables...)
+	for index := range copyValue.Tables {
+		copyValue.Tables[index].SyncKeyColumns = append([]string(nil), config.Tables[index].SyncKeyColumns...)
+	}
+	copyValue.LocalOnlyTables = append([]string(nil), config.LocalOnlyTables...)
+	if copyValue.LocalVersion == 0 {
+		copyValue.LocalVersion = 1
+	}
+	return &copyValue
+}
+
+func openPersistentSQLiteClient(
+	t *testing.T,
+	path string,
+	baseURL string,
+	token func(context.Context) (string, error),
+	config *oversqlite.Config,
+	ddl ...string,
+) *oversqlite.Client {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err == nil && info.Size() > 0 {
+		return openReadySQLiteClient(t, path, baseURL, token, config)
+	}
+	require.ErrorIs(t, err, os.ErrNotExist)
+	return openFreshSQLiteClient(t, path, baseURL, token, config, ddl...)
+}
+
+func sqliteDatabasePath(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var sequence int
+	var name, path string
+	require.NoError(t, db.QueryRow(`PRAGMA database_list`).Scan(&sequence, &name, &path))
+	require.Equal(t, "main", name)
+	require.NotEmpty(t, path)
+	return path
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

@@ -37,11 +37,14 @@ client
 test_reports/
 sqlitenow_server/
 
-examples/nethttp_server/nethttp_server
+integration/nethttp_server/nethttp_server
 examples/samplesync_server/samplesync_server
-example/mobile_flow/mobile_flow
+integration/mobile_flow/mobile_flow
 
 .drymint
 specs/
 
 AGENTS.md
+
+# Local validation evidence, candidate archives, and review handoffs
+.artifacts/

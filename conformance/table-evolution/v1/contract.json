@@ -1,0 +1,176 @@
+{
+  "format": "oversync.table-evolution.v1",
+  "registered_tables": [
+    {
+      "schema": "main",
+      "table": "people",
+      "sync_key_columns": [
+        "id"
+      ]
+    },
+    {
+      "schema": "main",
+      "table": "legacy_notes",
+      "sync_key_columns": [
+        "id"
+      ]
+    },
+    {
+      "schema": "main",
+      "table": "projects",
+      "sync_key_columns": [
+        "id"
+      ]
+    },
+    {
+      "schema": "main",
+      "table": "attachments",
+      "sync_key_columns": [
+        "id"
+      ]
+    }
+  ],
+  "generations": [
+    {
+      "ID": 1,
+      "Tables": [
+        {
+          "Schema": "main",
+          "Table": "people",
+          "Columns": [
+            {
+              "Name": "id",
+              "WireType": "uuid",
+              "Nullable": false
+            },
+            {
+              "Name": "name",
+              "WireType": "text",
+              "Nullable": false
+            }
+          ],
+          "ForeignKeys": null
+        },
+        {
+          "Schema": "main",
+          "Table": "legacy_notes",
+          "Columns": [
+            {
+              "Name": "id",
+              "WireType": "uuid",
+              "Nullable": false
+            },
+            {
+              "Name": "body",
+              "WireType": "text",
+              "Nullable": false
+            }
+          ],
+          "ForeignKeys": null
+        }
+      ]
+    },
+    {
+      "ID": 2,
+      "Tables": [
+        {
+          "Schema": "main",
+          "Table": "people",
+          "Columns": [
+            {
+              "Name": "id",
+              "WireType": "uuid",
+              "Nullable": false
+            },
+            {
+              "Name": "name",
+              "WireType": "text",
+              "Nullable": false
+            },
+            {
+              "Name": "project_id",
+              "WireType": "uuid",
+              "Nullable": true
+            }
+          ],
+          "ForeignKeys": [
+            {
+              "Columns": [
+                "project_id"
+              ],
+              "ReferencedSchema": "main",
+              "ReferencedTable": "projects",
+              "ReferencedColumns": [
+                "id"
+              ],
+              "OnDelete": "set_null",
+              "OnUpdate": "no_action"
+            }
+          ]
+        },
+        {
+          "Schema": "main",
+          "Table": "projects",
+          "Columns": [
+            {
+              "Name": "id",
+              "WireType": "uuid",
+              "Nullable": false
+            },
+            {
+              "Name": "title",
+              "WireType": "text",
+              "Nullable": false
+            }
+          ],
+          "ForeignKeys": null
+        },
+        {
+          "Schema": "main",
+          "Table": "attachments",
+          "Columns": [
+            {
+              "Name": "id",
+              "WireType": "uuid",
+              "Nullable": false
+            },
+            {
+              "Name": "person_id",
+              "WireType": "uuid",
+              "Nullable": true
+            },
+            {
+              "Name": "body",
+              "WireType": "text",
+              "Nullable": false
+            }
+          ],
+          "ForeignKeys": [
+            {
+              "Columns": [
+                "person_id"
+              ],
+              "ReferencedSchema": "main",
+              "ReferencedTable": "people",
+              "ReferencedColumns": [
+                "id"
+              ],
+              "OnDelete": "cascade",
+              "OnUpdate": "no_action"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "proofs": [
+    {
+      "ID": 1,
+      "Fingerprint": "a0b1f54db1af23c6da00b147633d2c5a59e6e8053b91ee3d3907f7d87f3ad60d"
+    },
+    {
+      "ID": 2,
+      "Fingerprint": "dc8c0efa7465a3f1e38424745c4051fc0bd5fba4c4695d2a0adc75fbbd526322"
+    }
+  ]
+}

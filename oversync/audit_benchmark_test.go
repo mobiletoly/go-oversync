@@ -210,13 +210,15 @@ func newAuditDatabaseBenchmarkFixture(b *testing.B, scenario string) *auditDatab
 		b.Fatalf("create benchmark schema: %v", err)
 	}
 
-	svc, err = NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "oversync-audit-" + scenario,
+	svc, err = newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
+	}), AppName: "oversync-audit-" + scenario,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	if err != nil {
 		b.Fatalf("create benchmark service: %v", err)
@@ -227,12 +229,17 @@ func newAuditDatabaseBenchmarkFixture(b *testing.B, scenario string) *auditDatab
 
 	userID := fmt.Sprintf("audit-benchmark-%s-%d", scenario, sequence)
 	writer := Actor{UserID: userID, SourceID: "writer"}
-	connect, err := svc.Connect(ctx, writer, &ConnectRequest{HasLocalPendingRows: false})
+	proof := testSchemaGenerationProofForService(svc)
+	connect, err := svc.Connect(ctx, writer, proof, &ConnectRequest{HasLocalPendingRows: false})
 	if err != nil {
 		b.Fatalf("initialize benchmark scope: %v", err)
 	}
 	if connect.Resolution != "initialize_empty" && connect.Resolution != "remote_authoritative" {
 		b.Fatalf("unexpected benchmark connect resolution %q", connect.Resolution)
+	}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	if _, err := svc.Connect(ctx, reader, proof, &ConnectRequest{HasLocalPendingRows: false}); err != nil {
+		b.Fatalf("bind benchmark reader: %v", err)
 	}
 
 	fixture := &auditDatabaseBenchmarkFixture{
@@ -241,7 +248,7 @@ func newAuditDatabaseBenchmarkFixture(b *testing.B, scenario string) *auditDatab
 		svc:                 svc,
 		schemaName:          schemaName,
 		writer:              writer,
-		reader:              Actor{UserID: userID, SourceID: "reader"},
+		reader:              reader,
 		operationTimeout:    operationTimeout,
 		postgresContainerID: "",
 	}
@@ -441,29 +448,25 @@ func auditBenchmarkPush(
 	actor Actor,
 	sourceBundleID int64,
 	rows []PushRequestRow,
-) (*PushSessionCommitResponse, error) {
-	requestHash, err := computeCanonicalPushRequestHash(rows)
+) (*Bundle, error) {
+	connect, err := svc.Connect(ctx, actor, testSchemaGenerationProofForService(svc), &ConnectRequest{HasLocalPendingRows: true})
 	if err != nil {
 		return nil, err
 	}
-	created, err := svc.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
+	requestHash, err := computeGenerationPinnedPushRequestHash(testSchemaGenerationProofForService(svc), rows)
+	if err != nil {
+		return nil, err
+	}
+	response, err := svc.PushOneShot(ctx, actor, testSchemaGenerationProofForService(svc), &OneShotPushRequest{
 		SourceBundleID:       sourceBundleID,
-		PlannedRowCount:      int64(len(rows)),
 		CanonicalRequestHash: requestHash,
+		InitializationID:     connect.InitializationID,
+		Rows:                 rows,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if created.Status != "staging" {
-		return nil, fmt.Errorf("unexpected push session status %q", created.Status)
-	}
-	if _, err := svc.UploadPushChunk(ctx, actor, created.PushID, &PushSessionChunkRequest{
-		StartRowOrdinal: 0,
-		Rows:            rows,
-	}); err != nil {
-		return nil, err
-	}
-	return svc.CommitPushSession(ctx, actor, created.PushID)
+	return response.Bundle, nil
 }
 
 func auditBenchmarkPushProfile(rowCount int, shape auditBenchmarkPayloadShape) auditBenchmarkProfile {
@@ -790,7 +793,7 @@ func auditRunDatabasePullBenchmarkGroup(
 					b.StopTimer()
 					opCtx, cancelOp := context.WithTimeout(fixture.ctx, fixture.operationTimeout)
 					b.StartTimer()
-					page, err := fixture.svc.ProcessPull(opCtx, fixture.reader, 0, layout.bundleCount, 0)
+					page, err := fixture.svc.ProcessPull(opCtx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), 0, layout.bundleCount, 0)
 					b.StopTimer()
 					cancelOp()
 					if err != nil {
@@ -876,7 +879,7 @@ func BenchmarkAuditDatabaseSnapshotCreate(b *testing.B) {
 				b.StopTimer()
 				opCtx, cancelOp := context.WithTimeout(fixture.ctx, fixture.operationTimeout)
 				b.StartTimer()
-				session, err := fixture.svc.CreateSnapshotSession(opCtx, fixture.reader)
+				session, err := fixture.svc.CreateSnapshotSession(opCtx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 				b.StopTimer()
 				cancelOp()
 				if err != nil {
@@ -892,7 +895,7 @@ func BenchmarkAuditDatabaseSnapshotCreate(b *testing.B) {
 					b.Fatalf("measure snapshot materialization storage: %v", err)
 				}
 				chunkCtx, cancelChunk := context.WithTimeout(fixture.ctx, fixture.operationTimeout)
-				chunk, chunkErr := fixture.svc.GetSnapshotChunk(chunkCtx, fixture.reader, session.SnapshotID, 0, fixture.svc.maxRowsPerSnapshotChunk(), fixture.svc.maxBytesPerSnapshotChunk())
+				chunk, chunkErr := fixture.svc.GetSnapshotChunk(chunkCtx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID, 0, fixture.svc.maxRowsPerSnapshotChunk(), fixture.svc.maxBytesPerSnapshotChunk())
 				cancelChunk()
 				if chunkErr != nil {
 					auditBenchmarkFatalOperation(b, "select snapshot chunk", fixture.operationTimeout, chunkErr)
@@ -902,7 +905,7 @@ func BenchmarkAuditDatabaseSnapshotCreate(b *testing.B) {
 				}
 
 				deleteCtx, cancelDelete := context.WithTimeout(fixture.ctx, fixture.operationTimeout)
-				deleteErr := fixture.svc.DeleteSnapshotSession(deleteCtx, fixture.reader, session.SnapshotID)
+				deleteErr := fixture.svc.DeleteSnapshotSession(deleteCtx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), session.SnapshotID)
 				cancelDelete()
 				if deleteErr != nil {
 					auditBenchmarkFatalOperation(b, "delete benchmark snapshot", fixture.operationTimeout, deleteErr)

@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "status": 426,
+  "error": "retired_schema_generation",
+  "retryable": false,
+  "remediation": "upgrade_application",
+  "cases": [
+    {
+      "id": "conflicted-intent",
+      "initial_state": "conflicted",
+      "events": [
+        "conflicting_commit",
+        "retirement",
+        "restart",
+        "retry"
+      ],
+      "requests_after_retirement": 0,
+      "outcome": "push_conflict",
+      "preserve": [
+        "business_rows",
+        "source_id",
+        "request_hash",
+        "conflict"
+      ]
+    },
+    {
+      "id": "uncertain-commit",
+      "initial_state": "uncertain",
+      "events": [
+        "commit_reply_lost",
+        "retirement",
+        "restart",
+        "retry"
+      ],
+      "requests_after_retirement": 1,
+      "outcome": "retired_schema_generation",
+      "preserve": [
+        "business_rows",
+        "source_id",
+        "request_hash",
+        "source_bundle_id"
+      ]
+    }
+  ]
+}

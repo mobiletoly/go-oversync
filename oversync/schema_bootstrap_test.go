@@ -25,13 +25,15 @@ func TestBootstrap_CreatesExplicitLayoutMarkerAndExactTableCatalog(t *testing.T)
 		_ = dropTestSchema(ctx, pool, schemaName)
 	}()
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "schema-bootstrap-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
+	}), AppName: "schema-bootstrap-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	require.NoError(t, svc.Bootstrap(ctx))
@@ -176,6 +178,34 @@ func TestBootstrap_CreatesExplicitLayoutMarkerAndExactTableCatalog(t *testing.T)
 		{TableID: 1, SchemaName: schemaName, TableName: "files", SyncKeyColumn: "id", SyncKeyKind: syncKeyKindUUIDCode},
 		{TableID: 2, SchemaName: schemaName, TableName: "users", SyncKeyColumn: "id", SyncKeyKind: syncKeyKindUUIDCode},
 	}, catalogRows)
+
+	fkRows, err := pool.Query(ctx, `
+		SELECT relation.relname, attribute.attname, constraint_entry.confdeltype::text
+		FROM pg_constraint constraint_entry
+		JOIN pg_class relation ON relation.oid = constraint_entry.conrelid
+		JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+		JOIN unnest(constraint_entry.conkey) WITH ORDINALITY AS key(attnum, ordinal) ON TRUE
+		JOIN pg_attribute attribute ON attribute.attrelid = relation.oid AND attribute.attnum = key.attnum
+		WHERE namespace.nspname='sync'
+		  AND constraint_entry.contype='f'
+		  AND constraint_entry.confrelid='sync.table_catalog'::regclass
+		ORDER BY relation.relname, attribute.attname
+	`)
+	require.NoError(t, err)
+	var catalogForeignKeys []string
+	for fkRows.Next() {
+		var tableName, columnName, deleteAction string
+		require.NoError(t, fkRows.Scan(&tableName, &columnName, &deleteAction))
+		catalogForeignKeys = append(catalogForeignKeys, tableName+"."+columnName+":"+deleteAction)
+	}
+	require.NoError(t, fkRows.Err())
+	fkRows.Close()
+	require.Equal(t, []string{
+		"bundle_capture_stage.table_id:a",
+		"bundle_rows.table_id:a",
+		"row_state.table_id:a",
+		"snapshot_session_rows.table_id:a",
+	}, catalogForeignKeys)
 
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT COUNT(*)
@@ -326,30 +356,34 @@ func TestBootstrap_FailsClosedWhenRegisteredTableCatalogDiffers(t *testing.T) {
 		_ = dropTestSchema(ctx, pool, schemaName)
 	}()
 
-	firstSvc, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "schema-bootstrap-first",
+	firstSvc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "schema-bootstrap-first",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	require.NoError(t, err)
 	require.NoError(t, firstSvc.Bootstrap(ctx))
 
-	secondSvc, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "schema-bootstrap-second",
+	secondSvc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
+	}), AppName: "schema-bootstrap-second",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "files", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	require.NoError(t, err)
 
 	err = secondSvc.Bootstrap(ctx)
 	require.Error(t, err)
-	var schemaErr *UnsupportedSchemaError
-	require.ErrorAs(t, err, &schemaErr)
-	require.Contains(t, err.Error(), "sync.table_catalog")
+	var catalogErr *RegisteredTableCatalogError
+	require.ErrorAs(t, err, &catalogErr)
+	require.Equal(t, RegisteredTableCatalogActiveTableOmitted, catalogErr.Code)
+	require.Equal(t, schemaName, catalogErr.Schema)
+	require.Equal(t, "users", catalogErr.Table)
 }
 
 func TestBootstrap_FailsClosedForLegacySyncSchemaWithoutLayoutMarker(t *testing.T) {
@@ -366,17 +400,18 @@ func TestBootstrap_FailsClosedForLegacySyncSchemaWithoutLayoutMarker(t *testing.
 	`)
 	require.NoError(t, err)
 
-	svc, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "legacy-sync-layout-test",
+	svc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(runtimeServiceTestRegisteredTables()), AppName: "legacy-sync-layout-test",
+		RegisteredTables:               runtimeServiceTestRegisteredTables(),
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 	require.NoError(t, err)
 
 	err = svc.Bootstrap(ctx)
 	require.Error(t, err)
-	var schemaErr *UnsupportedSchemaError
-	require.ErrorAs(t, err, &schemaErr)
-	require.Contains(t, err.Error(), "unsupported layout")
+	var catalogErr *RegisteredTableCatalogError
+	require.ErrorAs(t, err, &catalogErr)
+	require.Equal(t, RegisteredTableCatalogLayoutReplacementRequired, catalogErr.Code)
+	require.Equal(t, "<missing>", catalogErr.Actual)
 }
 
 type schemaBootstrapFailureHarness struct {
@@ -432,13 +467,31 @@ func (h *schemaBootstrapFailureHarness) requireSuccessfulBootstrap(
 ) {
 	t.Helper()
 
-	svc, err := NewRuntimeService(h.pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   appName,
-		RegisteredTables:          registeredTables,
+	svc, err := newTestRuntimeService(h.pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(registeredTables), AppName: appName,
+		RegisteredTables:               registeredTables,
+		RegisteredTableCatalogRevision: 1,
 	}, h.logger)
 	require.NoError(t, err)
 
+	require.NoError(t, svc.Bootstrap(h.ctx))
+	require.NoError(t, svc.Close(context.Background()))
+}
+
+func (h *schemaBootstrapFailureHarness) requireSuccessfulBootstrapWithGenerations(
+	t *testing.T,
+	appName string,
+	registeredTables []RegisteredTable,
+	generations []SchemaGeneration,
+) {
+	t.Helper()
+
+	svc, err := newTestRuntimeService(h.pool, &ServiceConfig{
+		SchemaGenerations:              generations,
+		AppName:                        appName,
+		RegisteredTables:               registeredTables,
+		RegisteredTableCatalogRevision: 1,
+	}, h.logger)
+	require.NoError(t, err)
 	require.NoError(t, svc.Bootstrap(h.ctx))
 	require.NoError(t, svc.Close(context.Background()))
 }
@@ -464,10 +517,9 @@ func (h *schemaBootstrapFailureHarness) unsupportedBootstrapError(
 ) error {
 	t.Helper()
 
-	svc, err := NewRuntimeService(h.pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   appName,
-		RegisteredTables:          registeredTables,
+	svc, err := newTestRuntimeService(h.pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(registeredTables), AppName: appName,
+		RegisteredTables:               registeredTables,
+		RegisteredTableCatalogRevision: 1,
 	}, h.logger)
 	require.NoError(t, err)
 
@@ -610,10 +662,9 @@ func TestBootstrap_NullableIdentityConcurrency(t *testing.T) {
 	_, err = gate.Exec(h.ctx, `SELECT pg_advisory_lock($1)`, syncBootstrapLockKey)
 	require.NoError(t, err)
 
-	svc, err := NewRuntimeService(h.pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "nullable-concurrency",
-		RegisteredTables:          []RegisteredTable{h.registeredTable("records", "id")},
+	svc, err := newTestRuntimeService(h.pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{h.registeredTable("records", "id")}), AppName: "nullable-concurrency",
+		RegisteredTables:               []RegisteredTable{h.registeredTable("records", "id")},
+		RegisteredTableCatalogRevision: 1,
 	}, h.logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
@@ -671,23 +722,22 @@ func TestBootstrap_NullableIdentityRollbackReadinessAndRetry(t *testing.T) {
 			CONSTRAINT records_owner_key UNIQUE (_sync_scope_id, id)
 		)
 	`, h.schemaIdent)
-	svc, err := NewRuntimeService(h.pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "nullable-retry",
-		RegisteredTables:          []RegisteredTable{h.registeredTable("records", "id")},
+	svc, err := newTestRuntimeService(h.pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{h.registeredTable("records", "id")}), AppName: "nullable-retry",
+		RegisteredTables:               []RegisteredTable{h.registeredTable("records", "id")},
+		RegisteredTableCatalogRevision: 1,
 	}, h.logger)
 	require.NoError(t, err)
 	err = svc.Bootstrap(h.ctx)
 	require.Error(t, err)
 	var schemaErr *UnsupportedSchemaError
 	require.ErrorAs(t, err, &schemaErr)
-	_, err = svc.Connect(h.ctx, Actor{UserID: "owner-a", SourceID: "reader"}, &ConnectRequest{})
+	_, err = svc.Connect(h.ctx, Actor{UserID: "owner-a", SourceID: "reader"}, testSchemaGenerationProofForService(svc), &ConnectRequest{})
 	require.ErrorIs(t, err, errServiceNotReady)
 	requireNoSyncLayoutOrCaptureTriggers(t, h.ctx, h.pool, h.schemaName)
 
 	h.execf(t, `ALTER TABLE %s.records ALTER COLUMN id SET NOT NULL`, h.schemaIdent)
 	require.NoError(t, svc.Bootstrap(h.ctx))
-	_, err = svc.Connect(h.ctx, Actor{UserID: "owner-a", SourceID: "reader"}, &ConnectRequest{})
+	_, err = svc.Connect(h.ctx, Actor{UserID: "owner-a", SourceID: "reader"}, testSchemaGenerationProofForService(svc), &ConnectRequest{})
 	require.NoError(t, err)
 	require.NoError(t, svc.Close(context.Background()))
 }
@@ -748,6 +798,7 @@ func TestBootstrap_RejectsPreH3IdentityFunctionsForMarkedLayoutWithoutRepair(t *
 }
 
 func TestBootstrap_RequiresPermanentRegisteredTables(t *testing.T) {
+	t.Parallel()
 	t.Run("permanent table accepted", func(t *testing.T) {
 		h := newSchemaBootstrapFailureHarness(t, "permanent_accept_")
 		h.execf(t, `
@@ -929,9 +980,13 @@ func TestBootstrap_AcceptsTextVisibleSyncKey(t *testing.T) {
 			PRIMARY KEY (_sync_scope_id, code)
 		)`, h.schemaIdent)
 
-	h.requireSuccessfulBootstrap(t,
+	registered := []RegisteredTable{h.registeredTable("products", "code")}
+	h.requireSuccessfulBootstrapWithGenerations(t,
 		"fk-key-type-accept-test",
-		[]RegisteredTable{h.registeredTable("products", "code")},
+		registered,
+		testSchemaGenerationsForRegisteredTablesWithWireTypes(registered, map[string]GenerationWireType{
+			Key(h.schemaName, "products") + ".code": GenerationWireTypeText,
+		}),
 	)
 }
 

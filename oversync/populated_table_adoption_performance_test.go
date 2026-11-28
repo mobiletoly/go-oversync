@@ -20,7 +20,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const adoptionQueryShapeBatchSize = 32
+const (
+	adoptionQueryShapeBatchSize         = 32
+	auditAdoptionQueryShapeRowsPerScope = 300
+)
 
 type adoptionQueryTracer struct {
 	mu             sync.Mutex
@@ -42,6 +45,7 @@ type adoptionQueryCounts struct {
 	historyStatements    int
 	persistence          int
 	catalogDefinition    int
+	outcomeAdmission     int
 	explicitDataLocks    int
 	dml                  int
 	ddl                  int
@@ -67,7 +71,7 @@ func loadFastAttachDataFingerprints(
 		relations = append(relations, pgx.Identifier{schemaName, fmt.Sprintf("table_%02d", tableIndex)}.Sanitize())
 	}
 	for _, tableName := range []string{
-		"bundle_capture_stage", "bundle_log", "bundle_rows", "meta", "push_session_rows", "push_sessions",
+		"bundle_capture_stage", "bundle_log", "bundle_rows", "meta",
 		"row_state", "scope_state", "scope_write_receipts", "server_source_reservations", "snapshot_session_rows",
 		"snapshot_sessions", "source_state", "table_catalog", "user_state",
 	} {
@@ -97,6 +101,9 @@ func (c *cancelAfterErrChecks) Err() error {
 }
 
 func (t *adoptionQueryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if isSyncMaintenanceContext(ctx) {
+		return ctx
+	}
 	t.mu.Lock()
 	t.queries = append(t.queries, data.SQL)
 	shouldCancel := !t.canceled && t.cancel != nil && strings.Contains(data.SQL, t.cancelContains)
@@ -113,6 +120,9 @@ func (t *adoptionQueryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, 
 func (*adoptionQueryTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func (t *adoptionQueryTracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchStartData) context.Context {
+	if isSyncMaintenanceContext(ctx) {
+		return ctx
+	}
 	queries := make([]string, len(data.Batch.QueuedQueries))
 	containsCancel := false
 	for i, query := range data.Batch.QueuedQueries {
@@ -155,7 +165,9 @@ func (t *adoptionQueryTracer) counts() adoptionQueryCounts {
 		classified := false
 		if normalized == "begin isolation level read committed read write not deferrable" ||
 			normalized == "commit" || normalized == "rollback" ||
-			strings.Contains(normalized, "pg_advisory_xact_lock") {
+			strings.Contains(normalized, "pg_advisory_xact_lock") ||
+			normalized == "select pg_try_advisory_xact_lock_shared($1::int,$2::int)" ||
+			normalized == "select pg_catalog.current_setting('session_replication_role')='origin'" {
 			counts.catalogDefinition++
 			classified = true
 		}
@@ -212,10 +224,16 @@ func (t *adoptionQueryTracer) counts() adoptionQueryCounts {
 			strings.Contains(normalized, "join pg_") || strings.Contains(normalized, "information_schema") ||
 			strings.Contains(normalized, "to_regclass(") || strings.Contains(normalized, "from sync.meta") ||
 			strings.Contains(normalized, "from sync.table_catalog") ||
-			strings.Contains(normalized, "from sync.server_source_reservations") {
+			strings.Contains(normalized, "from sync.server_source_reservations") ||
+			normalized == "select max_outcome_bytes from sync.push_protocol_store where singleton and format='durable_outcomes'" {
 			counts.catalogDefinition++
 			classified = true
 		}
+		if normalized == "select distinct generation_id,generation_fingerprint from sync.push_outcomes" {
+			counts.outcomeAdmission++
+			classified = true
+		}
+
 		if !classified {
 			counts.unknown = append(counts.unknown, normalized)
 		}
@@ -263,6 +281,7 @@ func (t *adoptionQueryTracer) normalizedStatementFamilies() []string {
 }
 
 func TestBootstrap_ExistingLayoutAttachesWithoutDataQueriesLocksOrMutation(t *testing.T) {
+	t.Parallel()
 	const tableCount = 8
 
 	ctx := context.Background()
@@ -318,13 +337,15 @@ func TestBootstrap_ExistingLayoutAttachesWithoutDataQueriesLocksOrMutation(t *te
 				}
 			}
 
-			if scopeCount == 500 {
+			// The audit-tagged correctness case uses 150,000 rows. The separate
+			// full-scale capacity benchmark retains the 350,000-row reference.
+			if scopeCount == 500 && oversyncAuditBuild {
 				for tableIndex := range tableCount {
 					tableName := fmt.Sprintf("table_%02d", tableIndex)
 					tableIdent := pgx.Identifier{schemaName, tableName}.Sanitize()
-					rowsPerScope := 87
-					if tableIndex < 4 {
-						rowsPerScope = 88
+					rowsPerScope := auditAdoptionQueryShapeRowsPerScope / tableCount
+					if tableIndex < auditAdoptionQueryShapeRowsPerScope%tableCount {
+						rowsPerScope++
 					}
 					_, err = pool.Exec(ctx, fmt.Sprintf(`
 						INSERT INTO %s (_sync_scope_id, id, payload)
@@ -361,13 +382,12 @@ func TestBootstrap_ExistingLayoutAttachesWithoutDataQueriesLocksOrMutation(t *te
 				require.NoError(t, results.Close())
 			}
 
-			config := &ServiceConfig{
-				MaxSupportedSchemaVersion: 1,
-				AppName:                   "populated-adoption-query-shape",
-				RegisteredTables:          registeredTables,
+			config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables(registeredTables), AppName: "populated-adoption-query-shape",
+				RegisteredTables:               registeredTables,
+				RegisteredTableCatalogRevision: 1,
 			}
 			tracer.reset()
-			first, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+			first, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 			require.NoError(t, err)
 			require.NoError(t, first.Bootstrap(ctx))
 			require.NoError(t, first.Close(ctx))
@@ -389,7 +409,7 @@ func TestBootstrap_ExistingLayoutAttachesWithoutDataQueriesLocksOrMutation(t *te
 			tracer.reset()
 			attachMetrics := &collectedStageMetrics{}
 			config.StageMetrics = attachMetrics
-			second, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+			second, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = second.Close(context.Background()) })
 			spoolDir := t.TempDir()
@@ -409,12 +429,20 @@ func TestBootstrap_ExistingLayoutAttachesWithoutDataQueriesLocksOrMutation(t *te
 
 			restartCounts := tracer.counts()
 			statementFamilies := tracer.normalizedStatementFamilies()
-			require.Equal(t, 29, restartCounts.total, "existing-layout attachment SQL count must be scale-independent")
+			require.Contains(t, statementFamilies, "select pg_try_advisory_xact_lock_shared($1::int,$2::int)", "readiness adds one fixed authority-lock query")
+			require.Contains(t, statementFamilies, "select pg_catalog.current_setting('session_replication_role')='origin'", "one fixed actual-session attestation")
+			// The catalog revision peek selects read-only attachment versus locked append.
+			// Current durable-outcome admission adds one store definition read and
+			// one operational outcome-header read. This fixture varies business
+			// population with an empty outcome backlog; it makes no outcome-backlog
+			// scaling or general constant-work claim.
+			require.Equal(t, 41, restartCounts.total, "statement count is constant across this business population with an empty outcome backlog")
 			if expectedAttachStatementFamilies == nil {
 				expectedAttachStatementFamilies = append([]string(nil), statementFamilies...)
 			} else {
 				require.Equal(t, expectedAttachStatementFamilies, statementFamilies, "existing-layout attachment SQL families and ordering must be scale-independent")
 			}
+			require.Equal(t, 1, restartCounts.outcomeAdmission, "current outcome-admission read is operational data, independently classified")
 			require.Zero(t, restartCounts.business, "existing-layout attachment must not query business rows")
 			require.Zero(t, restartCounts.scopeEnvelope, "existing-layout attachment must not query operational scope state")
 			require.Zero(t, restartCounts.currentRow, "existing-layout attachment must not query current row state")
@@ -430,8 +458,7 @@ func TestBootstrap_ExistingLayoutAttachesWithoutDataQueriesLocksOrMutation(t *te
 			require.NotZero(t, restartCounts.catalogDefinition, "existing-layout attachment must perform definition validation")
 			require.Empty(t, restartCounts.unknown, "every existing-layout Bootstrap SQL statement must be classified")
 			stageRecords := attachMetrics.recordsForOperation("bootstrap")
-			require.Len(t, stageRecords, 2, "existing attachment must emit only preflight and managed-layout validation")
-			require.Len(t, stageRecords["preflight"], 1)
+			require.Len(t, stageRecords, 1, "existing attachment must emit only managed-layout validation")
 			require.Len(t, stageRecords["managed_layout_validation"], 1)
 			require.Equal(t, before, loadFastAttachDataFingerprints(t, ctx, pool, schemaName, tableCount), "existing attachment must preserve every business and managed row value")
 			entries, err := os.ReadDir(spoolDir)
@@ -458,11 +485,13 @@ func TestAdoptionBusinessScopeReader_CancellationStopsSpoolReplay(t *testing.T) 
 		require.NoError(t, err)
 	}
 
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		AppName: "adoption-replay-cancellation",
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "adoption-replay-cancellation",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	replayCtx, cancel := context.WithCancel(ctx)
@@ -473,10 +502,12 @@ func TestAdoptionBusinessScopeReader_CancellationStopsSpoolReplay(t *testing.T) 
 		replayCtx,
 		tx,
 		service.sortedAdoptionTableInfos(),
+		service.columnTypesByTable,
 		userIDs,
 		func(schemaName, tableName string, payload []byte) ([]byte, error) {
 			return service.canonicalizeWirePayload(schemaName, tableName, payload)
 		},
+		service.config.MaxBytesPerBundle,
 	)
 	require.NoError(t, err)
 	var consumed []string
@@ -506,19 +537,21 @@ func TestAdoptionBusinessScopeReader_CancellationDuringSpoolReplay(t *testing.T)
 		`, pgx.Identifier{schemaName}.Sanitize()), userID, uuid.New(), fmt.Sprintf("User %d", index), fmt.Sprintf("user%d@example.com", index))
 		require.NoError(t, err)
 	}
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		AppName: "adoption-during-replay-cancellation",
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "adoption-during-replay-cancellation",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
-	reader, err := newAdoptionBusinessScopeReader(ctx, tx, service.sortedAdoptionTableInfos(), []string{userID}, func(schemaName, tableName string, payload []byte) ([]byte, error) {
+	reader, err := newAdoptionBusinessScopeReader(ctx, tx, service.sortedAdoptionTableInfos(), service.columnTypesByTable, []string{userID}, func(schemaName, tableName string, payload []byte) ([]byte, error) {
 		return service.canonicalizeWirePayload(schemaName, tableName, payload)
-	})
+	}, service.config.MaxBytesPerBundle)
 	require.NoError(t, err)
 	reader.ctx = &cancelAfterErrChecks{Context: ctx, cancelAt: 4}
 	consumeCalled := false
@@ -563,19 +596,22 @@ func TestAdoptionBusinessScopeReader_PostgresOrderingMatchesEncodedKeys(t *testi
 		require.NoError(t, err)
 	}
 
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		AppName: "adoption-key-ordering",
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTablesWithWireTypes([]RegisteredTable{
+		{Schema: schemaName, Table: "uuid_rows", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "text_rows", SyncKeyColumns: []string{"id"}},
+	}, map[string]GenerationWireType{Key(schemaName, "text_rows") + ".id": GenerationWireTypeText}), AppName: "adoption-key-ordering",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "uuid_rows", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "text_rows", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
-	reader, err := newAdoptionBusinessScopeReader(ctx, tx, service.sortedAdoptionTableInfos(), []string{userID}, func(schemaName, tableName string, payload []byte) ([]byte, error) {
+	reader, err := newAdoptionBusinessScopeReader(ctx, tx, service.sortedAdoptionTableInfos(), service.columnTypesByTable, []string{userID}, func(schemaName, tableName string, payload []byte) ([]byte, error) {
 		return service.canonicalizeWirePayload(schemaName, tableName, payload)
-	})
+	}, service.config.MaxBytesPerBundle)
 	require.NoError(t, err)
 	var actual []adoptionBusinessRow
 	require.NoError(t, reader.forEach(func(_ string, rows []adoptionBusinessRow) error {
@@ -608,21 +644,23 @@ func TestAdoptionBusinessScopeReader_CanonicalizesEachRowOncePerAttempt(t *testi
 		`, pgx.Identifier{schemaName}.Sanitize()), userID, uuid.New(), fmt.Sprintf("User %d", index), fmt.Sprintf("user%d@example.com", index))
 		require.NoError(t, err)
 	}
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		AppName: "adoption-canonicalization-count",
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "adoption-canonicalization-count",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	for attempt := 1; attempt <= 2; attempt++ {
 		tx, err := pool.Begin(ctx)
 		require.NoError(t, err)
 		canonicalizationCount := 0
-		reader, err := newAdoptionBusinessScopeReader(ctx, tx, service.sortedAdoptionTableInfos(), []string{userID}, func(schema, table string, payload []byte) ([]byte, error) {
+		reader, err := newAdoptionBusinessScopeReader(ctx, tx, service.sortedAdoptionTableInfos(), service.columnTypesByTable, []string{userID}, func(schema, table string, payload []byte) ([]byte, error) {
 			canonicalizationCount++
 			return service.canonicalizeWirePayload(schema, table, payload)
-		})
+		}, service.config.MaxBytesPerBundle)
 		require.NoError(t, err)
 		observedRows := 0
 		require.NoError(t, reader.forEach(func(_ string, rows []adoptionBusinessRow) error {
@@ -670,20 +708,22 @@ func TestAdoptionBusinessScopeReader_RemovesOwnedSpoolOnEveryExit(t *testing.T) 
 		`, pgx.Identifier{schemaName}.Sanitize()), userID, uuid.New(), fmt.Sprintf("User %d", index), fmt.Sprintf("user%d@example.com", index))
 		require.NoError(t, err)
 	}
-	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		AppName: "adoption-spool-cleanup",
+	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "adoption-spool-cleanup",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	newReader := func(t *testing.T, readerCtx context.Context, dir string) (*adoptionBusinessScopeReader, pgx.Tx) {
 		t.Helper()
 		tx, err := pool.Begin(readerCtx)
 		require.NoError(t, err)
-		reader, err := newAdoptionBusinessScopeReader(readerCtx, tx, service.sortedAdoptionTableInfos(), []string{userID}, func(schemaName, tableName string, payload []byte) ([]byte, error) {
+		reader, err := newAdoptionBusinessScopeReader(readerCtx, tx, service.sortedAdoptionTableInfos(), service.columnTypesByTable, []string{userID}, func(schemaName, tableName string, payload []byte) ([]byte, error) {
 			return service.canonicalizeWirePayload(schemaName, tableName, payload)
-		})
+		}, service.config.MaxBytesPerBundle)
 		require.NoError(t, err)
 		reader.spoolOwner = newAdoptionSpoolOwner(dir)
 		return reader, tx
@@ -771,11 +811,13 @@ func TestBootstrap_PopulatedAdoptionRetriesWithFreshReaderAndSpool(t *testing.T)
 		`, pgx.Identifier{schemaName}.Sanitize()), userID, uuid.New(), fmt.Sprintf("User %d", index), fmt.Sprintf("user%d@example.com", index))
 		require.NoError(t, err)
 	}
-	service, err := NewRuntimeService(pool, &ServiceConfig{
-		AppName: "adoption-actual-retry",
+	service, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "adoption-actual-retry",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
@@ -839,11 +881,13 @@ func TestBootstrap_PopulatedAdoptionStreamingRetainedHistoryCancellation(t *test
 		`, pgx.Identifier{schemaName}.Sanitize()), userID, uuid.New(), fmt.Sprintf("User %d", index), fmt.Sprintf("user%d@example.com", index))
 		require.NoError(t, err)
 	}
-	config := &ServiceConfig{
-		AppName: "adoption-streaming-retained-cancellation",
+	config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "adoption-streaming-retained-cancellation",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}
 	service := newBootstrappedIntegrationService(t, ctx, pool, config, integrationTestLogger(slog.LevelWarn))
 
@@ -867,7 +911,7 @@ func TestBootstrap_PopulatedAdoptionStreamingRetainedHistoryCancellation(t *test
 	require.ErrorIs(t, err, context.Canceled, "cancellation after a decoded retained row must stop validation")
 	require.NoError(t, tx.Rollback(context.Background()))
 
-	retry, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+	retry, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = retry.Close(context.Background()) })
 	require.NoError(t, retry.Bootstrap(ctx), "a clean retry must attach the unchanged durable state")
@@ -889,12 +933,14 @@ func TestBootstrap_PopulatedAdoptionProgressAdvancesInsideEveryLongStage(t *test
 		require.NoError(t, err)
 	}
 	var logs bytes.Buffer
-	service, err := NewRuntimeService(pool, &ServiceConfig{
-		AppName:         "adoption-loop-progress",
+	service, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "adoption-loop-progress",
 		LogStageTimings: true,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
@@ -949,7 +995,7 @@ func TestBootstrap_PopulatedAdoptionAttributesCanonicalizationError(t *testing.T
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 	recorder := &collectedStageMetrics{}
 	config.StageMetrics = recorder
-	service, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+	service, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
 	injected := errors.New("injected canonicalization failure")
@@ -983,7 +1029,7 @@ func runBootstrapCancellationStageAttributionTest(t *testing.T, fixtureSuffix, c
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 	recorder := &collectedStageMetrics{}
 	config.StageMetrics = recorder
-	service, err := NewRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
+	service, err := newTestRuntimeService(pool, config, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
 	require.ErrorIs(t, service.Bootstrap(ctx), context.Canceled)
@@ -1023,10 +1069,12 @@ func prepareStageAttributionFixture(t *testing.T, ctx context.Context, pool *pgx
 		VALUES ($1, $2, 'Existing', 'existing@example.com')
 	`, pgx.Identifier{schemaName}.Sanitize()), "stage-owner-"+suffix, uuid.New())
 	require.NoError(t, err)
-	return schemaName, &ServiceConfig{
-		AppName: "adoption-stage-attribution-" + label,
+	return schemaName, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "adoption-stage-attribution-" + label,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}
 }

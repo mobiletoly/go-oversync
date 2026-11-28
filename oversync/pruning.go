@@ -11,6 +11,15 @@ func (s *SyncService) applyRetentionPolicyForUser(ctx context.Context, tx pgx.Tx
 	if s == nil {
 		return nil
 	}
+	return s.applyRetentionPolicyForUserInSteps(ctx, tx, userPK, s.retentionPruneBatchSize())
+}
+
+// applyRetentionPolicyForUserInSteps advances the retained floor by at most
+// maxStep bundles.
+func (s *SyncService) applyRetentionPolicyForUserInSteps(ctx context.Context, tx pgx.Tx, userPK int64, maxStep int64) error {
+	if s == nil {
+		return nil
+	}
 	retainedWindow := s.retainedBundlesPerUser()
 	if retainedWindow <= 0 {
 		return nil
@@ -33,8 +42,8 @@ func (s *SyncService) applyRetentionPolicyForUser(ctx context.Context, tx pgx.Tx
 		return nil
 	}
 
-	if batchSize := s.retentionPruneBatchSize(); batchSize > 0 && targetFloor-state.RetainedFloor > batchSize {
-		targetFloor = state.RetainedFloor + batchSize
+	if maxStep > 0 && targetFloor-state.RetainedFloor > maxStep {
+		targetFloor = state.RetainedFloor + maxStep
 	}
 
 	if _, err := tx.Exec(ctx, `

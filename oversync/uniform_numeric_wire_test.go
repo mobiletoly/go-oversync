@@ -24,7 +24,7 @@ func uniformNumericWireTestService() *SyncService {
 	}
 }
 
-func TestUniformNumericWire_NormalizePushAcceptsOnlyLockedStringsAndBooleanBridge(t *testing.T) {
+func TestUniformNumericWire_NormalizePushAcceptsExactGenerationTokens(t *testing.T) {
 	t.Parallel()
 	service := uniformNumericWireTestService()
 	payload := map[string]any{
@@ -34,13 +34,14 @@ func TestUniformNumericWire_NormalizePushAcceptsOnlyLockedStringsAndBooleanBridg
 		"amount":      "1234567890.123456789",
 		"ratio":       "1.2345678901234567",
 		"score":       "5e-324",
-		"disabled":    "0",
-		"enabled":     "1",
+		"disabled":    false,
+		"enabled":     true,
 	}
 
 	require.NoError(t, service.normalizePushPayloadFields("business", "numeric_values", payload))
 	require.Equal(t, false, payload["disabled"])
 	require.Equal(t, true, payload["enabled"])
+	require.Equal(t, "1.2345678901234567", payload["ratio"], "request stays binary64; PostgreSQL rounds the committed value")
 }
 
 func TestUniformNumericWire_NormalizePushRejectsInvalidValues(t *testing.T) {
@@ -56,9 +57,11 @@ func TestUniformNumericWire_NormalizePushRejectsInvalidValues(t *testing.T) {
 		{name: "int4 overflow", column: "count", value: "2147483648"},
 		{name: "float JSON number", column: "score", value: json.Number("1.25")},
 		{name: "noncanonical float", column: "score", value: "1.0"},
+		{name: "float4 destination overflow", column: "ratio", value: "1e+100"},
 		{name: "float NaN", column: "score", value: "NaN"},
 		{name: "Boolean word", column: "enabled", value: "true"},
 		{name: "Boolean other integer", column: "enabled", value: "2"},
+		{name: "Boolean SQLite bridge integer", column: "enabled", value: "1"},
 	}
 
 	for _, test := range tests {

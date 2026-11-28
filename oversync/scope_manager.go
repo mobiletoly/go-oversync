@@ -35,7 +35,13 @@ func NewScopeManager(service *SyncService, cfg ScopeManagerConfig) *ScopeManager
 }
 
 type ScopeWriteOptions struct {
-	WriterID string
+	// MaxBytesPerBundle optionally tightens the service canonical effect limit.
+	// Include application-selected limits in OperationHash when freezing a request.
+	MaxBytesPerBundle int
+	WriterID          string
+	// RequireExistingScope rejects absent or uninitialized scopes instead of
+	// creating sync metadata. Include this choice in OperationHash.
+	RequireExistingScope bool
 	RetryableWriteOptions
 	RequiredEffectTables  []RegisteredEffectTable
 	ForbiddenEffectTables []RegisteredEffectTable
@@ -82,6 +88,7 @@ func (m *ScopeManager) ExecWrite(
 	if m == nil || m.service == nil {
 		return nil, &ScopeWriteInvalidError{Message: "scope manager requires a sync service"}
 	}
+	defer func() { err = m.service.classifyApplicationWriteError(err) }()
 	if err := rejectRetryableCallbackContext(ctx, "ScopeManager.ExecWrite"); err != nil {
 		return nil, err
 	}
@@ -93,6 +100,9 @@ func (m *ScopeManager) ExecWrite(
 	}
 	if err := validateRetryableWriteOptions(opts.RetryableWriteOptions); err != nil {
 		return nil, &ScopeWriteInvalidError{Message: err.Error()}
+	}
+	if opts.MaxBytesPerBundle < 0 || opts.MaxBytesPerBundle > m.service.config.MaxBytesPerBundle {
+		return nil, &ScopeWriteInvalidError{Message: "invalid scope write byte limit"}
 	}
 	if fn == nil {
 		return nil, &ScopeWriteInvalidError{Message: "scope write callback is required"}
@@ -109,7 +119,7 @@ func (m *ScopeManager) ExecWrite(
 		return nil, &ScopeWriteInvalidError{Message: err.Error()}
 	}
 
-	done, err := m.service.beginOperation()
+	done, err := m.service.beginOperation(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -122,113 +132,7 @@ func (m *ScopeManager) ExecWrite(
 	defer releaseConn()
 
 	result, err := runRetryableWriteTransaction(ctx, conn, func(tx pgx.Tx) (*ScopeWriteResult, error) {
-		if err := markReservedServerSourceUsed(ctx, tx, opts.WriterID, m.service.isReservedServerSourceID(opts.WriterID)); err != nil {
-			return nil, err
-		}
-		if err := ensureScopeStateExistsWithExec(ctx, tx, scopeID); err != nil {
-			return nil, err
-		}
-		userPK, err := lookupUserPK(ctx, tx, scopeID)
-		if err != nil {
-			return nil, err
-		}
-		decision, err := acquireScopeWriteReceipt(ctx, tx, scopeWriteReceiptSpec{
-			userPK:               userPK,
-			operationID:          opts.OperationID,
-			operationHash:        opts.OperationHash,
-			requiredEffectsHash:  requiredEffects.hash,
-			forbiddenEffectsHash: forbiddenEffects.hash,
-			writerID:             opts.WriterID,
-			operationValidUntil:  opts.OperationValidUntil,
-		})
-		if err != nil {
-			return nil, err
-		}
-		if decision.replay != nil {
-			return decision.replay, nil
-		}
-
-		scopeState, err := loadScopeStateForUpdate(ctx, tx, scopeID)
-		if err != nil {
-			return nil, err
-		}
-		scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
-		if err != nil {
-			return nil, err
-		}
-
-		autoInitialized := false
-		switch scopeState.State {
-		case scopeStateInitialized:
-		case scopeStateInitializing:
-			return nil, &ScopeInitializingError{UserID: scopeID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
-		case scopeStateUninitialized:
-			if err := transitionScopeToInitialized(ctx, tx, scopeID, opts.WriterID); err != nil {
-				return nil, err
-			}
-			autoInitialized = true
-		default:
-			return nil, fmt.Errorf("unexpected scope state %q for scope %s", scopeState.State, scopeID)
-		}
-
-		expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, scopeID, opts.WriterID)
-		if err != nil {
-			return nil, err
-		}
-
-		if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
-			return nil, fmt.Errorf("defer bundle constraints: %w", err)
-		}
-		source := BundleSource{
-			SourceID:       opts.WriterID,
-			SourceBundleID: expectedSourceBundleID,
-		}
-		if err := setBundleTxContext(ctx, tx, bundleTxContext{
-			UserID:         scopeID,
-			UserPK:         scopeState.UserPK,
-			SourceID:       opts.WriterID,
-			SourceBundleID: expectedSourceBundleID,
-		}); err != nil {
-			return nil, err
-		}
-		callbackCtx, capability, err := newRestrictedDatabaseWriteTx(ctx, tx, scopeID)
-		if err != nil {
-			return nil, err
-		}
-		if err := fn(callbackCtx, capability); err != nil {
-			return nil, err
-		}
-		if err := m.service.rejectForbiddenRawEffects(ctx, tx, scopeState.UserPK, forbiddenEffects); err != nil {
-			return nil, err
-		}
-		bundle, err := m.service.finalizeCapturedBundle(ctx, tx, Actor{UserID: scopeID}, scopeState.UserPK, source)
-		if err != nil {
-			return nil, err
-		}
-		if bundle == nil {
-			if len(requiredEffects.keys) != 0 {
-				return nil, &RetryableCallbackViolationError{Message: "retryable database-write callback produced no required normalized registered-table effect"}
-			}
-			return nil, &ScopeWriteNoCapturedChangesError{ScopeID: scopeID, WriterID: opts.WriterID}
-		}
-		if err := requireNormalizedEffects(bundle, requiredEffects); err != nil {
-			return nil, err
-		}
-		if err := activateSourceState(ctx, tx, scopeState.UserPK, scopeID, opts.WriterID, expectedSourceBundleID); err != nil {
-			return nil, err
-		}
-		if err := m.service.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
-			return nil, err
-		}
-
-		result := &ScopeWriteResult{
-			AutoInitialized: autoInitialized,
-			Bundle:          committedBundleRef(bundle),
-		}
-		if err := completeScopeWriteReceipt(ctx, tx, scopeState.UserPK, opts.OperationID, result); err != nil {
-			return nil, err
-		}
-		return result, nil
+		return m.executeScopeWriteInTx(ctx, tx, scopeID, opts, fn, requiredEffects, forbiddenEffects)
 	})
 	if err != nil {
 		return nil, err
@@ -243,7 +147,7 @@ func markReservedServerSourceUsed(ctx context.Context, tx pgx.Tx, writerID strin
 		SELECT ever_used
 		FROM sync.server_source_reservations
 		WHERE source_id = $1
-		FOR UPDATE
+		FOR KEY SHARE
 	`, writerID).Scan(&everUsed)
 	if err == pgx.ErrNoRows {
 		if required {
@@ -313,4 +217,144 @@ func requireNormalizedEffects(bundle *Bundle, required canonicalEffectSet) error
 		}
 	}
 	return &RetryableCallbackViolationError{Message: "retryable database-write callback produced no required normalized registered-table effect"}
+}
+
+// prepareScopeWriteInTx admits lifecycle policy, enforces existing-only writes,
+// marks trusted reservations, then creates or resolves the scope's metadata.
+// All locks and SQL effects remain in the attempt's transaction.
+func (s *SyncService) prepareScopeWriteInTx(ctx context.Context, tx pgx.Tx, scopeID string, opts ScopeWriteOptions) (int64, error) {
+	if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: scopeID, Kind: ScopeTransactionServerWrite, SourceID: opts.WriterID}); err != nil {
+		return 0, err
+	}
+	if opts.RequireExistingScope {
+		state, err := loadScopeStateForUpdate(ctx, tx, scopeID)
+		if err != nil {
+			return 0, err
+		}
+		if state.State != scopeStateInitialized {
+			return 0, &ScopeUninitializedError{UserID: scopeID}
+		}
+	}
+	if err := markReservedServerSourceUsed(ctx, tx, opts.WriterID, s.isReservedServerSourceID(opts.WriterID)); err != nil {
+		return 0, err
+	}
+	if !opts.RequireExistingScope {
+		if err := ensureScopeStateExistsWithExec(ctx, tx, scopeID); err != nil {
+			return 0, err
+		}
+	}
+	return lookupUserPK(ctx, tx, scopeID)
+}
+
+// executeScopeWriteInTx owns the receipt, callback and canonical effects within
+// one transaction, admitting lifecycle policy before initialization or receipt replay.
+// ExecWrite owns readiness admission, connection and bounded retry.
+func (m *ScopeManager) executeScopeWriteInTx(ctx context.Context, tx pgx.Tx, scopeID string, opts ScopeWriteOptions, fn RetryableDatabaseWrite, requiredEffects, forbiddenEffects canonicalEffectSet) (*ScopeWriteResult, error) {
+	userPK, err := m.service.prepareScopeWriteInTx(ctx, tx, scopeID, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireServerWriteSource(ctx, tx, userPK, opts.WriterID); err != nil {
+		return nil, err
+	}
+	decision, err := acquireScopeWriteReceipt(ctx, tx, scopeWriteReceiptSpec{
+		userPK:               userPK,
+		operationID:          opts.OperationID,
+		operationHash:        opts.OperationHash,
+		requiredEffectsHash:  requiredEffects.hash,
+		forbiddenEffectsHash: forbiddenEffects.hash,
+		writerID:             opts.WriterID,
+		operationValidUntil:  opts.OperationValidUntil,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if decision.replay != nil {
+		return decision.replay, nil
+	}
+
+	scopeState, err := loadScopeStateForUpdate(ctx, tx, scopeID)
+	if err != nil {
+		return nil, err
+	}
+	scopeState, err = expireInitializationLeaseIfNeeded(ctx, tx, scopeState)
+	if err != nil {
+		return nil, err
+	}
+
+	autoInitialized := false
+	switch scopeState.State {
+	case scopeStateInitialized:
+	case scopeStateInitializing:
+		return nil, &ScopeInitializingError{UserID: scopeID, LeaseExpiresAt: scopeState.LeaseExpiresAt}
+	case scopeStateUninitialized:
+		if err := transitionScopeToInitialized(ctx, tx, scopeID, opts.WriterID); err != nil {
+			return nil, err
+		}
+		autoInitialized = true
+	default:
+		return nil, fmt.Errorf("unexpected scope state %q for scope %s", scopeState.State, scopeID)
+	}
+
+	expectedSourceBundleID, _, err := loadNextExpectedSourceBundleIDForUpdate(ctx, tx, scopeState.UserPK, scopeID, opts.WriterID)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
+		return nil, fmt.Errorf("defer bundle constraints: %w", err)
+	}
+	source := BundleSource{
+		SourceID:       opts.WriterID,
+		SourceBundleID: expectedSourceBundleID,
+	}
+	if err := setBundleTxContext(ctx, tx, bundleTxContext{
+		UserID:         scopeID,
+		UserPK:         scopeState.UserPK,
+		SourceID:       opts.WriterID,
+		SourceBundleID: expectedSourceBundleID,
+	}); err != nil {
+		return nil, err
+	}
+	callbackCtx, capability, err := newRestrictedDatabaseWriteTx(ctx, tx, scopeID)
+	if err != nil {
+		return nil, err
+	}
+	if err := fn(callbackCtx, capability); err != nil {
+		return nil, err
+	}
+	if err := finishDeferredBundleEffects(ctx, tx); err != nil {
+		return nil, err
+	}
+	if err := m.service.rejectForbiddenRawEffects(ctx, tx, scopeState.UserPK, forbiddenEffects); err != nil {
+		return nil, err
+	}
+	bundle, err := m.service.finalizeCapturedBundleWithLimit(ctx, tx, Actor{UserID: scopeID}, scopeState.UserPK, source, opts.MaxBytesPerBundle)
+	if err != nil {
+		return nil, err
+	}
+	if bundle == nil {
+		if len(requiredEffects.keys) != 0 {
+			return nil, &RetryableCallbackViolationError{Message: "retryable database-write callback produced no required normalized registered-table effect"}
+		}
+		return nil, &ScopeWriteNoCapturedChangesError{ScopeID: scopeID, WriterID: opts.WriterID}
+	}
+	if err := requireNormalizedEffects(bundle, requiredEffects); err != nil {
+		return nil, err
+	}
+	if err := activateSourceState(ctx, tx, scopeState.UserPK, scopeID, opts.WriterID, expectedSourceBundleID); err != nil {
+		return nil, err
+	}
+	if err := m.service.applyRetentionPolicyForUser(ctx, tx, scopeState.UserPK); err != nil {
+		return nil, err
+	}
+
+	result := &ScopeWriteResult{
+		AutoInitialized: autoInitialized,
+		Bundle:          committedBundleRef(bundle),
+	}
+	if err := completeScopeWriteReceipt(ctx, tx, scopeState.UserPK, opts.OperationID, result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

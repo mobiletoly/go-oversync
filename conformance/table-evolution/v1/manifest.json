@@ -1,0 +1,82 @@
+{
+  "format": "oversync.table-evolution.manifest.v1",
+  "artifacts": {
+    "contract.json": "035acc4884bbe7d50e9063e567972376ac8a894f2019a4f059bcc3e4c9537c53",
+    "cases.json": "2f37add5791eea3d8d10121544d50dd8ee0ea13e7f5245e526df78e2f36dfe01",
+    "README.md": "28cbf51f7598be017c7c0b0c106932a31dd37d0693849972f41b8151699cd724"
+  },
+  "consumers": {
+    "added-table-snapshot": [
+      [
+        ".",
+        "./integration/schema_evolution",
+        "TestTableEvolution_ProtocolVectors"
+      ]
+    ],
+    "old-hidden-column": [
+      [
+        ".",
+        "./integration/schema_evolution",
+        "TestTableEvolution_ProtocolVectors"
+      ]
+    ],
+    "explicit-null": [
+      [
+        ".",
+        "./integration/schema_evolution",
+        "TestTableEvolution_ProtocolVectors"
+      ]
+    ],
+    "old-update-omission": [
+      [
+        ".",
+        "./integration/schema_evolution",
+        "TestTableEvolution_ProtocolVectors"
+      ]
+    ],
+    "hidden-cascade": [
+      [
+        ".",
+        "./integration/schema_evolution",
+        "TestTableEvolution_ProtocolVectors"
+      ]
+    ],
+    "fk-mismatch": [
+      [
+        ".",
+        "./oversqlite",
+        "TestTableEvolution_PhysicalFKVector"
+      ]
+    ],
+    "omitted-table-upgrade": [
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_TableEvolutionAddRemoveFKSameFile"
+      ]
+    ],
+    "interrupted-append-sessions": [
+      [
+        ".",
+        "./integration/schema_evolution",
+        "TestTableEvolution_CleanupExpiryBoundsAndReplay"
+      ],
+      [
+        "integration/mobile_flow",
+        "./simulator",
+        "TestMobileFlow_TableEvolutionAddRemoveFKSameFile"
+      ]
+    ],
+    "captured-set-null": [
+      [
+        ".",
+        "./integration/schema_evolution",
+        "TestTableEvolution_CapturedSetNull"
+      ]
+    ]
+  },
+  "later_runtimes": {
+    "SQLiteNow": "pending_non_go",
+    "parity": "pending"
+  }
+}

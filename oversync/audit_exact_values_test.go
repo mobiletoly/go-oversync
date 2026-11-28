@@ -275,18 +275,18 @@ func TestAuditExactValuesContract_PostgresNumericPayloadRoundTrip(t *testing.T) 
 			_sync_scope_id TEXT NOT NULL,
 			id UUID NOT NULL,
 			bigint_value BIGINT NOT NULL,
-			decimal_value NUMERIC(40, 20) NOT NULL,
+			decimal_value NUMERIC NOT NULL,
 			PRIMARY KEY (_sync_scope_id, id)
 		)
 	`, tableIdent))
 	require.NoError(t, err)
 
+	registeredTables := []RegisteredTable{{Schema: schemaName, Table: "exact_numbers", SyncKeyColumns: []string{"id"}}}
 	service := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "audit-exact-numeric-round-trip",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "exact_numbers", SyncKeyColumns: []string{"id"}},
-		},
+		SchemaGenerations:              testSchemaGenerationsFromDatabase(t, ctx, pool, registeredTables, nil),
+		AppName:                        "audit-exact-numeric-round-trip",
+		RegisteredTables:               registeredTables,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 
 	const (
@@ -324,8 +324,15 @@ func TestAuditExactValuesContract_PostgresNumericPayloadRoundTrip(t *testing.T) 
 		})
 
 		reader := Actor{UserID: writer.UserID, SourceID: writer.SourceID + "-reader"}
+		_, err := service.Connect(
+			ctx,
+			reader,
+			testSchemaGenerationProofForService(service),
+			&ConnectRequest{HasLocalPendingRows: false},
+		)
+		require.NoError(t, err)
 		t.Run("pull", func(t *testing.T) {
-			page, err := service.ProcessPull(ctx, reader, 0, 10, 0)
+			page, err := service.ProcessPull(ctx, reader, testSchemaGenerationProofForService(service), 0, 10, 0)
 			require.NoError(t, err)
 			require.Len(t, page.Bundles, 1)
 			require.Len(t, page.Bundles[0].Rows, 1)
@@ -333,9 +340,9 @@ func TestAuditExactValuesContract_PostgresNumericPayloadRoundTrip(t *testing.T) 
 		})
 
 		t.Run("snapshot", func(t *testing.T) {
-			session, err := service.CreateSnapshotSession(ctx, reader)
+			session, err := service.CreateSnapshotSession(ctx, reader, testSchemaGenerationProofForService(service))
 			require.NoError(t, err)
-			chunk, err := service.GetSnapshotChunk(ctx, reader, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+			chunk, err := service.GetSnapshotChunk(ctx, reader, testSchemaGenerationProofForService(service), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 			require.NoError(t, err)
 			require.Len(t, chunk.Rows, 1)
 			assertExactPayload(t, "snapshot payload", chunk.Rows[0].Payload, rowID)
@@ -345,7 +352,7 @@ func TestAuditExactValuesContract_PostgresNumericPayloadRoundTrip(t *testing.T) 
 	t.Run("native exact JSON numbers reject before mutation", func(t *testing.T) {
 		rowID := uuid.New()
 		writer := Actor{UserID: "audit-native-numeric-" + suffix, SourceID: "writer"}
-		bundle, err := pushRowsViaSession(t, ctx, service, writer, 1, []PushRequestRow{{
+		bundle, err := pushRowsOneShot(t, ctx, service, writer, 1, []PushRequestRow{{
 			Schema:         schemaName,
 			Table:          "exact_numbers",
 			Key:            SyncKey{"id": rowID.String()},
@@ -371,7 +378,7 @@ func TestAuditExactValuesContract_PostgresNumericPayloadRoundTrip(t *testing.T) 
 		// Quoted numeric lexemes isolate the outbound path: PostgreSQL accepts
 		// them when populating typed BIGINT/NUMERIC columns, after which bundle,
 		// pull, and snapshot payloads originate from exact database values.
-		bundle, err := pushRowsViaSession(t, ctx, service, writer, 1, []PushRequestRow{{
+		bundle, err := pushRowsOneShot(t, ctx, service, writer, 1, []PushRequestRow{{
 			Schema:         schemaName,
 			Table:          "exact_numbers",
 			Key:            SyncKey{"id": rowID.String()},

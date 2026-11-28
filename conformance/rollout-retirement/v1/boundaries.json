@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "retired-create",
+      "boundary": "push",
+      "status": 426,
+      "error": "retired_schema_generation",
+      "retryable": false,
+      "remediation": "upgrade_application",
+      "preserve": [
+        "canonical_request_hash",
+        "source_bundle_id",
+        "source_id",
+        "business_rows"
+      ]
+    },
+    {
+      "id": "retired-chunk",
+      "boundary": "push",
+      "status": 426,
+      "error": "retired_schema_generation",
+      "retryable": false,
+      "remediation": "upgrade_application",
+      "preserve": [
+        "canonical_request_hash",
+        "source_bundle_id",
+        "source_id",
+        "business_rows"
+      ]
+    },
+    {
+      "id": "retired-commit",
+      "boundary": "push",
+      "status": 426,
+      "error": "retired_schema_generation",
+      "retryable": false,
+      "remediation": "upgrade_application",
+      "preserve": [
+        "canonical_request_hash",
+        "source_bundle_id",
+        "source_id",
+        "business_rows"
+      ]
+    },
+    {
+      "id": "retired-replay",
+      "boundary": "push",
+      "status": 426,
+      "error": "retired_schema_generation",
+      "retryable": false,
+      "remediation": "upgrade_application",
+      "preserve": [
+        "canonical_request_hash",
+        "source_bundle_id",
+        "source_id",
+        "business_rows"
+      ]
+    },
+    {
+      "id": "maintenance-create",
+      "boundary": "push",
+      "status": 503,
+      "error": "application_maintenance",
+      "retryable": true,
+      "remediation": "retry",
+      "preserve": [
+        "canonical_request_hash",
+        "source_bundle_id",
+        "source_id",
+        "business_rows"
+      ]
+    },
+    {
+      "id": "maintenance-chunk",
+      "boundary": "push",
+      "status": 503,
+      "error": "application_maintenance",
+      "retryable": true,
+      "remediation": "retry",
+      "preserve": [
+        "canonical_request_hash",
+        "source_bundle_id",
+        "source_id",
+        "business_rows"
+      ]
+    },
+    {
+      "id": "maintenance-commit",
+      "boundary": "push",
+      "status": 503,
+      "error": "application_maintenance",
+      "retryable": true,
+      "remediation": "retry",
+      "preserve": [
+        "canonical_request_hash",
+        "source_bundle_id",
+        "source_id",
+        "business_rows"
+      ]
+    },
+    {
+      "id": "maintenance-replay",
+      "boundary": "push",
+      "status": 503,
+      "error": "application_maintenance",
+      "retryable": true,
+      "remediation": "retry",
+      "preserve": [
+        "canonical_request_hash",
+        "source_bundle_id",
+        "source_id",
+        "business_rows"
+      ]
+    }
+  ]
+}

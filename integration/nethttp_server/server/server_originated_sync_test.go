@@ -1,0 +1,127 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/mobiletoly/go-oversync/oversqlite"
+	"github.com/mobiletoly/go-oversync/oversync"
+	"github.com/stretchr/testify/require"
+)
+
+func TestWithinSyncBundle_ServerOriginatedWritePullsToRealClient(t *testing.T) {
+	ts, err := NewTestServer(&ServerConfig{
+		JWTSecret:         "real-server-e2e-secret",
+		SchemaGenerations: scopeClientGeneration("users"),
+	})
+	require.NoError(t, err)
+	defer ts.Close()
+
+	ctx := context.Background()
+	suffix := uuid.NewString()
+	userID := "e2e-server-originated-user-" + suffix
+
+	token, err := ts.GenerateToken(userID, time.Hour)
+	require.NoError(t, err)
+
+	dbPath := filepath.Join(t.TempDir(), "client.sqlite")
+	ddl := `
+		CREATE TABLE users (
+			id TEXT PRIMARY KEY NOT NULL,
+			name TEXT NOT NULL,
+			email TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	`
+	client := newReadyOnlyTestClient(t, dbPath, ts.URL(), func(context.Context) (string, error) { return token, nil },
+		defaultConfigForTest(t, "business", []oversqlite.SyncTable{
+			{TableName: "users", SyncKeyColumnName: "id"},
+		}), ddl)
+	db := client.Database()
+	defer func() {
+		require.NoError(t, client.Close())
+	}()
+
+	connectResult, err := client.Attach(ctx, userID)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.AttachStatusConnected, connectResult.Status)
+
+	_, err = client.PullToStable(ctx)
+	require.NoError(t, err)
+
+	rowID := uuid.New()
+	err = ts.SyncService.WithinSyncBundle(
+		ctx,
+		oversync.Actor{UserID: userID, SourceID: "server-admin"},
+		oversync.BundleSource{SourceID: "server-admin", SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
+			_, err := tx.Exec(ctx, `
+			INSERT INTO business.users (id, name, email)
+			VALUES ($1, $2, $3)
+		`, rowID, "Server Ada", "server.ada@example.com")
+			return err
+		},
+	)
+	require.NoError(t, err)
+
+	_, err = client.PullToStable(ctx)
+	require.NoError(t, err)
+
+	var (
+		name      string
+		email     string
+		createdAt string
+		updatedAt string
+	)
+	require.NoError(t, db.QueryRow(`
+		SELECT name, email, created_at, updated_at
+		FROM users
+		WHERE id = ?
+	`, rowID.String()).Scan(&name, &email, &createdAt, &updatedAt))
+	require.Equal(t, "Server Ada", name)
+	require.Equal(t, "server.ada@example.com", email)
+	require.NotEmpty(t, createdAt)
+	require.NotEmpty(t, updatedAt)
+
+	var lastBundleSeqSeen int64
+	require.NoError(t, db.QueryRow(`
+		SELECT last_bundle_seq_seen
+		FROM _sync_attachment_state
+		WHERE singleton_key = 1
+	`).Scan(&lastBundleSeqSeen))
+
+	var latestBundleSeq int64
+	require.NoError(t, ts.Pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(bundle_seq), 0)
+		FROM sync.bundle_log bl
+		INNER JOIN sync.user_state us
+			ON us.user_pk = bl.user_pk
+		WHERE us.user_id = $1
+	`, userID).Scan(&latestBundleSeq))
+	require.Equal(t, latestBundleSeq, lastBundleSeqSeen)
+
+	var rowCount int
+	require.NoError(t, ts.Pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.bundle_log bl
+		INNER JOIN sync.user_state us
+			ON us.user_pk = bl.user_pk
+		WHERE us.user_id = $1
+		  AND bl.source_id = $2
+	`, userID, "server-admin").Scan(&rowCount))
+	require.Equal(t, 1, rowCount)
+
+	var storedName string
+	require.NoError(t, ts.Pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT name
+		FROM %s.users
+		WHERE _sync_scope_id = $1
+		  AND id = $2
+	`, "business"), userID, rowID).Scan(&storedName))
+	require.Equal(t, "Server Ada", storedName)
+}

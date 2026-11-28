@@ -1,0 +1,333 @@
+package simulator
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	"github.com/google/uuid"
+	"github.com/mobiletoly/go-oversync/integration/mobile_flow/config"
+)
+
+// MultiDeviceComplexScenario performs a long, mixed sequence of ops across two devices for the SAME user
+// and verifies both devices converge to exactly the same records (no duplicates, no misses).
+//
+// Flow (users table only):
+// - Sign in as same user on Device 1 and Device 2; hydrate both
+// - D1 adds A1, A2, A3  -> full sync D1 (upload + download loop)
+// - D2 adds B1, B2      -> full sync D2
+// - D1 updates A2       -> full sync D1
+// - D2 deletes A1       -> full sync D2
+// - D1 adds B3          -> full sync D1
+// - D2 updates B2       -> full sync D2
+// - D1 deletes A3 then re-adds A3 and updates it -> full sync D1
+// - Final convergence download loops on both devices
+// - Verify final set equals expected, on both devices and on server
+// Expected final present IDs: {A2, A3(re-added), B1, B2(updated), B3}; Deleted: {A1}
+// Expected count: 5
+//
+// Notes: After each push, we run one bundle-era PullToStable() to converge to the
+// current frozen stable bundle checkpoint.
+
+type MultiDeviceComplexScenario struct {
+	*BaseScenario
+	device2App *MobileApp
+	device1ID  string
+	device2ID  string
+	userID     string
+
+	A1 string
+	A2 string
+	A3 string
+	B1 string
+	B2 string
+	B3 string
+}
+
+func NewMultiDeviceComplexScenario(sim *Simulator) Scenario {
+	return &MultiDeviceComplexScenario{BaseScenario: NewBaseScenario(sim, "multi-device-complex")}
+}
+
+func (s *MultiDeviceComplexScenario) Name() string { return "multi-device-complex" }
+func (s *MultiDeviceComplexScenario) Description() string {
+	return "Complex two-device session (same user): adds, updates, deletes, re-adds; verify convergence"
+}
+
+func (s *MultiDeviceComplexScenario) Setup(ctx context.Context) error {
+	logger := s.simulator.GetLogger()
+	logger.Info("🔧 Setting up complex multi-device scenario for SAME user")
+
+	// Prefer simulator-provided user/device identities (used by parallel runner), but keep a random fallback for
+	// interactive runs where this scenario doesn't have a dedicated ScenarioConfig entry.
+	if s.config != nil && s.config.UserID != "" && s.config.UserID != "user-unknown" {
+		s.userID = s.config.UserID
+	} else {
+		s.userID = "user-" + uuid.New().String()[:8]
+	}
+
+	sourceBase := "device-" + s.userID
+	if s.config != nil && s.config.DeviceID != "" && s.config.DeviceID != "device-unknown-001" {
+		sourceBase = s.config.DeviceID
+	}
+	s.device1ID = sourceBase + "-d1"
+	s.device2ID = sourceBase + "-d2"
+
+	cfg1 := &config.ScenarioConfig{UserID: s.userID}
+	cfg2 := &config.ScenarioConfig{UserID: s.userID}
+
+	app1, err := s.createDeviceApp(cfg1, s.device1ID, "Device 1 (Complex)")
+	if err != nil {
+		return err
+	}
+	app2, err := s.createDeviceApp(cfg2, s.device2ID, "Device 2 (Complex)")
+	if err != nil {
+		return err
+	}
+	s.app = app1
+	s.device2App = app2
+	s.simulator.currentApp = s.app // enable sqlite path reporting for parallel runs
+
+	if err := s.app.onLaunch(ctx); err != nil {
+		return err
+	}
+	if err := s.device2App.onLaunch(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *MultiDeviceComplexScenario) createDeviceApp(scenarioConfig *config.ScenarioConfig, deviceID, deviceName string) (*MobileApp, error) {
+	return s.simulator.newScenarioMobileApp(scenarioMobileAppOptions{
+		UserID:     scenarioConfig.UserID,
+		DeviceID:   deviceID,
+		DeviceName: deviceName,
+	})
+}
+
+func (s *MultiDeviceComplexScenario) Execute(ctx context.Context) error {
+	log := s.simulator.GetLogger()
+	log.Info("🎯 Starting Multi-Device Complex Scenario (SAME user)")
+
+	// Sign in both + hydrate
+	if err := s.app.signIn(ctx, s.userID); err != nil {
+		return err
+	}
+	if err := s.device2App.signIn(ctx, s.userID); err != nil {
+		return err
+	}
+	if err := s.app.rebuildKeepSource(ctx); err != nil {
+		return err
+	}
+	if err := s.device2App.rebuildKeepSource(ctx); err != nil {
+		return err
+	}
+
+	// D1 adds A1,A2,A3
+	s.A1, s.A2, s.A3 = uuid.New().String(), uuid.New().String(), uuid.New().String()
+	if err := s.app.createUserWithContext(ctx, s.A1, "A1", "a1@example.com"); err != nil {
+		return err
+	}
+	if err := s.app.createUserWithContext(ctx, s.A2, "A2", "a2@example.com"); err != nil {
+		return err
+	}
+	if err := s.app.createUserWithContext(ctx, s.A3, "A3", "a3@example.com"); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
+		return err
+	}
+
+	// D2 adds B1,B2
+	s.B1, s.B2 = uuid.New().String(), uuid.New().String()
+	if err := s.device2App.createUserWithContext(ctx, s.B1, "B1", "b1@example.com"); err != nil {
+		return err
+	}
+	if err := s.device2App.createUserWithContext(ctx, s.B2, "B2", "b2@example.com"); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
+		return err
+	}
+
+	// D1 updates A2
+	if err := s.app.updateUser(s.A2, "A2-upd", "a2u@example.com"); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
+		return err
+	}
+
+	// D2 deletes A1
+	if err := s.device2App.deleteUserWithContext(ctx, s.A1); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
+		return err
+	}
+
+	// D1 adds B3
+	s.B3 = uuid.New().String()
+	if err := s.app.createUserWithContext(ctx, s.B3, "B3", "b3@example.com"); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
+		return err
+	}
+
+	// D2 updates B2
+	if err := s.device2App.updateUser(s.B2, "B2-upd", "b2u@example.com"); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.device2App); err != nil {
+		return err
+	}
+
+	// D1 deletes A3
+	if err := s.app.deleteUserWithContext(ctx, s.A3); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
+		return err
+	}
+
+	// D1 re-adds A3
+	if err := s.app.createUserWithContext(ctx, s.A3, "A3-re", "a3re@example.com"); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
+		return err
+	}
+
+	// D1 updates A3
+	if err := s.app.updateUser(s.A3, "A3-re-upd", "a3reu@example.com"); err != nil {
+		return err
+	}
+	if err := s.fullSyncUploadThenPull(ctx, s.app); err != nil {
+		return err
+	}
+
+	// Final convergence downloads for both devices
+	if _, _, err := s.pullToStable(ctx, s.app); err != nil {
+		return err
+	}
+	if _, _, err := s.pullToStable(ctx, s.device2App); err != nil {
+		return err
+	}
+
+	// Debug dump right before verify if mismatch
+	if cnt1, _ := s.app.userCount(ctx); cnt1 != 5 {
+		debugDumpUsers(s.app, "Device 1", log)
+	}
+	if cnt2, _ := s.device2App.userCount(ctx); cnt2 != 5 {
+		debugDumpUsers(s.device2App, "Device 2", log)
+	}
+
+	// Verify
+	if err := s.verifyFinalState(ctx, log); err != nil {
+		return err
+	}
+	log.Info("🎉 Complex Multi-Device Scenario completed successfully")
+	return nil
+}
+
+func (s *MultiDeviceComplexScenario) fullSyncUploadThenPull(ctx context.Context, app *MobileApp) error {
+	if err := app.pushPending(ctx); err != nil {
+		return err
+	}
+	_, _, err := s.pullToStable(ctx, app)
+	return err
+}
+
+func (s *MultiDeviceComplexScenario) pullToStable(ctx context.Context, app *MobileApp) (total int, last int64, err error) {
+	return app.pullToStable(ctx)
+}
+
+func (s *MultiDeviceComplexScenario) verifyFinalState(ctx context.Context, logger *slog.Logger) error {
+	// Expected present: A2, A3, B1, B2, B3
+	expectedPresent := []string{s.A2, s.A3, s.B1, s.B2, s.B3}
+	expectedMissing := []string{s.A1}
+
+	// Device 1 checks
+	if err := s.checkCountsAndPresence(ctx, s.app, expectedPresent, expectedMissing, 5); err != nil {
+		return fmt.Errorf("device1: %w", err)
+	}
+	// Device 2 checks
+	if err := s.checkCountsAndPresence(ctx, s.device2App, expectedPresent, expectedMissing, 5); err != nil {
+		return fmt.Errorf("device2: %w", err)
+	}
+
+	// Server verification
+	if s.simulator.verifier != nil {
+		cnt, err := s.simulator.verifier.CountActualBusinessRecords(ctx, "business.users", s.userID)
+		if err != nil {
+			return err
+		}
+		if cnt != 5 {
+			return fmt.Errorf("server expected 5 users, got %d", cnt)
+		}
+	}
+	return nil
+}
+
+func (s *MultiDeviceComplexScenario) checkCountsAndPresence(ctx context.Context, app *MobileApp, present, missing []string, expectedCount int) error {
+	cnt, err := app.userCount(ctx)
+	if err != nil {
+		return err
+	}
+	if cnt != expectedCount {
+		return fmt.Errorf("expected %d users, got %d", expectedCount, cnt)
+	}
+	for _, id := range present {
+		ok, err := app.hasUser(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("expected user %s to exist", id)
+		}
+	}
+	for _, id := range missing {
+		ok, err := app.hasUser(ctx, id)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return fmt.Errorf("expected user %s to be deleted", id)
+		}
+	}
+	return nil
+}
+
+func (s *MultiDeviceComplexScenario) Verify(ctx context.Context, verifier *DatabaseVerifier) error {
+	// Already verified via verifyFinalState; optionally add deeper checks here
+	return nil
+}
+
+// debugDumpUsers prints current users for an app
+func debugDumpUsers(app *MobileApp, label string, logger *slog.Logger) {
+	if app == nil || app.db == nil {
+		return
+	}
+	rows, err := app.db.Query(`SELECT id, name FROM users ORDER BY id`)
+	if err != nil {
+		logger.Warn("debug dump users failed", "label", label, "err", err)
+		return
+	}
+	defer rows.Close()
+	logger.Info("🔎 Users on " + label)
+	for rows.Next() {
+		var id, name string
+		_ = rows.Scan(&id, &name)
+		logger.Info("  •", "id", id, "name", name)
+	}
+}
+
+func (s *MultiDeviceComplexScenario) Cleanup(ctx context.Context) error {
+	if s.app != nil {
+		_ = s.app.close()
+	}
+	if s.device2App != nil {
+		_ = s.device2App.close()
+	}
+	return nil
+}

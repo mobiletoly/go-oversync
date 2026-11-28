@@ -45,25 +45,30 @@ func newAuditDatabaseContractFixture(
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(context.Background(), pool, schemaName) })
 
-	config := &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "audit-database-contract-" + scenario,
-		MaxRowsPerBundle:          options.maxRowsPerBundle,
-		MaxBytesPerBundle:         options.maxBytesPerBundle,
-		RetainedBundlesPerUser:    options.retainedBundlesPerUser,
+	config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: "audit-database-contract-" + scenario,
+		MaxRowsPerBundle:       options.maxRowsPerBundle,
+		MaxBytesPerBundle:      options.maxBytesPerBundle,
+		RetainedBundlesPerUser: options.retainedBundlesPerUser,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}
 	svc := newBootstrappedIntegrationService(t, ctx, pool, config, integrationTestLogger(slog.LevelWarn))
 	userID := "audit-database-user-" + suffix
+	writer := Actor{UserID: userID, SourceID: "writer"}
+	reader := Actor{UserID: userID, SourceID: "reader"}
+	mustInitializeEmptyScope(t, ctx, svc, userID, writer.SourceID)
+	mustInitializeEmptyScope(t, ctx, svc, userID, reader.SourceID)
 
 	return &auditDatabaseContractFixture{
 		pool:       pool,
 		svc:        svc,
 		schemaName: schemaName,
-		writer:     Actor{UserID: userID, SourceID: "writer"},
-		reader:     Actor{UserID: userID, SourceID: "reader"},
+		writer:     writer,
+		reader:     reader,
 		options:    options,
 	}
 }
@@ -107,15 +112,16 @@ func (f *auditDatabaseContractFixture) committedBundleCount(t *testing.T, ctx co
 }
 
 func (f *auditDatabaseContractFixture) newServiceConfig(appName string) *ServiceConfig {
-	return &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   appName,
-		MaxRowsPerBundle:          f.options.maxRowsPerBundle,
-		MaxBytesPerBundle:         f.options.maxBytesPerBundle,
-		RetainedBundlesPerUser:    f.options.retainedBundlesPerUser,
+	return &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: f.schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: appName,
+		MaxRowsPerBundle:       f.options.maxRowsPerBundle,
+		MaxBytesPerBundle:      f.options.maxBytesPerBundle,
+		RetainedBundlesPerUser: f.options.retainedBundlesPerUser,
 		RegisteredTables: []RegisteredTable{
 			{Schema: f.schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}
 }
 
@@ -125,7 +131,7 @@ func TestAuditMaxRowsPerBundle_RejectsOversizedBundle(t *testing.T) {
 		maxRowsPerBundle: 1,
 	})
 
-	_, err := pushRowsViaSession(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
+	_, err := pushRowsOneShot(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
 		fixture.userRow(uuid.New(), "One"),
 		fixture.userRow(uuid.New(), "Two"),
 	})
@@ -137,10 +143,10 @@ func TestAuditMaxRowsPerBundle_RejectsOversizedBundle(t *testing.T) {
 func TestAuditMaxBytesPerBundle_RejectsOversizedBundle(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAuditDatabaseContractFixture(t, ctx, "bytelimit", auditDatabaseContractOptions{
-		maxBytesPerBundle: 1,
+		maxBytesPerBundle: 2,
 	})
 
-	_, err := pushRowsViaSession(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
+	_, err := pushRowsOneShot(t, ctx, fixture.svc, fixture.writer, 1, []PushRequestRow{
 		fixture.userRow(uuid.New(), strings.Repeat("payload", 32)),
 	})
 	require.Error(t, err, "a bundle with payload bytes above MaxBytesPerBundle must be rejected")
@@ -177,19 +183,18 @@ func TestAuditBootstrap_AdoptsPopulatedRegisteredTableIntoSnapshot(t *testing.T)
 	`, tableIdent), userID, rowID, "Existing")
 	require.NoError(t, err)
 
-	svc, err := NewRuntimeService(pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "audit-populated-adoption",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
-		},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}}}
+	svc, err := newTestRuntimeService(pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "audit-populated-adoption",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, integrationTestLogger(slog.LevelWarn))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
 	require.NoError(t, svc.Bootstrap(ctx))
 
 	actor := Actor{UserID: userID, SourceID: "snapshot-reader"}
-	session, err := svc.CreateSnapshotSession(ctx, actor)
+	mustInitializeEmptyScope(t, ctx, svc, userID, actor.SourceID)
+	session, err := svc.CreateSnapshotSession(ctx, actor, testSchemaGenerationProofForService(svc))
 	if err != nil {
 		var userStateCount, rowStateCount int64
 		require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sync.user_state WHERE user_id = $1`, userID).Scan(&userStateCount))
@@ -209,7 +214,7 @@ func TestAuditBootstrap_AdoptsPopulatedRegisteredTableIntoSnapshot(t *testing.T)
 	require.Equal(t, int64(1), session.RowCount)
 	require.Positive(t, session.SnapshotBundleSeq)
 
-	chunk, err := svc.GetSnapshotChunk(ctx, actor, session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	chunk, err := svc.GetSnapshotChunk(ctx, actor, testSchemaGenerationProofForService(svc), session.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Len(t, chunk.Rows, 1)
 	require.Equal(t, schemaName, chunk.Rows[0].Schema)
@@ -249,12 +254,13 @@ func TestAuditBootstrap_RejectsNullableScopeOrSyncKeyColumns(t *testing.T) {
 			harness := newSchemaBootstrapFailureHarness(t, "audit_nullable_")
 			harness.execf(t, test.definition, harness.schemaIdent)
 
-			svc, err := NewRuntimeService(harness.pool, &ServiceConfig{
-				MaxSupportedSchemaVersion: 1,
-				AppName:                   "audit-nullable-" + test.name,
+			svc, err := newTestRuntimeService(harness.pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+				harness.registeredTable("records", "id"),
+			}), AppName: "audit-nullable-" + test.name,
 				RegisteredTables: []RegisteredTable{
 					harness.registeredTable("records", "id"),
 				},
+				RegisteredTableCatalogRevision: 1,
 			}, harness.logger)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = svc.Close(context.Background()) })
@@ -298,16 +304,16 @@ func TestAuditRegisteredTable_TruncateFailsClosed(t *testing.T) {
 	require.Equal(t, int64(1), fixture.businessUserCount(t, ctx), "a rejected TRUNCATE must preserve business data")
 	requireAuditMetadataIntegrity(t, ctx, fixture.pool)
 
-	pull, err := fixture.svc.ProcessPull(ctx, fixture.reader, 0, 10, 0)
+	pull, err := fixture.svc.ProcessPull(ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), 0, 10, 0)
 	require.NoError(t, err)
 	require.Len(t, pull.Bundles, 1)
 	require.Len(t, pull.Bundles[0].Rows, 1)
 	require.Equal(t, rowID.String(), pull.Bundles[0].Rows[0].Key["id"])
 
-	snapshot, err := fixture.svc.CreateSnapshotSession(ctx, fixture.reader)
+	snapshot, err := fixture.svc.CreateSnapshotSession(ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Equal(t, int64(1), snapshot.RowCount)
-	chunk, err := fixture.svc.GetSnapshotChunk(ctx, fixture.reader, snapshot.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
+	chunk, err := fixture.svc.GetSnapshotChunk(ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), snapshot.SnapshotID, 0, 10, defaultBytesPerSnapshotChunk)
 	require.NoError(t, err)
 	require.Len(t, chunk.Rows, 1)
 	require.Equal(t, rowID.String(), chunk.Rows[0].Key["id"])
@@ -335,7 +341,7 @@ func TestAuditBootstrap_RejectsDamagedExistingLayout(t *testing.T) {
 			_, err := fixture.pool.Exec(ctx, test.damageSQL)
 			require.NoError(t, err)
 
-			second, err := NewRuntimeService(
+			second, err := newTestRuntimeService(
 				fixture.pool,
 				fixture.newServiceConfig("audit-damaged-layout-"+test.name),
 				integrationTestLogger(slog.LevelWarn),
@@ -370,7 +376,7 @@ func TestAuditProcessPull_RejectsZeroCheckpointAfterDatabasePruning(t *testing.T
 	require.Equal(t, int64(1), retainedFloor)
 	require.Equal(t, int64(1), remainingBundleCount)
 
-	_, err := fixture.svc.ProcessPull(ctx, fixture.reader, 0, 10, 0)
+	_, err := fixture.svc.ProcessPull(ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc), 0, 10, 0)
 	var prunedErr *HistoryPrunedError
 	require.ErrorAs(t, err, &prunedErr, "checkpoint zero must not receive a successful incomplete history")
 	require.Equal(t, int64(0), prunedErr.ProvidedSeq)

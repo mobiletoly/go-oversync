@@ -1,0 +1,15 @@
+{
+  "format": "go-oversync.static-baseline.v1",
+  "authority_id": "se03-notes-v1-v2",
+  "deployment_revision": 2,
+  "transition_revision": "notes-v1-v2",
+  "transition_phase": "coexistence",
+  "application": {
+    "id": "se03-authority",
+    "revision": 2
+  },
+  "qualification": {
+    "id": "se03-authority-qualification",
+    "revision": 1
+  }
+}

@@ -43,7 +43,7 @@ func newAuditPrunedHistoryFixture(t *testing.T) (*auditDatabaseContractFixture, 
 func TestAuditPullCheckpointBoundaries(t *testing.T) {
 	t.Run("zero", func(t *testing.T) {
 		fixture, retainedFloor, _ := newAuditPrunedHistoryFixture(t)
-		_, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, 0, 10, 0)
+		_, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, testSchemaGenerationProofForService(fixture.svc), 0, 10, 0)
 		var prunedErr *HistoryPrunedError
 		require.ErrorAs(t, err, &prunedErr)
 		require.Equal(t, retainedFloor, prunedErr.RetainedFloor)
@@ -51,7 +51,7 @@ func TestAuditPullCheckpointBoundaries(t *testing.T) {
 
 	t.Run("floor_minus_one", func(t *testing.T) {
 		fixture, retainedFloor, _ := newAuditPrunedHistoryFixture(t)
-		_, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, retainedFloor-1, 10, 0)
+		_, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, testSchemaGenerationProofForService(fixture.svc), retainedFloor-1, 10, 0)
 		var prunedErr *HistoryPrunedError
 		require.ErrorAs(t, err, &prunedErr)
 		require.Equal(t, retainedFloor, prunedErr.RetainedFloor)
@@ -59,7 +59,7 @@ func TestAuditPullCheckpointBoundaries(t *testing.T) {
 
 	t.Run("floor", func(t *testing.T) {
 		fixture, retainedFloor, currentBundleSeq := newAuditPrunedHistoryFixture(t)
-		response, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, retainedFloor, 10, 0)
+		response, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, testSchemaGenerationProofForService(fixture.svc), retainedFloor, 10, 0)
 		require.NoError(t, err)
 		require.Equal(t, currentBundleSeq, response.StableBundleSeq)
 		require.Len(t, response.Bundles, 1)
@@ -68,7 +68,7 @@ func TestAuditPullCheckpointBoundaries(t *testing.T) {
 
 	t.Run("current", func(t *testing.T) {
 		fixture, _, currentBundleSeq := newAuditPrunedHistoryFixture(t)
-		response, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, currentBundleSeq, 10, 0)
+		response, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, testSchemaGenerationProofForService(fixture.svc), currentBundleSeq, 10, 0)
 		require.NoError(t, err)
 		require.Equal(t, currentBundleSeq, response.StableBundleSeq)
 		require.Empty(t, response.Bundles)
@@ -76,7 +76,7 @@ func TestAuditPullCheckpointBoundaries(t *testing.T) {
 
 	t.Run("future_checkpoint", func(t *testing.T) {
 		fixture, _, currentBundleSeq := newAuditPrunedHistoryFixture(t)
-		_, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, currentBundleSeq+10, 10, 0)
+		_, err := fixture.svc.ProcessPull(context.Background(), fixture.reader, testSchemaGenerationProofForService(fixture.svc), currentBundleSeq+10, 10, 0)
 		var aheadErr *CheckpointAheadError
 		require.ErrorAs(t, err, &aheadErr)
 		require.Equal(t, "checkpoint", aheadErr.Field)
@@ -87,11 +87,12 @@ func TestAuditPullCheckpointBoundaries(t *testing.T) {
 		fixture, _, currentBundleSeq := newAuditPrunedHistoryFixture(t)
 		_, err := fixture.svc.ProcessPull(
 			context.Background(),
-			fixture.reader,
+			fixture.reader, testSchemaGenerationProofForService(fixture.svc),
+
 			currentBundleSeq,
 			10,
-			currentBundleSeq+10,
-		)
+			currentBundleSeq+10)
+
 		var aheadErr *CheckpointAheadError
 		require.ErrorAs(t, err, &aheadErr)
 		require.Equal(t, "target", aheadErr.Field)
@@ -103,7 +104,7 @@ func TestAuditSnapshotAfterPruningReconstructsAuthoritativeState(t *testing.T) {
 	fixture, _, currentBundleSeq := newAuditPrunedHistoryFixture(t)
 	ctx := context.Background()
 
-	session, err := fixture.svc.CreateSnapshotSession(ctx, fixture.reader)
+	session, err := fixture.svc.CreateSnapshotSession(ctx, fixture.reader, testSchemaGenerationProofForService(fixture.svc))
 	require.NoError(t, err)
 	require.Equal(t, currentBundleSeq, session.SnapshotBundleSeq)
 	require.Equal(t, int64(3), session.RowCount)

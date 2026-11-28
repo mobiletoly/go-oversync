@@ -1,16 +1,20 @@
 package oversync
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/mobiletoly/go-oversync/internal/jcs"
 	"github.com/mobiletoly/go-oversync/internal/sourceid"
 )
 
@@ -58,10 +62,10 @@ func (e *SnapshotCapacityError) Error() string {
 	return "snapshot " + e.Operation + " capacity is exhausted"
 }
 
-type SnapshotChunkTooSmallError struct{ RequiredByteCount int64 }
+type SnapshotChunkTooSmallError struct{ RequiredDecodedBodyBytes int64 }
 
 func (e *SnapshotChunkTooSmallError) Error() string {
-	return fmt.Sprintf("max_bytes is too small for the next snapshot row; required_byte_count=%d", e.RequiredByteCount)
+	return fmt.Sprintf("max_bytes is too small for the next snapshot row; required_decoded_body_bytes=%d", e.RequiredDecodedBodyBytes)
 }
 
 func (e *SnapshotSessionLimitExceededError) Error() string {
@@ -77,20 +81,55 @@ type snapshotMaterializedRow struct {
 	wireByteCount int64
 }
 
-func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor) (_ *SnapshotSession, err error) {
-	return s.CreateSnapshotSessionWithRequest(ctx, actor, nil)
+type snapshotPayloadScanObservation struct {
+	ReportedKeyByteCount     int64
+	ReportedPayloadByteCount int64
+	KeyMaterialized          bool
+	PayloadMaterialized      bool
+	MaterializedKeyBytes     int
+	MaterializedPayloadBytes int
 }
 
-func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, actor Actor, req *SnapshotSessionCreateRequest) (_ *SnapshotSession, err error) {
+func (s *SyncService) CreateSnapshotSession(ctx context.Context, actor Actor, proof SchemaGenerationProof) (_ *SnapshotSession, err error) {
+	return s.CreateSnapshotSessionWithRequest(ctx, actor, proof, nil)
+}
+
+func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, actor Actor, proof SchemaGenerationProof, req *SnapshotSessionCreateRequest) (_ *SnapshotSession, err error) {
 	if err := rejectRetryableCallbackContext(ctx, "CreateSnapshotSession"); err != nil {
 		return nil, err
 	}
-	done, err := s.beginOperation()
+	if err := s.validateClientActor(actor, true); err != nil {
+		return nil, err
+	}
+	if err := validateSchemaGenerationProof(proof); err != nil {
+		return nil, err
+	}
+	if req != nil && req.Recovery != nil && (req.SourceReplacement != nil || req.Recovery.MinimumBundleSeq < 0) {
+		return nil, &SnapshotSessionInvalidError{Message: "invalid recovery snapshot request"}
+	}
+	done, err := s.beginOperation(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	if err := s.validateClientActor(actor, false); err != nil {
+	view, err := s.resolveRequestGeneration(ctx, actor, proof)
+	if err != nil {
+		return nil, err
+	}
+	if req != nil && req.SourceReplacement != nil {
+		if _, err := s.validateSnapshotSourceReplacement(actor, req.SourceReplacement); err != nil {
+			return nil, err
+		}
+	}
+	if req == nil || req.SourceReplacement == nil {
+		if _, err := s.requireExactSourceGenerationBinding(ctx, actor, proof); err != nil {
+			return nil, err
+		}
+	} else if err := s.validateSnapshotReplacementBinding(ctx, actor, proof, req.SourceReplacement); err != nil {
+		return nil, err
+	}
+	selection, err := selectionFromResolvedGeneration(proof, view)
+	if err != nil {
 		return nil, err
 	}
 	startedAt := time.Now()
@@ -113,7 +152,10 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 	}
 
 	var resp *SnapshotSession
-	err = pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+	err = withOriginTransaction(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, Kind: ScopeTransactionSnapshotCreate, SourceID: actor.SourceID}); err != nil {
+			return err
+		}
 		if err := requireScopeInitializedQuerier(ctx, tx, actor.UserID); err != nil {
 			return err
 		}
@@ -125,20 +167,34 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 		if retainedState == nil {
 			return fmt.Errorf("missing retained history state for %q", actor.UserID)
 		}
-		if err := s.applySnapshotSourceReplacementInTx(ctx, tx, actor, retainedState.UserPK, req); err != nil {
+		if req == nil || req.SourceReplacement == nil {
+			if err := requireExactSourceGenerationBindingInTx(ctx, tx, retainedState.UserPK, actor.UserID, actor.SourceID, proof); err != nil {
+				return err
+			}
+		}
+		effectiveSourceID, err := s.applySnapshotSourceReplacementInTx(ctx, tx, actor, retainedState.UserPK, proof, req)
+		if err != nil {
 			return err
 		}
 
+		if req != nil && req.Recovery != nil {
+			if err := requireNoPendingPushOutcome(ctx, tx, retainedState.UserPK, effectiveSourceID); err != nil {
+				return err
+			}
+			if req.Recovery.MinimumBundleSeq > retainedState.highestBundleSeq() {
+				return &PushOutcomeError{Code: "recovery_floor_ahead"}
+			}
+		}
 		snapshotBundleSeq := retainedState.highestBundleSeq()
 		snapshotID = uuid.NewString()
 		var expiresAt time.Time
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO sync.snapshot_sessions (
-				snapshot_id, user_pk, snapshot_bundle_seq, row_count, byte_count, expires_at
-			) VALUES ($1::uuid, $2, $3, 0, 0,
-				transaction_timestamp() + $4::bigint * interval '1 microsecond')
+				snapshot_id, user_pk, source_id, schema_generation_id, schema_generation_fingerprint, snapshot_bundle_seq, row_count, byte_count, expires_at
+			) VALUES ($1::uuid, $2, $3, $4, $5, $6, 0, 0,
+				transaction_timestamp() + $7::bigint * interval '1 microsecond')
 			RETURNING expires_at
-		`, snapshotID, retainedState.UserPK, snapshotBundleSeq, s.snapshotSessionTTL().Microseconds()).Scan(&expiresAt); err != nil {
+		`, snapshotID, retainedState.UserPK, effectiveSourceID, proof.ID, proof.Fingerprint, snapshotBundleSeq, s.snapshotSessionTTL().Microseconds()).Scan(&expiresAt); err != nil {
 			return fmt.Errorf("insert snapshot session: %w", err)
 		}
 		if s.snapshotHooks != nil && s.snapshotHooks.afterSnapshotFence != nil {
@@ -146,7 +202,18 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 				return err
 			}
 		}
-		rowCount, byteCount, materializationHighWater, err := s.materializeSnapshotRows(ctx, tx, snapshotID, actor.UserID, retainedState.UserPK)
+		var recovery *SnapshotRecovery
+		if req != nil && req.Recovery != nil {
+			value := *req.Recovery
+			recovery = &value
+		}
+		// The seal is accumulated while staging, in row-ordinal order, from the same values the rows
+		// are stored and served with; serving still validates every stored row it returns.
+		hash, err := NewSnapshotHashWriter(effectiveSourceID, generationDescriptor(selection.view.contract), snapshotID, snapshotBundleSeq, recovery)
+		if err != nil {
+			return err
+		}
+		rowCount, byteCount, materializationHighWater, err := s.materializeSnapshotRowsForGeneration(ctx, tx, selection, snapshotID, actor.UserID, retainedState.UserPK, snapshotBundleSeq, hash)
 		batchHighWater = materializationHighWater
 		observeAtomicHighWater(&s.snapshotMetrics.materializationBatchRowsHighWater, int64(batchHighWater.rows))
 		observeAtomicHighWater(&s.snapshotMetrics.materializationBatchBytesHighWater, batchHighWater.bytes)
@@ -158,7 +225,15 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 				return err
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE sync.snapshot_sessions SET row_count=$2, byte_count=$3 WHERE snapshot_id=$1::uuid`, snapshotID, rowCount, byteCount); err != nil {
+		snapshotHash, err := hash.Sum(rowCount, byteCount)
+		if err != nil {
+			return err
+		}
+		var floor *int64
+		if recovery != nil {
+			floor = &recovery.MinimumBundleSeq
+		}
+		if _, err := tx.Exec(ctx, `UPDATE sync.snapshot_sessions SET row_count=$2, byte_count=$3,snapshot_hash=$4,recovery_minimum_bundle_seq=$5 WHERE snapshot_id=$1::uuid`, snapshotID, rowCount, byteCount, snapshotHash, floor); err != nil {
 			return fmt.Errorf("finalize snapshot session counts: %w", err)
 		}
 
@@ -168,6 +243,7 @@ func (s *SyncService) CreateSnapshotSessionWithRequest(ctx context.Context, acto
 			RowCount:          rowCount,
 			ByteCount:         byteCount,
 			ExpiresAt:         expiresAt.Format(time.RFC3339Nano),
+			SnapshotHash:      snapshotHash, Recovery: recovery,
 		}
 		return nil
 	})
@@ -232,7 +308,7 @@ func (s *SyncService) validateSnapshotSourceReplacement(actor Actor, replacement
 		return nil, &SnapshotSessionInvalidError{Message: "new_source_id must differ from previous_source_id"}
 	}
 	switch clean.Reason {
-	case "history_pruned", "source_sequence_out_of_order", "source_sequence_changed", "source_retired":
+	case "history_pruned", "source_sequence_out_of_order", "source_sequence_changed", "source_retired", "schema_generation_upgrade":
 	default:
 		return nil, &SnapshotSessionInvalidError{Message: "source replacement reason is unsupported"}
 	}
@@ -243,52 +319,215 @@ func validateSnapshotSourceReplacement(actor Actor, replacement *SnapshotSourceR
 	return (*SyncService)(nil).validateSnapshotSourceReplacement(actor, replacement)
 }
 
-func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, req *SnapshotSessionCreateRequest) error {
-	if req == nil || req.SourceReplacement == nil {
+func (s *SyncService) validateSnapshotReplacementBinding(ctx context.Context, actor Actor, proof SchemaGenerationProof, replacement *SnapshotSourceReplacement) error {
+	clean, err := s.validateSnapshotSourceReplacement(actor, replacement)
+	if err != nil {
+		return err
+	}
+	state, err := s.loadActorSourceGenerationState(ctx, actor, proof.ID)
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		return sourceGenerationError(SourceGenerationUnbound, proof.ID, 0, "", "source has not connected")
+	}
+	if err := validateStoredSourceGeneration(state, proof.ID); err != nil {
+		return err
+	}
+	if proof.ID < state.generationID {
+		return sourceGenerationError(SchemaGenerationDowngradeForbidden, proof.ID, state.generationID, "", "schema generation downgrade is forbidden")
+	}
+	if clean.Reason == "schema_generation_upgrade" {
+		if proof.ID <= state.generationID {
+			return sourceGenerationError(SourceGenerationConflict, proof.ID, state.generationID, "", "source replacement generation is invalid")
+		}
 		return nil
+	}
+	if proof.ID != state.generationID || proof.Fingerprint != state.fingerprint {
+		return sourceGenerationError(SourceGenerationConflict, proof.ID, state.generationID, "", "source replacement generation is invalid")
+	}
+	return nil
+}
+
+func (s *SyncService) applySnapshotSourceReplacementInTx(ctx context.Context, tx pgx.Tx, actor Actor, userPK int64, proof SchemaGenerationProof, req *SnapshotSessionCreateRequest) (string, error) {
+	if req == nil || req.SourceReplacement == nil {
+		return actor.SourceID, nil
 	}
 	replacement, err := s.validateSnapshotSourceReplacement(actor, req.SourceReplacement)
 	if err != nil {
-		return err
+		return "", err
 	}
-
-	previousState, err := loadSourceStateRow(ctx, tx, userPK, replacement.PreviousSourceID, true)
+	states, err := lockReplacementSourceStates(ctx, tx, userPK, replacement.PreviousSourceID, replacement.NewSourceID)
 	if err != nil {
-		return err
+		return "", err
 	}
-	newState, err := loadSourceStateRow(ctx, tx, userPK, replacement.NewSourceID, true)
+	bindings, err := lockReplacementSourceBindings(ctx, tx, userPK, replacement.PreviousSourceID, replacement.NewSourceID)
 	if err != nil {
-		return err
+		return "", err
+	}
+	if err := requireNoPendingPushOutcome(ctx, tx, userPK, replacement.PreviousSourceID); err != nil {
+		return "", err
+	}
+	previousState := states[replacement.PreviousSourceID]
+	newState := states[replacement.NewSourceID]
+	previousBinding := bindings[replacement.PreviousSourceID]
+	newBinding := bindings[replacement.NewSourceID]
+	if previousState == nil && previousBinding == nil {
+		return "", sourceGenerationError(SourceGenerationUnbound, proof.ID, 0, "", "source has not connected")
+	}
+	if previousState == nil {
+		if err := validateBindingRow(previousBinding, proof.ID); err != nil {
+			return "", err
+		}
+		return "", sourceGenerationError(SourceGenerationStateCorrupt, proof.ID, previousBinding.generationID, "source_state", "source generation state is corrupt")
+	}
+	if previousBinding == nil {
+		return "", sourceGenerationError(SourceGenerationStateCorrupt, proof.ID, 0, "source_generation_binding", "source generation state is corrupt")
+	}
+	if err := validateBindingRow(previousBinding, proof.ID); err != nil {
+		return "", err
+	}
+	if err := requireReplacementClientProgress(ctx, tx, userPK, replacement.PreviousSourceID, proof.ID); err != nil {
+		return "", err
+	}
+	if proof.ID < previousBinding.generationID {
+		return "", sourceGenerationError(SchemaGenerationDowngradeForbidden, proof.ID, previousBinding.generationID, "", "schema generation downgrade is forbidden")
+	}
+	if replacement.Reason == "schema_generation_upgrade" {
+		if proof.ID <= previousBinding.generationID {
+			return "", sourceGenerationError(SourceGenerationConflict, proof.ID, previousBinding.generationID, "", "source replacement generation is invalid")
+		}
+	} else if proof.ID != previousBinding.generationID || proof.Fingerprint != previousBinding.fingerprint {
+		return "", sourceGenerationError(SourceGenerationConflict, proof.ID, previousBinding.generationID, "", "source replacement generation is invalid")
 	}
 
 	if previousState != nil && previousState.State == sourceStateRetired {
-		if previousState.ReplacedBySourceID != replacement.NewSourceID {
-			return &SourceRetiredError{
+		if previousState.ReplacedBySourceID != replacement.NewSourceID || previousState.RetirementReason != replacement.Reason {
+			return "", &SourceRetiredError{
 				UserID:             actor.UserID,
 				SourceID:           replacement.PreviousSourceID,
 				ReplacedBySourceID: previousState.ReplacedBySourceID,
 			}
 		}
-		if newState == nil {
-			if err := reserveSourceState(ctx, tx, userPK, replacement.NewSourceID); err != nil {
-				return err
-			}
-		} else if newState.State != sourceStateReserved && newState.State != sourceStateActive {
-			return &SourceReplacementInvalidError{Message: "source replacement is invalid"}
+		if newState == nil || newBinding == nil || (newState.State != sourceStateReserved && newState.State != sourceStateActive) {
+			return "", &SourceReplacementInvalidError{Message: "source replacement is invalid"}
+		}
+		if err := requireBindingPair(newBinding, proof); err != nil {
+			return "", err
+		}
+		if err := requireReplacementClientProgress(ctx, tx, userPK, replacement.NewSourceID, proof.ID); err != nil {
+			return "", err
 		}
 	} else {
-		if newState != nil {
-			return &SourceReplacementInvalidError{Message: "source replacement is invalid"}
+		if previousState.State != sourceStateActive && previousState.State != sourceStateReserved {
+			return "", &SourceReplacementInvalidError{Message: "source replacement is invalid"}
 		}
-		if err := reserveSourceState(ctx, tx, userPK, replacement.NewSourceID); err != nil {
-			return err
+		if newState != nil || newBinding != nil {
+			return "", &SourceReplacementInvalidError{Message: "source replacement is invalid"}
+		}
+		conflict, err := replacementSourceHasConflict(ctx, tx, userPK, replacement.PreviousSourceID, replacement.NewSourceID)
+		if err != nil {
+			return "", err
+		}
+		if conflict {
+			return "", &SourceReplacementInvalidError{Message: "source replacement is invalid"}
+		}
+		if err := s.admitReplacementSourceBinding(ctx, tx, userPK, replacement.NewSourceID, proof); err != nil {
+			return "", err
 		}
 		if err := retireSourceState(ctx, tx, userPK, replacement.PreviousSourceID, replacement.NewSourceID, replacement.Reason); err != nil {
-			return err
+			return "", err
 		}
 	}
 
+	return replacement.NewSourceID, nil
+}
+
+// The source and binding have already been locked and validated. Missing
+// ownership evidence must not be replaced by a fresh successor or accepted on
+// replay, even when no terminal outcome remains.
+func requireReplacementClientProgress(ctx context.Context, tx pgx.Tx, userPK int64, sourceID string, generationID SchemaGenerationID) error {
+	progress, err := loadPushProgress(ctx, tx, userPK, sourceID)
+	if err != nil {
+		return err
+	}
+	if !progress.present {
+		return sourceGenerationError(SourceGenerationStateCorrupt, generationID, 0, "source_id", "client source ownership is missing")
+	}
 	return nil
+}
+
+func lockReplacementSourceStates(ctx context.Context, tx pgx.Tx, userPK int64, sourceA, sourceB string) (map[string]*sourceStateRow, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT user_pk, source_id, state, max_committed_source_bundle_id, replaced_by_source_id, retirement_reason
+		FROM sync.source_state
+		WHERE user_pk=$1 AND source_id IN ($2,$3)
+		ORDER BY source_id COLLATE "C"
+		FOR UPDATE
+	`, userPK, sourceA, sourceB)
+	if err != nil {
+		return nil, fmt.Errorf("lock replacement source state: %w", err)
+	}
+	defer rows.Close()
+	result := make(map[string]*sourceStateRow, 2)
+	for rows.Next() {
+		row := &sourceStateRow{}
+		if err := rows.Scan(&row.UserPK, &row.SourceID, &row.State, &row.MaxCommittedSourceBundleID, &row.ReplacedBySourceID, &row.RetirementReason); err != nil {
+			return nil, fmt.Errorf("scan replacement source state: %w", err)
+		}
+		result[row.SourceID] = row
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate replacement source state: %w", err)
+	}
+	return result, nil
+}
+
+func lockReplacementSourceBindings(ctx context.Context, tx pgx.Tx, userPK int64, sourceA, sourceB string) (map[string]*sourceGenerationBindingRow, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT source_id, schema_generation_id, schema_generation_fingerprint
+		FROM sync.source_generation_bindings
+		WHERE user_pk=$1 AND source_id IN ($2,$3)
+		ORDER BY source_id COLLATE "C"
+		FOR UPDATE
+	`, userPK, sourceA, sourceB)
+	if err != nil {
+		return nil, fmt.Errorf("lock replacement source binding: %w", err)
+	}
+	defer rows.Close()
+	result := make(map[string]*sourceGenerationBindingRow, 2)
+	for rows.Next() {
+		var sourceID string
+		var generationID int32
+		row := &sourceGenerationBindingRow{}
+		if err := rows.Scan(&sourceID, &generationID, &row.fingerprint); err != nil {
+			return nil, fmt.Errorf("scan replacement source binding: %w", err)
+		}
+		row.generationID = SchemaGenerationID(generationID)
+		result[sourceID] = row
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate replacement source binding: %w", err)
+	}
+	return result, nil
+}
+
+func replacementSourceHasConflict(ctx context.Context, tx pgx.Tx, userPK int64, previousSourceID, newSourceID string) (bool, error) {
+	var conflict bool
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			EXISTS (SELECT 1 FROM sync.bundle_log WHERE user_pk=$1 AND source_id=$3 LIMIT 1)
+			OR EXISTS (SELECT 1 FROM sync.server_source_reservations WHERE source_id=$3 LIMIT 1)
+			OR EXISTS (
+				SELECT 1 FROM sync.scope_state
+				WHERE user_pk=$1 AND state_code=$4 AND initializer_source_id=$2
+				  AND lease_expires_at > transaction_timestamp()
+				LIMIT 1
+			)
+	`, userPK, previousSourceID, newSourceID, scopeStateCodeInitializing).Scan(&conflict); err != nil {
+		return false, fmt.Errorf("inspect source replacement guards: %w", err)
+	}
+	return conflict, nil
 }
 
 type snapshotBatchHighWater struct {
@@ -297,61 +536,186 @@ type snapshotBatchHighWater struct {
 	batches int
 }
 
-func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, snapshotID, userID string, userPK int64) (int64, int64, snapshotBatchHighWater, error) {
-	tableInfos := make([]registeredTableRuntimeInfo, 0, len(s.registeredTableByID))
-	for _, info := range s.registeredTableByID {
-		tableInfos = append(tableInfos, info)
+// snapshotMaterializationPageSQL reads one page of a user's live rows of one
+// registered table: up to the batch limit of row_state keys after the cursor,
+// each joined to its business row for the payload.
+//
+// Parameters: $1 user id, $2 user_pk, $3 table id, $4 row byte limit, $5 payload
+// byte limit, then the cursor key bytes (only when afterCursor) and the page size.
+func snapshotMaterializationPageSQL(info registeredTableRuntimeInfo, payloadExpression string, afterCursor bool) string {
+	tableIdent := pgx.Identifier{info.schemaName, info.tableName}.Sanitize()
+	keyIdent := pgx.Identifier{info.syncKeyColumn}.Sanitize()
+	ownerIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
+	// Compare in the key column's own type so the join is a lookup on the
+	// (_sync_scope_id, key) primary key. A UUID is exactly its 16 bytes, so the
+	// CASE keeps any other length unmatched, as uuid_send equality did. Text keys
+	// look up by text equality and then recheck the exact UTF-8 bytes, so a
+	// nondeterministic key collation cannot widen the match. convert_from's
+	// result takes collation "C" from its name-typed encoding argument; the
+	// explicit default collation lets the comparison use the key's index.
+	keyJoin := fmt.Sprintf(`src.%[1]s=(convert_from(page.key_bytes, 'UTF8') COLLATE "default") AND convert_to(CAST(src.%[1]s AS text), 'UTF8')=page.key_bytes`, keyIdent)
+	if info.syncKeyType == syncKeyTypeUUID {
+		keyJoin = fmt.Sprintf("src.%s=CASE WHEN octet_length(page.key_bytes)=16 THEN encode(page.key_bytes, 'hex')::uuid END", keyIdent)
 	}
-	sort.Slice(tableInfos, func(i, j int) bool { return tableInfos[i].tableID < tableInfos[j].tableID })
-
-	var rowCount, byteCount int64
-	highWater := snapshotBatchHighWater{}
-	for _, info := range tableInfos {
-		tableIdent := pgx.Identifier{info.schemaName, info.tableName}.Sanitize()
-		keyIdent := pgx.Identifier{info.syncKeyColumn}.Sanitize()
-		ownerIdent := pgx.Identifier{syncScopeColumnName}.Sanitize()
-		businessKeyFromBytesExpr := "convert_from(page.key_bytes, 'UTF8')"
-		if info.syncKeyType == syncKeyTypeUUID {
-			businessKeyFromBytesExpr = "encode(page.key_bytes, 'hex')::uuid"
-		}
-		var lastKey []byte
-		for {
-			cursorPredicate := ""
-			limitPlaceholder := "$4"
-			queryArgs := []any{userID, userPK, info.tableID, s.config.SnapshotMaterializationBatchRows}
-			if lastKey != nil {
-				cursorPredicate = " AND rs.key_bytes > $4"
-				limitPlaceholder = "$5"
-				queryArgs = []any{userID, userPK, info.tableID, lastKey, s.config.SnapshotMaterializationBatchRows}
-			}
-			query := fmt.Sprintf(`
+	cursorPredicate := ""
+	limitPlaceholder := "$6"
+	if afterCursor {
+		cursorPredicate = " AND rs.key_bytes > $6"
+		limitPlaceholder = "$7"
+	}
+	return fmt.Sprintf(`
 				WITH page AS MATERIALIZED (
 					SELECT rs.key_bytes, rs.bundle_seq
 					FROM sync.row_state AS rs
 					WHERE rs.user_pk=$2 AND rs.table_id=$3 AND rs.deleted=FALSE%s
 					ORDER BY rs.key_bytes
 					LIMIT %s
+				), projected AS MATERIALIZED (
+					SELECT page.key_bytes, page.bundle_seq, %s AS payload_db
+					FROM page
+					JOIN %s AS src
+					  ON src.%s=$1 AND %s
 				)
-				SELECT page.key_bytes, page.bundle_seq, to_jsonb(src) - '_sync_scope_id'
-				FROM page
-				JOIN %s AS src
-				  ON src.%s=$1 AND src.%s=%s
-				ORDER BY page.key_bytes
-			`, cursorPredicate, limitPlaceholder, tableIdent, ownerIdent, keyIdent, businessKeyFromBytesExpr)
+				SELECT
+					octet_length(key_bytes),
+					CASE WHEN octet_length(key_bytes) <= $4 THEN key_bytes END,
+					bundle_seq,
+					octet_length(payload_db::text),
+					CASE WHEN octet_length(payload_db::text) <= $5 THEN payload_db END
+				FROM projected
+				ORDER BY key_bytes
+			`, cursorPredicate, limitPlaceholder, payloadExpression, tableIdent, ownerIdent, keyJoin)
+}
+
+// stagedSnapshotTable is the per-table context for encoding staged rows. index is the table's position
+// in the wire generation, or -1 when the generation does not list it. keyName is the canonical JSON
+// string of the single sync key column; keyNameErr is kept so a row reports it where the expanded-size
+// check would have.
+type stagedSnapshotTable struct {
+	index      int
+	keyName    []byte
+	keyNameErr error
+}
+
+func newStagedSnapshotTable(generation SchemaGenerationCapabilities, info registeredTableRuntimeInfo, contract GenerationTableContract) stagedSnapshotTable {
+	table := stagedSnapshotTable{index: -1}
+	for index, candidate := range generation.Tables {
+		if candidate.Schema == info.schemaName && candidate.Table == info.tableName {
+			table.index = index
+			break
+		}
+	}
+	if len(contract.SyncKeyColumns) == 1 {
+		table.keyName, table.keyNameErr = jcs.Marshal(contract.SyncKeyColumns[0])
+	} else {
+		table.keyNameErr = fmt.Errorf("snapshot key contract is invalid")
+	}
+	return table
+}
+
+// stagedSnapshotRowEncoding is one validated staged row's hash parts and its expanded decoded size,
+// len(jcs.Marshal(key)) + len(jcs.Marshal(payload)) as ExpandedRowDecodedBytes measures it.
+type stagedSnapshotRowEncoding struct {
+	parts         snapshotRowCanonicalParts
+	expandedBytes int64
+}
+
+// encodeStagedSnapshotRow canonicalizes the decoded payload once. keyCanonical is the canonical single
+// key value, already checked equal to the payload's key column.
+func encodeStagedSnapshotRow(table stagedSnapshotTable, keyCanonical []byte, version int64, payloadObject map[string]any) (stagedSnapshotRowEncoding, error) {
+	if table.keyNameErr != nil {
+		return stagedSnapshotRowEncoding{}, table.keyNameErr
+	}
+	payload, err := jcs.Marshal(payloadObject)
+	if err != nil {
+		return stagedSnapshotRowEncoding{}, fmt.Errorf("encode canonical snapshot payload: %w", err)
+	}
+	keyValues := make([]byte, 0, len(keyCanonical)+2)
+	keyValues = append(append(append(keyValues, '['), keyCanonical...), ']')
+	// The canonical key object is `{` + name + `:` + value + `}`.
+	expandedKey := int64(len(table.keyName) + len(keyCanonical) + 3)
+	return stagedSnapshotRowEncoding{
+		parts:         snapshotRowCanonicalParts{tableIndex: table.index, keyValues: keyValues, version: version, payload: payload},
+		expandedBytes: expandedKey + int64(len(payload)),
+	}, nil
+}
+
+// snapshotRowGroup is the one-row compact group CompactGroupsForSnapshotRowsAt builds for a snapshot
+// row at its row ordinal; keyValues are in the generation's key-column order.
+func snapshotRowGroup(tableIndex int, rowOrdinal int64, keyValues []any, version int64, payload json.RawMessage) CompactRowGroup {
+	return CompactRowGroup{TableIndex: tableIndex, FirstRowOrdinal: rowOrdinal, Rows: []CompactRowTuple{{
+		Op: "i", KeyValues: keyValues, Version: version, Payload: payload,
+	}}}
+}
+
+func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, view *schemaGenerationView, snapshotID, userID string, userPK, snapshotBundleSeq int64, hash *SnapshotHashWriter) (int64, int64, snapshotBatchHighWater, error) {
+	if view == nil {
+		return 0, 0, snapshotBatchHighWater{}, projectionError(GenerationProjectionIntegrityError, "snapshot", "generation view is unavailable")
+	}
+	tableInfos := make([]registeredTableRuntimeInfo, 0, len(view.byID))
+	contracts := make(map[int32]GenerationTableContract, len(view.byID))
+	for _, table := range view.byID {
+		info, ok := s.registeredTableByID[table.tableID]
+		if !ok {
+			return 0, 0, snapshotBatchHighWater{}, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible table identity is unavailable")
+		}
+		tableInfos = append(tableInfos, info)
+		contracts[table.tableID] = table.contract
+	}
+	sort.Slice(tableInfos, func(i, j int) bool { return tableInfos[i].tableID < tableInfos[j].tableID })
+	activeTableIDs := make([]int32, 0, len(tableInfos))
+	for _, info := range tableInfos {
+		activeTableIDs = append(activeTableIDs, info.tableID)
+	}
+
+	wireGeneration := generationDescriptor(view.contract)
+	var rowCount, byteCount int64
+	highWater := snapshotBatchHighWater{}
+	for _, info := range tableInfos {
+		contract := contracts[info.tableID]
+		columnTypes := s.columnTypesForTable(info.schemaName, info.tableName)
+		payloadExpression := databaseVisibleWirePayloadExpression("src", contract.Columns, columnTypes)
+		physicalPayloadLimit, err := physicalDatabasePayloadByteLimitForColumnTypes(s.maxBytesPerSnapshotRow(), columnTypes)
+		if err != nil {
+			return 0, 0, highWater, fmt.Errorf("derive snapshot payload transfer limit for %s.%s: %w", info.schemaName, info.tableName, err)
+		}
+		stagedTable := newStagedSnapshotTable(wireGeneration, info, contract)
+		var lastKey []byte
+		for {
+			queryArgs := []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, s.config.tuning.snapshotMaterializationBatchRows}
+			if lastKey != nil {
+				queryArgs = []any{userID, userPK, info.tableID, s.maxBytesPerSnapshotRow(), physicalPayloadLimit, lastKey, s.config.tuning.snapshotMaterializationBatchRows}
+			}
+			query := snapshotMaterializationPageSQL(info, payloadExpression, lastKey != nil)
 			liveRows, err := tx.Query(ctx, query, queryArgs...)
 			if err != nil {
 				return 0, 0, highWater, fmt.Errorf("query snapshot page for %s.%s: %w", info.schemaName, info.tableName, err)
 			}
 			s.snapshotMetrics.materializationPageQueries.Add(1)
 
-			batch := make([]snapshotMaterializedRow, 0, s.config.SnapshotMaterializationBatchRows)
+			batch := make([]snapshotMaterializedRow, 0, s.config.tuning.snapshotMaterializationBatchRows)
 			var batchBytes int64
 			for liveRows.Next() {
 				var keyBytes, payloadDB []byte
-				var bundleSeq int64
-				if err := liveRows.Scan(&keyBytes, &bundleSeq, &payloadDB); err != nil {
+				var keyByteCount, bundleSeq, payloadByteCount int64
+				if err := liveRows.Scan(&keyByteCount, &keyBytes, &bundleSeq, &payloadByteCount, &payloadDB); err != nil {
 					liveRows.Close()
 					return 0, 0, highWater, fmt.Errorf("scan snapshot page: %w", err)
+				}
+				if s.snapshotHooks != nil && s.snapshotHooks.afterSnapshotMaterializedRowScan != nil {
+					s.snapshotHooks.afterSnapshotMaterializedRowScan(snapshotPayloadScanObservation{
+						ReportedKeyByteCount: keyByteCount, ReportedPayloadByteCount: payloadByteCount,
+						KeyMaterialized: keyBytes != nil, PayloadMaterialized: payloadDB != nil,
+						MaterializedKeyBytes: len(keyBytes), MaterializedPayloadBytes: len(payloadDB),
+					})
+				}
+				if keyByteCount < 0 || keyByteCount > s.maxBytesPerSnapshotRow() || payloadByteCount < 0 || payloadByteCount > physicalPayloadLimit {
+					liveRows.Close()
+					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "row_decoded_body_bytes", Actual: max(keyByteCount, payloadByteCount), Limit: s.maxBytesPerSnapshotRow()}
+				}
+				if keyBytes == nil || payloadDB == nil {
+					liveRows.Close()
+					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot payload transfer is invalid")
 				}
 				if s.snapshotHooks != nil && s.snapshotHooks.afterSnapshotRowRead != nil {
 					if err := s.snapshotHooks.afterSnapshotRowRead(ctx); err != nil {
@@ -368,37 +732,89 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, sn
 				payloadWire, err := s.canonicalizeWirePayload(info.schemaName, info.tableName, payloadDB)
 				if err != nil {
 					liveRows.Close()
-					return 0, 0, highWater, err
+					if strings.Contains(err.Error(), "database value must be finite") {
+						return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot payload integrity mismatch: database value must be finite")
+					}
+					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot payload is invalid")
+				}
+				payloadObject, err := jcs.DecodeObjectLossless(payloadWire)
+				if err != nil || len(payloadObject) != len(contract.Columns) {
+					liveRows.Close()
+					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot payload is invalid")
+				}
+				for _, column := range contract.Columns {
+					value, ok := payloadObject[column.Name]
+					if !ok || validateGenerationWireValue(column, value) != nil {
+						liveRows.Close()
+						return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot payload is invalid")
+					}
 				}
 				key, err := wireSyncKeyFromBytes(info, keyBytes)
 				if err != nil {
 					liveRows.Close()
-					return 0, 0, highWater, err
+					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot key is invalid")
 				}
-				wire, err := json.Marshal(SnapshotRow{Schema: info.schemaName, Table: info.tableName, Key: key, RowVersion: bundleSeq, Payload: payloadWire})
+				if len(contract.SyncKeyColumns) != 1 {
+					liveRows.Close()
+					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot key contract is invalid")
+				}
+				keyName := contract.SyncKeyColumns[0]
+				keyValue, keyOK := key[keyName]
+				payloadKey, payloadOK := payloadObject[keyName]
+				keyCanonical, keyErr := jcs.Marshal(keyValue)
+				payloadCanonical, payloadErr := jcs.Marshal(payloadKey)
+				if !keyOK || !payloadOK || keyErr != nil || payloadErr != nil || string(keyCanonical) != string(payloadCanonical) {
+					liveRows.Close()
+					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot key does not match payload")
+				}
+				if bundleSeq <= 0 || bundleSeq > snapshotBundleSeq {
+					liveRows.Close()
+					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot row version is outside the pinned checkpoint")
+				}
+				nextRows := rowCount + int64(len(batch)) + 1
+				// One canonical payload serves the expanded size, the logical size and the hash frame.
+				encoding, err := encodeStagedSnapshotRow(stagedTable, keyCanonical, bundleSeq, payloadObject)
+				if err != nil || encoding.expandedBytes > s.maxBytesPerSnapshotRow() {
+					liveRows.Close()
+					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "row_decoded_body_bytes", Actual: encoding.expandedBytes, Limit: s.maxBytesPerSnapshotRow()}
+				}
+				if stagedTable.index < 0 || !bytes.HasPrefix(payloadWire, []byte("{")) {
+					liveRows.Close()
+					return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot row cannot be compact encoded")
+				}
+				logicalBytes := encoding.parts.logicalByteCount()
+				group := snapshotRowGroup(stagedTable.index, nextRows, []any{keyValue}, bundleSeq, payloadWire)
+				// false is the longer JSON literal, so this proves that the row can fit
+				// even when it is the final row in the snapshot.
+				body, err := json.Marshal(CompactSnapshotChunkResponse{Rows: []CompactRowGroup{group}, NextRowOrdinal: nextRows, LogicalByteCount: logicalBytes, HasMore: false})
 				if err != nil {
 					liveRows.Close()
-					return 0, 0, highWater, fmt.Errorf("encode snapshot row wire form: %w", err)
+					return 0, 0, highWater, fmt.Errorf("encode compact snapshot body: %w", err)
 				}
-				wireBytes := int64(len(wire))
-				if wireBytes > s.maxBytesPerSnapshotRow() {
+				if int64(len(body)) > s.maxBytesPerSnapshotChunk() {
 					liveRows.Close()
-					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "row_byte_count", Actual: wireBytes, Limit: s.maxBytesPerSnapshotRow()}
+					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "row_decoded_body_bytes", Actual: int64(len(body)), Limit: s.maxBytesPerSnapshotChunk()}
 				}
-				if len(batch) > 0 && batchBytes+wireBytes > s.config.SnapshotMaterializationBatchBytes {
+				if len(batch) > 0 && batchBytes+logicalBytes > s.config.tuning.snapshotMaterializationBatchBytes {
 					break
 				}
-				nextRows, nextBytes := rowCount+int64(len(batch))+1, byteCount+batchBytes+wireBytes
+				nextBytes := byteCount + batchBytes + logicalBytes
 				if limit := s.maxRowsPerSnapshotSession(); limit > 0 && nextRows > limit {
 					liveRows.Close()
 					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "row_count", Actual: nextRows, Limit: limit}
 				}
 				if limit := s.maxBytesPerSnapshotSession(); limit > 0 && nextBytes > limit {
 					liveRows.Close()
-					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "byte_count", Actual: nextBytes, Limit: limit}
+					return 0, 0, highWater, &SnapshotSessionLimitExceededError{Dimension: "logical_byte_count", Actual: nextBytes, Limit: limit}
 				}
-				batch = append(batch, snapshotMaterializedRow{rowOrdinal: nextRows, tableID: info.tableID, keyBytes: append([]byte(nil), keyBytes...), bundleSeq: bundleSeq, payloadWire: append([]byte(nil), payloadWire...), wireByteCount: wireBytes})
-				batchBytes += wireBytes
+				// Only a row committed to the batch is hashed; one read past the batch byte limit above
+				// is read again, and hashed then, on the next page.
+				if err := hash.addCanonical(encoding.parts); err != nil {
+					liveRows.Close()
+					return 0, 0, highWater, fmt.Errorf("hash snapshot row: %w", err)
+				}
+				batch = append(batch, snapshotMaterializedRow{rowOrdinal: nextRows, tableID: info.tableID, keyBytes: append([]byte(nil), keyBytes...), bundleSeq: bundleSeq, payloadWire: append([]byte(nil), payloadWire...), wireByteCount: logicalBytes})
+				batchBytes += logicalBytes
 			}
 			if err := liveRows.Err(); err != nil {
 				liveRows.Close()
@@ -436,17 +852,23 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, sn
 			if batchBytes > highWater.bytes {
 				highWater.bytes = batchBytes
 			}
-			if len(batch) < s.config.SnapshotMaterializationBatchRows && batchBytes < s.config.SnapshotMaterializationBatchBytes {
+			if len(batch) < s.config.tuning.snapshotMaterializationBatchRows && batchBytes < s.config.tuning.snapshotMaterializationBatchBytes {
 				continue
 			}
 		}
 	}
 	var stateCount int64
-	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM sync.row_state WHERE user_pk=$1 AND deleted=FALSE`, userPK).Scan(&stateCount); err != nil {
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sync.row_state
+		WHERE user_pk=$1
+		  AND deleted=FALSE
+		  AND table_id=ANY($2::integer[])
+	`, userPK, activeTableIDs).Scan(&stateCount); err != nil {
 		return 0, 0, highWater, fmt.Errorf("count snapshot row_state: %w", err)
 	}
 	if rowCount != stateCount {
-		return 0, 0, highWater, fmt.Errorf("snapshot integrity mismatch: materialized %d rows but live row_state contains %d", rowCount, stateCount)
+		return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot row state integrity mismatch")
 	}
 	// Each registered table count must also be represented by the exact row_state join.
 	var allBusinessRows int64
@@ -460,16 +882,16 @@ func (s *SyncService) materializeSnapshotRows(ctx context.Context, tx pgx.Tx, sn
 		allBusinessRows += n
 	}
 	if rowCount != allBusinessRows {
-		return 0, 0, highWater, fmt.Errorf("snapshot integrity mismatch: materialized %d rows but business tables contain %d", rowCount, allBusinessRows)
+		return 0, 0, highWater, projectionError(GenerationProjectionIntegrityError, "snapshot", "visible snapshot business row integrity mismatch")
 	}
 	return rowCount, byteCount, highWater, nil
 }
 
-func (s *SyncService) GetSnapshotChunk(ctx context.Context, actor Actor, snapshotID string, afterRowOrdinal int64, maxRows int, maxBytes int64) (_ *SnapshotChunkResponse, err error) {
+func (s *SyncService) GetSnapshotChunk(ctx context.Context, actor Actor, proof SchemaGenerationProof, snapshotID string, afterRowOrdinal int64, maxRows int, maxBytes int64) (_ *SnapshotChunkResponse, err error) {
 	if err := rejectRetryableCallbackContext(ctx, "GetSnapshotChunk"); err != nil {
 		return nil, err
 	}
-	response, release, err := s.getSnapshotChunkWithLease(ctx, actor, snapshotID, afterRowOrdinal, maxRows, maxBytes)
+	response, release, err := s.getSnapshotChunkWithLease(ctx, actor, proof, snapshotID, afterRowOrdinal, maxRows, maxBytes)
 	if release != nil {
 		defer release()
 	}
@@ -540,8 +962,14 @@ func (o *snapshotChunkObservation) finish(s *SyncService, actor Actor, snapshotI
 	s.logger.Info("Snapshot chunk selection completed", attrs...)
 }
 
-func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor, snapshotID string, afterRowOrdinal int64, maxRows int, maxBytes int64) (_ *SnapshotChunkResponse, release func(), err error) {
-	done, err := s.beginOperation()
+func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor, proof SchemaGenerationProof, snapshotID string, afterRowOrdinal int64, maxRows int, maxBytes int64) (_ *SnapshotChunkResponse, release func(), err error) {
+	if err := s.validateClientActor(actor, true); err != nil {
+		return nil, nil, err
+	}
+	if err := validateSchemaGenerationProof(proof); err != nil {
+		return nil, nil, err
+	}
+	done, err := s.beginOperation(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -561,28 +989,27 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 			release()
 		}
 	}()
-	if err := s.validateClientActor(actor, false); err != nil {
+	view, err := s.resolveRequestGeneration(ctx, actor, proof)
+	if err != nil {
 		return nil, release, err
 	}
-	if snapshotID == "" {
-		return nil, release, &SnapshotChunkInvalidError{Message: "snapshot_id must be provided"}
+	selection, err := selectionFromResolvedGeneration(proof, view)
+	if err != nil {
+		return nil, release, err
 	}
-	if afterRowOrdinal < 0 {
-		return nil, release, &SnapshotChunkInvalidError{Message: "after_row_ordinal must be >= 0"}
+	effectiveMaxRows, effectiveMaxBytes, err := s.snapshotChunkLimits(snapshotID, afterRowOrdinal, maxRows, maxBytes)
+	if err != nil {
+		return nil, release, err
 	}
-	if maxRows <= 0 {
-		return nil, release, &SnapshotChunkInvalidError{Message: "max_rows must be > 0"}
+	if err := withOriginTransaction(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		_, _, err := validateSnapshotSessionAccess(ctx, tx, actor, proof, snapshotID)
+		return err
+	}); err != nil {
+		return nil, release, err
 	}
-	if maxBytes <= 0 {
-		return nil, release, &SnapshotChunkInvalidError{Message: "max_bytes must be > 0"}
-	}
-	effectiveMaxRows := maxRows
-	if effectiveMaxRows > s.maxRowsPerSnapshotChunk() {
-		effectiveMaxRows = s.maxRowsPerSnapshotChunk()
-	}
-	effectiveMaxBytes := maxBytes
-	if effectiveMaxBytes > s.maxBytesPerSnapshotChunk() {
-		effectiveMaxBytes = s.maxBytesPerSnapshotChunk()
+	physicalStoredPayloadLimit, err := physicalStoredWirePayloadByteLimit(s.maxBytesPerSnapshotRow())
+	if err != nil {
+		return nil, release, fmt.Errorf("derive retained snapshot payload transfer limit: %w", err)
 	}
 	observation := snapshotChunkObservation{
 		requestedMaxRows:  maxRows,
@@ -605,28 +1032,10 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 	observation.selectionStartedAt = time.Now()
 
 	var resp *SnapshotChunkResponse
-	err = pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
-		var (
-			sessionUserID     string
-			snapshotBundleSeq int64
-			expired           bool
-		)
-		if err := tx.QueryRow(ctx, `
-			SELECT us.user_id, ss.snapshot_bundle_seq, ss.expires_at <= transaction_timestamp()
-			FROM sync.snapshot_sessions AS ss
-			JOIN sync.user_state AS us ON us.user_pk = ss.user_pk
-			WHERE ss.snapshot_id = $1::uuid
-		`, snapshotID).Scan(&sessionUserID, &snapshotBundleSeq, &expired); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return &SnapshotSessionNotFoundError{SnapshotID: snapshotID}
-			}
-			return fmt.Errorf("query snapshot session: %w", err)
-		}
-		if sessionUserID != actor.UserID {
-			return &SnapshotSessionForbiddenError{SnapshotID: snapshotID}
-		}
-		if expired {
-			return &SnapshotSessionExpiredError{SnapshotID: snapshotID}
+	err = withOriginTransaction(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly, DeferrableMode: pgx.NotDeferrable}, func(tx pgx.Tx) error {
+		_, snapshotBundleSeq, err := validateSnapshotSessionAccess(ctx, tx, actor, proof, snapshotID)
+		if err != nil {
+			return err
 		}
 		if s.snapshotHooks != nil && s.snapshotHooks.afterChunkSessionRead != nil {
 			if err := s.snapshotHooks.afterChunkSessionRead(ctx); err != nil {
@@ -635,78 +1044,31 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 		}
 
 		queryRows, err := tx.Query(ctx, `
-			SELECT row_ordinal, table_id, key_bytes, bundle_seq, payload_wire, wire_byte_count
+			SELECT
+				row_ordinal,
+				table_id,
+				octet_length(key_bytes),
+				CASE WHEN octet_length(key_bytes) <= $4 THEN key_bytes END,
+				bundle_seq,
+				octet_length(payload_wire::text),
+				CASE WHEN octet_length(payload_wire::text) <= $5 THEN payload_wire END,
+				wire_byte_count
 			FROM sync.snapshot_session_rows
 			WHERE snapshot_id = $1::uuid
 			  AND row_ordinal > $2
 			ORDER BY row_ordinal
 			LIMIT $3
-		`, snapshotID, afterRowOrdinal, effectiveMaxRows+1)
+		`, snapshotID, afterRowOrdinal, effectiveMaxRows+1, s.maxBytesPerSnapshotRow(), physicalStoredPayloadLimit)
 		if err != nil {
 			return fmt.Errorf("query snapshot chunk rows: %w", err)
 		}
 		s.snapshotMetrics.chunkQueries.Add(1)
 		defer queryRows.Close()
 
-		chunkRows := make([]SnapshotRow, 0, effectiveMaxRows)
-		var chunkBytes int64
-		hasMore := false
-		nextRowOrdinal := afterRowOrdinal
-		for queryRows.Next() {
-			var (
-				row           SnapshotRow
-				tableID       int32
-				keyBytes      []byte
-				rowOrdinal    int64
-				wireByteCount int64
-			)
-			if err := queryRows.Scan(&rowOrdinal, &tableID, &keyBytes, &row.RowVersion, &row.Payload, &wireByteCount); err != nil {
-				return fmt.Errorf("scan snapshot chunk row: %w", err)
-			}
-			candidateRetainedRows := int64(len(chunkRows) + 1)
-			candidateRetainedBytes := chunkBytes + wireByteCount
-			if candidateRetainedRows > observation.retainedRowsHighWater {
-				observation.retainedRowsHighWater = candidateRetainedRows
-			}
-			if candidateRetainedBytes > observation.retainedBytesHighWater {
-				observation.retainedBytesHighWater = candidateRetainedBytes
-			}
-			if len(chunkRows) >= effectiveMaxRows || chunkBytes+wireByteCount > effectiveMaxBytes {
-				hasMore = true
-				if len(chunkRows) == 0 {
-					return &SnapshotChunkTooSmallError{RequiredByteCount: wireByteCount}
-				}
-				break
-			}
-			info, err := s.tableInfoForID(tableID)
-			if err != nil {
-				return err
-			}
-			row.Schema = info.schemaName
-			row.Table = info.tableName
-			row.Key, err = wireSyncKeyFromBytes(info, keyBytes)
-			if err != nil {
-				return fmt.Errorf("decode snapshot chunk row key: %w", err)
-			}
-			chunkRows = append(chunkRows, row)
-			chunkBytes += wireByteCount
-			observation.selectedRowsHighWater = int64(len(chunkRows))
-			observation.selectedBytesHighWater = chunkBytes
-			nextRowOrdinal = rowOrdinal
-		}
-		if err := queryRows.Err(); err != nil {
-			return fmt.Errorf("iterate snapshot chunk rows: %w", err)
-		}
-
 		resp = &SnapshotChunkResponse{
-			SnapshotID:        snapshotID,
-			SnapshotBundleSeq: snapshotBundleSeq,
-			Rows:              chunkRows,
-			NextRowOrdinal:    nextRowOrdinal,
-			HasMore:           hasMore,
-			ByteCount:         chunkBytes,
+			SnapshotID: snapshotID, SnapshotBundleSeq: snapshotBundleSeq, NextRowOrdinal: afterRowOrdinal,
 		}
-		return nil
+		return s.selectSnapshotChunkRows(ctx, queryRows, selection, resp, effectiveMaxRows, effectiveMaxBytes, physicalStoredPayloadLimit, &observation)
 	})
 	if err != nil {
 		return nil, release, err
@@ -717,37 +1079,39 @@ func (s *SyncService) getSnapshotChunkWithLease(ctx context.Context, actor Actor
 	return resp, release, nil
 }
 
-func (s *SyncService) DeleteSnapshotSession(ctx context.Context, actor Actor, snapshotID string) (err error) {
+func (s *SyncService) DeleteSnapshotSession(ctx context.Context, actor Actor, proof SchemaGenerationProof, snapshotID string) (err error) {
 	if err := rejectRetryableCallbackContext(ctx, "DeleteSnapshotSession"); err != nil {
 		return err
 	}
-	done, err := s.beginOperation()
+	if err := s.validateClientActor(actor, true); err != nil {
+		return err
+	}
+	if err := validateSchemaGenerationProof(proof); err != nil {
+		return err
+	}
+	done, err := s.beginOperation(ctx)
 	if err != nil {
 		return err
 	}
 	defer done()
-	if err := s.validateClientActor(actor, false); err != nil {
+	if _, err := s.resolveRequestGeneration(ctx, actor, proof); err != nil {
 		return err
 	}
 	if snapshotID == "" {
 		return &SnapshotChunkInvalidError{Message: "snapshot_id must be provided"}
 	}
 
-	err = pgx.BeginTxFunc(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
-		var sessionUserID string
-		if err := tx.QueryRow(ctx, `
-			SELECT us.user_id
-			FROM sync.snapshot_sessions AS ss
-			JOIN sync.user_state AS us ON us.user_pk = ss.user_pk
-			WHERE ss.snapshot_id = $1::uuid
-		`, snapshotID).Scan(&sessionUserID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return &SnapshotSessionNotFoundError{SnapshotID: snapshotID}
-			}
-			return fmt.Errorf("query snapshot session for delete: %w", err)
+	err = withOriginTransaction(ctx, s.pool, syncMutationTxOptions(), func(tx pgx.Tx) error {
+		if err := s.admitScopeTransaction(ctx, tx, ScopeTransactionOperation{ScopeID: actor.UserID, Kind: ScopeTransactionSnapshotRetire, SourceID: actor.SourceID}); err != nil {
+			return err
 		}
-		if sessionUserID != actor.UserID {
-			return &SnapshotSessionForbiddenError{SnapshotID: snapshotID}
+		if _, _, err := validateSnapshotSessionAccessForUpdate(ctx, tx, actor, proof, snapshotID); err != nil {
+			return err
+		}
+		if s.snapshotHooks != nil && s.snapshotHooks.afterDeleteSessionRead != nil {
+			if err := s.snapshotHooks.afterDeleteSessionRead(ctx); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE sync.snapshot_sessions SET expires_at=LEAST(expires_at, transaction_timestamp()) WHERE snapshot_id=$1::uuid`, snapshotID); err != nil {
 			return fmt.Errorf("retire snapshot session: %w", err)
@@ -758,4 +1122,77 @@ func (s *SyncService) DeleteSnapshotSession(ctx context.Context, actor Actor, sn
 		s.requestSnapshotCleanup("explicit_delete")
 	}
 	return err
+}
+
+func validateSnapshotSessionAccess(ctx context.Context, tx pgx.Tx, actor Actor, proof SchemaGenerationProof, snapshotID string) (int64, int64, error) {
+	return validateSnapshotSessionAccessWithLock(ctx, tx, actor, proof, snapshotID, false)
+}
+
+func validateSnapshotSessionAccessForUpdate(ctx context.Context, tx pgx.Tx, actor Actor, proof SchemaGenerationProof, snapshotID string) (int64, int64, error) {
+	return validateSnapshotSessionAccessWithLock(ctx, tx, actor, proof, snapshotID, true)
+}
+
+func validateSnapshotSessionAccessWithLock(ctx context.Context, tx pgx.Tx, actor Actor, proof SchemaGenerationProof, snapshotID string, forUpdate bool) (int64, int64, error) {
+	var (
+		sessionUserID      string
+		sessionUserPK      int64
+		sessionSourceID    string
+		storedGenerationID int32
+		storedFingerprint  string
+		snapshotBundleSeq  int64
+		expired            bool
+	)
+	query := `
+		SELECT us.user_id, ss.user_pk, ss.source_id, ss.schema_generation_id, ss.schema_generation_fingerprint,
+		       ss.snapshot_bundle_seq, ss.expires_at <= transaction_timestamp()
+		FROM sync.snapshot_sessions AS ss
+		JOIN sync.user_state AS us ON us.user_pk = ss.user_pk
+		WHERE ss.snapshot_id = $1::uuid
+	`
+	if forUpdate {
+		query += ` FOR UPDATE OF ss`
+	}
+	if err := tx.QueryRow(ctx, query, snapshotID).Scan(&sessionUserID, &sessionUserPK, &sessionSourceID, &storedGenerationID, &storedFingerprint, &snapshotBundleSeq, &expired); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, 0, &SnapshotSessionNotFoundError{SnapshotID: snapshotID}
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+			return 0, 0, &SnapshotChunkInvalidError{Message: "snapshot_id must be a UUID"}
+		}
+		return 0, 0, fmt.Errorf("query snapshot session: %w", err)
+	}
+	if sessionUserID != actor.UserID || sessionSourceID != actor.SourceID {
+		return 0, 0, &SnapshotSessionForbiddenError{SnapshotID: snapshotID}
+	}
+	if expired {
+		return 0, 0, &SnapshotSessionExpiredError{SnapshotID: snapshotID}
+	}
+	if err := validateSnapshotSessionGeneration(SchemaGenerationID(storedGenerationID), storedFingerprint, proof); err != nil {
+		return 0, 0, err
+	}
+	source, err := loadSourceStateRow(ctx, tx, sessionUserPK, actor.SourceID, forUpdate)
+	if err != nil {
+		return 0, 0, err
+	}
+	binding, err := loadSourceGenerationBindingRow(ctx, tx, sessionUserPK, actor.SourceID, forUpdate)
+	if err != nil {
+		return 0, 0, err
+	}
+	if binding == nil {
+		return 0, 0, sourceGenerationError(SourceGenerationStateCorrupt, proof.ID, 0, "source_generation_binding", "source generation state is corrupt")
+	}
+	if err := validateBindingRow(binding, proof.ID); err != nil {
+		return 0, 0, err
+	}
+	if source == nil {
+		return 0, 0, sourceGenerationError(SourceGenerationStateCorrupt, proof.ID, binding.generationID, "source_state", "source generation state is corrupt")
+	}
+	if err := requireBindingPair(binding, proof); err != nil {
+		return 0, 0, err
+	}
+	if source.State == sourceStateRetired {
+		return 0, 0, &SourceRetiredError{UserID: actor.UserID, SourceID: actor.SourceID, ReplacedBySourceID: source.ReplacedBySourceID}
+	}
+	return sessionUserPK, snapshotBundleSeq, nil
 }

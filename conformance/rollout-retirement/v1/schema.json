@@ -1,0 +1,304 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://go-oversync.dev/conformance/rollout-retirement/v1/schema.json",
+  "$defs": {
+    "retired-client.json": {
+      "type": "object",
+      "required": [
+        "version",
+        "cases"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "operation",
+              "status",
+              "error",
+              "retryable",
+              "remediation",
+              "requests"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "operation": {
+                "type": "string"
+              },
+              "status": {
+                "type": "integer",
+                "enum": [
+                  426,
+                  503
+                ]
+              },
+              "error": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "remediation": {
+                "type": "string"
+              },
+              "requests": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    },
+    "http.json": {
+      "type": "object",
+      "required": [
+        "version",
+        "cases"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "method",
+              "path",
+              "body",
+              "status",
+              "error",
+              "retryable",
+              "remediation",
+              "unauthenticated_status"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "method": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              },
+              "status": {
+                "type": "integer",
+                "enum": [
+                  426,
+                  503
+                ]
+              },
+              "error": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "remediation": {
+                "type": "string"
+              },
+              "unauthenticated_status": {
+                "type": "integer",
+                "enum": [
+                  401
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "intent.json": {
+      "type": "object",
+      "required": [
+        "version",
+        "cases"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "initial_state",
+              "events",
+              "requests_after_retirement",
+              "outcome",
+              "preserve"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "initial_state": {
+                "type": "string"
+              },
+              "events": {
+                "type": "array"
+              },
+              "requests_after_retirement": {
+                "type": "integer"
+              },
+              "outcome": {
+                "type": "string"
+              },
+              "preserve": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      }
+    },
+    "boundaries.json": {
+      "type": "object",
+      "required": [
+        "version",
+        "cases"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "boundary",
+              "status",
+              "error",
+              "retryable",
+              "remediation",
+              "preserve"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "boundary": {
+                "type": "string"
+              },
+              "status": {
+                "type": "integer",
+                "enum": [
+                  426,
+                  503
+                ]
+              },
+              "error": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "remediation": {
+                "type": "string"
+              },
+              "preserve": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      }
+    },
+    "journeys.json": {
+      "type": "object",
+      "required": [
+        "version",
+        "cases"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "table",
+              "old_generation",
+              "supported_generation",
+              "pending_outcome",
+              "empty_outcome",
+              "retired_error",
+              "events"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "table": {
+                "type": "boolean"
+              },
+              "old_generation": {
+                "type": "integer"
+              },
+              "supported_generation": {
+                "type": "integer"
+              },
+              "pending_outcome": {
+                "type": "string"
+              },
+              "empty_outcome": {
+                "type": "string"
+              },
+              "retired_error": {
+                "type": "string"
+              },
+              "events": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

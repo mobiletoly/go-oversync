@@ -69,15 +69,16 @@ func newAuditMultiServiceFixture(
 	})
 
 	for i := range fixture.services {
-		config := &ServiceConfig{
-			MaxSupportedSchemaVersion: 1,
-			AppName:                   fmt.Sprintf("audit-concurrency-service-%d", i+1),
-			UploadLockTimeout:         uploadLockTimeout,
+		config := &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+			{Schema: fixture.schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		}), AppName: fmt.Sprintf("audit-concurrency-service-%d", i+1),
+			UploadLockTimeout: uploadLockTimeout,
 			RegisteredTables: []RegisteredTable{
 				{Schema: fixture.schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			},
+			RegisteredTableCatalogRevision: 1,
 		}
-		service, err := NewRuntimeService(fixture.servicePools[i], config, integrationTestLogger(slog.LevelWarn))
+		service, err := newTestRuntimeService(fixture.servicePools[i], config, integrationTestLogger(slog.LevelWarn))
 		require.NoError(t, err)
 		require.NoError(t, service.Bootstrap(ctx))
 		fixture.services[i] = service
@@ -138,28 +139,22 @@ func (f *auditMultiServiceFixture) userRow(t *testing.T, id uuid.UUID, name stri
 	}
 }
 
-func (f *auditMultiServiceFixture) stagePush(
+func (f *auditMultiServiceFixture) directPushRequest(
 	t *testing.T,
 	ctx context.Context,
 	service *SyncService,
 	actor Actor,
 	row PushRequestRow,
-) *PushSessionCreateResponse {
+) *OneShotPushRequest {
 	t.Helper()
 
-	created, err := service.CreatePushSession(ctx, actor, &PushSessionCreateRequest{
+	initializationID := resolveConnectForPush(t, ctx, service, actor, true)
+	return &OneShotPushRequest{
 		SourceBundleID:       1,
-		PlannedRowCount:      1,
-		CanonicalRequestHash: mustCanonicalPushRequestHash(t, []PushRequestRow{row}),
-	})
-	require.NoError(t, err)
-	require.Equal(t, "staging", created.Status)
-	_, err = service.UploadPushChunk(ctx, actor, created.PushID, &PushSessionChunkRequest{
-		StartRowOrdinal: 0,
-		Rows:            []PushRequestRow{row},
-	})
-	require.NoError(t, err)
-	return created
+		CanonicalRequestHash: mustCanonicalPushRequestHash(t, service, []PushRequestRow{row}),
+		InitializationID:     initializationID,
+		Rows:                 []PushRequestRow{row},
+	}
 }
 
 func (f *auditMultiServiceFixture) requireBusinessRowCount(
@@ -288,7 +283,7 @@ func waitForAuditAdvisoryLockWaiters(t *testing.T, ctx context.Context, pool *pg
 
 type auditCommitResult struct {
 	index    int
-	response *PushSessionCommitResponse
+	response *Bundle
 	err      error
 }
 
@@ -317,26 +312,30 @@ func TestAuditConcurrency_TwoServicesSerializeSameScopePushes(t *testing.T) {
 		{UserID: scopeID, SourceID: "writer-a"},
 		{UserID: scopeID, SourceID: "writer-b"},
 	}
-	sessions := []*PushSessionCreateResponse{
-		fixture.stagePush(t, ctx, fixture.services[0], actors[0], fixture.userRow(t, uuid.New(), "Same A")),
-		fixture.stagePush(t, ctx, fixture.services[1], actors[1], fixture.userRow(t, uuid.New(), "Same B")),
+	requests := []*OneShotPushRequest{
+		fixture.directPushRequest(t, ctx, fixture.services[0], actors[0], fixture.userRow(t, uuid.New(), "Same A")),
+		fixture.directPushRequest(t, ctx, fixture.services[1], actors[1], fixture.userRow(t, uuid.New(), "Same B")),
 	}
 
 	held := holdAuditScopeLock(t, ctx, fixture.controlPool, scopeID)
 	start := make(chan struct{})
-	results := make(chan auditCommitResult, len(sessions))
-	for i := range sessions {
+	results := make(chan auditCommitResult, len(requests))
+	for i := range requests {
 		go func(index int) {
 			<-start
-			response, err := fixture.services[index].CommitPushSession(ctx, actors[index], sessions[index].PushID)
-			results <- auditCommitResult{index: index, response: response, err: err}
+			response, err := fixture.services[index].PushOneShot(ctx, actors[index], testSchemaGenerationProofForService(fixture.services[index]), requests[index])
+			var bundle *Bundle
+			if response != nil {
+				bundle = response.Bundle
+			}
+			results <- auditCommitResult{index: index, response: bundle, err: err}
 		}(i)
 	}
 	close(start)
 	waitForAuditAdvisoryLockWaiters(t, ctx, fixture.controlPool, 2)
 	held.release(t, ctx)
 
-	commits := receiveAuditCommitResults(t, results, 2)
+	commits := receiveAuditCommitResults(t, results, len(requests))
 	bundleSeqs := make([]int64, 0, len(commits))
 	for _, commit := range commits {
 		require.NoError(t, commit.err)
@@ -359,9 +358,9 @@ func TestAuditConcurrency_TwoServicesProgressDifferentScopes(t *testing.T) {
 	for i := range actors {
 		mustInitializeEmptyScope(t, ctx, fixture.services[i], actors[i].UserID, actors[i].SourceID)
 	}
-	sessions := []*PushSessionCreateResponse{
-		fixture.stagePush(t, ctx, fixture.services[0], actors[0], fixture.userRow(t, uuid.New(), "Left")),
-		fixture.stagePush(t, ctx, fixture.services[1], actors[1], fixture.userRow(t, uuid.New(), "Right")),
+	requests := []*OneShotPushRequest{
+		fixture.directPushRequest(t, ctx, fixture.services[0], actors[0], fixture.userRow(t, uuid.New(), "Left")),
+		fixture.directPushRequest(t, ctx, fixture.services[1], actors[1], fixture.userRow(t, uuid.New(), "Right")),
 	}
 	held := []*auditHeldScopeLock{
 		holdAuditScopeLock(t, ctx, fixture.controlPool, actors[0].UserID),
@@ -369,12 +368,16 @@ func TestAuditConcurrency_TwoServicesProgressDifferentScopes(t *testing.T) {
 	}
 
 	start := make(chan struct{})
-	results := make(chan auditCommitResult, len(sessions))
-	for i := range sessions {
+	results := make(chan auditCommitResult, len(requests))
+	for i := range requests {
 		go func(index int) {
 			<-start
-			response, err := fixture.services[index].CommitPushSession(ctx, actors[index], sessions[index].PushID)
-			results <- auditCommitResult{index: index, response: response, err: err}
+			response, err := fixture.services[index].PushOneShot(ctx, actors[index], testSchemaGenerationProofForService(fixture.services[index]), requests[index])
+			var bundle *Bundle
+			if response != nil {
+				bundle = response.Bundle
+			}
+			results <- auditCommitResult{index: index, response: bundle, err: err}
 		}(i)
 	}
 	close(start)
@@ -383,7 +386,7 @@ func TestAuditConcurrency_TwoServicesProgressDifferentScopes(t *testing.T) {
 		lock.release(t, ctx)
 	}
 
-	commits := receiveAuditCommitResults(t, results, 2)
+	commits := receiveAuditCommitResults(t, results, len(requests))
 	for _, commit := range commits {
 		require.NoError(t, commit.err)
 		require.NotNil(t, commit.response)
@@ -402,21 +405,18 @@ func TestAuditConcurrency_BlockedScopeAllowsIndependentProgressCancellationAndRe
 	mustInitializeEmptyScope(t, ctx, fixture.services[0], blockedActor.UserID, blockedActor.SourceID)
 	mustInitializeEmptyScope(t, ctx, fixture.services[0], independentActor.UserID, independentActor.SourceID)
 
+	blockedRequest := fixture.directPushRequest(t, ctx, fixture.services[0], blockedActor, fixture.userRow(t, uuid.New(), "Blocked"))
 	held := holdAuditScopeLock(t, ctx, fixture.controlPool, blockedActor.UserID)
 	waitCtx, cancelWait := context.WithCancel(ctx)
 	waitResult := make(chan error, 1)
 	go func() {
-		_, err := fixture.services[0].CreatePushSession(waitCtx, blockedActor, &PushSessionCreateRequest{
-			SourceBundleID:       1,
-			PlannedRowCount:      1,
-			CanonicalRequestHash: strings.Repeat("0", 64),
-		})
+		_, err := fixture.services[0].PushOneShot(waitCtx, blockedActor, testSchemaGenerationProofForService(fixture.services[0]), blockedRequest)
 		waitResult <- err
 	}()
 	waitForAuditAdvisoryLockWaiters(t, ctx, fixture.controlPool, 1)
 
 	independentCtx, cancelIndependent := context.WithTimeout(ctx, 5*time.Second)
-	independentBundle, err := pushRowsViaSession(
+	independentBundle, err := pushRowsOneShot(
 		t,
 		independentCtx,
 		fixture.services[0],
@@ -443,7 +443,7 @@ func TestAuditConcurrency_BlockedScopeAllowsIndependentProgressCancellationAndRe
 	requireAuditMetadataIntegrity(t, ctx, fixture.controlPool)
 
 	held.release(t, ctx)
-	retriedBundle, err := pushRowsViaSession(
+	retriedBundle, err := pushRowsOneShot(
 		t,
 		ctx,
 		fixture.services[0],
@@ -459,8 +459,6 @@ func TestAuditConcurrency_BlockedScopeAllowsIndependentProgressCancellationAndRe
 	requireAuditMetadataIntegrity(t, ctx, fixture.controlPool)
 }
 
-// This desired-contract reproducer is intentionally red while scope-lock waiters pin every
-// connection in a small pool. Run it separately from the green Phase 4 concurrency group.
 func TestAuditConcurrencyContract_BlockedScopeWaitersDoNotStarveIndependentScope(t *testing.T) {
 	ctx := context.Background()
 	fixture := newAuditMultiServiceFixture(t, ctx, "starvation_contract", 2, 0)
@@ -469,27 +467,24 @@ func TestAuditConcurrencyContract_BlockedScopeWaitersDoNotStarveIndependentScope
 	mustInitializeEmptyScope(t, ctx, fixture.services[0], blockedActor.UserID, blockedActor.SourceID)
 	mustInitializeEmptyScope(t, ctx, fixture.services[0], independentActor.UserID, independentActor.SourceID)
 
+	blockedRequest := fixture.directPushRequest(t, ctx, fixture.services[0], blockedActor, fixture.userRow(t, uuid.New(), "Starved"))
 	held := holdAuditScopeLock(t, ctx, fixture.controlPool, blockedActor.UserID)
 	waitCtx, cancelWaiters := context.WithCancel(ctx)
 	waitResults := make(chan error, 2)
 	for range 2 {
 		go func() {
-			_, err := fixture.services[0].CreatePushSession(waitCtx, blockedActor, &PushSessionCreateRequest{
-				SourceBundleID:       1,
-				PlannedRowCount:      1,
-				CanonicalRequestHash: strings.Repeat("0", 64),
-			})
+			_, err := fixture.services[0].PushOneShot(waitCtx, blockedActor, testSchemaGenerationProofForService(fixture.services[0]), blockedRequest)
 			waitResults <- err
 		}()
 	}
-	waitForAuditAdvisoryLockWaiters(t, ctx, fixture.controlPool, 2)
+	waitForAuditAdvisoryLockWaiters(t, ctx, fixture.controlPool, 1)
+	require.Eventually(t, func() bool {
+		return fixture.servicePools[0].Stat().AcquiredConns() == 1
+	}, 5*time.Second, 10*time.Millisecond, "same-scope waiters must share one pool slot while blocked")
 
 	independentCtx, cancelIndependent := context.WithTimeout(ctx, 300*time.Millisecond)
-	independentResponse, independentErr := fixture.services[0].CreatePushSession(
-		independentCtx,
-		independentActor,
-		&PushSessionCreateRequest{SourceBundleID: 1, PlannedRowCount: 1, CanonicalRequestHash: strings.Repeat("0", 64)},
-	)
+	independentResponse, independentErr := pushRowsOneShot(t, independentCtx, fixture.services[0], independentActor, 1, []PushRequestRow{fixture.userRow(t, uuid.New(), "Independent")})
+
 	cancelIndependent()
 
 	cancelWaiters()
@@ -507,8 +502,7 @@ func TestAuditConcurrencyContract_BlockedScopeWaitersDoNotStarveIndependentScope
 	}, 5*time.Second, 10*time.Millisecond, "blocked-scope waiters leaked pool slots")
 	requireAuditMetadataIntegrity(t, ctx, fixture.controlPool)
 
-	t.Logf("independent scope result while both pool slots were advisory-lock waiters: response=%v error=%v", independentResponse, independentErr)
+	t.Logf("independent scope result while same-scope waiters shared one pool slot: response=%v error=%v", independentResponse, independentErr)
 	require.NoError(t, independentErr, "waiters for one blocked scope must not exhaust the pool or starve an independent scope")
 	require.NotNil(t, independentResponse)
-	require.Equal(t, "staging", independentResponse.Status)
 }

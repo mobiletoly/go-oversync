@@ -59,10 +59,9 @@ func runPushCycleInsertTest(t *testing.T, scenario string, tables []string) {
 			SyncKeyColumns: []string{"id"},
 		})
 	}
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-" + strings.ReplaceAll(scenario, "_", "-") + "-test",
-		RegisteredTables:          registeredTables,
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registeredTables, nil), AppName: "push-" + strings.ReplaceAll(scenario, "_", "-") + "-test",
+		RegisteredTables:               registeredTables,
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	actor := Actor{UserID: "push-" + scenario + "-user-" + suffix, SourceID: "device-a"}
@@ -76,7 +75,7 @@ func runPushCycleInsertTest(t *testing.T, scenario string, tables []string) {
 		nextTable := tables[(i+1)%len(tables)]
 		rows = append(rows, pushCycleInsertRow(t, schemaName, table, ids[table], nextTable+"_id", ids[nextTable]))
 	}
-	bundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, rows)
+	bundle, err := pushRowsOneShot(t, ctx, svc, actor, 1, rows)
 	require.NoError(t, err)
 	require.Len(t, bundle.Rows, len(tables))
 
@@ -182,12 +181,13 @@ func newPushUsersFixture(t *testing.T, ctx context.Context, schemaPrefix, appNam
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   appName,
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+	}), AppName: appName,
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	return &pushUsersFixture{
@@ -206,7 +206,7 @@ func (f *pushUsersFixture) actorWith(userPrefix, sourceID string) Actor {
 
 func (f *pushUsersFixture) push(t *testing.T, actor Actor, sourceBundleID int64, rows ...PushRequestRow) (*Bundle, error) {
 	t.Helper()
-	return pushRowsViaSession(t, f.ctx, f.svc, actor, sourceBundleID, rows)
+	return pushRowsOneShot(t, f.ctx, f.svc, actor, sourceBundleID, rows)
 }
 
 func (f *pushUsersFixture) userInsert(rowID uuid.UUID, name, email string) PushRequestRow {
@@ -291,24 +291,26 @@ func (f *pushUsersFixture) rowStateBundleSeq(t *testing.T, userID string, rowID 
 	return stateBundleSeq
 }
 
-func TestPushSessions_ConflictRejectsWholeBundle(t *testing.T) {
+func TestDirectPush_ConflictRejectsWholeBundle(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushUsersFixture(t, ctx, "push_conflict_", "push-conflict-test", "push-conflict-user-")
 	rowID := uuid.New()
-
 	_, err := fixture.push(t, fixture.actor, 1, fixture.userInsert(rowID, "Alice", "alice@example.com"))
 	require.NoError(t, err)
-
-	_, err = fixture.push(t, fixture.actor, 2, fixture.userUpdate(rowID, 999, "Alice 2", "alice2@example.com"))
-	var conflictErr *PushConflictError
-	require.ErrorAs(t, err, &conflictErr)
-	require.NotNil(t, conflictErr.Conflict)
-	require.NotContains(t, string(conflictErr.Conflict.ServerRow), `"_sync_scope_id"`)
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	acknowledgeRetainedOutcomeForTest(t, ctx, fixture.svc, fixture.actor, proof)
+	rows := []PushRequestRow{fixture.userUpdate(rowID, 999, "Alice 2", "alice2@example.com")}
+	rejected, err := fixture.svc.PushOneShot(ctx, fixture.actor, proof, &OneShotPushRequest{SourceBundleID: 2, CanonicalRequestHash: mustCanonicalPushRequestHash(t, fixture.svc, rows), Rows: rows})
+	require.NoError(t, err)
+	require.Equal(t, "rejected", rejected.Outcome.Status)
+	conflict := rejected.Outcome.Rejection.Conflict
+	require.NotNil(t, conflict)
+	require.NotContains(t, string(conflict.ServerRow), `"_sync_scope_id"`)
 	require.Equal(t, 1, fixture.bundleLogCount(t, fixture.actor.UserID))
 	require.Equal(t, "Alice", fixture.userName(t, rowID))
 }
 
-func TestPushSessions_AllowsSameVisibleSyncKeyForDifferentUsers(t *testing.T) {
+func TestDirectPush_AllowsSameVisibleSyncKeyForDifferentUsers(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushUsersFixture(t, ctx, "push_same_key_users_", "push-same-key-users-test", "push-same-key-user-a-")
 	rowID := uuid.New()
@@ -326,7 +328,7 @@ func TestPushSessions_AllowsSameVisibleSyncKeyForDifferentUsers(t *testing.T) {
 	require.Equal(t, "Bob", fixture.scopedUserName(t, actorB.UserID, rowID))
 }
 
-func TestPushSessions_WrongOwnerUpdateDeleteDoNotAffectAnotherUsersRow(t *testing.T) {
+func TestDirectPush_WrongOwnerUpdateDeleteDoNotAffectAnotherUsersRow(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushUsersFixture(t, ctx, "push_wrong_owner_conflict_", "push-wrong-scope-conflict-test", "push-owner-a-")
 	rowID := uuid.New()
@@ -336,21 +338,22 @@ func TestPushSessions_WrongOwnerUpdateDeleteDoNotAffectAnotherUsersRow(t *testin
 	_, err := fixture.push(t, actorA, 1, fixture.userInsert(rowID, "Owner A", "owner-a@example.com"))
 	require.NoError(t, err)
 
-	_, err = fixture.push(t, actorB, 1, fixture.userUpdate(rowID, 1, "Intruder", "intruder@example.com"))
-	var updateConflict *PushConflictError
-	require.ErrorAs(t, err, &updateConflict)
-	require.Equal(t, SyncKey{"id": rowID.String()}, updateConflict.Conflict.Key)
-
-	_, err = fixture.push(t, actorB, 1, fixture.userDelete(rowID, 1))
-	var deleteConflict *PushConflictError
-	require.ErrorAs(t, err, &deleteConflict)
-	require.Equal(t, SyncKey{"id": rowID.String()}, deleteConflict.Conflict.Key)
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	resolveConnectForPush(t, ctx, fixture.svc, actorB, false)
+	for i, row := range []PushRequestRow{fixture.userUpdate(rowID, 1, "Intruder", "intruder@example.com"), fixture.userDelete(rowID, 1)} {
+		rows := []PushRequestRow{row}
+		rejected, err := fixture.svc.PushOneShot(ctx, actorB, proof, &OneShotPushRequest{SourceBundleID: int64(i + 1), CanonicalRequestHash: mustCanonicalPushRequestHash(t, fixture.svc, rows), Rows: rows})
+		require.NoError(t, err)
+		require.Equal(t, "rejected", rejected.Outcome.Status)
+		require.Equal(t, SyncKey{"id": rowID.String()}, rejected.Outcome.Rejection.Conflict.Key)
+		acknowledgeRetainedOutcomeForTest(t, ctx, fixture.svc, actorB, proof)
+	}
 
 	require.Equal(t, "Owner A", fixture.scopedUserName(t, actorA.UserID, rowID))
 	require.Equal(t, 1, fixture.userRowCount(t, rowID))
 }
 
-func TestPushSessions_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
+func TestDirectPush_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushUsersFixture(t, ctx, "push_update_after_insert_", "push-update-after-insert-test", "push-update-after-insert-user-")
 	rowID := uuid.New()
@@ -359,6 +362,8 @@ func TestPushSessions_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(1), firstBundle.BundleSeq)
 
+	acknowledgeRetainedOutcomeForTest(t, ctx, fixture.svc, fixture.actor, testSchemaGenerationProofForService(fixture.svc))
+
 	secondBundle, err := fixture.push(t, fixture.actor, 2, fixture.userUpdate(rowID, 1, "Alice Updated", "alice-updated@example.com"))
 	require.NoError(t, err)
 	require.Equal(t, int64(2), secondBundle.BundleSeq)
@@ -366,7 +371,7 @@ func TestPushSessions_UpdateAfterInsertUsesCapturedRowStateKey(t *testing.T) {
 	require.Equal(t, "Alice Updated", fixture.userName(t, rowID))
 }
 
-func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t *testing.T) {
+func TestDirectPush_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -376,13 +381,15 @@ func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t 
 	require.NoError(t, resetTestBusinessSchema(ctx, pool, schemaName))
 	t.Cleanup(func() { _ = dropTestSchema(ctx, pool, schemaName) })
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-delete-cascade-test",
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsForRegisteredTables([]RegisteredTable{
+		{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
+		{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
+	}), AppName: "push-delete-cascade-test",
 		RegisteredTables: []RegisteredTable{
 			{Schema: schemaName, Table: "users", SyncKeyColumns: []string{"id"}},
 			{Schema: schemaName, Table: "posts", SyncKeyColumns: []string{"id"}},
 		},
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	userID := "push-delete-cascade-user-" + suffix
@@ -390,7 +397,7 @@ func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t 
 	userRowID := uuid.New()
 	postRowID := uuid.New()
 
-	insertBundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, []PushRequestRow{
+	insertBundle, err := pushRowsOneShot(t, ctx, svc, actor, 1, []PushRequestRow{
 		{
 			Schema:         schemaName,
 			Table:          "posts",
@@ -411,7 +418,9 @@ func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t 
 	require.NoError(t, err)
 	require.Equal(t, int64(1), insertBundle.BundleSeq)
 
-	deleteBundle, err := pushRowsViaSession(t, ctx, svc, actor, 2, []PushRequestRow{{
+	acknowledgeRetainedOutcomeForTest(t, ctx, svc, actor, testSchemaGenerationProofForService(svc))
+
+	deleteBundle, err := pushRowsOneShot(t, ctx, svc, actor, 2, []PushRequestRow{{
 		Schema:         schemaName,
 		Table:          "users",
 		Key:            SyncKey{"id": userRowID.String()},
@@ -457,21 +466,25 @@ func TestPushSessions_DeleteParentAfterInsertCascadesChildRowsAndUpdatesState(t 
 	require.Equal(t, int64(2), postState.rowVersion)
 }
 
-func TestPushSessions_AlreadyCommittedReturnsSameCommittedBundle(t *testing.T) {
+func TestDirectPush_AlreadyCommittedReturnsSameCommittedBundle(t *testing.T) {
 	ctx := context.Background()
 	fixture := newPushUsersFixture(t, ctx, "push_replay_", "push-replay-test", "push-replay-user-")
 	rowID := uuid.New()
 	rows := []PushRequestRow{fixture.userInsert(rowID, "Replay", "replay@example.com")}
 
-	firstBundle, err := fixture.push(t, fixture.actor, 1, rows...)
+	proof := testSchemaGenerationProofForService(fixture.svc)
+	initializationID := resolveConnectForPush(t, ctx, fixture.svc, fixture.actor, true)
+	req := &OneShotPushRequest{SourceBundleID: 1, CanonicalRequestHash: mustCanonicalPushRequestHash(t, fixture.svc, rows), InitializationID: initializationID, Rows: rows}
+	exact, err := fixture.svc.PushOneShot(ctx, fixture.actor, proof, req)
 	require.NoError(t, err)
-	replayBundle, err := fixture.push(t, fixture.actor, 1, rows...)
+	require.Equal(t, "committed", exact.Outcome.Status)
+	replay, err := fixture.svc.PushOneShot(ctx, fixture.actor, proof, req)
 	require.NoError(t, err)
-	requireBundlesSemanticallyEqual(t, firstBundle, replayBundle)
+	require.Equal(t, exact.encoded, replay.encoded)
 	require.Equal(t, 1, fixture.bundleLogCount(t, fixture.actor.UserID))
 }
 
-func TestPushSessions_AllowsSelfReferentialInsert(t *testing.T) {
+func TestDirectPush_AllowsSelfReferentialInsert(t *testing.T) {
 	ctx := context.Background()
 	logger := integrationTestLogger(slog.LevelWarn)
 	pool := newIntegrationTestPool(t, ctx)
@@ -497,18 +510,16 @@ func TestPushSessions_AllowsSelfReferentialInsert(t *testing.T) {
 		)`, schemaIdent, schemaIdent))
 	require.NoError(t, err)
 
-	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{
-		MaxSupportedSchemaVersion: 1,
-		AppName:                   "push-self-ref-test",
-		RegisteredTables: []RegisteredTable{
-			{Schema: schemaName, Table: "categories", SyncKeyColumns: []string{"id"}},
-		},
+	registered := []RegisteredTable{{Schema: schemaName, Table: "categories", SyncKeyColumns: []string{"id"}}}
+	svc := newBootstrappedIntegrationService(t, ctx, pool, &ServiceConfig{SchemaGenerations: testSchemaGenerationsFromDatabase(t, ctx, pool, registered, nil), AppName: "push-self-ref-test",
+		RegisteredTables:               registered,
+		RegisteredTableCatalogRevision: 1,
 	}, logger)
 
 	actor := Actor{UserID: "push-self-ref-user-" + suffix, SourceID: "device-a"}
 	rowID := uuid.New()
 
-	bundle, err := pushRowsViaSession(t, ctx, svc, actor, 1, []PushRequestRow{{
+	bundle, err := pushRowsOneShot(t, ctx, svc, actor, 1, []PushRequestRow{{
 		Schema:         schemaName,
 		Table:          "categories",
 		Key:            SyncKey{"id": rowID.String()},
@@ -524,7 +535,7 @@ func TestPushSessions_AllowsSelfReferentialInsert(t *testing.T) {
 	require.Equal(t, rowID, parentID)
 }
 
-func TestPushSessions_AllowsCycleInsert(t *testing.T) {
+func TestDirectPush_AllowsCycleInsert(t *testing.T) {
 	tests := []struct {
 		name   string
 		tables []string

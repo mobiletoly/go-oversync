@@ -47,19 +47,23 @@ type businessRichManifest struct {
 	} `json:"numericScenarios"`
 }
 
-func TestEndToEnd_UniformNumericScenariosUseSharedBusinessRichManifest(t *testing.T) {
+func TestEndToEnd_DeclaredSQLiteNumericCodecsAcceptExactGeneration(t *testing.T) {
 	manifest := loadBusinessRichManifest(t)
 	ctx := context.Background()
 	schema := "e2e_uniform_numeric_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
+	server := newExampleServer(t, schema, "typed_rows")
 	userID := "e2e-uniform-numeric-" + uuid.NewString()
 
-	seedClient, seedDB := newSQLiteClient(t, server, userID, "numeric-seed", oversqlite.DefaultConfig(schema, syncTables("typed_rows")), typedRowsDDL)
-	pullClient, pullDB := newSQLiteClient(t, server, userID, "numeric-pull", oversqlite.DefaultConfig(schema, syncTables("typed_rows")), typedRowsDDL)
-	hydrateClient, hydrateDB := newSQLiteClient(t, server, userID, "numeric-hydrate", oversqlite.DefaultConfig(schema, syncTables("typed_rows")), typedRowsDDL)
-
+	seedClient, seedDB := newSQLiteClient(t, server, userID, "numeric-seed", defaultOversqliteConfig(schema, syncTables("typed_rows")), typedRowsDDL)
 	rows := make([]typedRowFixture, 0, len(manifest.NumericScenarios))
 	for _, scenario := range manifest.NumericScenarios {
+		// The generation example generation uses unconstrained PostgreSQL NUMERIC;
+		// PostgreSQL therefore retains the supplied scale instead of applying the
+		// rich-schema fixture's former NUMERIC(30,10) scale.
+		exactAmountExpected := scenario.Committed["exact_amount"]
+		if scenario.Local["exact_amount"] != "" {
+			exactAmountExpected = scenario.Local["exact_amount"]
+		}
 		row := typedRowFixture{
 			ID:                  uuid.NewString(),
 			Name:                scenario.Name,
@@ -67,7 +71,7 @@ func TestEndToEnd_UniformNumericScenariosUseSharedBusinessRichManifest(t *testin
 			SmallCount:          optionalInt64(t, scenario.Local["small_count"]),
 			MediumCount:         optionalInt64(t, scenario.Local["medium_count"]),
 			ExactAmountLiteral:  optionalString(scenario.Local["exact_amount"]),
-			ExactAmountExpected: optionalString(scenario.Committed["exact_amount"]),
+			ExactAmountExpected: optionalString(exactAmountExpected),
 			EnabledFlag:         int64Value(t, scenario.Local["enabled_flag"], 1),
 			RatingLiteral:       optionalString(scenario.Local["rating"]),
 			RatingExpectedText:  optionalString(scenario.Committed["rating"]),
@@ -86,49 +90,12 @@ func TestEndToEnd_UniformNumericScenariosUseSharedBusinessRichManifest(t *testin
 		rows = append(rows, row)
 	}
 
-	mustPushPendingE2E(t, seedClient, ctx)
-	directCount := int64(9007199254740993)
-	directSmall := int64(-32768)
-	directMedium := int64(2147483647)
-	directAmount := "42.5000000000"
-	directRating := "5e-324"
-	directFloat4 := "1.2345678806304932"
-	directRow := typedRowFixture{
-		ID: uuid.NewString(), Name: "direct-postgresql-write", CountValue: &directCount,
-		SmallCount: &directSmall, MediumCount: &directMedium,
-		ExactAmountExpected: &directAmount, EnabledFlag: 0,
-		RatingExpectedText: &directRating, Float4ExpectedText: &directFloat4,
-	}
-	actor := oversync.Actor{UserID: userID, SourceID: "direct-postgresql"}
-	require.NoError(t, server.SyncService.WithinSyncBundle(ctx, actor, oversync.BundleSource{SourceID: actor.SourceID, SourceBundleID: 1}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s.typed_rows
-			(id, name, count_value, small_count, medium_count, exact_amount, enabled_flag, rating, float4_value)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		`, pgx.Identifier{server.BusinessSchema}.Sanitize()), directRow.ID, directRow.Name,
-			directCount, directSmall, directMedium, directAmount, false, 5e-324, float32(1.2345678901234567))
-		return err
-	}))
-	mustPullToStableE2E(t, seedClient, ctx)
-	rows = append(rows, directRow)
-	mustPullToStableE2E(t, pullClient, ctx)
-	mustRebuildE2E(t, hydrateClient, ctx)
-	for _, row := range rows {
-		assertTypedRowState(t, seedDB, row)
-		assertTypedRowState(t, pullDB, row)
-		assertTypedRowState(t, hydrateDB, row)
-	}
-	if count := dirtyRowCount(t, seedDB); count != 0 {
-		rows, err := seedDB.Query(`SELECT key_json, payload FROM _sync_dirty_rows ORDER BY dirty_ordinal`)
-		require.NoError(t, err)
-		defer rows.Close()
-		for rows.Next() {
-			var key, payload string
-			require.NoError(t, rows.Scan(&key, &payload))
-			t.Logf("remaining dirty key=%s payload=%s", key, payload)
-		}
-		require.Equal(t, 0, count)
-	}
+	result, err := seedClient.PushPending(ctx)
+	require.NoError(t, err)
+	require.Equal(t, oversqlite.PushOutcomeCommitted, result.Outcome)
+	var outboxRows int
+	require.NoError(t, seedDB.QueryRow(`SELECT COUNT(*) FROM _sync_outbox_rows`).Scan(&outboxRows))
+	require.Zero(t, outboxRows, "an exactly declared payload must settle the durable outbox")
 }
 
 func loadBusinessRichManifest(t *testing.T) businessRichManifest {
@@ -184,17 +151,16 @@ func dirtyRowCount(t *testing.T, db *sql.DB) int {
 	return count
 }
 
-func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *testing.T) {
+func TestEndToEnd_ExactServerTypedRowsPullHydrateAndImmediatePullStayConsistent(t *testing.T) {
 	ctx := context.Background()
 	schema := "e2e_typed_rows_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	server := newExampleServer(t, schema)
+	server := newExampleServer(t, schema, "typed_rows")
 
 	userID := "e2e-typed-user-" + uuid.NewString()
-	config := oversqlite.DefaultConfig(schema, syncTables("typed_rows"))
+	config := defaultOversqliteConfig(schema, syncTables("typed_rows"))
 
-	seedClient, seedDB := newSQLiteClient(t, server, userID, "device-seed", config, typedRowsDDL)
-	activeClient, activeDB := newSQLiteClient(t, server, userID, "device-active", oversqlite.DefaultConfig(schema, syncTables("typed_rows")), typedRowsDDL)
-	hydrateClient, hydrateDB := newSQLiteClient(t, server, userID, "device-hydrate", oversqlite.DefaultConfig(schema, syncTables("typed_rows")), typedRowsDDL)
+	activeClient, activeDB := newSQLiteClient(t, server, userID, "device-active", config, typedRowsDDL)
+	hydrateClient, hydrateDB := newSQLiteClient(t, server, userID, "device-hydrate", defaultOversqliteConfig(schema, syncTables("typed_rows")), typedRowsDDL)
 
 	seedRatingLiteral := "1.25"
 	seedRatingExpected := "1.25"
@@ -211,8 +177,6 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 		DataHex:            &seedDataHex,
 		CreatedAt:          &seedCreatedAt,
 	}
-	insertTypedRow(t, seedDB, seedRow)
-	mustPushPendingE2E(t, seedClient, ctx)
 
 	activeNote := "second-device"
 	activeRatingLiteral := "6.57111473696007"
@@ -225,8 +189,6 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 		RatingLiteral:      &activeRatingLiteral,
 		RatingExpectedText: &activeRatingExpected,
 	}
-	insertTypedRow(t, activeDB, activeRow)
-
 	peerNote := "peer-from-server"
 	peerRatingLiteral := "2.5"
 	peerRatingExpected := "2.5"
@@ -245,29 +207,19 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 		SourceID:       serverActor.SourceID,
 		SourceBundleID: 1,
 	}, retryableBundleWriteOptionsForTest(), func(ctx context.Context, tx oversync.DatabaseWriteTx) error {
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
-			INSERT INTO %s.typed_rows (id, name, note, count_value, enabled_flag, rating, data, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		`, pgx.Identifier{server.BusinessSchema}.Sanitize()),
-			peerRow.ID,
-			peerRow.Name,
-			peerNote,
-			nil,
-			peerRow.EnabledFlag == 1,
-			2.5,
-			nil,
-			peerCreatedAt,
-		)
-		return err
+		for _, row := range []typedRowFixture{seedRow, activeRow, peerRow} {
+			if err := insertTypedRowOnServer(ctx, tx, server.BusinessSchema, row); err != nil {
+				return err
+			}
+		}
+		return nil
 	}))
 
-	mustPushPendingE2E(t, activeClient, ctx)
 	mustPullToStableE2E(t, activeClient, ctx)
 	mustRebuildE2E(t, hydrateClient, ctx)
 
 	assertTableCount(t, activeDB, "typed_rows", 3)
 	assertTableCount(t, hydrateDB, "typed_rows", 3)
-	assertTableCount(t, seedDB, "_sync_dirty_rows", 0)
 	assertTableCount(t, activeDB, "_sync_dirty_rows", 0)
 	assertTableCount(t, hydrateDB, "_sync_dirty_rows", 0)
 
@@ -277,6 +229,39 @@ func TestEndToEnd_TypedRowsPushPullHydrateAndImmediatePullStayConsistent(t *test
 	assertTypedRowState(t, hydrateDB, seedRow)
 	assertTypedRowState(t, hydrateDB, activeRow)
 	assertTypedRowState(t, hydrateDB, peerRow)
+}
+
+func insertTypedRowOnServer(ctx context.Context, tx oversync.DatabaseWriteTx, schema string, row typedRowFixture) error {
+	var data []byte
+	var err error
+	if row.DataHex != nil {
+		data, err = hex.DecodeString(*row.DataHex)
+		if err != nil {
+			return err
+		}
+	}
+	var rating any
+	if row.RatingLiteral != nil {
+		rating, err = strconv.ParseFloat(*row.RatingLiteral, 64)
+		if err != nil {
+			return err
+		}
+	}
+	var float4 any
+	if row.Float4Literal != nil {
+		float4, err = strconv.ParseFloat(*row.Float4Literal, 32)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s.typed_rows
+		(id, name, note, count_value, small_count, medium_count, exact_amount, enabled_flag, rating, float4_value, data, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+	`, pgx.Identifier{schema}.Sanitize()), row.ID, row.Name, nullStringPointer(row.Note),
+		nullInt64Pointer(row.CountValue), nullInt64Pointer(row.SmallCount), nullInt64Pointer(row.MediumCount),
+		nullStringPointer(row.ExactAmountLiteral), row.EnabledFlag == 1, rating, float4, data, nullStringPointer(row.CreatedAt))
+	return err
 }
 
 func insertTypedRow(t *testing.T, db *sql.DB, row typedRowFixture) {

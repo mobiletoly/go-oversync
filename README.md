@@ -14,7 +14,7 @@ conflict handling, and snapshot recovery without hand-rolling the replication pr
 go-oversync handles the sync machinery that is easy to underestimate:
 
 - trigger-based dirty-row capture on SQLite clients
-- staged push sessions for durable, retryable uploads
+- one bounded whole-bundle push request with durable, exact replay
 - authoritative PostgreSQL commits and replay back to clients
 - retry-safe server-originated writes recorded in normal sync history
 - complete committed-bundle pulls with stable checkpoints
@@ -46,6 +46,22 @@ PostgreSQL business tables are authoritative. Clients push local dirty rows, rep
 authoritative result, and pull complete committed bundles from the server. Fresh installs and
 history-pruned clients rebuild from frozen server snapshots.
 
+The server stores one immutable canonical history of normalized PostgreSQL effects. Each client is
+pinned to one immutable schema generation, and push replay, pull, conflicts, and snapshots expose a
+deterministic projection containing only that generation's tables and columns. Projection is
+bounded and computed on demand; there is no durable per-generation history copy or projection
+cache. A canonical bundle that has no visible effects is still returned as an empty envelope so a
+client can durably advance its checkpoint.
+
+A push succeeds only when every uploaded key has a final captured effect visible to the pushing
+generation. Trigger normalization and additional captured effects are allowed, but suppressed or
+uncovered uploaded keys reject the whole transaction with HTTP 422
+`push_effect_coverage_incomplete`. The fixed-generation Go client verifies projected counts,
+bytes and hashes, preserves newer local edits while applying authoritative effects, and
+acknowledges each outcome under its original generation proof. Upload outcomes survive history
+pruning until acknowledgment. `Opening` supports same-proof local migrations and coordinated
+generation changes.
+
 ## Client Options
 
 - Go clients can use `oversqlite` directly.
@@ -58,14 +74,26 @@ simulators.
 
 ## Numeric Wire Contract
 
-The active breaking-development contract is `jcs_uniform_numeric_strings_v1`. PostgreSQL integer,
-decimal, and floating business values are canonical JSON strings on every wire surface. Floating
-strings use the shortest finite RFC 8785 binary64 spelling and normalize negative zero to `"0"`.
-SQLite clients may upload Boolean affinity as strict `"0"`/`"1"` strings; authoritative committed
-output uses JSON Booleans. Numeric behavior comes from PostgreSQL schema discovery and SQLite
-affinity, not per-column client configuration.
+Generation-bound rows use the exact generation tokens. Integers are canonical range-checked decimal
+strings; exact decimals are bounded strings with no exponent notation; `float64` values use a
+shortest finite spelling, including PostgreSQL `float4` values after storage normalization; and
+Boolean values are JSON `true` or `false` only.
+Bytes use canonical padded standard base64, UUIDs use lowercase dashed text, and JSON values are
+inner RFC 8785 JCS bytes carried in an outer JSON string. Text and inner-JSON strings preserve every
+Unicode scalar except U+0000, which PostgreSQL text/JSON storage cannot represent. Outer JSON
+`null` means SQL NULL; outer string `"null"` means a non-null JSON document. Invalid tokens are
+rejected before request hashing, staging, or mutation.
+
+The fixed generation proof supplies wire identity. Ordinary clients discover the server-owned
+column contract and derive SQLite conversions internally; applications do not declare per-column
+wire types or codecs. The separately gated upgrade machinery retains explicit historical local
+codec metadata for coordinated generation changes, but ordinary open, attach, push, pull, and
+rebuild do not depend on it.
 
 ## Quick Start
+
+Use Go 1.25.0 or later and PostgreSQL 17. Development checks use Go 1.25.12.
+See the [v0.5.0 release notes](docs/releases/v0.5.0.md) for compatibility.
 
 Install the module:
 
@@ -73,26 +101,24 @@ Install the module:
 go get github.com/mobiletoly/go-oversync
 ```
 
-Run the fast checks:
+Run the package checks with Docker and the paired SQLiteNow contract corpus:
 
 ```bash
-go test ./oversync ./oversqlite
+GOTOOLCHAIN=go1.25.12 \
+  OVERSQLITE_CONTRACTS_ROOT="$PWD/../sqlitenow-kmp/oversqlite-contracts" \
+  go test ./oversync ./oversqlite
 ```
 
-Start the reference server:
+Start the maintained sample server:
 
 ```bash
-DATABASE_URL="postgres://postgres:postgres@localhost:5432/clisync_example?sslmode=disable" \
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/samplesync?sslmode=disable" \
 JWT_SECRET="dev-secret" \
-go run ./examples/nethttp_server
+go run ./examples/samplesync_server
 ```
 
-Run an implemented simulator scenario:
-
-```bash
-cd examples/mobile_flow
-go run . --scenario=fresh-install
-```
+See [`examples/samplesync_server`](examples/samplesync_server/) for its PostgreSQL setup and the
+matching `samplesync-kmp` client application.
 
 ## Server Integration
 
@@ -100,9 +126,31 @@ Register the PostgreSQL tables that participate in sync, bootstrap the runtime, 
 HTTP handlers behind your existing authentication middleware.
 
 ```go
+schemaGenerations := []oversync.SchemaGeneration{{
+    ID: 1,
+    Tables: []oversync.GenerationTable{
+        {Schema: "business", Table: "users", Columns: []oversync.GenerationColumn{
+            {Name: "email", WireType: oversync.GenerationWireTypeText},
+            {Name: "id", WireType: oversync.GenerationWireTypeUUID},
+            {Name: "name", WireType: oversync.GenerationWireTypeText},
+        }},
+        {Schema: "business", Table: "posts", Columns: []oversync.GenerationColumn{
+            {Name: "author_id", WireType: oversync.GenerationWireTypeUUID, Nullable: true},
+            {Name: "content", WireType: oversync.GenerationWireTypeText},
+            {Name: "id", WireType: oversync.GenerationWireTypeUUID},
+            {Name: "title", WireType: oversync.GenerationWireTypeText},
+        }, ForeignKeys: []oversync.GenerationForeignKey{{
+            Columns: []string{"author_id"}, ReferencedSchema: "business", ReferencedTable: "users",
+            ReferencedColumns: []string{"id"}, OnDelete: oversync.GenerationForeignKeyNoAction,
+            OnUpdate: oversync.GenerationForeignKeyNoAction,
+        }}},
+    },
+}}
 cfg := &oversync.ServiceConfig{
-    MaxSupportedSchemaVersion: 1,
-    AppName:                   "my-sync-app",
+    Readiness:                      yourApplicationReadiness,
+    SchemaGenerations:              schemaGenerations,
+    RegisteredTableCatalogRevision: 1,
+    AppName:                        "my-sync-app",
     RegisteredTables: []oversync.RegisteredTable{
         {Schema: "business", Table: "users", SyncKeyColumns: []string{"id"}},
         {Schema: "business", Table: "posts", SyncKeyColumns: []string{"id"}},
@@ -130,49 +178,123 @@ syncActorMiddleware := oversync.ActorMiddleware(oversync.ActorMiddlewareConfig{
 withSyncActor := func(next http.Handler) http.Handler {
     return yourAuthMiddleware(syncActorMiddleware(next))
 }
+withSyncAdmission := func(next http.Handler) http.Handler {
+    // Discovery bypasses rollout readiness, but retains authentication,
+    // actor/source validation, client policy, cancellation, and tracking.
+    return yourSyncClientPolicy(withSyncActor(next))
+}
 
 mux := http.NewServeMux()
-// Wire the handlers behind your auth and sync actor middleware.
-// In most cases you can just copy these lines into your server setup
-mux.Handle("POST /sync/connect", withSyncActor(http.HandlerFunc(handlers.HandleConnect)))
-mux.Handle("POST /sync/push-sessions", withSyncActor(http.HandlerFunc(handlers.HandleCreatePushSession)))
-mux.Handle("POST /sync/push-sessions/{push_id}/chunks", withSyncActor(http.HandlerFunc(handlers.HandlePushSessionChunk)))
-mux.Handle("POST /sync/push-sessions/{push_id}/commit", withSyncActor(http.HandlerFunc(handlers.HandleCommitPushSession)))
-mux.Handle("DELETE /sync/push-sessions/{push_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeletePushSession)))
-mux.Handle("GET /sync/committed-bundles/{bundle_seq}/rows", withSyncActor(http.HandlerFunc(handlers.HandleGetCommittedBundleRows)))
-mux.Handle("GET /sync/pull", withSyncActor(http.HandlerFunc(handlers.HandlePull)))
-mux.Handle("POST /sync/snapshot-sessions", withSyncActor(http.HandlerFunc(handlers.HandleCreateSnapshotSession)))
-mux.Handle("GET /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleGetSnapshotChunk)))
-mux.Handle("DELETE /sync/snapshot-sessions/{snapshot_id}", withSyncActor(http.HandlerFunc(handlers.HandleDeleteSnapshotSession)))
-mux.Handle("GET /sync/capabilities", withSyncActor(http.HandlerFunc(handlers.HandleCapabilities)))
+// Register raw sync handlers. The outer dispatcher below owns admission.
+mux.HandleFunc("POST /sync/connect", handlers.HandleConnect)
+mux.HandleFunc("POST /sync/push", handlers.HandlePush)
+mux.HandleFunc("POST /sync/push-outcomes/resolve", handlers.HandlePushOutcomeResolve)
+mux.HandleFunc("POST /sync/push-outcomes/retained", handlers.HandlePushOutcomeRetained)
+mux.HandleFunc("POST /sync/push-outcomes/ack", handlers.HandlePushOutcomeAck)
+mux.HandleFunc("GET /sync/pull", handlers.HandlePull)
+mux.HandleFunc("POST /sync/snapshot-sessions", handlers.HandleCreateSnapshotSession)
+mux.HandleFunc("GET /sync/snapshot-sessions/{snapshot_id}", handlers.HandleGetSnapshotChunk)
+mux.HandleFunc("DELETE /sync/snapshot-sessions/{snapshot_id}", handlers.HandleDeleteSnapshotSession)
+generationDiscovery := http.HandlerFunc(handlers.HandleGeneration)
+mux.Handle("GET /sync/generations/{generation_id}", generationDiscovery)
+mux.Handle("GET /sync/generations/", generationDiscovery)
 mux.HandleFunc("GET /syncx/health", handlers.HandleHealth)
 mux.HandleFunc("GET /syncx/status", handlers.HandleStatus)
+
+isGenerationDiscovery := func(r *http.Request) bool {
+    return r.Method == http.MethodGet &&
+        (r.URL.Path == "/sync/generations" || strings.HasPrefix(r.URL.Path, "/sync/generations/"))
+}
+admissionTarget := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    if isGenerationDiscovery(r) {
+        generationDiscovery.ServeHTTP(w, r)
+        return
+    }
+    mux.ServeHTTP(w, r)
+})
+admittedSync := withSyncAdmission(admissionTarget)
+operationalSync := svc.ReadinessGuard(admittedSync)
+syncHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    if isGenerationDiscovery(r) {
+        admittedSync.ServeHTTP(w, r)
+        return
+    }
+    if strings.HasPrefix(r.URL.Path, "/sync/") {
+        operationalSync.ServeHTTP(w, r)
+        return
+    }
+    mux.ServeHTTP(w, r)
+})
+// Use syncHandler as the root http.Server Handler.
 ```
+
+Supply `yourApplicationReadiness` as an application-owned `*oversync.ReadinessConfig`.
+Prepare the matching deployment evidence before bootstrap. See the
+[readiness setup](docs/getting-started.md#step-3-create-the-server) and the
+[maintained sample server](examples/samplesync_server/server/setup.go).
 
 `yourAuthMiddleware` must authenticate the request and expose trusted `user_id` in request context.
 `oversync.ActorMiddleware(...)` reads `Oversync-Source-ID` from the client request and combines it
 with that trusted user identity. The runtime derives user sync scope id from `Actor.UserID`.
+
+Clients select a generation ID and discover its server-owned descriptor through
+`GET /sync/generations/{generation_id}`. Send `Oversync-Protocol-Version: v1` and
+`Oversync-Source-ID` on authenticated sync requests. Omit both generation proof headers
+during discovery. After validation, the SDK sends the exact `Oversync-Schema-Generation-ID`
+and `Oversync-Schema-Generation-Fingerprint` on every subsequent `/sync` request. Upload acknowledgment carries the original source and proof.
+Discovery bypasses only operational readiness. The root dispatcher runs before `http.ServeMux`, so
+malformed discovery paths remain authenticated and receive the protocol HTTP 400 response without
+a cleaning redirect. Non-GET discovery and all other `/sync/` requests remain behind operational
+readiness.
 
 ## SQLite Client
 
 Go clients can use `oversqlite` to install local metadata tables, capture local dirty rows, attach
 an authenticated user, and run push/pull sync.
 
-```go
-cfg := oversqlite.DefaultConfig("business", []oversqlite.SyncTable{
-    {TableName: "users", SyncKeyColumnName: "id"},
-    {TableName: "posts", SyncKeyColumnName: "id"},
-})
+Opening and local writes work offline. `Attach` discovers and confirms the selected generation,
+validates local storage, and saves the contract before connecting. Later opens reuse that contract.
+The `ContractConfirmed` field returned by `SyncStatus(ctx)` distinguishes unconfirmed local state. Register every table in the
+selected generation; schema names and conversions come from the server. Generation or managed-shape
+changes require the explicit preserving upgrade path described in [the upgrade design](docs/client-upgrades.md).
 
-client, err := oversqlite.NewClient(db, "http://localhost:8080", tokenProvider, cfg)
+```go
+cfg := &oversqlite.Config{
+    GenerationID: 1,
+    DatabaseID: "app-db",
+    ServiceID: "my-service",
+    LocalVersion: 1,
+    Tables: []oversqlite.SyncTable{
+        {TableName: "users", SyncKeyColumnName: "id"},
+        {TableName: "posts", SyncKeyColumnName: "id"},
+    },
+    UploadLimit: 200,
+    DownloadLimit: 1000,
+}
+
+opening, err := oversqlite.NewOpening(&oversqlite.OpeningConfig{
+    DatabasePath:       "app.db",
+    Plan:               freshPlan, // exact first-install or upgrade edge
+    BaseURL:            "http://localhost:8080",
+    Token:              tokenProvider,
+    TargetClientConfig: cfg,
+})
 if err != nil {
     log.Fatal(err)
 }
-defer client.Close()
+defer opening.Close()
 
-if err := client.Open(ctx); err != nil {
+opened, err := opening.Advance(ctx)
+if err != nil {
     log.Fatal(err)
 }
+client := opened.Ready
+if client == nil {
+    log.Fatalf("database is not ready: %s", opened.Status.Outcome)
+}
+defer client.Close()
+
+db := client.Database() // borrowed; stop application SQL before Close or UninstallSync
 
 attachResult, err := client.Attach(ctx, "user-123")
 if err != nil {
@@ -206,8 +328,8 @@ Both clients target the same go-oversync server protocol.
 The current contract is bundle-based:
 
 - PostgreSQL business tables are authoritative.
-- clients push one logical dirty set at a time through staged push sessions
-- accepted pushes are replayed locally from the authoritative committed result
+- clients freeze one bounded bundle of pending edits at a time for `POST /sync/push`
+- clients settle the terminal outcome locally and acknowledge it under the original binding
 - clients pull complete committed bundles only
 - fresh installs and prune recovery rebuild from frozen snapshot sessions
 
@@ -239,13 +361,12 @@ The SQLite client is likewise fail-closed:
 
 See `docs/getting-started.md` and `docs/documentation/server.md` for the full table requirements.
 
-Oversync does not provide an in-place migration or automated repair for deployments outside this
-supported envelope. Stop affected instances and restore a reviewed, compatible database backup or
-follow a separately reviewed operator procedure; do not make ad hoc changes while Oversync is
-running. Mixed-version operation is unsupported.
+`Opening` supports planned changes to the visible column and table sets, including qualifying
+nullable additive foreign keys. Shared sync keys and shared foreign-key semantics stay stable.
+Separate devices can sync against different supported generations with independent source
+identities. See [Go SQLite client upgrades](docs/client-upgrades.md).
 
-Nullable identity declarations use a data-preserving operator migration rather than the destructive
-reset above. Stop all writers and mixed-version instances, resolve existing NULL owner/key values
+To correct nullable identity declarations, stop all writers and server instances, resolve existing NULL owner/key values
 according to application policy, add explicit `NOT NULL` to every reported PostgreSQL
 root/descendant or SQLite visible key, then retry bootstrap/initialization. Corrected binaries do not
 change the wire, checkpoint, or snapshot contract, but older binaries do not enforce this invariant.
@@ -258,16 +379,15 @@ runtime reset endpoint or bundle-context escape hatch.
 Supported populated registered tables are adopted only while creating a fresh managed layout,
 without rewriting their business rows. Bootstrap locks registered writes and commits trigger
 installation plus one replayable baseline bundle per populated scope atomically. Runtime operations
-remain unavailable until bootstrap succeeds. Existing populated deployments require a coordinated
-stop, backup, upgraded bootstrap, and readiness check for that one-time adoption.
+remain unavailable until bootstrap succeeds. For a first deployment with populated business
+tables, stop writers, take a backup, then bootstrap and verify readiness before opening traffic.
 
 The PostgreSQL `sync` namespace is reserved for Oversync. After the fresh transaction has committed,
 later `Bootstrap()` calls use a trusted-database attachment path: they revalidate registered-table
-declarations, the marker/catalog, and the complete `server_postgres_sync_v1` semantic definition,
-then publish readiness without reading business rows or managed operational state. Attachment takes
-no explicit data locks and performs no DML, DDL, adoption, canonicalization, hashing, cleanup, or
-repair. Missing, extra, disabled, invalid, or altered managed definitions return a typed
-`UnsupportedSchemaError` with expected/actual fingerprints and bounded field differences.
+declarations, the marker/catalog, the `server_postgres_sync_catalog_v1` definition, and the push
+outcome store. Attachment checks the stored ceiling and outstanding outcome generation proofs
+without scanning business rows. Definition drift returns a typed `UnsupportedSchemaError`
+with expected and actual fingerprints and bounded field differences.
 
 This fast path trusts PostgreSQL's committed durable data. It does not audit or repair business or
 managed row values after privileged trigger bypass or direct managed-state edits. Such intervention
@@ -282,9 +402,9 @@ HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable sta
 
 - `oversync/`: PostgreSQL adapter, schema validation, bundle capture, HTTP handlers
 - `oversqlite/`: SQLite client SDK with trigger-based dirty capture and sync loops
-- `examples/nethttp_server/`: reference `net/http` server
-- `examples/mobile_flow/`: end-to-end simulator for the current client/server contract
 - `examples/samplesync_server/`: sample server for the KMP sample app
+- `integration/`: repository-owned server, simulator, schema-evolution, conformance, load, and
+  recovery harnesses
 - `docs/`: Jekyll site content
 - `swagger/two_way_sync.yaml`: OpenAPI description of the HTTP surface
 
@@ -297,13 +417,56 @@ HTTP/wire shape, checkpoint, snapshot, bundle, or Go/KMP/Dart client durable sta
 - server-originated writes: `docs/documentation/server-originated-writes.md`
 - client reference: `docs/documentation/client.md`
 - HTTP API reference: `docs/documentation/api.md`
+- [Durable upload outcomes](docs/documentation/durable-upload-outcomes.md)
+- [Snapshot recovery](docs/documentation/snapshot-recovery.md)
 
 ## Examples
 
-- `examples/nethttp_server/`: reference server with JWT auth and test helpers
-- `examples/mobile_flow/`: simulator for implemented sync scenarios plus a small number of still-partial CLI entries
 - `examples/samplesync_server/`: sample server used by the Kotlin sample app
+
+## Integration Harnesses
+
+- `integration/nethttp_server/`: repository test server with JWT auth and fault/test helpers
+- `integration/mobile_flow/`: end-to-end simulator and load/recovery scenarios
+- `integration/schema_evolution/`: migration, rollout, and recovery qualification authority
 
 ## License
 
 Apache 2.0. See `LICENSE` if present in your distribution or the source headers in this repository.
+
+### Transaction admission for application-owned scope lifecycle
+
+`ServiceConfig.ScopeTransactionAdmission` optionally supplies an application policy implementing
+`AdmitScopeTransaction(context.Context, DatabaseWriteTx, ScopeTransactionOperation) error`.
+Oversync calls it inside each actual scoped mutation transaction, before scope creation or receipt
+replay, and calls it again on every transaction retry. A nil capability preserves SDK behavior.
+The supplied SQL-only transaction has the same context, SQL and nested SDK operation restrictions
+as retryable write callbacks. The application owns its policy tables and lock namespace.
+
+`ScopeTransactionOperation` carries exact `ScopeID` and `SourceID` values and an SDK-derived `Kind`:
+
+| Entry point | Kind | Source |
+| --- | --- | --- |
+| `Connect` | `ScopeTransactionConnect` | authenticated client source |
+| `PushOneShot` and `WithinSyncBundle` | `ScopeTransactionClientPush` | validated non-reserved source |
+| `ScopeManager.ExecWrite` | `ScopeTransactionServerWrite` | trusted in-process writer |
+| Populated-table baseline adoption | `ScopeTransactionServerWrite` | SDK `oversync-adoption:` namespace |
+| Snapshot creation and source replacement | `ScopeTransactionSnapshotCreate` | authenticated old/current source |
+| Explicit snapshot retirement | `ScopeTransactionSnapshotRetire` | authenticated client source |
+
+Client sources cannot impersonate configured reserved server writers. Authorize privileged writers
+using both the kind and exact source ID. A policy can acquire a shared transaction advisory lock,
+then read application lifecycle state in a **separate statement** under Read Committed; a retiring
+application takes the matching exclusive lock and durably records retirement. The lock stays held
+until commit or rollback. Scope reads, watches and erasure-only metadata maintenance do not invoke
+this capability or hold its lifecycle lock.
+
+Return `&oversync.ScopeAccessDeniedError{}` to reject with safe HTTP 403 `scope_access_denied`.
+Other policy errors fail closed as `ScopeAdmissionUnavailableError`, with safe HTTP 503
+`scope_admission_unavailable`; the cause is available to trusted Go callers through `Unwrap`.
+The SDK implements no account-deletion policy and creates no lifecycle table.
+
+`ScopeWriteOptions.RequireExistingScope` makes trusted server writes reject absent or uninitialized
+scopes with `ScopeUninitializedError`, after transaction admission and without creating metadata.
+It supports repeated application erasure without accidentally initializing an empty scope. Include
+this option in the application's frozen `OperationHash`, just as application-selected byte limits.
